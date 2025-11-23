@@ -119,6 +119,24 @@ export const SSTV_MODES = {
     colorScanTimes: [138.24, 138.24, 138.24], // R, G, B channels all 138.24ms
     colorOrder: ['R', 'G', 'B'], // RGB sequential (sync-R-sep-G-sep-B)
   },
+  SCOTTIE_S2: {
+    name: 'Scottie S2',
+    visCode: 56,
+    width: 320,
+    height: 256,
+    // Scottie S2 is faster than S1: sync(9) + R(88.064) + sep(1.5) + G(88.064) + sep(1.5) + B(88.064) = 277.692ms
+    // Same RGB sequential encoding as S1, just faster transmission
+    // Transmission order: Green → Blue → [SYNC] → Red (negative timing like S1)
+    scanTime: 277.692,
+    syncPulse: 9,
+    syncPorch: 0, // Scottie uses separator, not sync porch
+    porchFreq: 1500,
+    separatorPulse: 1.5,
+    separatorPulses: [1.5, 1.5], // Two separators (after R and after G)
+    colorScanTime: 88.064,
+    colorScanTimes: [88.064, 88.064, 88.064], // R, G, B channels all 88.064ms
+    colorOrder: ['R', 'G', 'B'], // RGB sequential (G-B-sync-R order in time)
+  },
 } as const;
 
 // Frequency constants

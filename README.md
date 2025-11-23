@@ -36,7 +36,7 @@
 
 ## Features
 
-- **Multi-Mode Support**: Robot36 Color (320×240), PD120 (640×496), PD160 (512×400), and PD180 (640×496) with manual mode selection
+- **Multi-Mode Support**: Robot36 Color (320×240), Robot72 (320×240), Scottie S1 (320×256), Scottie S2 (320×256), PD120 (640×496), PD160 (512×400), and PD180 (640×496) with manual mode selection
 - **Real-time Audio Processing**: Captures microphone input using Web Audio API (auto-detects 44.1 kHz or 48 kHz)
 - **Professional DSP Chain**:
   - FM demodulation with complex baseband conversion
@@ -59,6 +59,7 @@
 | **Robot36 Color** | 320×240 | 9ms | ~150ms | ~36s | 8 | ✅ Implemented | [ROBOT36.md](./doc/ROBOT36.md) |
 | **Robot72 Color** | 320×240 | 9ms | ~300ms | ~1m 12s | 12 | ✅ Implemented | [ROBOT72.md](./doc/ROBOT72.md) |
 | **Scottie S1** | 320×256 | 9ms | ~428ms | ~1m 50s | 60 | ✅ Implemented | [SCOTTIE_S1.md](./doc/SCOTTIE_S1.md) |
+| **Scottie S2** | 320×256 | 9ms | ~278ms | ~1m 11s | 56 | ✅ Implemented | [SCOTTIE_S2.md](./doc/SCOTTIE_S2.md) |
 | **PD120** | 640×496 | 20ms | ~508ms | ~2m 6s | 95 | ✅ Implemented | [PD120.md](./doc/PD120.md) |
 | **PD160** | 512×400 | 20ms | ~804ms | ~2m 41s | 98 | ✅ Implemented | [PD160.md](./doc/PD160.md) |
 | **PD180** | 640×496 | 20ms | ~752ms | ~3m 6s | 96 | ✅ Implemented | [PD180.md](./doc/PD180.md) |
@@ -69,7 +70,6 @@ The decoder architecture supports adding these modes in future updates:
 
 | Mode | Resolution | Sync Pulse | Line Time | Total Time | VIS Code | Complexity |
 |------|------------|------------|-----------|------------|----------|------------|
-| **Scottie S2** | 320×256 | 9ms | ~277ms | ~1m 11s | 56 | Medium (RGB sequential) |
 | **Scottie DX** | 320×256 | 9ms | ~1069ms | ~4m 34s | 76 | Medium (RGB sequential) |
 | **Martin M1** | 320×256 | 5ms | ~446ms | ~1m 54s | 44 | Medium (GBR sequential) |
 | **Martin M2** | 320×256 | 5ms | ~226ms | ~58s | 40 | Medium (GBR sequential) |
@@ -87,9 +87,10 @@ The decoder architecture supports adding these modes in future updates:
 - **Robot72**: 72 seconds, higher quality than Robot36
 
 **For High Quality** (1-3 minutes):
+- **Scottie S2**: 1m 11s, RGB sequential, faster HF mode, clean colors
+- **Scottie S1**: 1m 50s, RGB sequential, original HF classic, clean colors
 - **PD120**: 2m 6s, 640×496, excellent for ISS SSTV events
 - **PD160**: 2m 41s, 512×400, balanced quality and time
-- **Scottie S1**: 1m 50s, RGB sequential, clean colors
 - **PD180**: 3m 9s, 640×496, extended transmission
 
 **For Maximum Quality** (3+ minutes):
@@ -181,6 +182,7 @@ npm start
    - Robot36: 320×240, fastest decode (~36 seconds)
    - Robot72: 320×240, better color than Robot36 (~72 seconds)
    - Scottie S1: 320×256, HF classic, RGB sequential (~1m 50s)
+   - Scottie S2: 320×256, faster HF mode, RGB sequential (~1m 11s)
    - PD120: 640×496, high resolution (~2 minutes), used for ISS SSTV
    - PD160: 512×400, balanced mode (~2m 41s), good SNR
    - PD180: 640×496, highest quality (~3 minutes), best SNR
@@ -305,12 +307,13 @@ src/
 │   └── useAudioProcessor.ts    # Web Audio API integration (mode-aware)
 └── lib/
     └── sstv/
-        ├── constants.ts             # SSTV mode specifications (Robot36, Robot72, Scottie S1, PD120, PD160, PD180)
+        ├── constants.ts             # SSTV mode specifications (Robot36, Robot72, Scottie S1, Scottie S2, PD120, PD160, PD180)
         ├── decoder.ts               # Main decoder orchestration (multi-mode)
         ├── sync-detector.ts         # Sync pulse detection (9ms/20ms)
         ├── robot36-line-decoder.ts  # Robot36 interlaced YUV decoder
         ├── robot72-line-decoder.ts  # Robot72 sequential YUV decoder (better color)
         ├── scottie-s1-line-decoder.ts # Scottie S1 RGB sequential decoder (HF classic)
+        ├── scottie-s2-line-decoder.ts # Scottie S2 RGB sequential decoder (faster HF)
         ├── pd120-line-decoder.ts    # PD120 dual-luminance decoder
         ├── pd160-line-decoder.ts    # PD160 dual-luminance decoder (balanced mode)
         ├── pd180-line-decoder.ts    # PD180 dual-luminance decoder (high quality)
@@ -321,6 +324,7 @@ doc/
 ├── ROBOT36.md                  # Robot36 technical specification
 ├── ROBOT72.md                  # Robot72 technical specification
 ├── SCOTTIE_S1.md               # Scottie S1 technical specification
+├── SCOTTIE_S2.md               # Scottie S2 technical specification
 ├── PD120.md                    # PD120 technical specification
 ├── PD160.md                    # PD160 technical specification
 ├── PD180.md                    # PD180 technical specification
@@ -401,7 +405,7 @@ This implementation closely follows the [Robot36 Android app](https://github.com
 - [ ] **Audio File Upload**: Decode from WAV/MP3 files for offline processing
 
 ### Medium Priority
-- [ ] **Scottie Modes**: S1, S2, DX (RGB sequential encoding)
+- [ ] **Scottie DX Mode**: DX variant with 4m 34s transmission time (RGB sequential encoding)
 - [ ] **Martin Modes**: M1, M2 (GBR sequential encoding)
 - [ ] **Wraase SC2-180**: High-quality RGB mode
 - [ ] **Improved Noise Reduction**: Advanced filtering for weak signals

@@ -6,8 +6,9 @@ import { PD120LineDecoder, DecodedLine as PD120DecodedLine } from './pd120-line-
 import { PD160LineDecoder, DecodedLine as PD160DecodedLine } from './pd160-line-decoder';
 import { PD180LineDecoder, DecodedLine as PD180DecodedLine } from './pd180-line-decoder';
 import { ScottieS1LineDecoder, DecodedLine as ScottieS1DecodedLine } from './scottie-s1-line-decoder';
+import { ScottieS2LineDecoder, DecodedLine as ScottieS2DecodedLine } from './scottie-s2-line-decoder';
 
-type DecodedLine = Robot36DecodedLine | Robot72DecodedLine | PD120DecodedLine | PD160DecodedLine | PD180DecodedLine | ScottieS1DecodedLine;
+type DecodedLine = Robot36DecodedLine | Robot72DecodedLine | PD120DecodedLine | PD160DecodedLine | PD180DecodedLine | ScottieS1DecodedLine | ScottieS2DecodedLine;
 
 export enum DecoderState {
   IDLE = 'IDLE',
@@ -45,7 +46,7 @@ export class SSTVDecoder {
 
   // Sync detection
   private syncDetector: SyncDetector;
-  private lineDecoder: Robot36LineDecoder | Robot72LineDecoder | PD120LineDecoder | PD160LineDecoder | PD180LineDecoder | ScottieS1LineDecoder;
+  private lineDecoder: Robot36LineDecoder | Robot72LineDecoder | PD120LineDecoder | PD160LineDecoder | PD180LineDecoder | ScottieS1LineDecoder | ScottieS2LineDecoder;
 
   // Line boundaries detected by sync pulses
   private lastSyncPos: number = -1;
@@ -86,6 +87,8 @@ export class SSTVDecoder {
       this.lineDecoder = new Robot72LineDecoder(sampleRate);
     } else if (modeName === 'SCOTTIE_S1') {
       this.lineDecoder = new ScottieS1LineDecoder(sampleRate);
+    } else if (modeName === 'SCOTTIE_S2') {
+      this.lineDecoder = new ScottieS2LineDecoder(sampleRate);
     } else if (modeName === 'PD120') {
       this.lineDecoder = new PD120LineDecoder(sampleRate);
     } else if (modeName === 'PD160') {

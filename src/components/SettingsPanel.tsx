@@ -4,7 +4,7 @@ import { useState } from 'react';
 import Fab from '@mui/material/Fab';
 import SettingsIcon from '@mui/icons-material/Settings';
 
-export type SSTVMode = 'ROBOT36' | 'ROBOT72' | 'SCOTTIE_S1' | 'PD120' | 'PD160' | 'PD180';
+export type SSTVMode = 'ROBOT36' | 'ROBOT72' | 'SCOTTIE_S1' | 'SCOTTIE_S2' | 'PD120' | 'PD160' | 'PD180';
 
 interface SettingsPanelProps {
   currentMode: SSTVMode;
@@ -30,6 +30,11 @@ export default function SettingsPanel({ currentMode, onModeChange, disabled = fa
       id: 'SCOTTIE_S1',
       name: 'Scottie S1',
       description: '320×256 • HF classic (428ms/line) • RGB sequential',
+    },
+    {
+      id: 'SCOTTIE_S2',
+      name: 'Scottie S2',
+      description: '320×256 • Faster HF (278ms/line) • RGB sequential',
     },
     {
       id: 'PD120',
