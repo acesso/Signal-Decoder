@@ -6,8 +6,37 @@ const withPWA = require('next-pwa')({
   // Precache important pages for offline access
   cacheOnFrontEndNav: true,
   // Build offline support directly into the PWA
-  buildExcludes: [/middleware-manifest\.json$/],
+  buildExcludes: [/middleware-manifest\.json$/, /app-build-manifest\.json$/],
+  // Fallback to offline page when offline
+  fallbacks: {
+    document: '/offline',
+  },
+  // Customize workbox to enable full offline support
+  cacheStartUrl: true,
+  dynamicStartUrl: false,
+  // Only precache files that actually exist
+  publicExcludes: ['!app-build-manifest.json', '!ngsw.json'],
   runtimeCaching: [
+    // Start URL - Cache first for true offline support
+    {
+      urlPattern: ({ url }) => url.pathname === '/',
+      handler: 'CacheFirst',
+      options: {
+        cacheName: 'start-url',
+        expiration: {
+          maxEntries: 1,
+          maxAgeSeconds: 30 * 24 * 60 * 60 // 30 days
+        },
+        cacheableResponse: {
+          statuses: [0, 200]
+        },
+        plugins: [
+          {
+            handlerDidError: async () => caches.match('/offline')
+          }
+        ]
+      }
+    },
     // External fonts - cache first for offline support
     {
       urlPattern: /^https:\/\/fonts\.(?:gstatic|googleapis)\.com\/.*/i,
@@ -56,23 +85,25 @@ const withPWA = require('next-pwa')({
         }
       }
     },
-    // HTML pages - Network first with fast fallback to cache for offline
+    // HTML pages - Cache first with network fallback for true offline support
     {
-      urlPattern: /^https?:\/\/[^\/]+\/$/,
-      handler: 'NetworkFirst',
+      urlPattern: ({ url, request }) => {
+        return url.origin === self.location.origin &&
+               request.destination === 'document';
+      },
+      handler: 'CacheFirst',
       options: {
         cacheName: 'pages',
-        networkTimeoutSeconds: 2, // Quick timeout for offline detection
         expiration: {
-          maxEntries: 10,
-          maxAgeSeconds: 24 * 60 * 60 // 24 hours
+          maxEntries: 50,
+          maxAgeSeconds: 30 * 24 * 60 * 60 // 30 days
         },
         cacheableResponse: {
           statuses: [0, 200]
         }
       }
     },
-    // Catch-all for same-origin - cache first for maximum offline support
+    // API and other same-origin requests
     {
       urlPattern: ({ url, request }) => {
         return url.origin === self.location.origin &&
@@ -91,6 +122,13 @@ const withPWA = require('next-pwa')({
 });
 
 /** @type {import('next').NextConfig} */
-const nextConfig = {}
+const nextConfig = {
+  // Enable static export for true offline PWA support
+  output: 'export',
+  // Disable image optimization for static export
+  images: {
+    unoptimized: true,
+  },
+}
 
 module.exports = withPWA(nextConfig)

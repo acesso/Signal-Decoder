@@ -125,6 +125,24 @@ export default function RootLayout({
       <body className="antialiased">
         {children}
         <PWAInstallPrompt />
+        <script
+          dangerouslySetInnerHTML={{
+            __html: `
+              if ('serviceWorker' in navigator && process.env.NODE_ENV !== 'development') {
+                window.addEventListener('load', function() {
+                  navigator.serviceWorker.register('/sw.js', { scope: '/' }).then(
+                    function(registration) {
+                      console.log('SW registered:', registration);
+                    },
+                    function(err) {
+                      console.log('SW registration failed:', err);
+                    }
+                  );
+                });
+              }
+            `.replace('process.env.NODE_ENV', JSON.stringify(process.env.NODE_ENV || 'production'))
+          }}
+        />
       </body>
     </html>
   );
