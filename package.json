@@ -1,6 +1,39 @@
 {
   "name": "sstv-decoder",
   "version": "0.1.0",
+  "description": "Free web-based SSTV decoder for amateur radio. Decode Robot36, Robot72, Scottie, and PD mode signals in real-time from your browser. Perfect for ham radio, ISS SSTV events, and satellite image reception.",
+  "keywords": [
+    "sstv",
+    "sstv-decoder",
+    "slow-scan-television",
+    "amateur-radio",
+    "ham-radio",
+    "robot36",
+    "robot72",
+    "scottie",
+    "pd120",
+    "iss-sstv",
+    "web-audio",
+    "fm-demodulation",
+    "dsp",
+    "pwa",
+    "offline-first",
+    "radio-decoder",
+    "satellite-images"
+  ],
+  "author": {
+    "name": "smolgroot",
+    "url": "https://github.com/smolgroot"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/smolgroot/sstv-decoder.git"
+  },
+  "homepage": "https://sstv-decoder.vercel.app",
+  "bugs": {
+    "url": "https://github.com/smolgroot/sstv-decoder/issues"
+  },
+  "license": "0BSD",
   "private": true,
   "scripts": {
     "dev": "next dev",

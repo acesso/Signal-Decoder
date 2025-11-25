@@ -14,7 +14,9 @@ export default function SSTVDecoder({ selectedMode, onModeChange }: SSTVDecoderP
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const spectrumCanvasRef = useRef<HTMLCanvasElement>(null);
   const spectrogramCanvasRef = useRef<HTMLCanvasElement>(null);
+  const waveformCanvasRef = useRef<HTMLCanvasElement>(null);
   const animationFrameRef = useRef<number | null>(null);
+  const waveformHistoryRef = useRef<Float32Array[]>([]);
 
   const {
     state,
@@ -56,19 +58,25 @@ export default function SSTVDecoder({ selectedMode, onModeChange }: SSTVDecoderP
     ctx.fillStyle = 'rgb(10, 10, 10)';
     ctx.fillRect(0, 0, canvas.width, canvas.height);
 
-    const barWidth = canvas.width / bufferLength;
-    let x = 0;
+    // Draw spectrum as a line
+    ctx.strokeStyle = '#2ea043';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
 
-    // Draw frequency bars
+    const barWidth = canvas.width / bufferLength;
     for (let i = 0; i < bufferLength; i++) {
       const barHeight = (dataArray[i] / 255) * plotHeight;
+      const x = i * barWidth;
+      const y = plotHeight - barHeight;
 
-      const hue = (i / bufferLength) * 120;
-      ctx.fillStyle = `hsl(${hue}, 100%, 50%)`;
-      ctx.fillRect(x, plotHeight - barHeight, barWidth, barHeight);
-
-      x += barWidth;
+      if (i === 0) {
+        ctx.moveTo(x, y);
+      } else {
+        ctx.lineTo(x, y);
+      }
     }
+
+    ctx.stroke();
 
     // Draw frequency axis
     ctx.fillStyle = '#8b949e';
@@ -156,6 +164,130 @@ export default function SSTVDecoder({ selectedMode, onModeChange }: SSTVDecoderP
     }
   }, []);
 
+  // Draw waveform timeline (like Audacity)
+  const drawWaveform = useCallback((canvas: HTMLCanvasElement) => {
+    const analyser = getAnalyser();
+    if (!analyser) return;
+
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+
+    // Get time domain data
+    const bufferLength = analyser.fftSize;
+    const dataArray = new Float32Array(bufferLength);
+    analyser.getFloatTimeDomainData(dataArray);
+
+    // Store waveform data in history (keep last 300 frames for ~10 seconds at 30fps)
+    const maxHistory = 300;
+    waveformHistoryRef.current.push(dataArray.slice());
+    if (waveformHistoryRef.current.length > maxHistory) {
+      waveformHistoryRef.current.shift();
+    }
+
+    const history = waveformHistoryRef.current;
+    if (history.length === 0) return;
+
+    // Reserve space for time axis at the bottom
+    const axisHeight = 25;
+    const plotHeight = canvas.height - axisHeight;
+
+    // Clear canvas
+    ctx.fillStyle = 'rgb(10, 10, 10)';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+    // Draw center line (zero amplitude)
+    ctx.strokeStyle = '#30363d';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(0, plotHeight / 2);
+    ctx.lineTo(canvas.width, plotHeight / 2);
+    ctx.stroke();
+
+    // Calculate pixels per frame
+    const pixelsPerFrame = canvas.width / maxHistory;
+
+    // Draw waveform history - green color to match theme
+    ctx.strokeStyle = '#2ea043';
+    ctx.fillStyle = 'rgba(46, 160, 67, 0.3)';
+    ctx.lineWidth = 1.5;
+
+    for (let frameIdx = 0; frameIdx < history.length; frameIdx++) {
+      const frame = history[frameIdx];
+      const x = frameIdx * pixelsPerFrame;
+      const samplesPerPixel = Math.max(1, Math.floor(frame.length / pixelsPerFrame));
+
+      // Draw waveform for this frame
+      ctx.beginPath();
+      ctx.moveTo(x, plotHeight / 2);
+
+      // Calculate min/max for each pixel column
+      for (let px = 0; px < pixelsPerFrame; px++) {
+        const sampleStart = Math.floor(px * samplesPerPixel);
+        const sampleEnd = Math.min(sampleStart + samplesPerPixel, frame.length);
+
+        let min = 1;
+        let max = -1;
+
+        for (let i = sampleStart; i < sampleEnd; i++) {
+          const sample = frame[i];
+          if (sample < min) min = sample;
+          if (sample > max) max = sample;
+        }
+
+        const xPos = x + px;
+        const yMin = plotHeight / 2 - (min * plotHeight / 2);
+        const yMax = plotHeight / 2 - (max * plotHeight / 2);
+
+        // Draw vertical line from min to max
+        ctx.moveTo(xPos, yMin);
+        ctx.lineTo(xPos, yMax);
+      }
+
+      ctx.stroke();
+    }
+
+    // Draw time axis
+    ctx.fillStyle = '#8b949e';
+    ctx.strokeStyle = '#30363d';
+    ctx.lineWidth = 1;
+    ctx.font = '10px monospace';
+    ctx.textAlign = 'center';
+
+    // Draw horizontal line for axis
+    ctx.beginPath();
+    ctx.moveTo(0, plotHeight);
+    ctx.lineTo(canvas.width, plotHeight);
+    ctx.stroke();
+
+    // Calculate time range (assuming ~30fps polling)
+    const fps = 30;
+    const totalSeconds = maxHistory / fps;
+    const secondsVisible = (history.length / maxHistory) * totalSeconds;
+
+    // Draw time labels every 2 seconds for 10s range
+    const labelInterval = 2;
+    const pixelsPerSecond = canvas.width / totalSeconds;
+    for (let sec = 0; sec <= Math.ceil(secondsVisible); sec += labelInterval) {
+      const xPos = (totalSeconds - secondsVisible + sec) * pixelsPerSecond;
+      
+      if (xPos >= 0 && xPos <= canvas.width) {
+        // Draw tick mark
+        ctx.beginPath();
+        ctx.moveTo(xPos, plotHeight);
+        ctx.lineTo(xPos, plotHeight + 5);
+        ctx.stroke();
+
+        // Draw label
+        const timeLabel = `-${Math.floor(secondsVisible - sec)}s`;
+        ctx.fillText(timeLabel, xPos, plotHeight + 18);
+      }
+    }
+
+    // Draw "now" indicator
+    ctx.fillStyle = '#2ea043';
+    ctx.fillText('now', canvas.width - 20, plotHeight + 18);
+  }, [getAnalyser]);
+
   // Update canvas with decoded image
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -219,10 +351,11 @@ export default function SSTVDecoder({ selectedMode, onModeChange }: SSTVDecoderP
         lastRenderedLine = currentLine;
       }
 
-      // Draw spectrum and spectrogram only when recording
+      // Draw spectrum, spectrogram, and waveform only when recording
       if (state.isRecording) {
         const spectrumCanvas = spectrumCanvasRef.current;
         const spectrogramCanvas = spectrogramCanvasRef.current;
+        const waveformCanvas = waveformCanvasRef.current;
 
         if (spectrumCanvas) {
           const frequencyData = drawSpectrum(spectrumCanvas);
@@ -231,6 +364,11 @@ export default function SSTVDecoder({ selectedMode, onModeChange }: SSTVDecoderP
           if (spectrogramCanvas && frequencyData) {
             drawSpectrogram(spectrogramCanvas, frequencyData);
           }
+        }
+
+        // Update waveform timeline
+        if (waveformCanvas) {
+          drawWaveform(waveformCanvas);
         }
       }
 
@@ -244,7 +382,7 @@ export default function SSTVDecoder({ selectedMode, onModeChange }: SSTVDecoderP
         cancelAnimationFrame(animationFrameRef.current);
       }
     };
-  }, [state.isRecording, state.stats?.currentLine, getImageData, getDimensions, drawSpectrum, drawSpectrogram, getAnalyser]);
+  }, [state.isRecording, state.stats?.currentLine, getImageData, getDimensions, drawSpectrum, drawSpectrogram, drawWaveform, getAnalyser]);
 
   const handleStart = async () => {
     await startRecording();
@@ -256,6 +394,8 @@ export default function SSTVDecoder({ selectedMode, onModeChange }: SSTVDecoderP
 
   const handleReset = () => {
     resetDecoder();
+    // Clear waveform history
+    waveformHistoryRef.current = [];
   };
 
   const handleSaveImage = () => {
@@ -464,8 +604,19 @@ export default function SSTVDecoder({ selectedMode, onModeChange }: SSTVDecoderP
             )}
           </div>
 
-          {/* Real-time Spectrum */}
+          {/* Waveform Timeline */}
           <div className="space-y-2">
+            <h3 className="text-sm sm:text-base font-medium text-[#8b949e]">Waveform</h3>
+            <canvas
+              ref={waveformCanvasRef}
+              width={640}
+              height={180}
+              className="w-full border border-[#30363d] rounded bg-[#0d1117] touch-manipulation"
+            />
+          </div>
+
+          {/* Real-time Spectrum */}
+          <div className="space-y-2 mt-3 sm:mt-4">
             <h3 className="text-sm sm:text-base font-medium text-[#8b949e]">Spectrum</h3>
             <canvas
               ref={spectrumCanvasRef}

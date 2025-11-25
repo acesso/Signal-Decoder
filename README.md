@@ -1,8 +1,8 @@
 <h1 align="center">
-    SSTV Decoder - Web Application
+    🛰️ SSTV Decoder - Cross-Platform Amateur Radio App
 </h3>
 <p align="center">
-   A web application for real-time SSTV (Slow Scan Television) decoding from microphone input. Supports multiple SSTV modes including Robot36 and PD120. Based on the <a href="https://github.com/xdsopl/robot36">Robot36 Android app</a> by xdsopl.
+   <strong>Decode SSTV signals in your browser!</strong> Free, open-source web application for real-time SSTV (Slow Scan Television) decoding from microphone input. Supports several modes: Robot36, Robot72, Scottie S1/S2, PD120, PD160, PD180. Perfect for ham radio operators, ISS SSTV events, and satellite image reception. Works offline as a PWA. Based on the <a href="https://github.com/xdsopl/robot36">Robot36 Android app</a> by xdsopl.
 </p>
 <br />
 
@@ -10,29 +10,56 @@
     <a href="https://github.com/smolgroot/sstv-decoder/stargazers">
         <img src="https://img.shields.io/github/stars/smolgroot/sstv-decoder?style=social" alt="GitHub stars" />
     </a>
+    <a href="https://github.com/smolgroot/sstv-decoder/network/members">
+        <img src="https://img.shields.io/github/forks/smolgroot/sstv-decoder?style=social" alt="GitHub forks" />
+    </a>
+    <a href="https://github.com/smolgroot/sstv-decoder/watchers">
+        <img src="https://img.shields.io/github/watchers/smolgroot/sstv-decoder?style=social" alt="GitHub watchers" />
+    </a>
+</p>
+
+<p align="center">
+    <!-- <img src="https://img.shields.io/github/v/release/smolgroot/sstv-decoder?include_prereleases" alt="Latest Release" /> -->
     <a href="https://github.com/smolgroot/sstv-decoder/issues">
         <img src="https://img.shields.io/github/issues/smolgroot/sstv-decoder" alt="GitHub Issues" />
     </a>
     <a href="https://github.com/smolgroot/sstv-decoder/blob/main/LICENSE">
-        <img src="https://img.shields.io/badge/license-0bsd-blue" alt="License" />
+        <img src="https://img.shields.io/badge/license-0BSD-blue" alt="License: 0BSD" />
     </a>
+    <img src="https://img.shields.io/badge/PWA-Offline%20Ready-success" alt="PWA Offline Ready" />
     <a href="https://sstv-decoder.vercel.app">
         <img src="https://img.shields.io/badge/demo-live-brightgreen" alt="Live Demo" />
     </a>
+    <img src="https://img.shields.io/badge/modes-7%20supported-blue" alt="7 SSTV Modes" />
 </p>
 
 <hr>
 
 <p align="center">
-   <a href="https://sstv-decoder.vercel.app"><b>🚀 Try the Live Demo</b></a>
+   <a href="https://sstv-decoder.vercel.app"><b>🚀 Try the Live Demo - No Installation Required!</b></a>
 </p>
 
-<p float="left">
-<img src="doc/screenshots/1.jpg" width="180"/>
-<img src="doc/screenshots/4.jpg" width="180"/>
-<img src="doc/screenshots/3.jpg" width="180"/>
-<img src="doc/screenshots/5.jpg" width="180">
+<p align="center">
+   <em>Works on Desktop • Mobile • Tablet | Chrome • Firefox • Safari • Edge</em>
 </p>
+
+## Screenshots
+
+<p float="left">
+<img src="doc/screenshots/1.jpg" width="180" alt="SSTV Decoder Main Interface"/>
+<img src="doc/screenshots/4.jpg" width="180" alt="Real-time Signal Decoding"/>
+<img src="doc/screenshots/3.jpg" width="180" alt="Spectrum Analyzer View"/>
+<img src="doc/screenshots/5.jpg" width="180" alt="Multi-Mode Support"/>
+</p>
+
+## Quick Start
+
+1. **Visit** → [sstv-decoder.vercel.app](https://sstv-decoder.vercel.app)
+2. **Allow** microphone access when prompted
+3. **Play** an SSTV signal near your microphone
+4. **Watch** the image decode in real-time!
+
+No installation, no downloads, no setup - just open and decode!
 
 ## Features
 
