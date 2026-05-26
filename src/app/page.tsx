@@ -1,36 +1,8 @@
 'use client';
 
-import { useState } from 'react';
 import SSTVDecoder from "@/components/SSTVDecoder";
 
-export type SSTVMode = 'ROBOT36' | 'ROBOT72' | 'SCOTTIE_S1' | 'SCOTTIE_S2' | 'PD120' | 'PD160' | 'PD180';
-
 export default function Home() {
-  const [selectedMode, setSelectedMode] = useState<SSTVMode>('ROBOT36');
-
-  // Get mode display info
-  const getModeInfo = () => {
-    switch (selectedMode) {
-      case 'ROBOT36':
-        return { name: 'Robot36 Mode', resolution: '320×240 px' };
-      case 'ROBOT72':
-        return { name: 'Robot72 Mode', resolution: '320×240 px' };
-      case 'SCOTTIE_S1':
-        return { name: 'Scottie S1 Mode', resolution: '320×256 px' };
-      case 'SCOTTIE_S2':
-        return { name: 'Scottie S2 Mode', resolution: '320×256 px' };
-      case 'PD120':
-        return { name: 'PD120 Mode', resolution: '640×496 px' };
-      case 'PD160':
-        return { name: 'PD160 Mode', resolution: '512×400 px' };
-      case 'PD180':
-        return { name: 'PD180 Mode', resolution: '640×496 px' };
-      default:
-        return { name: 'Robot36 Mode', resolution: '320×240 px' };
-    }
-  };
-
-  const modeInfo = getModeInfo();
   const jsonLd = {
     "@context": "https://schema.org",
     "@type": "WebApplication",
@@ -79,10 +51,10 @@ export default function Home() {
       <div className="max-w-6xl mx-auto">
         <div className="mb-6 sm:mb-8">
           <h1 className="text-2xl sm:text-3xl lg:text-4xl font-bold mb-2 text-[#c9d1d9]">
-            SSTV Decoder
+            RTTY Decoder
           </h1>
           <p className="text-sm sm:text-base text-[#8b949e] mb-3">
-            Real-time Slow Scan Television signal decoder from microphone
+            Real-time Radioteletype signal decoder from microphone
           </p>
           <div className="flex flex-wrap gap-2">
             <a
@@ -100,18 +72,11 @@ export default function Home() {
               <svg className="w-3 h-3" fill="currentColor" viewBox="0 0 16 16">
                 <path d="M2.75 3.75a.75.75 0 000 1.5h10.5a.75.75 0 000-1.5H2.75zM2 7.75A.75.75 0 012.75 7h10.5a.75.75 0 010 1.5H2.75A.75.75 0 012 7.75zm0 4a.75.75 0 01.75-.75h10.5a.75.75 0 010 1.5H2.75a.75.75 0 01-.75-.75z"/>
               </svg>
-              {modeInfo.name}
-            </span>
-            <span className="inline-flex items-center gap-1 px-2 py-1 text-xs rounded-md bg-[#238636]/10 text-[#2ea043] border border-[#238636]/30">
-              <svg className="w-3 h-3" fill="currentColor" viewBox="0 0 16 16">
-                <path d="M0 2.5A1.5 1.5 0 011.5 1h13A1.5 1.5 0 0116 2.5v11a1.5 1.5 0 01-1.5 1.5h-13A1.5 1.5 0 010 13.5v-11zM1.5 2a.5.5 0 00-.5.5v11a.5.5 0 00.5.5h13a.5.5 0 00.5-.5v-11a.5.5 0 00-.5-.5h-13z"/>
-                <path d="M3 5.5a.5.5 0 01.5-.5h9a.5.5 0 010 1h-9a.5.5 0 01-.5-.5zm0 3a.5.5 0 01.5-.5h9a.5.5 0 010 1h-9a.5.5 0 01-.5-.5zm.5 2.5a.5.5 0 000 1h9a.5.5 0 000-1h-9z"/>
-              </svg>
-              {modeInfo.resolution}
+              RTTY Mode
             </span>
           </div>
         </div>
-        <SSTVDecoder selectedMode={selectedMode} onModeChange={setSelectedMode} />
+        <SSTVDecoder />
       </div>
     </main>
     </>
