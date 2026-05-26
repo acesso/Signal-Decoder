@@ -43,8 +43,6 @@ export class RTTYDecoder {
 
   // Baudot shift state
   private inFigs = false;
-  // CRLF normalization: skip LF that immediately follows CR
-  private lastDecodedChar = '';
 
   constructor(sampleRate: number, config: RTTYConfig) {
     this.sampleRate = sampleRate;
@@ -131,15 +129,7 @@ export class RTTYDecoder {
     const c = ch.charCodeAt(0);
     if (c === 0 || c === 5 || c === 0x1b || c === 0x1f) return '';
     if (c === 7) return '🔔'; // BEL
-    // Normalise CRLF → single \n (RTTY sends CR then LF for each line break)
-    if (ch === '\r') { this.lastDecodedChar = '\r'; return '\n'; }
-    if (ch === '\n') {
-      const prev = this.lastDecodedChar;
-      this.lastDecodedChar = '\n';
-      return prev === '\r' ? '' : '\n'; // drop LF that follows the CR we already emitted
-    }
-    this.lastDecodedChar = ch;
-    return ch;
+    return ch; // CR/LF pass through raw; component handles CRLF normalisation
   }
 
   private decodeASCII(code: number): string {
@@ -214,6 +204,5 @@ export class RTTYDecoder {
     this.dataBits = 0;
     this.bitIndex = 0;
     this.inFigs = false;
-    this.lastDecodedChar = '';
   }
 }

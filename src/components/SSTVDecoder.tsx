@@ -34,11 +34,17 @@ export default function SSTVDecoder() {
   const reverseShiftRef = useRef(false);
   const markPeakRef = useRef(0);
   const spacePeakRef = useRef(0);
+  const [spectrogramGamma, setSpectrogramGamma] = useState(3.0);
+  const spectrogramGammaRef = useRef(3.0);
+  const [spectrogramSpeed, setSpectrogramSpeed] = useState(2);
+  const spectrogramSpeedRef = useRef(2);
 
   useEffect(() => { centerFreqRef.current = centerFreq; }, [centerFreq]);
   useEffect(() => { carrierShiftRef.current = carrierShift; }, [carrierShift]);
   useEffect(() => { baudRateRef.current = baudRate; }, [baudRate]);
   useEffect(() => { reverseShiftRef.current = reverseShift; }, [reverseShift]);
+  useEffect(() => { spectrogramGammaRef.current = spectrogramGamma; }, [spectrogramGamma]);
+  useEffect(() => { spectrogramSpeedRef.current = spectrogramSpeed; }, [spectrogramSpeed]);
 
   // Standard USB RTTY: mark = lower tone, space = higher tone
   const markFreq  = Math.round(reverseShift
@@ -55,7 +61,15 @@ export default function SSTVDecoder() {
   const spaceBandHigh = Math.min(DISPLAY_MAX_HZ, spaceFreq + halfBW);
 
   const handleChar = useCallback((chars: string) => {
-    setDecodedText(prev => prev + chars);
+    setDecodedText(prev => {
+      // Operate on the combined string so a \r at the end of one batch
+      // and \n at the start of the next are caught as a CRLF pair.
+      const combined = prev + chars;
+      return combined
+        .replace(/\r\n/g, '\n')   // CRLF → single LF
+        .replace(/\r/g, '\n')     // lone CR → LF
+        .replace(/\n{3,}/g, '\n\n'); // cap consecutive blank lines at one
+    });
   }, []);
 
   const rttyConfig = useMemo<RTTYConfig>(() => ({
@@ -266,10 +280,13 @@ export default function SSTVDecoder() {
       const t = binF - b0;
       const value = frequencyData[b0] * (1 - t) + frequencyData[b1] * t;
 
+      const gamma = spectrogramGammaRef.current;
+      const adjusted = gamma === 1 ? value : Math.pow(value / 255, gamma) * 255;
       let r, g, b;
-      if (value < 85)       { r = 0;                g = 0;                b = value * 3; }
-      else if (value < 170) { r = 0;                g = (value - 85) * 3; b = 255 - (value - 85) * 3; }
-      else                  { r = (value - 170) * 3; g = 255;              b = 0; }
+      // black → deep blue → purple → red  (dark-friendly, no yellow/white)
+      const v = adjusted;
+      if (v < 128) { r = 0;                    g = 0; b = Math.round(v * 2); }
+      else         { r = Math.round((v-128)*2); g = 0; b = Math.round(255-(v-128)*2); }
 
       const i = px * 4;
       newRow.data[i]     = r;
@@ -292,9 +309,8 @@ export default function SSTVDecoder() {
 
       if (state.isRecording && spectrumCanvas) {
         const frequencyData = drawSpectrum(spectrumCanvas);
-        // Scroll spectrogram every 2nd frame (~30 rows/sec)
         spectrogramFrameRef.current++;
-        if (spectrogramCanvas && frequencyData && spectrogramFrameRef.current % 2 === 0) {
+        if (spectrogramCanvas && frequencyData && spectrogramFrameRef.current % spectrogramSpeedRef.current === 0) {
           drawSpectrogram(spectrogramCanvas, frequencyData);
         }
       } else if (spectrumCanvas) {
@@ -458,6 +474,171 @@ export default function SSTVDecoder() {
         )}
       </div>
 
+      {/* ── Main display ── */}
+      <div className="space-y-4 lg:space-y-0 lg:grid lg:grid-cols-2 lg:gap-6">
+
+        {/* RTTY Output terminal */}
+        <div className="bg-[#161b22] border border-[#30363d] rounded-lg p-3 sm:p-4 flex flex-col">
+          <div className="flex items-center justify-between mb-2 sm:mb-3">
+            <h2 className="text-lg sm:text-xl font-semibold">RTTY Output</h2>
+            <div className="flex items-center gap-3">
+              <span className="text-xs text-[#8b949e] font-mono">{decodedText.length} chars</span>
+              <button
+                onClick={() => setDecodedText('')}
+                disabled={!decodedText}
+                className="text-xs px-2 py-0.5 rounded border border-[#30363d] text-[#8b949e] hover:text-[#f85149] hover:border-[#f85149]/40 disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
+              >
+                Clear
+              </button>
+            </div>
+          </div>
+          <textarea
+            ref={textareaRef}
+            readOnly
+            value={decodedText}
+            placeholder="Decoded RTTY text will appear here..."
+            className="flex-1 min-h-[300px] w-full bg-[#0d1117] border border-[#30363d] rounded font-mono text-sm text-[#2ea043] p-3 resize-none focus:outline-none placeholder:text-[#30363d] leading-snug"
+          />
+        </div>
+
+        {/* Audio Analysis */}
+        <div className="bg-[#161b22] border border-[#30363d] rounded-lg p-3 sm:p-4">
+          <div className="flex items-center justify-between mb-2 sm:mb-3">
+            <h2 className="text-lg sm:text-xl font-semibold">Audio Analysis</h2>
+            {state.isRecording && (
+              <div className="flex items-center gap-2">
+                <span className="text-xs text-[#8b949e]">Signal</span>
+                <div className="flex items-center gap-1">
+                  {[0, 1, 2, 3, 4].map((bar) => {
+                    const isActive = signalStrengthPct > bar * 20;
+                    const color = !isActive ? 'bg-[#21262d]'
+                      : signalStrengthPct < 30 ? 'bg-[#da3633]'
+                      : signalStrengthPct < 60 ? 'bg-[#e3b341]'
+                      : 'bg-[#2ea043]';
+                    return <div key={bar} className={`w-1.5 sm:w-2 rounded-sm transition-colors ${color}`} style={{ height: `${8 + bar * 3}px` }} />;
+                  })}
+                </div>
+                <span className="text-xs font-mono text-[#c9d1d9] min-w-[3ch]">{signalStrengthPct}%</span>
+              </div>
+            )}
+          </div>
+
+          {/* Spectrum — interactive drag to tune */}
+          <div className="space-y-1">
+            <div className="flex items-center justify-between">
+              <h3 className="text-sm font-medium text-[#8b949e]">Spectrum</h3>
+              <span className="text-xs text-[#8b949e] font-mono">click &amp; drag to tune</span>
+            </div>
+            <canvas
+              ref={spectrumCanvasRef}
+              width={640}
+              height={200}
+              className="w-full border border-[#30363d] rounded bg-[#0d1117] touch-manipulation cursor-crosshair select-none"
+            />
+          </div>
+
+          {/* Freq readout + center input + sideband — between spectrum and spectrogram */}
+          <div className="flex flex-wrap items-center gap-4 mt-2 text-xs font-mono text-[#8b949e]">
+            <span>Mark:&nbsp;<span className="text-[#58a6ff]">{markFreq} Hz</span></span>
+            <span>Space:&nbsp;<span className="text-[#f0883e]">{spaceFreq} Hz</span></span>
+            <label className="flex items-center gap-1">
+              Center:
+              <input
+                type="number"
+                value={centerFreq}
+                min={0}
+                max={DISPLAY_MAX_HZ}
+                onChange={(e) => {
+                  const v = parseInt(e.target.value);
+                  if (!isNaN(v)) setCenterFreq(Math.max(0, Math.min(DISPLAY_MAX_HZ, v)));
+                }}
+                className="bg-[#0d1117] border border-[#30363d] rounded px-2 py-0.5 w-20 text-[#c9d1d9] focus:outline-none focus:border-[#2ea043] transition-colors"
+              />
+              <span>Hz</span>
+            </label>
+            <span className="flex items-center gap-1">
+              Sideband:
+              <button
+                onClick={() => setReverseShift(r => !r)}
+                className={`px-2 py-0.5 rounded border transition-colors ${
+                  reverseShift
+                    ? 'bg-[#f0883e]/10 border-[#f0883e]/50 text-[#f0883e]'
+                    : 'bg-[#0d1117] border-[#30363d] text-[#8b949e] hover:border-[#58a6ff]/40 hover:text-[#58a6ff]'
+                }`}
+              >
+                {reverseShift ? 'LSB' : 'USB'}
+              </button>
+            </span>
+          </div>
+
+          {/* Spectrogram — CSS overlay markers to avoid scroll artifacts */}
+          <div className="space-y-2 mt-3 sm:mt-4">
+            <h3 className="text-sm font-medium text-[#8b949e]">Spectrogram</h3>
+            <div className="relative">
+              <canvas
+                ref={spectrogramCanvasRef}
+                width={640}
+                height={500}
+                className="w-full border border-[#30363d] rounded bg-[#0d1117] touch-manipulation block"
+              />
+              {/* Space baud-rate band fill + edges */}
+              <div className="absolute inset-y-0 pointer-events-none" style={{
+                left: `${(spaceBandLow / DISPLAY_MAX_HZ) * 100}%`,
+                width: `${((spaceBandHigh - spaceBandLow) / DISPLAY_MAX_HZ) * 100}%`,
+                backgroundColor: 'rgba(240,136,62,0.07)',
+                borderLeft:  '1px solid rgba(240,136,62,0.28)',
+                borderRight: '1px solid rgba(240,136,62,0.28)',
+              }} />
+              {/* Mark baud-rate band fill + edges */}
+              <div className="absolute inset-y-0 pointer-events-none" style={{
+                left: `${(markBandLow / DISPLAY_MAX_HZ) * 100}%`,
+                width: `${((markBandHigh - markBandLow) / DISPLAY_MAX_HZ) * 100}%`,
+                backgroundColor: 'rgba(88,166,255,0.07)',
+                borderLeft:  '1px solid rgba(88,166,255,0.28)',
+                borderRight: '1px solid rgba(88,166,255,0.28)',
+              }} />
+              {/* Space centre line */}
+              {spaceFreq >= 0 && spaceFreq <= DISPLAY_MAX_HZ && (
+                <div className="absolute inset-y-0 pointer-events-none" style={{ left: `${(spaceFreq / DISPLAY_MAX_HZ) * 100}%`, width: '2px', backgroundColor: '#f0883e', opacity: 0.9 }}>
+                  <span className="absolute top-1 left-1 text-[10px] font-mono font-bold text-[#f0883e] leading-none drop-shadow-md">S</span>
+                </div>
+              )}
+              {/* Mark centre line */}
+              {markFreq >= 0 && markFreq <= DISPLAY_MAX_HZ && (
+                <div className="absolute inset-y-0 pointer-events-none" style={{ left: `${(markFreq / DISPLAY_MAX_HZ) * 100}%`, width: '2px', backgroundColor: '#58a6ff', opacity: 0.9 }}>
+                  <span className="absolute top-1 left-1 text-[10px] font-mono font-bold text-[#58a6ff] leading-none drop-shadow-md">M</span>
+                </div>
+              )}
+            </div>
+            {/* Contrast + Speed controls below spectrogram */}
+            <div className="flex flex-wrap items-center gap-4 text-xs text-[#8b949e]">
+              <label className="flex items-center gap-2">
+                Contrast
+                <input
+                  type="range" min={0.5} max={6} step={0.1}
+                  value={spectrogramGamma}
+                  onChange={(e) => setSpectrogramGamma(parseFloat(e.target.value))}
+                  className="w-32 accent-[#2ea043] cursor-pointer"
+                />
+              </label>
+              <label className="flex items-center gap-2">
+                Speed
+                <select
+                  value={spectrogramSpeed}
+                  onChange={(e) => setSpectrogramSpeed(parseInt(e.target.value))}
+                  className="bg-[#0d1117] border border-[#30363d] rounded px-2 py-0.5 text-[#c9d1d9] focus:outline-none focus:border-[#2ea043] transition-colors cursor-pointer"
+                >
+                  <option value={1}>Fast</option>
+                  <option value={2}>Normal</option>
+                  <option value={4}>Slow</option>
+                  <option value={8}>Very Slow</option>
+                </select>
+              </label>
+            </div>
+          </div>
+        </div>
+      </div>
+
       {/* ── RTTY Configuration ── */}
       <div className="bg-[#161b22] border border-[#30363d] rounded-lg p-4 sm:p-6">
         <h2 className="text-lg sm:text-xl font-semibold mb-4">RTTY Configuration</h2>
@@ -506,138 +687,8 @@ export default function SSTVDecoder() {
             </select>
           </div>
 
-          <div>
-            <label className={labelCls}>Sideband</label>
-            <button
-              onClick={() => setReverseShift(r => !r)}
-              className={`w-full px-3 py-2 rounded font-mono text-sm border transition-colors ${
-                reverseShift
-                  ? 'bg-[#f0883e]/10 border-[#f0883e]/50 text-[#f0883e]'
-                  : 'bg-[#0d1117] border-[#30363d] text-[#8b949e] hover:border-[#58a6ff]/40 hover:text-[#58a6ff]'
-              }`}
-            >
-              {reverseShift ? 'LSB' : 'USB'}
-            </button>
-          </div>
         </div>
 
-        {/* Derived frequency readout + editable center freq */}
-        <div className="mt-3 flex flex-wrap items-center gap-4 text-xs font-mono text-[#8b949e]">
-          <span>Mark:&nbsp;<span className="text-[#58a6ff]">{markFreq} Hz</span></span>
-          <span>Space:&nbsp;<span className="text-[#f0883e]">{spaceFreq} Hz</span></span>
-          <label className="flex items-center gap-1">
-            Center:
-            <input
-              type="number"
-              value={centerFreq}
-              min={0}
-              max={DISPLAY_MAX_HZ}
-              onChange={(e) => {
-                const v = parseInt(e.target.value);
-                if (!isNaN(v)) setCenterFreq(Math.max(0, Math.min(DISPLAY_MAX_HZ, v)));
-              }}
-              className="bg-[#0d1117] border border-[#30363d] rounded px-2 py-0.5 w-20 text-[#c9d1d9] focus:outline-none focus:border-[#2ea043] transition-colors"
-            />
-            <span>Hz</span>
-          </label>
-        </div>
-      </div>
-
-      {/* ── Main display ── */}
-      <div className="space-y-4 lg:space-y-0 lg:grid lg:grid-cols-2 lg:gap-6">
-
-        {/* RTTY Output terminal */}
-        <div className="bg-[#161b22] border border-[#30363d] rounded-lg p-3 sm:p-4 flex flex-col">
-          <div className="flex items-center justify-between mb-2 sm:mb-3">
-            <h2 className="text-lg sm:text-xl font-semibold">RTTY Output</h2>
-            <span className="text-xs text-[#8b949e] font-mono">{decodedText.length} chars</span>
-          </div>
-          <textarea
-            ref={textareaRef}
-            readOnly
-            value={decodedText}
-            placeholder="Decoded RTTY text will appear here..."
-            className="flex-1 min-h-[300px] w-full bg-[#0d1117] border border-[#30363d] rounded font-mono text-sm text-[#2ea043] p-3 resize-none focus:outline-none placeholder:text-[#30363d] leading-relaxed"
-          />
-        </div>
-
-        {/* Audio Analysis */}
-        <div className="bg-[#161b22] border border-[#30363d] rounded-lg p-3 sm:p-4">
-          <div className="flex items-center justify-between mb-2 sm:mb-3">
-            <h2 className="text-lg sm:text-xl font-semibold">Audio Analysis</h2>
-            {state.isRecording && (
-              <div className="flex items-center gap-2">
-                <span className="text-xs text-[#8b949e]">Signal</span>
-                <div className="flex items-center gap-1">
-                  {[0, 1, 2, 3, 4].map((bar) => {
-                    const isActive = signalStrengthPct > bar * 20;
-                    const color = !isActive ? 'bg-[#21262d]'
-                      : signalStrengthPct < 30 ? 'bg-[#da3633]'
-                      : signalStrengthPct < 60 ? 'bg-[#e3b341]'
-                      : 'bg-[#2ea043]';
-                    return <div key={bar} className={`w-1.5 sm:w-2 rounded-sm transition-colors ${color}`} style={{ height: `${8 + bar * 3}px` }} />;
-                  })}
-                </div>
-                <span className="text-xs font-mono text-[#c9d1d9] min-w-[3ch]">{signalStrengthPct}%</span>
-              </div>
-            )}
-          </div>
-
-          {/* Spectrum — interactive drag to tune */}
-          <div className="space-y-1">
-            <div className="flex items-center justify-between">
-              <h3 className="text-sm font-medium text-[#8b949e]">Spectrum</h3>
-              <span className="text-xs text-[#8b949e] font-mono">click &amp; drag to tune</span>
-            </div>
-            <canvas
-              ref={spectrumCanvasRef}
-              width={640}
-              height={200}
-              className="w-full border border-[#30363d] rounded bg-[#0d1117] touch-manipulation cursor-crosshair select-none"
-            />
-          </div>
-
-          {/* Spectrogram — CSS overlay markers to avoid scroll artifacts */}
-          <div className="space-y-2 mt-3 sm:mt-4">
-            <h3 className="text-sm font-medium text-[#8b949e]">Spectrogram</h3>
-            <div className="relative">
-              <canvas
-                ref={spectrogramCanvasRef}
-                width={640}
-                height={500}
-                className="w-full border border-[#30363d] rounded bg-[#0d1117] touch-manipulation block"
-              />
-              {/* Space baud-rate band fill + edges */}
-              <div className="absolute inset-y-0 pointer-events-none" style={{
-                left: `${(spaceBandLow / DISPLAY_MAX_HZ) * 100}%`,
-                width: `${((spaceBandHigh - spaceBandLow) / DISPLAY_MAX_HZ) * 100}%`,
-                backgroundColor: 'rgba(240,136,62,0.07)',
-                borderLeft:  '1px solid rgba(240,136,62,0.28)',
-                borderRight: '1px solid rgba(240,136,62,0.28)',
-              }} />
-              {/* Mark baud-rate band fill + edges */}
-              <div className="absolute inset-y-0 pointer-events-none" style={{
-                left: `${(markBandLow / DISPLAY_MAX_HZ) * 100}%`,
-                width: `${((markBandHigh - markBandLow) / DISPLAY_MAX_HZ) * 100}%`,
-                backgroundColor: 'rgba(88,166,255,0.07)',
-                borderLeft:  '1px solid rgba(88,166,255,0.28)',
-                borderRight: '1px solid rgba(88,166,255,0.28)',
-              }} />
-              {/* Space centre line */}
-              {spaceFreq >= 0 && spaceFreq <= DISPLAY_MAX_HZ && (
-                <div className="absolute inset-y-0 pointer-events-none" style={{ left: `${(spaceFreq / DISPLAY_MAX_HZ) * 100}%`, width: '2px', backgroundColor: '#f0883e', opacity: 0.9 }}>
-                  <span className="absolute top-1 left-1 text-[10px] font-mono font-bold text-[#f0883e] leading-none drop-shadow-md">S</span>
-                </div>
-              )}
-              {/* Mark centre line */}
-              {markFreq >= 0 && markFreq <= DISPLAY_MAX_HZ && (
-                <div className="absolute inset-y-0 pointer-events-none" style={{ left: `${(markFreq / DISPLAY_MAX_HZ) * 100}%`, width: '2px', backgroundColor: '#58a6ff', opacity: 0.9 }}>
-                  <span className="absolute top-1 left-1 text-[10px] font-mono font-bold text-[#58a6ff] leading-none drop-shadow-md">M</span>
-                </div>
-              )}
-            </div>
-          </div>
-        </div>
       </div>
 
       {/* ── How to Use ── */}
