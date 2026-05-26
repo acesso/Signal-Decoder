@@ -1,8 +1,8 @@
 'use client';
 
-import { useEffect, useRef, useState, useCallback } from 'react';
-import { useAudioProcessor } from '@/hooks/useAudioProcessor';
-import { DecoderState } from '@/lib/sstv/decoder';
+import { useEffect, useRef, useState, useCallback, useMemo } from 'react';
+import { useRTTYProcessor } from '@/hooks/useRTTYProcessor';
+import type { RTTYConfig } from '@/lib/rtty/decoder';
 
 // Maximum frequency rendered on spectrum and spectrogram.
 // Limits display to the range where RTTY signals live, keeping them centred.
@@ -25,20 +25,28 @@ export default function SSTVDecoder() {
   const [parity, setParity] = useState('none');
   const [stopBits, setStopBits] = useState(1.5);
   const [centerFreq, setCenterFreq] = useState(500);
+  const [reverseShift, setReverseShift] = useState(false);
   // nyquist ref only — used to compute bin slicing inside draw callbacks
   const nyquistRef = useRef(22050);
   const centerFreqRef = useRef(500);
   const carrierShiftRef = useRef(450);
   const baudRateRef = useRef(50);
+  const reverseShiftRef = useRef(false);
   const markPeakRef = useRef(0);
   const spacePeakRef = useRef(0);
 
   useEffect(() => { centerFreqRef.current = centerFreq; }, [centerFreq]);
   useEffect(() => { carrierShiftRef.current = carrierShift; }, [carrierShift]);
   useEffect(() => { baudRateRef.current = baudRate; }, [baudRate]);
+  useEffect(() => { reverseShiftRef.current = reverseShift; }, [reverseShift]);
 
-  const markFreq = Math.round(centerFreq + carrierShift / 2);
-  const spaceFreq = Math.round(centerFreq - carrierShift / 2);
+  // Standard USB RTTY: mark = lower tone, space = higher tone
+  const markFreq  = Math.round(reverseShift
+    ? centerFreq + carrierShift / 2
+    : centerFreq - carrierShift / 2);
+  const spaceFreq = Math.round(reverseShift
+    ? centerFreq - carrierShift / 2
+    : centerFreq + carrierShift / 2);
   // Band edges for the baud rate envelope around each tone
   const halfBW = baudRate / 2;
   const markBandLow   = Math.max(0, markFreq  - halfBW);
@@ -46,7 +54,21 @@ export default function SSTVDecoder() {
   const spaceBandLow  = Math.max(0, spaceFreq - halfBW);
   const spaceBandHigh = Math.min(DISPLAY_MAX_HZ, spaceFreq + halfBW);
 
-  const { state, startRecording, stopRecording, resetDecoder, getAnalyser } = useAudioProcessor();
+  const handleChar = useCallback((chars: string) => {
+    setDecodedText(prev => prev + chars);
+  }, []);
+
+  const rttyConfig = useMemo<RTTYConfig>(() => ({
+    centerFreq,
+    carrierShift,
+    baudRate,
+    bitsPerChar,
+    parity: parity as RTTYConfig['parity'],
+    stopBits,
+    reverseShift,
+  }), [centerFreq, carrierShift, baudRate, bitsPerChar, parity, stopBits, reverseShift]);
+
+  const { state, startRecording, stopRecording, resetDecoder, getAnalyser } = useRTTYProcessor(rttyConfig, handleChar);
 
   // Draw M/S marker lines, baud-rate bandwidth edges, and peak-hold indicators
   const drawFrequencyMarkers = useCallback((
@@ -55,8 +77,9 @@ export default function SSTVDecoder() {
     plotHeight: number,
     nq: number,
   ) => {
-    const mark  = centerFreqRef.current + carrierShiftRef.current / 2;
-    const space = centerFreqRef.current - carrierShiftRef.current / 2;
+    const half  = carrierShiftRef.current / 2;
+    const mark  = reverseShiftRef.current ? centerFreqRef.current + half : centerFreqRef.current - half;
+    const space = reverseShiftRef.current ? centerFreqRef.current - half : centerFreqRef.current + half;
     const markX  = (mark  / nq) * canvasWidth;
     const spaceX = (space / nq) * canvasWidth;
 
@@ -193,8 +216,9 @@ export default function SSTVDecoder() {
 
     // Update peak-hold values at mark / space bins, then decay each frame
     const PEAK_DECAY = 0.4;
-    const mark  = centerFreqRef.current + carrierShiftRef.current / 2;
-    const space = centerFreqRef.current - carrierShiftRef.current / 2;
+    const _half = carrierShiftRef.current / 2;
+    const mark  = reverseShiftRef.current ? centerFreqRef.current + _half : centerFreqRef.current - _half;
+    const space = reverseShiftRef.current ? centerFreqRef.current - _half : centerFreqRef.current + _half;
     const mBin  = Math.min(Math.round((mark  / DISPLAY_MAX_HZ) * (binsToShow - 1)), binsToShow - 1);
     const sBin  = Math.min(Math.round((space / DISPLAY_MAX_HZ) * (binsToShow - 1)), binsToShow - 1);
     const mLvl  = mBin  >= 0 ? (visibleData[mBin]  ?? 0) : 0;
@@ -336,13 +360,15 @@ export default function SSTVDecoder() {
   };
 
   const getStateColor = () => {
-    if (!state.stats) return 'text-gray-400';
-    switch (state.stats.state) {
-      case DecoderState.IDLE:           return 'text-gray-400';
-      case DecoderState.DECODING_IMAGE: return 'text-green-400';
-      default:                          return 'text-gray-400';
+    switch (state.status) {
+      case 'receiving': return 'text-green-400';
+      case 'syncing':   return 'text-[#e3b341]';
+      case 'error':     return 'text-[#f85149]';
+      default:          return 'text-gray-400';
     }
   };
+
+  const signalStrengthPct = Math.round(state.signalStrength * 100);
 
   const inputCls = "bg-[#0d1117] border border-[#30363d] rounded px-3 py-2 font-mono text-sm text-[#c9d1d9] focus:outline-none focus:border-[#2ea043] w-full transition-colors";
   const labelCls = "text-[#8b949e] text-xs mb-1 block";
@@ -356,8 +382,7 @@ export default function SSTVDecoder() {
           {!state.isRecording ? (
             <button
               onClick={handleStart}
-              disabled={!state.isSupported}
-              className="w-full sm:flex-1 bg-[#238636] hover:bg-[#2ea043] disabled:bg-[#21262d] disabled:text-[#8b949e] disabled:cursor-not-allowed text-white font-semibold px-6 py-3 rounded-md transition-colors text-base border border-transparent disabled:border-[#30363d] flex items-center justify-center gap-2"
+              className="w-full sm:flex-1 bg-[#238636] hover:bg-[#2ea043] text-white font-semibold px-6 py-3 rounded-md transition-colors text-base border border-transparent flex items-center justify-center gap-2"
             >
               <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" viewBox="0 0 20 20" fill="currentColor">
                 <path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zM9.555 7.168A1 1 0 008 8v4a1 1 0 001.555.832l3-2a1 1 0 000-1.664l-3-2z" clipRule="evenodd" />
@@ -399,22 +424,17 @@ export default function SSTVDecoder() {
           </button>
         </div>
 
-        {state.error && (
+        {state.errorMessage && (
           <div className="bg-[#da3633]/10 border border-[#f85149]/30 rounded-md p-3 text-[#f85149] text-sm">
-            {state.error}
-          </div>
-        )}
-        {!state.isSupported && (
-          <div className="bg-[#bb8009]/10 border border-[#bb8009]/30 rounded-md p-3 text-[#e3b341] text-sm">
-            Web Audio API is not supported in this browser
+            {state.errorMessage}
           </div>
         )}
 
-        {state.stats && (
+        {state.isRecording && (
           <div className="grid grid-cols-2 lg:grid-cols-4 gap-3 sm:gap-4 text-sm">
             <div className="bg-[#0d1117] border border-[#30363d] rounded-lg p-3">
               <div className="text-[#8b949e] text-xs mb-1">State</div>
-              <div className={`font-mono font-semibold text-sm ${getStateColor()}`}>{state.stats.state}</div>
+              <div className={`font-mono font-semibold text-sm ${getStateColor()}`}>{state.status.toUpperCase()}</div>
             </div>
             <div className="bg-[#0d1117] border border-[#30363d] rounded-lg p-3">
               <div className="text-[#8b949e] text-xs mb-1">Mode</div>
@@ -427,19 +447,13 @@ export default function SSTVDecoder() {
             <div className="bg-[#0d1117] border border-[#30363d] rounded-lg p-3">
               <div className="text-[#8b949e] text-xs mb-1">SNR</div>
               <div className={`font-mono font-semibold text-sm ${
-                state.stats.snr === null    ? 'text-[#8b949e]' :
-                state.stats.snr < 10        ? 'text-[#da3633]' :
-                state.stats.snr < 18        ? 'text-[#e3b341]' : 'text-[#2ea043]'
+                state.snr === null ? 'text-[#8b949e]' :
+                state.snr < 10    ? 'text-[#da3633]' :
+                state.snr < 18    ? 'text-[#e3b341]' : 'text-[#2ea043]'
               }`}>
-                {state.stats.snr !== null ? `${state.stats.snr.toFixed(1)} dB` : '-- dB'}
+                {state.snr !== null ? `${state.snr.toFixed(1)} dB` : '-- dB'}
               </div>
             </div>
-          </div>
-        )}
-
-        {state.stats && state.stats.progress > 0 && (
-          <div className="w-full bg-[#21262d] rounded-full h-2 overflow-hidden border border-[#30363d]">
-            <div className="bg-[#238636] h-2 rounded-full transition-all duration-300" style={{ width: `${Math.min(100, state.stats.progress)}%` }} />
           </div>
         )}
       </div>
@@ -491,13 +505,41 @@ export default function SSTVDecoder() {
               {[1, 1.5, 2].map((s) => <option key={s} value={s}>{s}</option>)}
             </select>
           </div>
+
+          <div>
+            <label className={labelCls}>Sideband</label>
+            <button
+              onClick={() => setReverseShift(r => !r)}
+              className={`w-full px-3 py-2 rounded font-mono text-sm border transition-colors ${
+                reverseShift
+                  ? 'bg-[#f0883e]/10 border-[#f0883e]/50 text-[#f0883e]'
+                  : 'bg-[#0d1117] border-[#30363d] text-[#8b949e] hover:border-[#58a6ff]/40 hover:text-[#58a6ff]'
+              }`}
+            >
+              {reverseShift ? 'LSB' : 'USB'}
+            </button>
+          </div>
         </div>
 
-        {/* Derived frequency readout */}
-        <div className="mt-3 flex flex-wrap gap-4 text-xs font-mono text-[#8b949e]">
+        {/* Derived frequency readout + editable center freq */}
+        <div className="mt-3 flex flex-wrap items-center gap-4 text-xs font-mono text-[#8b949e]">
           <span>Mark:&nbsp;<span className="text-[#58a6ff]">{markFreq} Hz</span></span>
           <span>Space:&nbsp;<span className="text-[#f0883e]">{spaceFreq} Hz</span></span>
-          <span>Center:&nbsp;<span className="text-[#c9d1d9]">{centerFreq} Hz</span></span>
+          <label className="flex items-center gap-1">
+            Center:
+            <input
+              type="number"
+              value={centerFreq}
+              min={0}
+              max={DISPLAY_MAX_HZ}
+              onChange={(e) => {
+                const v = parseInt(e.target.value);
+                if (!isNaN(v)) setCenterFreq(Math.max(0, Math.min(DISPLAY_MAX_HZ, v)));
+              }}
+              className="bg-[#0d1117] border border-[#30363d] rounded px-2 py-0.5 w-20 text-[#c9d1d9] focus:outline-none focus:border-[#2ea043] transition-colors"
+            />
+            <span>Hz</span>
+          </label>
         </div>
       </div>
 
@@ -523,20 +565,20 @@ export default function SSTVDecoder() {
         <div className="bg-[#161b22] border border-[#30363d] rounded-lg p-3 sm:p-4">
           <div className="flex items-center justify-between mb-2 sm:mb-3">
             <h2 className="text-lg sm:text-xl font-semibold">Audio Analysis</h2>
-            {state.stats && (
+            {state.isRecording && (
               <div className="flex items-center gap-2">
                 <span className="text-xs text-[#8b949e]">Signal</span>
                 <div className="flex items-center gap-1">
                   {[0, 1, 2, 3, 4].map((bar) => {
-                    const isActive = state.stats!.signalStrength > bar * 20;
+                    const isActive = signalStrengthPct > bar * 20;
                     const color = !isActive ? 'bg-[#21262d]'
-                      : state.stats!.signalStrength < 30 ? 'bg-[#da3633]'
-                      : state.stats!.signalStrength < 60 ? 'bg-[#e3b341]'
+                      : signalStrengthPct < 30 ? 'bg-[#da3633]'
+                      : signalStrengthPct < 60 ? 'bg-[#e3b341]'
                       : 'bg-[#2ea043]';
                     return <div key={bar} className={`w-1.5 sm:w-2 rounded-sm transition-colors ${color}`} style={{ height: `${8 + bar * 3}px` }} />;
                   })}
                 </div>
-                <span className="text-xs font-mono text-[#c9d1d9] min-w-[3ch]">{state.stats.signalStrength}%</span>
+                <span className="text-xs font-mono text-[#c9d1d9] min-w-[3ch]">{signalStrengthPct}%</span>
               </div>
             )}
           </div>
