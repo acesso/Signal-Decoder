@@ -47,9 +47,9 @@ export default function Home() {
         type="application/ld+json"
         dangerouslySetInnerHTML={{ __html: JSON.stringify(jsonLd) }}
       />
-      <main className="min-h-screen p-4 sm:p-6 lg:p-8">
-      <div className="max-w-6xl mx-auto">
-        <div className="mb-6 sm:mb-8">
+      <main className="min-h-screen flex flex-col">
+        {/* Header — constrained width */}
+        <div className="px-4 sm:px-6 lg:px-8 pt-4 sm:pt-6 lg:pt-8 pb-4 max-w-6xl">
           <h1 className="text-2xl sm:text-3xl lg:text-4xl font-bold mb-2 text-[#c9d1d9]">
             RTTY Decoder
           </h1>
@@ -76,9 +76,11 @@ export default function Home() {
             </span>
           </div>
         </div>
-        <SSTVDecoder />
-      </div>
-    </main>
+        {/* Main content — full viewport width with side padding */}
+        <div className="flex-1 px-4 sm:px-6 lg:px-8 pb-8">
+          <SSTVDecoder />
+        </div>
+      </main>
     </>
   );
 }

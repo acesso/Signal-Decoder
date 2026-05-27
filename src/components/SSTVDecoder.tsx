@@ -1,90 +1,230 @@
 'use client';
 
-import { useEffect, useRef, useState, useCallback, useMemo } from 'react';
-import { useRTTYProcessor } from '@/hooks/useRTTYProcessor';
+import { useEffect, useRef, useState, useCallback, useReducer } from 'react';
+import { useMultiRTTYProcessor } from '@/hooks/useMultiRTTYProcessor';
+import { SessionCard } from '@/components/SessionCard';
+import { sessionsReducer, makeSession } from '@/lib/rtty/sessions';
 import type { RTTYConfig } from '@/lib/rtty/decoder';
 
-// Maximum frequency rendered on spectrum and spectrogram.
-// Limits display to the range where RTTY signals live, keeping them centred.
 const DISPLAY_MAX_HZ = 1500;
 
+const DEFAULT_CONFIG: RTTYConfig = {
+  centerFreq: 500,
+  carrierShift: 450,
+  baudRate: 50,
+  bitsPerChar: 5,
+  parity: 'none',
+  stopBits: 1.5,
+  reverseShift: false,
+};
+
+// Initialise once at module level to avoid ID mismatch between the two useStates
+const _initialSession = makeSession(DEFAULT_CONFIG);
+const _initialState = { sessions: [_initialSession], activeSessionId: _initialSession.id };
+
 export default function SSTVDecoder() {
-  const spectrumCanvasRef = useRef<HTMLCanvasElement>(null);
+  // Canvas / animation refs
+  const spectrumCanvasRef    = useRef<HTMLCanvasElement>(null);
   const spectrogramCanvasRef = useRef<HTMLCanvasElement>(null);
-  const animationFrameRef = useRef<number | null>(null);
-  const textareaRef = useRef<HTMLTextAreaElement>(null);
-  const isDraggingRef = useRef(false);
-  const spectrogramFrameRef = useRef(0);
+  const animationFrameRef    = useRef<number | null>(null);
+  const textareaRef          = useRef<HTMLTextAreaElement>(null);
+  const isDraggingRef        = useRef(false);
+  const spectrogramFrameRef  = useRef(0);
 
-  const [decodedText, setDecodedText] = useState('');
+  // Sessions state
+  const [sessionState, dispatch] = useReducer(sessionsReducer, _initialState);
+  const { sessions, activeSessionId } = sessionState;
+  const activeSession = sessions.find(s => s.id === activeSessionId) ?? sessions[0];
+  const activeConfig  = activeSession.config;
 
-  // RTTY configuration
-  const [carrierShift, setCarrierShift] = useState(450);
-  const [baudRate, setBaudRate] = useState(50);
-  const [bitsPerChar, setBitsPerChar] = useState(5);
-  const [parity, setParity] = useState('none');
-  const [stopBits, setStopBits] = useState(1.5);
-  const [centerFreq, setCenterFreq] = useState(500);
-  const [reverseShift, setReverseShift] = useState(false);
-  // nyquist ref only — used to compute bin slicing inside draw callbacks
-  const nyquistRef = useRef(22050);
-  const centerFreqRef = useRef(500);
-  const carrierShiftRef = useRef(450);
-  const baudRateRef = useRef(50);
-  const reverseShiftRef = useRef(false);
-  const markPeakRef = useRef(0);
-  const spacePeakRef = useRef(0);
+  // Spectrogram display controls
   const [spectrogramGamma, setSpectrogramGamma] = useState(3.0);
-  const spectrogramGammaRef = useRef(3.0);
   const [spectrogramSpeed, setSpectrogramSpeed] = useState(2);
+  const spectrogramGammaRef = useRef(3.0);
   const spectrogramSpeedRef = useRef(2);
-
-  useEffect(() => { centerFreqRef.current = centerFreq; }, [centerFreq]);
-  useEffect(() => { carrierShiftRef.current = carrierShift; }, [carrierShift]);
-  useEffect(() => { baudRateRef.current = baudRate; }, [baudRate]);
-  useEffect(() => { reverseShiftRef.current = reverseShift; }, [reverseShift]);
   useEffect(() => { spectrogramGammaRef.current = spectrogramGamma; }, [spectrogramGamma]);
   useEffect(() => { spectrogramSpeedRef.current = spectrogramSpeed; }, [spectrogramSpeed]);
 
-  // Standard USB RTTY: mark = lower tone, space = higher tone
-  const markFreq  = Math.round(reverseShift
-    ? centerFreq + carrierShift / 2
-    : centerFreq - carrierShift / 2);
-  const spaceFreq = Math.round(reverseShift
-    ? centerFreq - carrierShift / 2
-    : centerFreq + carrierShift / 2);
-  // Band edges for the baud rate envelope around each tone
-  const halfBW = baudRate / 2;
-  const markBandLow   = Math.max(0, markFreq  - halfBW);
-  const markBandHigh  = Math.min(DISPLAY_MAX_HZ, markFreq  + halfBW);
-  const spaceBandLow  = Math.max(0, spaceFreq - halfBW);
-  const spaceBandHigh = Math.min(DISPLAY_MAX_HZ, spaceFreq + halfBW);
+  // Dynamic spectrogram height — follows the Audio Analysis panel's available space
+  const spectrogramContainerRef = useRef<HTMLDivElement>(null);
+  const [spectrogramCanvasHeight, setSpectrogramCanvasHeight] = useState(500);
+  const spectrogramCanvasHeightRef = useRef(500);
 
-  const handleChar = useCallback((chars: string) => {
-    setDecodedText(prev => {
-      // Operate on the combined string so a \r at the end of one batch
-      // and \n at the start of the next are caught as a CRLF pair.
-      const combined = prev + chars;
-      return combined
-        .replace(/\r\n/g, '\n')   // CRLF → single LF
-        .replace(/\r/g, '\n')     // lone CR → LF
-        .replace(/\n{3,}/g, '\n\n'); // cap consecutive blank lines at one
+  useEffect(() => {
+    const el = spectrogramContainerRef.current;
+    if (!el) return;
+    const ro = new ResizeObserver(entries => {
+      const h = Math.round(entries[0].contentRect.height);
+      if (h > 80 && Math.abs(h - spectrogramCanvasHeightRef.current) > 4) {
+        spectrogramCanvasHeightRef.current = h;
+        setSpectrogramCanvasHeight(h);
+      }
     });
+    ro.observe(el);
+    return () => ro.disconnect();
   }, []);
 
-  const rttyConfig = useMemo<RTTYConfig>(() => ({
-    centerFreq,
-    carrierShift,
-    baudRate,
-    bitsPerChar,
-    parity: parity as RTTYConfig['parity'],
-    stopBits,
-    reverseShift,
-  }), [centerFreq, carrierShift, baudRate, bitsPerChar, parity, stopBits, reverseShift]);
+  // Resizable panels
+  const containerRef    = useRef<HTMLDivElement>(null);
+  const [panelWeights, setPanelWeights] = useState([1, 1, 1]);
+  const panelWeightsRef = useRef([1, 1, 1]);
+  const dragRef = useRef<{ handle: number; startX: number; startWeights: number[] } | null>(null);
+  useEffect(() => { panelWeightsRef.current = panelWeights; }, [panelWeights]);
 
-  const { state, startRecording, stopRecording, resetDecoder, getAnalyser } = useRTTYProcessor(rttyConfig, handleChar);
+  const startDrag = (e: React.MouseEvent, handle: number) => {
+    e.preventDefault();
+    dragRef.current = { handle, startX: e.clientX, startWeights: [...panelWeightsRef.current] };
+  };
 
-  // Draw M/S marker lines, baud-rate bandwidth edges, and peak-hold indicators
+  useEffect(() => {
+    const onMove = (e: MouseEvent) => {
+      const drag = dragRef.current;
+      if (!drag || !containerRef.current) return;
+      const containerWidth = containerRef.current.offsetWidth;
+      const dx = e.clientX - drag.startX;
+      const total = drag.startWeights.reduce((a, b) => a + b, 0);
+      const dw = (dx / containerWidth) * total;
+      const w = [...drag.startWeights];
+      w[drag.handle]     = Math.max(0.15, w[drag.handle]     + dw);
+      w[drag.handle + 1] = Math.max(0.15, w[drag.handle + 1] - dw);
+      setPanelWeights([...w]);
+    };
+    const onUp = () => { dragRef.current = null; };
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup', onUp);
+    return () => {
+      window.removeEventListener('mousemove', onMove);
+      window.removeEventListener('mouseup', onUp);
+    };
+  }, []);
+
+  // Draw-callback refs — updated from active session config
+  const nyquistRef      = useRef(22050);
+  const centerFreqRef   = useRef(activeConfig.centerFreq);
+  const carrierShiftRef = useRef(activeConfig.carrierShift);
+  const baudRateRef     = useRef(activeConfig.baudRate);
+  const reverseShiftRef = useRef(activeConfig.reverseShift);
+  const markPeakRef     = useRef(0);
+  const spacePeakRef    = useRef(0);
+
+  useEffect(() => { centerFreqRef.current   = activeConfig.centerFreq;   }, [activeConfig.centerFreq]);
+  useEffect(() => { carrierShiftRef.current  = activeConfig.carrierShift; }, [activeConfig.carrierShift]);
+  useEffect(() => { baudRateRef.current      = activeConfig.baudRate;     }, [activeConfig.baudRate]);
+  useEffect(() => { reverseShiftRef.current  = activeConfig.reverseShift; }, [activeConfig.reverseShift]);
+
+  // Stable ref to dispatch for use in [] effects
+  const dispatchRef        = useRef(dispatch);
+  const activeSessionIdRef = useRef(activeSessionId);
+  useEffect(() => { dispatchRef.current = dispatch; }, []);
+  useEffect(() => { activeSessionIdRef.current = activeSessionId; }, [activeSessionId]);
+
+  // Derived display values from active config
+  const { centerFreq, carrierShift, baudRate, reverseShift } = activeConfig;
+  const markFreq  = Math.round(reverseShift ? centerFreq + carrierShift / 2 : centerFreq - carrierShift / 2);
+  const spaceFreq = Math.round(reverseShift ? centerFreq - carrierShift / 2 : centerFreq + carrierShift / 2);
+  const halfBW         = baudRate / 2;
+  const markBandLow    = Math.max(0, markFreq  - halfBW);
+  const markBandHigh   = Math.min(DISPLAY_MAX_HZ, markFreq  + halfBW);
+  const spaceBandLow   = Math.max(0, spaceFreq - halfBW);
+  const spaceBandHigh  = Math.min(DISPLAY_MAX_HZ, spaceFreq + halfBW);
+
+  // ── Multi-decoder hook ────────────────────────────────────────────────────
+
+  const handleText = useCallback((sessionId: string, chars: string) => {
+    dispatchRef.current({ type: 'APPEND_TEXT', id: sessionId, chars });
+  }, []);
+
+  const {
+    state: procState,
+    startRecording,
+    stopRecording,
+    addSession:          hookAddSession,
+    removeSession:       hookRemoveSession,
+    updateSessionConfig: hookUpdateConfig,
+    resetSession:        hookResetSession,
+    setActiveSession:    hookSetActive,
+    getAnalyser,
+  } = useMultiRTTYProcessor(handleText);
+
+  // Register initial session with the hook on mount
+  useEffect(() => {
+    hookAddSession(_initialSession.id, _initialSession.config);
+    hookSetActive(_initialSession.id);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // ── Session management ────────────────────────────────────────────────────
+
+  const [addPanelOpen, setAddPanelOpen] = useState(false);
+  const [addShift, setAddShift] = useState(450);
+  const [addBaud, setAddBaud] = useState(50);
+  const addPanelRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!addPanelOpen) return;
+    const handler = (e: MouseEvent) => {
+      if (!addPanelRef.current?.contains(e.target as Node)) setAddPanelOpen(false);
+    };
+    document.addEventListener('mousedown', handler);
+    return () => document.removeEventListener('mousedown', handler);
+  }, [addPanelOpen]);
+
+  const addNewSession = useCallback(() => {
+    dispatch({ type: 'ADD_SESSION', config: { ...activeConfig, carrierShift: addShift, baudRate: addBaud } });
+    setAddPanelOpen(false);
+  }, [activeConfig, addShift, addBaud]);
+
+  // After ADD_SESSION, register the newest session with the hook
+  const prevSessionCount = useRef(sessions.length);
+  useEffect(() => {
+    if (sessions.length > prevSessionCount.current) {
+      const newest = sessions[sessions.length - 1];
+      hookAddSession(newest.id, newest.config);
+    }
+    prevSessionCount.current = sessions.length;
+  }, [sessions, hookAddSession]);
+
+  const removeSession = useCallback((id: string) => {
+    dispatch({ type: 'REMOVE_SESSION', id });
+    hookRemoveSession(id);
+  }, [hookRemoveSession]);
+
+  const promoteSession = useCallback((id: string) => {
+    dispatch({ type: 'ACTIVATE', id });
+    hookSetActive(id);
+    markPeakRef.current  = 0;
+    spacePeakRef.current = 0;
+  }, [hookSetActive]);
+
+  const updateSessionConfig = useCallback((id: string, patch: Partial<RTTYConfig>) => {
+    dispatch({ type: 'UPDATE_CONFIG', id, patch });
+    const current = sessions.find(s => s.id === id)?.config;
+    if (current) hookUpdateConfig(id, { ...current, ...patch });
+  }, [sessions, hookUpdateConfig]);
+
+  const updateSessionColor = useCallback((id: string, color: string) => {
+    dispatch({ type: 'UPDATE_COLOR', id, color });
+  }, []);
+
+  // Sync active session config changes to the hook
+  useEffect(() => {
+    hookUpdateConfig(activeSessionId, activeConfig);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeConfig]);
+
+  // Sync active session id to hook
+  useEffect(() => {
+    hookSetActive(activeSessionId);
+  }, [activeSessionId, hookSetActive]);
+
+  // ── Active-config setters (RTTY Configuration panel) ─────────────────────
+
+  const patchActive = useCallback((patch: Partial<RTTYConfig>) => {
+    dispatch({ type: 'UPDATE_CONFIG', id: activeSessionIdRef.current, patch });
+  }, []);
+
+  // ── Drawing callbacks ─────────────────────────────────────────────────────
+
   const drawFrequencyMarkers = useCallback((
     ctx: CanvasRenderingContext2D,
     canvasWidth: number,
@@ -97,16 +237,14 @@ export default function SSTVDecoder() {
     const markX  = (mark  / nq) * canvasWidth;
     const spaceX = (space / nq) * canvasWidth;
 
-    // ── Inter-tone shaded band ──
     ctx.fillStyle = 'rgba(88, 166, 255, 0.06)';
     ctx.fillRect(Math.min(markX, spaceX), 0, Math.abs(markX - spaceX), plotHeight);
 
-    // ── Baud-rate bandwidth edges (very dim dashed) ──
     const hw = baudRateRef.current / 2;
-    const mLoX  = Math.max(0, ((mark  - hw) / nq) * canvasWidth);
-    const mHiX  = Math.min(canvasWidth, ((mark  + hw) / nq) * canvasWidth);
-    const sLoX  = Math.max(0, ((space - hw) / nq) * canvasWidth);
-    const sHiX  = Math.min(canvasWidth, ((space + hw) / nq) * canvasWidth);
+    const mLoX = Math.max(0, ((mark  - hw) / nq) * canvasWidth);
+    const mHiX = Math.min(canvasWidth, ((mark  + hw) / nq) * canvasWidth);
+    const sLoX = Math.max(0, ((space - hw) / nq) * canvasWidth);
+    const sHiX = Math.min(canvasWidth, ((space + hw) / nq) * canvasWidth);
 
     ctx.lineWidth = 1;
     ctx.setLineDash([2, 4]);
@@ -118,38 +256,30 @@ export default function SSTVDecoder() {
     ctx.beginPath(); ctx.moveTo(sHiX, 0); ctx.lineTo(sHiX, plotHeight); ctx.stroke();
     ctx.setLineDash([]);
 
-    // ── Main M / S dashed centre lines ──
     ctx.lineWidth = 1.5;
     ctx.setLineDash([4, 3]);
     ctx.strokeStyle = '#f0883e';
     ctx.beginPath(); ctx.moveTo(spaceX, 0); ctx.lineTo(spaceX, plotHeight); ctx.stroke();
     ctx.strokeStyle = '#58a6ff';
-    ctx.beginPath(); ctx.moveTo(markX, 0);  ctx.lineTo(markX, plotHeight);  ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(markX,  0); ctx.lineTo(markX,  plotHeight); ctx.stroke();
     ctx.setLineDash([]);
 
-    // ── Peak-hold horizontal lines (span the baud-rate band) ──
     const mPeak = markPeakRef.current;
     const sPeak = spacePeakRef.current;
     if (mPeak > 0) {
       const y = plotHeight * (1 - mPeak / 255);
-      ctx.strokeStyle = '#58a6ff';
-      ctx.lineWidth = 2;
+      ctx.strokeStyle = '#58a6ff'; ctx.lineWidth = 2;
       ctx.beginPath(); ctx.moveTo(mLoX, y); ctx.lineTo(mHiX, y); ctx.stroke();
     }
     if (sPeak > 0) {
       const y = plotHeight * (1 - sPeak / 255);
-      ctx.strokeStyle = '#f0883e';
-      ctx.lineWidth = 2;
+      ctx.strokeStyle = '#f0883e'; ctx.lineWidth = 2;
       ctx.beginPath(); ctx.moveTo(sLoX, y); ctx.lineTo(sHiX, y); ctx.stroke();
     }
 
-    // ── Labels ──
-    ctx.font = '10px monospace';
-    ctx.textAlign = 'center';
-    ctx.fillStyle = '#f0883e';
-    ctx.fillText('S', spaceX, 14);
-    ctx.fillStyle = '#58a6ff';
-    ctx.fillText('M', markX,  14);
+    ctx.font = '10px monospace'; ctx.textAlign = 'center';
+    ctx.fillStyle = '#f0883e'; ctx.fillText('S', spaceX, 14);
+    ctx.fillStyle = '#58a6ff'; ctx.fillText('M', markX,  14);
   }, []);
 
   const drawAxisLabels = useCallback((
@@ -158,37 +288,19 @@ export default function SSTVDecoder() {
     plotHeight: number,
     maxFreq: number,
   ) => {
-    // Baseline
-    ctx.strokeStyle = '#30363d';
-    ctx.lineWidth = 1;
-    ctx.beginPath();
-    ctx.moveTo(0, plotHeight);
-    ctx.lineTo(canvasWidth, plotHeight);
-    ctx.stroke();
+    ctx.strokeStyle = '#30363d'; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(0, plotHeight); ctx.lineTo(canvasWidth, plotHeight); ctx.stroke();
 
-    // Three tick levels: minor 10 Hz (2px), medium 50 Hz (4px), major 100 Hz (6px + label)
-    const minorStep  = 10;
-    const mediumStep = 50;
-    const majorStep  = 100;
-
-    for (let freq = 0; freq <= maxFreq; freq += minorStep) {
-      const xPos = (freq / maxFreq) * canvasWidth;
-      const isMajor  = freq % majorStep === 0;
-      const isMedium = !isMajor && freq % mediumStep === 0;
+    for (let freq = 0; freq <= maxFreq; freq += 10) {
+      const xPos     = (freq / maxFreq) * canvasWidth;
+      const isMajor  = freq % 100 === 0;
+      const isMedium = !isMajor && freq % 50 === 0;
       const tickLen  = isMajor ? 6 : isMedium ? 4 : 2;
-
       ctx.strokeStyle = isMajor ? '#8b949e' : '#30363d';
-      ctx.beginPath();
-      ctx.moveTo(xPos, plotHeight);
-      ctx.lineTo(xPos, plotHeight + tickLen);
-      ctx.stroke();
-
+      ctx.beginPath(); ctx.moveTo(xPos, plotHeight); ctx.lineTo(xPos, plotHeight + tickLen); ctx.stroke();
       if (isMajor) {
-        ctx.fillStyle = '#8b949e';
-        ctx.font = '10px monospace';
-        ctx.textAlign = 'center';
-        const label = freq >= 1000 ? `${freq / 1000}k` : `${freq}`;
-        ctx.fillText(label, xPos, plotHeight + 17);
+        ctx.fillStyle = '#8b949e'; ctx.font = '10px monospace'; ctx.textAlign = 'center';
+        ctx.fillText(freq >= 1000 ? `${freq / 1000}k` : `${freq}`, xPos, plotHeight + 17);
       }
     }
   }, []);
@@ -200,91 +312,78 @@ export default function SSTVDecoder() {
     if (!ctx) return;
 
     const bufferLength = analyser.frequencyBinCount;
-    const dataArray = new Uint8Array(bufferLength);
+    const dataArray    = new Uint8Array(bufferLength);
     analyser.getByteFrequencyData(dataArray);
 
     const nq = analyser.context.sampleRate / 2;
     nyquistRef.current = nq;
 
-    // Only render bins up to DISPLAY_MAX_HZ
-    const binsToShow = Math.max(1, Math.floor((DISPLAY_MAX_HZ / nq) * bufferLength));
+    const binsToShow  = Math.max(1, Math.floor((DISPLAY_MAX_HZ / nq) * bufferLength));
     const visibleData = dataArray.subarray(0, binsToShow);
-
-    const axisHeight = 25;
-    const plotHeight = canvas.height - axisHeight;
+    const axisHeight  = 25;
+    const plotHeight  = canvas.height - axisHeight;
 
     ctx.fillStyle = 'rgb(10, 10, 10)';
     ctx.fillRect(0, 0, canvas.width, canvas.height);
 
-    ctx.strokeStyle = '#2ea043';
-    ctx.lineWidth = 2;
+    ctx.strokeStyle = '#2ea043'; ctx.lineWidth = 2;
     ctx.beginPath();
     const barWidth = canvas.width / binsToShow;
     for (let i = 0; i < binsToShow; i++) {
       const x = i * barWidth;
       const y = plotHeight - (visibleData[i] / 255) * plotHeight;
-      if (i === 0) ctx.moveTo(x, y);
-      else ctx.lineTo(x, y);
+      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
     }
     ctx.stroke();
 
-    // Update peak-hold values at mark / space bins, then decay each frame
     const PEAK_DECAY = 0.4;
-    const _half = carrierShiftRef.current / 2;
-    const mark  = reverseShiftRef.current ? centerFreqRef.current + _half : centerFreqRef.current - _half;
-    const space = reverseShiftRef.current ? centerFreqRef.current - _half : centerFreqRef.current + _half;
-    const mBin  = Math.min(Math.round((mark  / DISPLAY_MAX_HZ) * (binsToShow - 1)), binsToShow - 1);
-    const sBin  = Math.min(Math.round((space / DISPLAY_MAX_HZ) * (binsToShow - 1)), binsToShow - 1);
-    const mLvl  = mBin  >= 0 ? (visibleData[mBin]  ?? 0) : 0;
-    const sLvl  = sBin  >= 0 ? (visibleData[sBin]  ?? 0) : 0;
-    markPeakRef.current  = mLvl  > markPeakRef.current  ? mLvl  : Math.max(0, markPeakRef.current  - PEAK_DECAY);
-    spacePeakRef.current = sLvl  > spacePeakRef.current ? sLvl  : Math.max(0, spacePeakRef.current - PEAK_DECAY);
+    const _half  = carrierShiftRef.current / 2;
+    const mark   = reverseShiftRef.current ? centerFreqRef.current + _half : centerFreqRef.current - _half;
+    const space  = reverseShiftRef.current ? centerFreqRef.current - _half : centerFreqRef.current + _half;
+    const mBin   = Math.min(Math.round((mark  / DISPLAY_MAX_HZ) * (binsToShow - 1)), binsToShow - 1);
+    const sBin   = Math.min(Math.round((space / DISPLAY_MAX_HZ) * (binsToShow - 1)), binsToShow - 1);
+    const mLvl   = mBin >= 0 ? (visibleData[mBin]  ?? 0) : 0;
+    const sLvl   = sBin >= 0 ? (visibleData[sBin]  ?? 0) : 0;
+    markPeakRef.current  = mLvl > markPeakRef.current  ? mLvl  : Math.max(0, markPeakRef.current  - PEAK_DECAY);
+    spacePeakRef.current = sLvl > spacePeakRef.current ? sLvl  : Math.max(0, spacePeakRef.current - PEAK_DECAY);
 
     drawFrequencyMarkers(ctx, canvas.width, plotHeight, DISPLAY_MAX_HZ);
     drawAxisLabels(ctx, canvas.width, plotHeight, DISPLAY_MAX_HZ);
-
     return visibleData;
   }, [getAnalyser, drawFrequencyMarkers, drawAxisLabels]);
 
-  // Shown when not recording — axis + markers; peaks decay to zero
   const drawIdleSpectrum = useCallback((canvas: HTMLCanvasElement) => {
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
     const axisHeight = 25;
     const plotHeight = canvas.height - axisHeight;
-
     markPeakRef.current  = Math.max(0, markPeakRef.current  - 0.4);
     spacePeakRef.current = Math.max(0, spacePeakRef.current - 0.4);
-
     ctx.fillStyle = 'rgb(10, 10, 10)';
     ctx.fillRect(0, 0, canvas.width, canvas.height);
-
     drawFrequencyMarkers(ctx, canvas.width, plotHeight, DISPLAY_MAX_HZ);
     drawAxisLabels(ctx, canvas.width, plotHeight, DISPLAY_MAX_HZ);
   }, [drawFrequencyMarkers, drawAxisLabels]);
 
-  // Spectrogram: per-pixel linear interpolation across bins for smooth rendering.
-  // Markers are CSS overlays (drawing pixels would scroll them into history).
   const drawSpectrogram = useCallback((canvas: HTMLCanvasElement, frequencyData: Uint8Array) => {
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
 
     const binCount = frequencyData.length;
-    const newRow = ctx.createImageData(canvas.width, 1);
+    const newRow   = ctx.createImageData(canvas.width, 1);
 
     for (let px = 0; px < canvas.width; px++) {
-      // Map pixel to a (possibly fractional) bin index
-      const binF = (px / canvas.width) * (binCount - 1);
-      const b0 = Math.floor(binF);
-      const b1 = Math.min(b0 + 1, binCount - 1);
-      const t = binF - b0;
+      const binF  = (px / canvas.width) * (binCount - 1);
+      const b0    = Math.floor(binF);
+      const b1    = Math.min(b0 + 1, binCount - 1);
+      const t     = binF - b0;
       const value = frequencyData[b0] * (1 - t) + frequencyData[b1] * t;
 
-      const gamma = spectrogramGammaRef.current;
+      const gamma    = spectrogramGammaRef.current;
       const adjusted = gamma === 1 ? value : Math.pow(value / 255, gamma) * 255;
-      let r, g, b;
-      // black → deep blue → purple → red  (dark-friendly, no yellow/white)
       const v = adjusted;
+      let r: number, g: number, b: number;
+      // black → deep blue → purple → red
       if (v < 128) { r = 0;                    g = 0; b = Math.round(v * 2); }
       else         { r = Math.round((v-128)*2); g = 0; b = Math.round(255-(v-128)*2); }
 
@@ -295,19 +394,18 @@ export default function SSTVDecoder() {
       newRow.data[i + 3] = 255;
     }
 
-    // Scroll existing content down one row, then stamp new row at top
     const existing = ctx.getImageData(0, 0, canvas.width, canvas.height - 1);
     ctx.putImageData(existing, 0, 1);
     ctx.putImageData(newRow, 0, 0);
   }, []);
 
-  // Animation loop — always runs, draws idle spectrum when not recording
+  // Animation loop
   useEffect(() => {
     const tick = () => {
-      const spectrumCanvas = spectrumCanvasRef.current;
+      const spectrumCanvas    = spectrumCanvasRef.current;
       const spectrogramCanvas = spectrogramCanvasRef.current;
 
-      if (state.isRecording && spectrumCanvas) {
+      if (procState.isRecording && spectrumCanvas) {
         const frequencyData = drawSpectrum(spectrumCanvas);
         spectrogramFrameRef.current++;
         if (spectrogramCanvas && frequencyData && spectrogramFrameRef.current % spectrogramSpeedRef.current === 0) {
@@ -319,12 +417,11 @@ export default function SSTVDecoder() {
 
       animationFrameRef.current = requestAnimationFrame(tick);
     };
-
     animationFrameRef.current = requestAnimationFrame(tick);
     return () => { if (animationFrameRef.current) cancelAnimationFrame(animationFrameRef.current); };
-  }, [state.isRecording, drawSpectrum, drawSpectrogram, drawIdleSpectrum]);
+  }, [procState.isRecording, drawSpectrum, drawSpectrogram, drawIdleSpectrum]);
 
-  // Click/drag on spectrum canvas to reposition M/S pair
+  // Spectrum click / drag — reposition center freq of active session
   useEffect(() => {
     const canvas = spectrumCanvasRef.current;
     if (!canvas) return;
@@ -332,51 +429,63 @@ export default function SSTVDecoder() {
     const applyFreq = (clientX: number) => {
       const rect = canvas.getBoundingClientRect();
       const relX = Math.max(0, Math.min(1, (clientX - rect.left) / rect.width));
-      setCenterFreq(Math.round(relX * DISPLAY_MAX_HZ));
+      dispatchRef.current({
+        type: 'UPDATE_CONFIG',
+        id: activeSessionIdRef.current,
+        patch: { centerFreq: Math.round(relX * DISPLAY_MAX_HZ) },
+      });
     };
 
-    const onMouseDown = (e: MouseEvent) => { isDraggingRef.current = true; applyFreq(e.clientX); };
-    const onMouseMove = (e: MouseEvent) => { if (isDraggingRef.current) applyFreq(e.clientX); };
-    const onMouseUp   = () => { isDraggingRef.current = false; };
-    const onTouchStart = (e: TouchEvent) => { e.preventDefault(); isDraggingRef.current = true; applyFreq(e.touches[0].clientX); };
-    const onTouchMove  = (e: TouchEvent) => { e.preventDefault(); if (isDraggingRef.current) applyFreq(e.touches[0].clientX); };
-    const onTouchEnd   = () => { isDraggingRef.current = false; };
+    const onMouseDown  = (e: MouseEvent)  => { isDraggingRef.current = true; applyFreq(e.clientX); };
+    const onMouseMove  = (e: MouseEvent)  => { if (isDraggingRef.current) applyFreq(e.clientX); };
+    const onMouseUp    = ()               => { isDraggingRef.current = false; };
+    const onTouchStart = (e: TouchEvent)  => { e.preventDefault(); isDraggingRef.current = true; applyFreq(e.touches[0].clientX); };
+    const onTouchMove  = (e: TouchEvent)  => { e.preventDefault(); if (isDraggingRef.current) applyFreq(e.touches[0].clientX); };
+    const onTouchEnd   = ()               => { isDraggingRef.current = false; };
 
-    canvas.addEventListener('mousedown', onMouseDown);
+    canvas.addEventListener('mousedown',  onMouseDown);
     canvas.addEventListener('touchstart', onTouchStart, { passive: false });
-    window.addEventListener('mousemove', onMouseMove);
-    window.addEventListener('mouseup',   onMouseUp);
-    window.addEventListener('touchmove', onTouchMove as EventListener, { passive: false });
-    window.addEventListener('touchend',  onTouchEnd);
+    window.addEventListener('mousemove',  onMouseMove);
+    window.addEventListener('mouseup',    onMouseUp);
+    window.addEventListener('touchmove',  onTouchMove as EventListener, { passive: false });
+    window.addEventListener('touchend',   onTouchEnd);
 
     return () => {
-      canvas.removeEventListener('mousedown', onMouseDown);
+      canvas.removeEventListener('mousedown',  onMouseDown);
       canvas.removeEventListener('touchstart', onTouchStart);
-      window.removeEventListener('mousemove', onMouseMove);
-      window.removeEventListener('mouseup',   onMouseUp);
-      window.removeEventListener('touchmove', onTouchMove as EventListener);
-      window.removeEventListener('touchend',  onTouchEnd);
+      window.removeEventListener('mousemove',  onMouseMove);
+      window.removeEventListener('mouseup',    onMouseUp);
+      window.removeEventListener('touchmove',  onTouchMove as EventListener);
+      window.removeEventListener('touchend',   onTouchEnd);
     };
-  }, []); // refs only — no deps needed
+  }, []);
 
+  // Auto-scroll textarea when active session text changes
   useEffect(() => {
-    const textarea = textareaRef.current;
-    if (textarea) textarea.scrollTop = textarea.scrollHeight;
-  }, [decodedText]);
+    const t = textareaRef.current;
+    if (t) t.scrollTop = t.scrollHeight;
+  }, [activeSession.fullText]);
 
-  const handleStart    = async () => { await startRecording(); };
-  const handleStop     = () => { stopRecording(); };
-  const handleReset    = () => { resetDecoder(); setDecodedText(''); markPeakRef.current = 0; spacePeakRef.current = 0; };
+  // ── UI helpers ────────────────────────────────────────────────────────────
+
+  const handleStart = async () => { await startRecording(); };
+  const handleStop  = () => { stopRecording(); };
+  const handleReset = () => {
+    hookResetSession(activeSessionId);
+    dispatch({ type: 'CLEAR_TEXT', id: activeSessionId });
+    markPeakRef.current = 0; spacePeakRef.current = 0;
+  };
   const handleCopyText = () => {
-    if (!decodedText) return;
-    navigator.clipboard.writeText(decodedText).catch(() => {
+    const text = activeSession.fullText;
+    if (!text) return;
+    navigator.clipboard.writeText(text).catch(() => {
       const t = textareaRef.current;
       if (t) { t.select(); document.execCommand('copy'); }
     });
   };
 
   const getStateColor = () => {
-    switch (state.status) {
+    switch (procState.status) {
       case 'receiving': return 'text-green-400';
       case 'syncing':   return 'text-[#e3b341]';
       case 'error':     return 'text-[#f85149]';
@@ -384,7 +493,7 @@ export default function SSTVDecoder() {
     }
   };
 
-  const signalStrengthPct = Math.round(state.signalStrength * 100);
+  const signalStrengthPct = Math.round(procState.signalStrength * 100);
 
   const inputCls = "bg-[#0d1117] border border-[#30363d] rounded px-3 py-2 font-mono text-sm text-[#c9d1d9] focus:outline-none focus:border-[#2ea043] w-full transition-colors";
   const labelCls = "text-[#8b949e] text-xs mb-1 block";
@@ -395,7 +504,7 @@ export default function SSTVDecoder() {
       {/* ── Controls ── */}
       <div className="bg-[#161b22] border border-[#30363d] rounded-lg p-4 sm:p-6 space-y-4">
         <div className="flex flex-col sm:flex-row gap-3 sm:gap-4">
-          {!state.isRecording ? (
+          {!procState.isRecording ? (
             <button
               onClick={handleStart}
               className="w-full sm:flex-1 bg-[#238636] hover:bg-[#2ea043] text-white font-semibold px-6 py-3 rounded-md transition-colors text-base border border-transparent flex items-center justify-center gap-2"
@@ -429,7 +538,7 @@ export default function SSTVDecoder() {
 
           <button
             onClick={handleCopyText}
-            disabled={!decodedText}
+            disabled={!activeSession.fullText}
             className="w-full sm:flex-1 bg-[#21262d] hover:bg-[#30363d] disabled:opacity-40 disabled:cursor-not-allowed text-white font-semibold px-6 py-3 rounded-md transition-colors text-base border border-[#30363d] flex items-center justify-center gap-2"
           >
             <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" viewBox="0 0 20 20" fill="currentColor">
@@ -440,17 +549,17 @@ export default function SSTVDecoder() {
           </button>
         </div>
 
-        {state.errorMessage && (
+        {procState.errorMessage && (
           <div className="bg-[#da3633]/10 border border-[#f85149]/30 rounded-md p-3 text-[#f85149] text-sm">
-            {state.errorMessage}
+            {procState.errorMessage}
           </div>
         )}
 
-        {state.isRecording && (
+        {procState.isRecording && (
           <div className="grid grid-cols-2 lg:grid-cols-4 gap-3 sm:gap-4 text-sm">
             <div className="bg-[#0d1117] border border-[#30363d] rounded-lg p-3">
               <div className="text-[#8b949e] text-xs mb-1">State</div>
-              <div className={`font-mono font-semibold text-sm ${getStateColor()}`}>{state.status.toUpperCase()}</div>
+              <div className={`font-mono font-semibold text-sm ${getStateColor()}`}>{procState.status.toUpperCase()}</div>
             </div>
             <div className="bg-[#0d1117] border border-[#30363d] rounded-lg p-3">
               <div className="text-[#8b949e] text-xs mb-1">Mode</div>
@@ -458,34 +567,42 @@ export default function SSTVDecoder() {
             </div>
             <div className="bg-[#0d1117] border border-[#30363d] rounded-lg p-3">
               <div className="text-[#8b949e] text-xs mb-1">Chars</div>
-              <div className="font-mono font-semibold text-sm">{decodedText.length}</div>
+              <div className="font-mono font-semibold text-sm">{activeSession.fullText.length}</div>
             </div>
             <div className="bg-[#0d1117] border border-[#30363d] rounded-lg p-3">
               <div className="text-[#8b949e] text-xs mb-1">SNR</div>
               <div className={`font-mono font-semibold text-sm ${
-                state.snr === null ? 'text-[#8b949e]' :
-                state.snr < 10    ? 'text-[#da3633]' :
-                state.snr < 18    ? 'text-[#e3b341]' : 'text-[#2ea043]'
+                procState.snr === null ? 'text-[#8b949e]' :
+                procState.snr < 10    ? 'text-[#da3633]' :
+                procState.snr < 18    ? 'text-[#e3b341]' : 'text-[#2ea043]'
               }`}>
-                {state.snr !== null ? `${state.snr.toFixed(1)} dB` : '-- dB'}
+                {procState.snr !== null ? `${procState.snr.toFixed(1)} dB` : '-- dB'}
               </div>
             </div>
           </div>
         )}
       </div>
 
-      {/* ── Main display ── */}
-      <div className="space-y-4 lg:space-y-0 lg:grid lg:grid-cols-2 lg:gap-6">
+      {/* ── Main display — fluid resizable columns ── */}
+      <div ref={containerRef} className="flex flex-col lg:flex-row lg:items-stretch gap-4 lg:gap-0">
 
         {/* RTTY Output terminal */}
-        <div className="bg-[#161b22] border border-[#30363d] rounded-lg p-3 sm:p-4 flex flex-col">
+        <div
+          className="bg-[#161b22] border border-[#30363d] rounded-lg p-3 sm:p-4 flex flex-col min-w-0"
+          style={{ flex: panelWeights[0] }}
+        >
           <div className="flex items-center justify-between mb-2 sm:mb-3">
-            <h2 className="text-lg sm:text-xl font-semibold">RTTY Output</h2>
+            <h2 className="text-lg sm:text-xl font-semibold">
+              RTTY Output
+              {sessions.length > 1 && (
+                <span className="ml-2 text-xs font-normal text-[#8b949e]">— {activeSession.label}</span>
+              )}
+            </h2>
             <div className="flex items-center gap-3">
-              <span className="text-xs text-[#8b949e] font-mono">{decodedText.length} chars</span>
+              <span className="text-xs text-[#8b949e] font-mono">{activeSession.fullText.length} chars</span>
               <button
-                onClick={() => setDecodedText('')}
-                disabled={!decodedText}
+                onClick={() => dispatch({ type: 'CLEAR_TEXT', id: activeSessionId })}
+                disabled={!activeSession.fullText}
                 className="text-xs px-2 py-0.5 rounded border border-[#30363d] text-[#8b949e] hover:text-[#f85149] hover:border-[#f85149]/40 disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
               >
                 Clear
@@ -495,17 +612,29 @@ export default function SSTVDecoder() {
           <textarea
             ref={textareaRef}
             readOnly
-            value={decodedText}
+            value={activeSession.fullText}
             placeholder="Decoded RTTY text will appear here..."
-            className="flex-1 min-h-[300px] w-full bg-[#0d1117] border border-[#30363d] rounded font-mono text-sm text-[#2ea043] p-3 resize-none focus:outline-none placeholder:text-[#30363d] leading-snug"
+            style={{ color: activeSession.color }}
+            className="flex-1 min-h-[300px] w-full bg-[#0d1117] border border-[#30363d] rounded font-mono text-sm p-3 resize-none focus:outline-none placeholder:text-[#30363d] leading-snug"
           />
         </div>
 
+        {/* Drag handle 0↔1 */}
+        <div
+          className="hidden lg:flex w-3 self-stretch cursor-col-resize items-center justify-center group shrink-0"
+          onMouseDown={(e) => startDrag(e, 0)}
+        >
+          <div className="w-px h-full bg-[#30363d] group-hover:bg-[#2ea043]/50 transition-colors" />
+        </div>
+
         {/* Audio Analysis */}
-        <div className="bg-[#161b22] border border-[#30363d] rounded-lg p-3 sm:p-4">
+        <div
+          className="bg-[#161b22] border border-[#30363d] rounded-lg p-3 sm:p-4 min-w-0 flex flex-col"
+          style={{ flex: panelWeights[1] }}
+        >
           <div className="flex items-center justify-between mb-2 sm:mb-3">
             <h2 className="text-lg sm:text-xl font-semibold">Audio Analysis</h2>
-            {state.isRecording && (
+            {procState.isRecording && (
               <div className="flex items-center gap-2">
                 <span className="text-xs text-[#8b949e]">Signal</span>
                 <div className="flex items-center gap-1">
@@ -523,7 +652,7 @@ export default function SSTVDecoder() {
             )}
           </div>
 
-          {/* Spectrum — interactive drag to tune */}
+          {/* Spectrum */}
           <div className="space-y-1">
             <div className="flex items-center justify-between">
               <h3 className="text-sm font-medium text-[#8b949e]">Spectrum</h3>
@@ -531,13 +660,12 @@ export default function SSTVDecoder() {
             </div>
             <canvas
               ref={spectrumCanvasRef}
-              width={640}
-              height={200}
+              width={640} height={200}
               className="w-full border border-[#30363d] rounded bg-[#0d1117] touch-manipulation cursor-crosshair select-none"
             />
           </div>
 
-          {/* Freq readout + center input + sideband — between spectrum and spectrogram */}
+          {/* Freq readout + center + sideband */}
           <div className="flex flex-wrap items-center gap-4 mt-2 text-xs font-mono text-[#8b949e]">
             <span>Mark:&nbsp;<span className="text-[#58a6ff]">{markFreq} Hz</span></span>
             <span>Space:&nbsp;<span className="text-[#f0883e]">{spaceFreq} Hz</span></span>
@@ -546,11 +674,10 @@ export default function SSTVDecoder() {
               <input
                 type="number"
                 value={centerFreq}
-                min={0}
-                max={DISPLAY_MAX_HZ}
+                min={0} max={DISPLAY_MAX_HZ}
                 onChange={(e) => {
                   const v = parseInt(e.target.value);
-                  if (!isNaN(v)) setCenterFreq(Math.max(0, Math.min(DISPLAY_MAX_HZ, v)));
+                  if (!isNaN(v)) patchActive({ centerFreq: Math.max(0, Math.min(DISPLAY_MAX_HZ, v)) });
                 }}
                 className="bg-[#0d1117] border border-[#30363d] rounded px-2 py-0.5 w-20 text-[#c9d1d9] focus:outline-none focus:border-[#2ea043] transition-colors"
               />
@@ -559,7 +686,7 @@ export default function SSTVDecoder() {
             <span className="flex items-center gap-1">
               Sideband:
               <button
-                onClick={() => setReverseShift(r => !r)}
+                onClick={() => patchActive({ reverseShift: !reverseShift })}
                 className={`px-2 py-0.5 rounded border transition-colors ${
                   reverseShift
                     ? 'bg-[#f0883e]/10 border-[#f0883e]/50 text-[#f0883e]'
@@ -571,47 +698,41 @@ export default function SSTVDecoder() {
             </span>
           </div>
 
-          {/* Spectrogram — CSS overlay markers to avoid scroll artifacts */}
-          <div className="space-y-2 mt-3 sm:mt-4">
-            <h3 className="text-sm font-medium text-[#8b949e]">Spectrogram</h3>
-            <div className="relative">
+          {/* Spectrogram — flex-1 so it fills remaining panel height */}
+          <div className="flex flex-col flex-1 gap-2 mt-3 sm:mt-4 min-h-0">
+            <h3 className="text-sm font-medium text-[#8b949e] shrink-0">Spectrogram</h3>
+            <div ref={spectrogramContainerRef} className="relative flex-1 min-h-[150px]">
               <canvas
                 ref={spectrogramCanvasRef}
                 width={640}
-                height={500}
-                className="w-full border border-[#30363d] rounded bg-[#0d1117] touch-manipulation block"
+                height={spectrogramCanvasHeight}
+                className="w-full h-full border border-[#30363d] rounded bg-[#0d1117] touch-manipulation block"
               />
-              {/* Space baud-rate band fill + edges */}
               <div className="absolute inset-y-0 pointer-events-none" style={{
                 left: `${(spaceBandLow / DISPLAY_MAX_HZ) * 100}%`,
                 width: `${((spaceBandHigh - spaceBandLow) / DISPLAY_MAX_HZ) * 100}%`,
                 backgroundColor: 'rgba(240,136,62,0.07)',
-                borderLeft:  '1px solid rgba(240,136,62,0.28)',
-                borderRight: '1px solid rgba(240,136,62,0.28)',
+                borderLeft: '1px solid rgba(240,136,62,0.28)', borderRight: '1px solid rgba(240,136,62,0.28)',
               }} />
-              {/* Mark baud-rate band fill + edges */}
               <div className="absolute inset-y-0 pointer-events-none" style={{
                 left: `${(markBandLow / DISPLAY_MAX_HZ) * 100}%`,
                 width: `${((markBandHigh - markBandLow) / DISPLAY_MAX_HZ) * 100}%`,
                 backgroundColor: 'rgba(88,166,255,0.07)',
-                borderLeft:  '1px solid rgba(88,166,255,0.28)',
-                borderRight: '1px solid rgba(88,166,255,0.28)',
+                borderLeft: '1px solid rgba(88,166,255,0.28)', borderRight: '1px solid rgba(88,166,255,0.28)',
               }} />
-              {/* Space centre line */}
               {spaceFreq >= 0 && spaceFreq <= DISPLAY_MAX_HZ && (
                 <div className="absolute inset-y-0 pointer-events-none" style={{ left: `${(spaceFreq / DISPLAY_MAX_HZ) * 100}%`, width: '2px', backgroundColor: '#f0883e', opacity: 0.9 }}>
                   <span className="absolute top-1 left-1 text-[10px] font-mono font-bold text-[#f0883e] leading-none drop-shadow-md">S</span>
                 </div>
               )}
-              {/* Mark centre line */}
               {markFreq >= 0 && markFreq <= DISPLAY_MAX_HZ && (
                 <div className="absolute inset-y-0 pointer-events-none" style={{ left: `${(markFreq / DISPLAY_MAX_HZ) * 100}%`, width: '2px', backgroundColor: '#58a6ff', opacity: 0.9 }}>
                   <span className="absolute top-1 left-1 text-[10px] font-mono font-bold text-[#58a6ff] leading-none drop-shadow-md">M</span>
                 </div>
               )}
             </div>
-            {/* Contrast + Speed controls below spectrogram */}
-            <div className="flex flex-wrap items-center gap-4 text-xs text-[#8b949e]">
+            {/* Contrast + Speed */}
+            <div className="flex flex-wrap items-center gap-4 text-xs text-[#8b949e] shrink-0">
               <label className="flex items-center gap-2">
                 Contrast
                 <input
@@ -637,58 +758,91 @@ export default function SSTVDecoder() {
             </div>
           </div>
         </div>
-      </div>
-
-      {/* ── RTTY Configuration ── */}
-      <div className="bg-[#161b22] border border-[#30363d] rounded-lg p-4 sm:p-6">
-        <h2 className="text-lg sm:text-xl font-semibold mb-4">RTTY Configuration</h2>
-        <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-3 sm:gap-4">
-
-          <div>
-            <label className={labelCls}>Carrier Shift (Hz)</label>
-            <input
-              type="number"
-              value={carrierShift}
-              min={1}
-              onChange={(e) => setCarrierShift(Math.max(1, parseInt(e.target.value) || 450))}
-              className={inputCls}
-            />
-          </div>
-
-          <div>
-            <label className={labelCls}>Baud Rate</label>
-            <select value={baudRate} onChange={(e) => setBaudRate(parseFloat(e.target.value))} className={inputCls}>
-              {[45, 45.45, 50, 65, 75, 100, 110, 150, 200, 300].map((b) => (
-                <option key={b} value={b}>{b}</option>
-              ))}
-            </select>
-          </div>
-
-          <div>
-            <label className={labelCls}>Bits / Char</label>
-            <select value={bitsPerChar} onChange={(e) => setBitsPerChar(parseInt(e.target.value))} className={inputCls}>
-              {[5, 7, 8].map((b) => <option key={b} value={b}>{b}</option>)}
-            </select>
-          </div>
-
-          <div>
-            <label className={labelCls}>Parity</label>
-            <select value={parity} onChange={(e) => setParity(e.target.value)} className={inputCls}>
-              {['none', 'even', 'odd', 'zero', 'one'].map((p) => (
-                <option key={p} value={p}>{p.charAt(0).toUpperCase() + p.slice(1)}</option>
-              ))}
-            </select>
-          </div>
-
-          <div>
-            <label className={labelCls}>Stop Bits</label>
-            <select value={stopBits} onChange={(e) => setStopBits(parseFloat(e.target.value))} className={inputCls}>
-              {[1, 1.5, 2].map((s) => <option key={s} value={s}>{s}</option>)}
-            </select>
-          </div>
-
+        {/* Drag handle 1↔2 */}
+        <div
+          className="hidden lg:flex w-3 self-stretch cursor-col-resize items-center justify-center group shrink-0"
+          onMouseDown={(e) => startDrag(e, 1)}
+        >
+          <div className="w-px h-full bg-[#30363d] group-hover:bg-[#2ea043]/50 transition-colors" />
         </div>
 
+        {/* Decoder Sessions — 3rd column */}
+        <div
+          className="bg-[#161b22] border border-[#30363d] rounded-lg p-3 sm:p-4 min-w-0"
+          style={{ flex: panelWeights[2] }}
+        >
+          <div className="flex items-center justify-between mb-3">
+            <h2 className="text-lg sm:text-xl font-semibold">Decoder Sessions</h2>
+            <div ref={addPanelRef} className="relative">
+              <button
+                onClick={() => setAddPanelOpen(v => !v)}
+                className="flex items-center gap-1 px-2.5 py-1 rounded-md bg-[#238636]/10 border border-[#238636]/40 text-[#2ea043] text-xs font-mono hover:bg-[#238636]/20 hover:border-[#238636]/60 transition-colors"
+              >
+                <svg xmlns="http://www.w3.org/2000/svg" className="h-3.5 w-3.5" viewBox="0 0 20 20" fill="currentColor">
+                  <path fillRule="evenodd" d="M10 3a1 1 0 011 1v5h5a1 1 0 110 2h-5v5a1 1 0 11-2 0v-5H4a1 1 0 110-2h5V4a1 1 0 011-1z" clipRule="evenodd" />
+                </svg>
+                Add
+              </button>
+              {addPanelOpen && (
+                <div className="absolute right-0 top-full mt-1 z-10 bg-[#161b22] border border-[#30363d] rounded-lg p-3 shadow-lg w-48">
+                  <div className="mb-2">
+                    <div className="text-[10px] text-[#8b949e] mb-1.5">Carrier Shift</div>
+                    <div className="flex gap-1">
+                      {[170, 200, 450].map(s => (
+                        <button
+                          key={s}
+                          onClick={() => setAddShift(s)}
+                          className={`flex-1 text-xs py-0.5 rounded border transition-colors ${
+                            addShift === s
+                              ? 'border-[#2ea043]/60 bg-[#2ea043]/10 text-[#2ea043]'
+                              : 'border-[#30363d] text-[#8b949e] hover:border-[#8b949e]/50'
+                          }`}
+                        >{s}</button>
+                      ))}
+                    </div>
+                  </div>
+                  <div className="mb-3">
+                    <div className="text-[10px] text-[#8b949e] mb-1.5">Baud Rate</div>
+                    <div className="flex gap-1">
+                      {[45, 45.45, 50].map(b => (
+                        <button
+                          key={b}
+                          onClick={() => setAddBaud(b)}
+                          className={`flex-1 text-xs py-0.5 rounded border transition-colors ${
+                            addBaud === b
+                              ? 'border-[#2ea043]/60 bg-[#2ea043]/10 text-[#2ea043]'
+                              : 'border-[#30363d] text-[#8b949e] hover:border-[#8b949e]/50'
+                          }`}
+                        >{b}</button>
+                      ))}
+                    </div>
+                  </div>
+                  <button
+                    onClick={addNewSession}
+                    className="w-full text-xs py-1 rounded bg-[#238636]/20 border border-[#238636]/50 text-[#2ea043] hover:bg-[#238636]/30 transition-colors"
+                  >
+                    Create Session
+                  </button>
+                </div>
+              )}
+            </div>
+          </div>
+          <div className="grid grid-cols-2 gap-2">
+            {sessions.map(session => (
+              <SessionCard
+                key={session.id}
+                session={session}
+                isActive={session.id === activeSessionId}
+                canRemove={sessions.length > 1}
+                onActivate={promoteSession}
+                onRemove={removeSession}
+                onConfigChange={updateSessionConfig}
+                onLabelChange={(id, label) => dispatch({ type: 'UPDATE_LABEL', id, label })}
+                onColorChange={updateSessionColor}
+              />
+            ))}
+          </div>
+        </div>
       </div>
 
       {/* ── How to Use ── */}
@@ -702,6 +856,7 @@ export default function SSTVDecoder() {
             <li>Tune your radio to an RTTY signal (typically 45 or 50 baud, 170 or 450 Hz shift)</li>
             <li>On the Spectrum panel, click and drag to position the <span className="text-[#58a6ff] font-mono">M</span> (mark) and <span className="text-[#f0883e] font-mono">S</span> (space) markers over the two signal peaks</li>
             <li>Adjust Carrier Shift and Baud Rate in the configuration panel to match the transmission</li>
+            <li>Use <strong>Add Decoder</strong> to run multiple decoders simultaneously with different settings — promote the best one to take over the main output</li>
             <li>Decoded text will appear in the terminal output area as characters are received</li>
             <li>Click &quot;Copy Text&quot; to copy the decoded output to clipboard</li>
           </ol>
