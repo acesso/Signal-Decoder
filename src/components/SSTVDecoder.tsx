@@ -706,7 +706,8 @@ export default function SSTVDecoder() {
                 ref={spectrogramCanvasRef}
                 width={640}
                 height={spectrogramCanvasHeight}
-                className="w-full h-full border border-[#30363d] rounded bg-[#0d1117] touch-manipulation block"
+                style={{ height: spectrogramCanvasHeight }}
+                className="w-full border border-[#30363d] rounded bg-[#0d1117] touch-manipulation block"
               />
               <div className="absolute inset-y-0 pointer-events-none" style={{
                 left: `${(spaceBandLow / DISPLAY_MAX_HZ) * 100}%`,
