@@ -1,344 +1,351 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useRef, useState, useCallback } from 'react';
 import { SSTVDecoder, DecoderStats } from '@/lib/sstv/decoder';
+import { VISDetector } from '@/lib/sstv/vis-detector';
 import { SSTV_MODES } from '@/lib/sstv/constants';
 
 export type SSTVMode = keyof typeof SSTV_MODES;
+
+export interface CapturedImage {
+  id: string;
+  mode: SSTVMode;
+  width: number;
+  height: number;
+  data: Uint8ClampedArray;
+  thumbnailUrl: string;
+  captureTime: Date;
+  duration: number; // seconds
+}
 
 export interface AudioProcessorState {
   isRecording: boolean;
   isSupported: boolean;
   error: string | null;
   stats: DecoderStats | null;
+  // VIS / auto-detect
+  isListeningForVIS: boolean;
+  detectionStatus: string;
+  activeMode: SSTVMode;
+  capturedImages: CapturedImage[];
 }
 
-export function useAudioProcessor(mode: SSTVMode = 'ROBOT36') {
+const SILENCE_THRESHOLD = 0.008;
+const SILENCE_DURATION_MS = 2500;
+
+function makeThumbnail(data: Uint8ClampedArray, width: number, height: number): string {
+  const canvas = document.createElement('canvas');
+  canvas.width = width;
+  canvas.height = height;
+  const ctx = canvas.getContext('2d')!;
+  const clamped = new Uint8ClampedArray(data.buffer as ArrayBuffer, data.byteOffset, data.byteLength);
+  ctx.putImageData(new ImageData(clamped, width, height), 0, 0);
+  return canvas.toDataURL('image/jpeg', 0.7);
+}
+
+export function useAudioProcessor(manualMode: SSTVMode = 'ROBOT36', autoDetect = false) {
   const [state, setState] = useState<AudioProcessorState>({
     isRecording: false,
     isSupported: false,
     error: null,
     stats: null,
+    isListeningForVIS: false,
+    detectionStatus: '',
+    activeMode: manualMode,
+    capturedImages: [],
   });
 
-  const audioContextRef = useRef<AudioContext | null>(null);
-  const analyserRef = useRef<AnalyserNode | null>(null);
-  const streamRef = useRef<MediaStream | null>(null);
-  const decoderRef = useRef<SSTVDecoder | null>(null);
-  const animationFrameRef = useRef<number | null>(null);
-  const processorNodeRef = useRef<ScriptProcessorNode | null>(null);
-  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
-  const audioChunksRef = useRef<Float32Array[]>([]);
+  const audioContextRef    = useRef<AudioContext | null>(null);
+  const analyserRef        = useRef<AnalyserNode | null>(null);
+  const streamRef          = useRef<MediaStream | null>(null);
+  const decoderRef         = useRef<SSTVDecoder | null>(null);
+  const visDetectorRef     = useRef<VISDetector | null>(null);
+  const animationFrameRef  = useRef<number | null>(null);
+  const processorNodeRef   = useRef<ScriptProcessorNode | null>(null);
 
-  // Check browser support on mount
+  // Refs for values used inside audio callbacks (avoids stale closures)
+  const autoDetectRef      = useRef(autoDetect);
+  const activeModeRef      = useRef<SSTVMode>(manualMode);
+  const isDecodingRef      = useRef(false);      // true while decoder is running
+  const decodingStartRef   = useRef<number>(0);  // Date.now() when decode started
+  const silenceMsRef       = useRef(0);          // accumulated silence ms
+  const capturedImagesRef  = useRef<CapturedImage[]>([]);
+
+  useEffect(() => { autoDetectRef.current = autoDetect; }, [autoDetect]);
+
+  // Sync activeMode when manual mode changes and not in auto-detect
   useEffect(() => {
-    const checkSupport = () => {
-      const hasAudioContext = typeof window !== 'undefined' && 'AudioContext' in window;
-      const hasMediaDevices = typeof navigator !== 'undefined' &&
-                              navigator.mediaDevices &&
-                              typeof navigator.mediaDevices.getUserMedia === 'function';
+    if (!autoDetect) {
+      activeModeRef.current = manualMode;
+      setState(prev => ({ ...prev, activeMode: manualMode }));
+    }
+  }, [manualMode, autoDetect]);
 
-      setState(prev => ({
-        ...prev,
-        isSupported: hasAudioContext && hasMediaDevices
-      }));
-    };
-
-    checkSupport();
+  useEffect(() => {
+    const hasAudioContext  = typeof window !== 'undefined' && 'AudioContext' in window;
+    const hasMediaDevices  = typeof navigator !== 'undefined' &&
+                             navigator.mediaDevices &&
+                             typeof navigator.mediaDevices.getUserMedia === 'function';
+    setState(prev => ({ ...prev, isSupported: hasAudioContext && hasMediaDevices }));
   }, []);
 
-  // Decoder will be initialized when we start recording and know the sample rate
+  // ── Audio callback (called from ScriptProcessor or RAF) ──────────────────────
+
+  const processAudioChunk = useCallback((inputData: Float32Array, sampleRate: number) => {
+    // RMS for silence detection
+    let rmsSum = 0;
+    for (let i = 0; i < inputData.length; i++) rmsSum += inputData[i] * inputData[i];
+    const rms = Math.sqrt(rmsSum / inputData.length);
+    const chunkMs = (inputData.length / sampleRate) * 1000;
+
+    if (autoDetectRef.current && !isDecodingRef.current) {
+      // ── Listening for VIS ──
+      if (visDetectorRef.current) {
+        const result = visDetectorRef.current.process(inputData);
+        if (result.detected && result.modeName) {
+          const detectedMode = result.modeName;
+          activeModeRef.current = detectedMode;
+          isDecodingRef.current = true;
+          decodingStartRef.current = Date.now();
+          silenceMsRef.current = 0;
+
+          // Create decoder for detected mode
+          decoderRef.current = new SSTVDecoder(sampleRate, detectedMode);
+          decoderRef.current.start();
+
+          setState(prev => ({
+            ...prev,
+            activeMode: detectedMode,
+            isListeningForVIS: false,
+            detectionStatus: `VIS detected: ${SSTV_MODES[detectedMode].name}`,
+          }));
+        }
+      }
+    } else if (isDecodingRef.current && decoderRef.current) {
+      // ── Decoding image ──
+      decoderRef.current.processSamples(inputData);
+
+      // Silence detection
+      if (rms < SILENCE_THRESHOLD) {
+        silenceMsRef.current += chunkMs;
+        if (silenceMsRef.current >= SILENCE_DURATION_MS) {
+          // End of transmission — capture image
+          captureCurrentImage(sampleRate);
+        }
+      } else {
+        silenceMsRef.current = 0;
+      }
+
+      const stats = decoderRef.current.getStats();
+      const snr   = calculateSNRFromAnalyser(analyserRef.current, audioContextRef.current);
+      setState(prev => ({ ...prev, stats: { ...stats, snr } }));
+    } else if (!autoDetectRef.current && decoderRef.current) {
+      // ── Manual mode: always decoding ──
+      decoderRef.current.processSamples(inputData);
+
+      const stats = decoderRef.current.getStats();
+      const snr   = calculateSNRFromAnalyser(analyserRef.current, audioContextRef.current);
+      setState(prev => ({ ...prev, stats: { ...stats, snr } }));
+    }
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const captureCurrentImage = useCallback((sampleRate: number) => {
+    if (!decoderRef.current) return;
+    const { width, height } = decoderRef.current.getDimensions();
+    const rawData    = decoderRef.current.getImageData();
+    const dataCopy   = new Uint8ClampedArray(rawData.buffer.slice(rawData.byteOffset, rawData.byteOffset + rawData.byteLength));
+    const thumbUrl   = makeThumbnail(dataCopy, width, height);
+    const duration   = (Date.now() - decodingStartRef.current) / 1000;
+    const mode       = activeModeRef.current;
+
+    const img: CapturedImage = {
+      id: `${Date.now()}-${Math.random().toString(36).slice(2)}`,
+      mode,
+      width,
+      height,
+      data: dataCopy,
+      thumbnailUrl: thumbUrl,
+      captureTime: new Date(),
+      duration,
+    };
+
+    capturedImagesRef.current = [img, ...capturedImagesRef.current];
+    isDecodingRef.current = false;
+    silenceMsRef.current  = 0;
+
+    if (autoDetectRef.current) {
+      // Reset VIS detector to listen for next transmission
+      if (visDetectorRef.current) visDetectorRef.current.reset();
+      setState(prev => ({
+        ...prev,
+        stats: null,
+        isListeningForVIS: true,
+        detectionStatus: 'Listening for VIS…',
+        capturedImages: capturedImagesRef.current,
+      }));
+    } else {
+      // In manual mode, restart decoder immediately
+      decoderRef.current = new SSTVDecoder(sampleRate, activeModeRef.current);
+      decoderRef.current.start();
+      isDecodingRef.current = true;
+      setState(prev => ({
+        ...prev,
+        stats: null,
+        capturedImages: capturedImagesRef.current,
+      }));
+    }
+  }, []);
 
   const startRecording = async () => {
     try {
-      // Check support at call time, not from state
       const hasAudioContext = typeof window !== 'undefined' && 'AudioContext' in window;
       const hasMediaDevices = typeof navigator !== 'undefined' &&
                               navigator.mediaDevices &&
                               typeof navigator.mediaDevices.getUserMedia === 'function';
-
       if (!hasAudioContext || !hasMediaDevices) {
         throw new Error('Web Audio API not supported in this browser');
       }
 
-      // Request microphone access
-      // Don't specify sampleRate - let the browser use the hardware's native rate
       const stream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          echoCancellation: false,
-          noiseSuppression: false,
-          autoGainControl: false,
-        },
+        audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false },
       });
-
       streamRef.current = stream;
 
-      // Create audio context with default sample rate to match MediaStream
-      // Firefox requires AudioContext and MediaStream to have the same sample rate
       const audioContext = new AudioContext();
       audioContextRef.current = audioContext;
+      console.log(`AudioContext created: ${audioContext.sampleRate} Hz`);
 
-      console.log(`AudioContext created with sample rate: ${audioContext.sampleRate} Hz`);
-
-      // Create audio source from microphone
       const source = audioContext.createMediaStreamSource(stream);
-
-      // Create analyser for visualization
       const analyser = audioContext.createAnalyser();
       analyser.fftSize = 2048;
       analyserRef.current = analyser;
-
-      // Connect source to analyser
       source.connect(analyser);
 
-      // Try to use ScriptProcessorNode (deprecated but still works in some browsers)
-      // If it fails or is not available, we'll fall back to polling via requestAnimationFrame
+      const sampleRate = audioContext.sampleRate;
+
+      if (autoDetectRef.current) {
+        visDetectorRef.current = new VISDetector(sampleRate);
+        isDecodingRef.current  = false;
+        setState(prev => ({
+          ...prev,
+          isListeningForVIS: true,
+          detectionStatus: 'Listening for VIS…',
+          activeMode: activeModeRef.current,
+        }));
+      } else {
+        decoderRef.current = new SSTVDecoder(sampleRate, activeModeRef.current);
+        decoderRef.current.start();
+        isDecodingRef.current = true;
+      }
+
       let useScriptProcessor = false;
       try {
         if (typeof audioContext.createScriptProcessor === 'function') {
-          const bufferSize = 4096;
-          const processor = audioContext.createScriptProcessor(bufferSize, 1, 1);
+          const processor = audioContext.createScriptProcessor(4096, 1, 1);
           processorNodeRef.current = processor;
-
           processor.onaudioprocess = (event) => {
-            const inputData = event.inputBuffer.getChannelData(0);
-
-            // Process audio with SSTV decoder
-            if (decoderRef.current) {
-              decoderRef.current.processSamples(inputData);
-
-              // Update stats with SNR
-              const stats = decoderRef.current.getStats();
-              const snr = calculateSNR();
-              setState(prev => ({ ...prev, stats: { ...stats, snr } }));
-            }
+            processAudioChunk(event.inputBuffer.getChannelData(0), sampleRate);
           };
-
           analyser.connect(processor);
           processor.connect(audioContext.destination);
           useScriptProcessor = true;
-          console.log('Using ScriptProcessorNode for audio processing');
+          console.log('Using ScriptProcessorNode');
         }
-      } catch (e) {
-        console.warn('ScriptProcessorNode not available, using polling fallback');
-      }
+      } catch { /* fall through */ }
 
-      // Fallback: Use requestAnimationFrame polling for Safari/iOS
       if (!useScriptProcessor) {
-        // Create a silent destination to keep the graph active
         const silentGain = audioContext.createGain();
-        silentGain.gain.value = 0.001; // Very quiet so we can monitor but not hear it
+        silentGain.gain.value = 0.001;
         analyser.connect(silentGain);
         silentGain.connect(audioContext.destination);
 
-        // Poll analyser for time domain data
-        const pollAudio = () => {
-          if (!analyserRef.current || !decoderRef.current) {
-            return;
-          }
-
-          const bufferLength = analyser.fftSize;
-          const dataArray = new Float32Array(bufferLength);
-          analyser.getFloatTimeDomainData(dataArray);
-
-          // Process audio with SSTV decoder
-          decoderRef.current.processSamples(dataArray);
-
-          // Update stats with SNR
-          const stats = decoderRef.current.getStats();
-          const snr = calculateSNR();
-          setState(prev => ({ ...prev, stats: { ...stats, snr } }));
-
-          // Continue polling
-          animationFrameRef.current = requestAnimationFrame(pollAudio);
+        const poll = () => {
+          if (!analyserRef.current) return;
+          const buf = new Float32Array(analyser.fftSize);
+          analyser.getFloatTimeDomainData(buf);
+          processAudioChunk(buf, sampleRate);
+          animationFrameRef.current = requestAnimationFrame(poll);
         };
-
-        console.log('Using requestAnimationFrame polling for audio processing (Safari-compatible)');
-        animationFrameRef.current = requestAnimationFrame(pollAudio);
+        console.log('Using RAF polling');
+        animationFrameRef.current = requestAnimationFrame(poll);
       }
 
-      // Initialize and start decoder with the actual sample rate and selected mode
-      decoderRef.current = new SSTVDecoder(audioContext.sampleRate, mode);
-      decoderRef.current.start();
-
-      setState(prev => ({
-        ...prev,
-        isRecording: true,
-        error: null,
-      }));
-
+      setState(prev => ({ ...prev, isRecording: true, error: null }));
     } catch (err) {
       const error = err instanceof Error ? err.message : 'Failed to access microphone';
-      setState(prev => ({
-        ...prev,
-        error,
-        isRecording: false,
-      }));
+      setState(prev => ({ ...prev, error, isRecording: false }));
     }
   };
 
   const stopRecording = () => {
-    // Stop all tracks
     if (streamRef.current) {
-      streamRef.current.getTracks().forEach(track => track.stop());
+      streamRef.current.getTracks().forEach(t => t.stop());
       streamRef.current = null;
     }
-
-    // Disconnect audio nodes
-    if (processorNodeRef.current) {
-      processorNodeRef.current.disconnect();
-      processorNodeRef.current = null;
-    }
-
-    if (analyserRef.current) {
-      analyserRef.current.disconnect();
-      analyserRef.current = null;
-    }
-
-    // Close audio context
-    if (audioContextRef.current) {
-      audioContextRef.current.close();
-      audioContextRef.current = null;
-    }
-
-    // Cancel animation frame
-    if (animationFrameRef.current) {
-      cancelAnimationFrame(animationFrameRef.current);
-      animationFrameRef.current = null;
-    }
-
-    // Stop decoder but keep the stats so the image persists
-    if (decoderRef.current) {
-      decoderRef.current.stop();
-    }
-
-    setState(prev => ({
-      ...prev,
-      isRecording: false,
-      // Keep stats so the decoded image remains visible
-    }));
+    if (processorNodeRef.current) { processorNodeRef.current.disconnect(); processorNodeRef.current = null; }
+    if (analyserRef.current)      { analyserRef.current.disconnect();      analyserRef.current = null; }
+    if (audioContextRef.current)  { audioContextRef.current.close();       audioContextRef.current = null; }
+    if (animationFrameRef.current){ cancelAnimationFrame(animationFrameRef.current); animationFrameRef.current = null; }
+    if (decoderRef.current)       { decoderRef.current.stop(); }
+    if (visDetectorRef.current)   { visDetectorRef.current.reset(); }
+    isDecodingRef.current = false;
+    setState(prev => ({ ...prev, isRecording: false, isListeningForVIS: false, detectionStatus: '' }));
   };
 
   const resetDecoder = () => {
     if (decoderRef.current) {
       decoderRef.current.reset();
-      if (state.isRecording) {
-        decoderRef.current.start();
-      }
-      // Clear stats when explicitly resetting
-      setState(prev => ({
-        ...prev,
-        stats: null,
-      }));
+      if (state.isRecording && !autoDetectRef.current) decoderRef.current.start();
     }
+    setState(prev => ({ ...prev, stats: null }));
   };
 
-  const getImageData = (): Uint8ClampedArray | null => {
-    return decoderRef.current ? decoderRef.current.getImageData() : null;
+  const clearImages = () => {
+    capturedImagesRef.current = [];
+    setState(prev => ({ ...prev, capturedImages: [] }));
   };
+
+  const getImageData = (): Uint8ClampedArray | null =>
+    decoderRef.current ? decoderRef.current.getImageData() : null;
 
   const getDimensions = () => {
-    if (decoderRef.current) {
-      return decoderRef.current.getDimensions();
-    }
-    // Return dimensions based on current mode
-    const modeConfig = SSTV_MODES[mode];
-    return { width: modeConfig.width, height: modeConfig.height };
+    if (decoderRef.current) return decoderRef.current.getDimensions();
+    const cfg = SSTV_MODES[activeModeRef.current];
+    return { width: cfg.width, height: cfg.height };
   };
 
-  const getAnalyser = (): AnalyserNode | null => {
-    return analyserRef.current;
-  };
+  const getAnalyser = (): AnalyserNode | null => analyserRef.current;
 
-  /**
-   * Calculate Signal-to-Noise Ratio (SNR) in dB
-   * Uses AnalyserNode to measure signal power in SSTV band vs noise floor
-   */
-  const calculateSNR = (): number | null => {
-    const analyser = analyserRef.current;
-    const audioContext = audioContextRef.current;
-    if (!analyser || !audioContext) return null;
-
-    // Get frequency data
-    const bufferLength = analyser.frequencyBinCount;
-    const dataArray = new Uint8Array(bufferLength);
-    analyser.getByteFrequencyData(dataArray);
-
-    const sampleRate = audioContext.sampleRate;
-    const nyquist = sampleRate / 2;
-
-    // SSTV signal band: 1200-2300 Hz (sync to white)
-    const signalBandStart = 1200;
-    const signalBandEnd = 2300;
-
-    // Noise bands (outside SSTV signal)
-    // Lower band: 300-1000 Hz (below SSTV)
-    // Upper band: 2500-4000 Hz (above SSTV)
-    const noiseBandLow1 = 300;
-    const noiseBandLow2 = 1000;
-    const noiseBandHigh1 = 2500;
-    const noiseBandHigh2 = 4000;
-
-    // Convert frequencies to bin indices
-    const freqToBin = (freq: number) => Math.floor((freq / nyquist) * bufferLength);
-
-    const signalBinStart = freqToBin(signalBandStart);
-    const signalBinEnd = freqToBin(signalBandEnd);
-    const noiseBinLow1 = freqToBin(noiseBandLow1);
-    const noiseBinLow2 = freqToBin(noiseBandLow2);
-    const noiseBinHigh1 = freqToBin(noiseBandHigh1);
-    const noiseBinHigh2 = freqToBin(noiseBandHigh2);
-
-    // Calculate average power in signal band
-    let signalPower = 0;
-    let signalCount = 0;
-    for (let i = signalBinStart; i <= signalBinEnd; i++) {
-      // Convert byte value (0-255) to linear power (squaring approximates power)
-      signalPower += dataArray[i] * dataArray[i];
-      signalCount++;
-    }
-    signalPower = signalPower / signalCount;
-
-    // Calculate average power in noise bands
-    let noisePower = 0;
-    let noiseCount = 0;
-
-    // Lower noise band
-    for (let i = noiseBinLow1; i <= noiseBinLow2; i++) {
-      noisePower += dataArray[i] * dataArray[i];
-      noiseCount++;
-    }
-
-    // Upper noise band
-    for (let i = noiseBinHigh1; i <= noiseBinHigh2; i++) {
-      noisePower += dataArray[i] * dataArray[i];
-      noiseCount++;
-    }
-
-    noisePower = noisePower / noiseCount;
-
-    // Avoid division by zero and log of zero
-    if (noisePower < 1) noisePower = 1;
-    if (signalPower < 1) signalPower = 1;
-
-    // Calculate SNR in dB: SNR = 10 * log10(signal_power / noise_power)
-    const snrDb = 10 * Math.log10(signalPower / noisePower);
-
-    return snrDb;
-  };
-
-  // Cleanup on unmount
-  useEffect(() => {
-    return () => {
-      stopRecording();
-    };
-  }, []);
+  useEffect(() => () => { stopRecording(); }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   return {
     state,
     startRecording,
     stopRecording,
     resetDecoder,
+    clearImages,
     getImageData,
     getDimensions,
     getAnalyser,
   };
+}
+
+function calculateSNRFromAnalyser(
+  analyser: AnalyserNode | null,
+  audioContext: AudioContext | null,
+): number | null {
+  if (!analyser || !audioContext) return null;
+  const bufLen   = analyser.frequencyBinCount;
+  const data     = new Uint8Array(bufLen);
+  analyser.getByteFrequencyData(data);
+  const nyquist  = audioContext.sampleRate / 2;
+  const freqToBin = (f: number) => Math.floor((f / nyquist) * bufLen);
+
+  const sum = (lo: number, hi: number) => {
+    let p = 0, n = 0;
+    for (let i = freqToBin(lo); i <= freqToBin(hi); i++) { p += data[i] * data[i]; n++; }
+    return n > 0 ? p / n : 1;
+  };
+
+  const sig  = sum(1200, 2300);
+  const noise = (sum(300, 1000) + sum(2500, 4000)) / 2;
+  return 10 * Math.log10(Math.max(sig, 1) / Math.max(noise, 1));
 }
