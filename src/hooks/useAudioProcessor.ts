@@ -41,7 +41,7 @@ function makeThumbnail(data: Uint8ClampedArray, width: number, height: number): 
   return canvas.toDataURL('image/jpeg', 0.7);
 }
 
-export function useAudioProcessor(manualMode: SSTVMode = 'ROBOT36', autoDetect = false) {
+export function useAudioProcessor(manualMode: SSTVMode = 'ROBOT36', autoDetect = false, autoSlant = true) {
   const [state, setState] = useState<AudioProcessorState>({
     isRecording: false,
     isSupported: false,
@@ -63,6 +63,7 @@ export function useAudioProcessor(manualMode: SSTVMode = 'ROBOT36', autoDetect =
 
   // Refs for values used inside audio callbacks (avoids stale closures)
   const autoDetectRef      = useRef(autoDetect);
+  const autoSlantRef       = useRef(autoSlant);
   const activeModeRef      = useRef<SSTVMode>(manualMode);
   const isDecodingRef      = useRef(false);      // true while decoder is running
   const decodingStartRef   = useRef<number>(0);  // Date.now() when decode started
@@ -70,6 +71,7 @@ export function useAudioProcessor(manualMode: SSTVMode = 'ROBOT36', autoDetect =
   const capturedImagesRef  = useRef<CapturedImage[]>([]);
 
   useEffect(() => { autoDetectRef.current = autoDetect; }, [autoDetect]);
+  useEffect(() => { autoSlantRef.current = autoSlant; }, [autoSlant]);
 
   // Sync activeMode when manual mode changes and not in auto-detect
   useEffect(() => {
@@ -107,8 +109,7 @@ export function useAudioProcessor(manualMode: SSTVMode = 'ROBOT36', autoDetect =
           decodingStartRef.current = Date.now();
           silenceMsRef.current = 0;
 
-          // Create decoder for detected mode
-          decoderRef.current = new SSTVDecoder(sampleRate, detectedMode);
+          decoderRef.current = new SSTVDecoder(sampleRate, detectedMode, autoSlantRef.current);
           decoderRef.current.start();
 
           setState(prev => ({
@@ -123,19 +124,35 @@ export function useAudioProcessor(manualMode: SSTVMode = 'ROBOT36', autoDetect =
       // ── Decoding image ──
       decoderRef.current.processSamples(inputData);
 
-      // Silence detection
+      const stats = decoderRef.current.getStats();
+
+      // Auto-capture when image is complete (100%)
+      if (stats.currentLine >= stats.totalLines && stats.totalLines > 0) {
+        captureCurrentImage(sampleRate);
+        return;
+      }
+
+      // In auto-detect mode, run VIS detector in parallel to catch back-to-back transmissions
+      if (autoDetectRef.current && visDetectorRef.current) {
+        const visResult = visDetectorRef.current.process(inputData);
+        if (visResult.detected && visResult.modeName) {
+          captureCurrentImage(sampleRate, visResult.modeName);
+          return;
+        }
+      }
+
+      // Silence detection as fallback end-of-transmission trigger
       if (rms < SILENCE_THRESHOLD) {
         silenceMsRef.current += chunkMs;
         if (silenceMsRef.current >= SILENCE_DURATION_MS) {
-          // End of transmission — capture image
           captureCurrentImage(sampleRate);
+          return;
         }
       } else {
         silenceMsRef.current = 0;
       }
 
-      const stats = decoderRef.current.getStats();
-      const snr   = calculateSNRFromAnalyser(analyserRef.current, audioContextRef.current);
+      const snr = calculateSNRFromAnalyser(analyserRef.current, audioContextRef.current);
       setState(prev => ({ ...prev, stats: { ...stats, snr } }));
     } else if (!autoDetectRef.current && decoderRef.current) {
       // ── Manual mode: always decoding ──
@@ -147,7 +164,7 @@ export function useAudioProcessor(manualMode: SSTVMode = 'ROBOT36', autoDetect =
     }
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
-  const captureCurrentImage = useCallback((sampleRate: number) => {
+  const captureCurrentImage = useCallback((sampleRate: number, nextMode?: SSTVMode) => {
     if (!decoderRef.current) return;
     const { width, height } = decoderRef.current.getDimensions();
     const rawData    = decoderRef.current.getImageData();
@@ -171,7 +188,23 @@ export function useAudioProcessor(manualMode: SSTVMode = 'ROBOT36', autoDetect =
     isDecodingRef.current = false;
     silenceMsRef.current  = 0;
 
-    if (autoDetectRef.current) {
+    if (nextMode) {
+      // Back-to-back VIS: immediately start decoding the next mode without returning to listen state
+      activeModeRef.current = nextMode;
+      decoderRef.current = new SSTVDecoder(sampleRate, nextMode, autoSlantRef.current);
+      decoderRef.current.start();
+      isDecodingRef.current = true;
+      decodingStartRef.current = Date.now();
+      if (visDetectorRef.current) visDetectorRef.current.reset();
+      setState(prev => ({
+        ...prev,
+        stats: null,
+        activeMode: nextMode,
+        isListeningForVIS: false,
+        detectionStatus: `VIS detected: ${SSTV_MODES[nextMode].name}`,
+        capturedImages: capturedImagesRef.current,
+      }));
+    } else if (autoDetectRef.current) {
       // Reset VIS detector to listen for next transmission
       if (visDetectorRef.current) visDetectorRef.current.reset();
       setState(prev => ({
@@ -183,7 +216,7 @@ export function useAudioProcessor(manualMode: SSTVMode = 'ROBOT36', autoDetect =
       }));
     } else {
       // In manual mode, restart decoder immediately
-      decoderRef.current = new SSTVDecoder(sampleRate, activeModeRef.current);
+      decoderRef.current = new SSTVDecoder(sampleRate, activeModeRef.current, autoSlantRef.current);
       decoderRef.current.start();
       isDecodingRef.current = true;
       setState(prev => ({
@@ -231,7 +264,7 @@ export function useAudioProcessor(manualMode: SSTVMode = 'ROBOT36', autoDetect =
           activeMode: activeModeRef.current,
         }));
       } else {
-        decoderRef.current = new SSTVDecoder(sampleRate, activeModeRef.current);
+        decoderRef.current = new SSTVDecoder(sampleRate, activeModeRef.current, autoSlantRef.current);
         decoderRef.current.start();
         isDecodingRef.current = true;
       }

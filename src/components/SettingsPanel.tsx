@@ -4,7 +4,7 @@ import { useState } from 'react';
 import Fab from '@mui/material/Fab';
 import SettingsIcon from '@mui/icons-material/Settings';
 
-export type SSTVMode = 'ROBOT36' | 'ROBOT72' | 'SCOTTIE_S1' | 'SCOTTIE_S2' | 'PD120' | 'PD160' | 'PD180';
+export type SSTVMode = 'ROBOT36' | 'ROBOT72' | 'SCOTTIE_S1' | 'SCOTTIE_S2' | 'MARTIN_M1' | 'MARTIN_M2' | 'SCOTTIE_DX' | 'WRAASE_SC2_180' | 'PD50' | 'PD90' | 'PD120' | 'PD160' | 'PD180' | 'PD240' | 'PD290';
 
 interface SettingsPanelProps {
   currentMode: SSTVMode;
@@ -37,6 +37,36 @@ export default function SettingsPanel({ currentMode, onModeChange, disabled = fa
       description: '320×256 • Faster HF (278ms/line) • RGB sequential',
     },
     {
+      id: 'MARTIN_M1',
+      name: 'Martin M1',
+      description: '320×256 • Most popular HF mode (446ms/line) • RGB sequential',
+    },
+    {
+      id: 'MARTIN_M2',
+      name: 'Martin M2',
+      description: '320×256 • Popular fast HF (181ms/line) • RGB sequential',
+    },
+    {
+      id: 'SCOTTIE_DX',
+      name: 'Scottie DX',
+      description: '320×256 • High quality (1049ms/line) • RGB sequential',
+    },
+    {
+      id: 'WRAASE_SC2_180',
+      name: 'Wraase SC2-180',
+      description: '320×256 • HF quality (712ms/line) • RGB sequential',
+    },
+    {
+      id: 'PD50',
+      name: 'PD 50',
+      description: '320×240 • Quick mode (388ms/line) • Dual-luminance',
+    },
+    {
+      id: 'PD90',
+      name: 'PD 90',
+      description: '320×240 • Balanced (703ms/line) • Dual-luminance',
+    },
+    {
       id: 'PD120',
       name: 'PD 120',
       description: '640×496 • High resolution (508ms/line) • Dual-luminance',
@@ -50,6 +80,16 @@ export default function SettingsPanel({ currentMode, onModeChange, disabled = fa
       id: 'PD180',
       name: 'PD 180',
       description: '640×496 • Highest quality (752ms/line) • Dual-luminance',
+    },
+    {
+      id: 'PD240',
+      name: 'PD 240',
+      description: '640×496 • Very high quality (995ms/line) • Dual-luminance',
+    },
+    {
+      id: 'PD290',
+      name: 'PD 290',
+      description: '640×496 • Ultra quality (1200ms/line) • Dual-luminance',
     },
   ];
 

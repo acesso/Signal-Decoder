@@ -139,6 +139,7 @@ function ImageModal({ img, onClose }: { img: CapturedImage; onClose: () => void 
 export default function SSTVImageDecoder() {
   const [manualMode, setManualMode] = useState<SSTVMode>('ROBOT36');
   const [autoDetect, setAutoDetect] = useState(true);
+  const [autoSlant, setAutoSlant] = useState(true);
   const [selectedImage, setSelectedImage] = useState<CapturedImage | null>(null);
 
   // Canvas refs
@@ -207,8 +208,9 @@ export default function SSTVImageDecoder() {
   // ── Audio hook ───────────────────────────────────────────────────────────────
 
   const { state, startRecording, stopRecording, resetDecoder, clearImages, getImageData, getDimensions, getAnalyser } =
-    useAudioProcessor(manualMode, autoDetect);
+    useAudioProcessor(manualMode, autoDetect, autoSlant);
 
+  // Used only for canvas element sizing and the header label — NOT passed into the draw callback
   const { width, height } = getDimensions();
 
   // ── Drawing ──────────────────────────────────────────────────────────────────
@@ -220,10 +222,13 @@ export default function SSTVImageDecoder() {
     if (!ctx) return;
     const data = getImageData();
     if (data) {
-      const clamped = new Uint8ClampedArray(data.buffer as ArrayBuffer, data.byteOffset, data.byteLength);
-      ctx.putImageData(new ImageData(clamped, width, height), 0, 0);
+      const { width: w, height: h } = getDimensions();
+      if (w > 0 && h > 0 && data.length === w * h * 4) {
+        const clamped = new Uint8ClampedArray(data.buffer as ArrayBuffer, data.byteOffset, data.byteLength);
+        ctx.putImageData(new ImageData(clamped, w, h), 0, 0);
+      }
     }
-  }, [getImageData, width, height]);
+  }, [getImageData, getDimensions]);
 
   const drawSpectrum = useCallback((canvas: HTMLCanvasElement): Uint8Array | undefined => {
     const ctx = canvas.getContext('2d');
@@ -332,6 +337,22 @@ export default function SSTVImageDecoder() {
               <path fillRule="evenodd" d="M11.3 1.046A1 1 0 0112 2v5h4a1 1 0 01.82 1.573l-7 10A1 1 0 018 18v-5H4a1 1 0 01-.82-1.573l7-10a1 1 0 011.12-.38z" clipRule="evenodd" />
             </svg>
             {autoDetect ? 'Auto-detect ON' : 'Auto-detect OFF'}
+          </button>
+
+          {/* Auto Slant toggle */}
+          <button
+            onClick={() => setAutoSlant(v => !v)}
+            title="Auto Slant corrects clock skew between transmitter and receiver. Disable if images appear correct but blurry."
+            className={`shrink-0 px-4 py-3 rounded-md text-sm font-semibold border transition-colors flex items-center gap-2 ${
+              autoSlant
+                ? 'bg-[#388bfd]/20 border-[#388bfd]/50 text-[#79c0ff] hover:bg-[#388bfd]/30'
+                : 'bg-[#21262d] border-[#30363d] text-[#8b949e] hover:text-[#c9d1d9] hover:bg-[#30363d]'
+            }`}
+          >
+            <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" viewBox="0 0 20 20" fill="currentColor">
+              <path d="M3 4a1 1 0 011-1h12a1 1 0 011 1v2a1 1 0 01-1 1H4a1 1 0 01-1-1V4zM3 10a1 1 0 011-1h6a1 1 0 011 1v6a1 1 0 01-1 1H4a1 1 0 01-1-1v-6zM14 9a1 1 0 00-1 1v6a1 1 0 001 1h2a1 1 0 001-1v-6a1 1 0 00-1-1h-2z" />
+            </svg>
+            {autoSlant ? 'Auto Slant ON' : 'Auto Slant OFF'}
           </button>
 
           {!state.isRecording ? (

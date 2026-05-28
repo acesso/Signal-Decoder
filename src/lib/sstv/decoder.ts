@@ -5,10 +5,13 @@ import { Robot72LineDecoder, DecodedLine as Robot72DecodedLine } from './robot72
 import { PD120LineDecoder, DecodedLine as PD120DecodedLine } from './pd120-line-decoder';
 import { PD160LineDecoder, DecodedLine as PD160DecodedLine } from './pd160-line-decoder';
 import { PD180LineDecoder, DecodedLine as PD180DecodedLine } from './pd180-line-decoder';
+import { PDLineDecoder, DecodedLine as PDDecodedLine } from './pd-line-decoder';
 import { ScottieS1LineDecoder, DecodedLine as ScottieS1DecodedLine } from './scottie-s1-line-decoder';
 import { ScottieS2LineDecoder, DecodedLine as ScottieS2DecodedLine } from './scottie-s2-line-decoder';
+import { MartinLineDecoder, DecodedLine as MartinDecodedLine } from './martin-line-decoder';
+import { ScottieDXLineDecoder, DecodedLine as ScottieDXDecodedLine } from './scottie-dx-line-decoder';
 
-type DecodedLine = Robot36DecodedLine | Robot72DecodedLine | PD120DecodedLine | PD160DecodedLine | PD180DecodedLine | ScottieS1DecodedLine | ScottieS2DecodedLine;
+type DecodedLine = Robot36DecodedLine | Robot72DecodedLine | PD120DecodedLine | PD160DecodedLine | PD180DecodedLine | PDDecodedLine | ScottieS1DecodedLine | ScottieS2DecodedLine | MartinDecodedLine | ScottieDXDecodedLine;
 
 export enum DecoderState {
   IDLE = 'IDLE',
@@ -46,7 +49,7 @@ export class SSTVDecoder {
 
   // Sync detection
   private syncDetector: SyncDetector;
-  private lineDecoder: Robot36LineDecoder | Robot72LineDecoder | PD120LineDecoder | PD160LineDecoder | PD180LineDecoder | ScottieS1LineDecoder | ScottieS2LineDecoder;
+  private lineDecoder: Robot36LineDecoder | Robot72LineDecoder | PD120LineDecoder | PD160LineDecoder | PD180LineDecoder | PDLineDecoder | ScottieS1LineDecoder | ScottieS2LineDecoder | MartinLineDecoder | ScottieDXLineDecoder;
 
   // Line boundaries detected by sync pulses
   private lastSyncPos: number = -1;
@@ -58,9 +61,13 @@ export class SSTVDecoder {
   // Signal strength tracking
   private signalStrength: number = 0;
 
-  constructor(sampleRate: number = SAMPLE_RATE, modeName: keyof typeof SSTV_MODES = 'ROBOT36') {
+  // Auto slant correction
+  private autoSlant: boolean;
+
+  constructor(sampleRate: number = SAMPLE_RATE, modeName: keyof typeof SSTV_MODES = 'ROBOT36', autoSlant: boolean = true) {
     this.sampleRate = sampleRate;
     this.modeName = modeName;
+    this.autoSlant = autoSlant;
     this.mode = SSTV_MODES[modeName];
 
     // Initialize image data based on mode dimensions
@@ -74,7 +81,7 @@ export class SSTVDecoder {
       this.imageData[i + 3] = 255; // A
     }
 
-    // Buffer size: 7 seconds (max line ~752ms for PD180 + safety margin)
+    // Buffer size: 7 seconds (max line ~1200ms for PD290 + safety margin)
     this.bufferSize = Math.floor(sampleRate * 7);
     this.audioBuffer = new Float32Array(this.bufferSize);
     this.demodulatedBuffer = new Float32Array(this.bufferSize);
@@ -95,6 +102,22 @@ export class SSTVDecoder {
       this.lineDecoder = new PD160LineDecoder(sampleRate);
     } else if (modeName === 'PD180') {
       this.lineDecoder = new PD180LineDecoder(sampleRate);
+    } else if (modeName === 'MARTIN_M1') {
+      this.lineDecoder = new MartinLineDecoder(sampleRate, 0.146432);
+    } else if (modeName === 'MARTIN_M2') {
+      this.lineDecoder = new MartinLineDecoder(sampleRate, 0.073216);
+    } else if (modeName === 'SCOTTIE_DX') {
+      this.lineDecoder = new ScottieDXLineDecoder(sampleRate);
+    } else if (modeName === 'WRAASE_SC2_180') {
+      this.lineDecoder = new MartinLineDecoder(sampleRate, 0.235, 5.5225, 0.5, 0.5, ['R', 'G', 'B']);
+    } else if (modeName === 'PD50') {
+      this.lineDecoder = new PDLineDecoder(sampleRate, 320, 0.09152);
+    } else if (modeName === 'PD90') {
+      this.lineDecoder = new PDLineDecoder(sampleRate, 320, 0.17024);
+    } else if (modeName === 'PD240') {
+      this.lineDecoder = new PDLineDecoder(sampleRate, 640, 0.2432);
+    } else if (modeName === 'PD290') {
+      this.lineDecoder = new PDLineDecoder(sampleRate, 640, 0.2944);
     } else {
       // Default to PD120 for unknown modes
       this.lineDecoder = new PD120LineDecoder(sampleRate);
@@ -148,8 +171,15 @@ export class SSTVDecoder {
       // Calculate absolute position in buffer (where sync pulse ended)
       const syncEndPos = (this.bufferWritePos - samples.length + result.offset + this.bufferSize) % this.bufferSize;
 
-      // Only process if this is a new sync pulse (9ms or 20ms)
-      if ((result.width === SyncPulseWidth.NineMilliSeconds || result.width === SyncPulseWidth.TwentyMilliSeconds) &&
+      // Martin M1/M2 use a 4.862ms sync pulse, Wraase SC2-180 uses 5.5225ms — both classified as FiveMilliSeconds
+      const isMartinMode = this.modeName === 'MARTIN_M1' || this.modeName === 'MARTIN_M2';
+      const isShortSyncMode = isMartinMode || this.modeName === 'WRAASE_SC2_180';
+      const isValidLineSync =
+        result.width === SyncPulseWidth.NineMilliSeconds ||
+        result.width === SyncPulseWidth.TwentyMilliSeconds ||
+        (isShortSyncMode && result.width === SyncPulseWidth.FiveMilliSeconds);
+
+      if (isValidLineSync &&
           (this.lastSyncPos === -1 || this.distanceInBuffer(this.lastSyncPos, syncEndPos) > this.sampleRate * 0.1)) {
 
         // Update frequency calibration
@@ -164,7 +194,7 @@ export class SSTVDecoder {
 
         this.lastSyncPos = syncEndPos;
         this.lastSyncWidth = result.width;
-      } else if (result.width === SyncPulseWidth.FiveMilliSeconds) {
+      } else if (result.width === SyncPulseWidth.FiveMilliSeconds && !isShortSyncMode) {
         console.log(`⏭️ Skipping 5ms sync (VIS code)`);
       } else {
         console.log(`⏭️ Skipping sync: too close to last`);
@@ -206,15 +236,21 @@ export class SSTVDecoder {
     console.log(`🔍 Decoder timing: beginOffset=${beginOffset}, endOffset=${endOffset}, totalSamples=${totalSamples}`);
 
     // Extract DEMODULATED line samples into contiguous buffer
-    const lineSamples = new Float32Array(totalSamples);
+    const rawSamples = new Float32Array(totalSamples);
     for (let i = 0; i < totalSamples; i++) {
       const pos = (extractStart + i) % this.bufferSize;
-      lineSamples[i] = this.demodulatedBuffer[pos]; // Use demodulated, not raw audio
+      rawSamples[i] = this.demodulatedBuffer[pos]; // Use demodulated, not raw audio
     }
 
-    // Check sample quality (demodulated values should be ~±300 range after compensation)
+    // Slant correction: resample to expected line length for positive-timing modes.
+    // For negative-timing modes (Scottie), the buffer size is already based on expected timing.
+    const lineSamples = (this.autoSlant && !hasNegativeTiming)
+      ? this.applySlantCorrection(rawSamples, lineLength)
+      : rawSamples;
+
+    // Check sample quality
     const avgAmp = lineSamples.reduce((sum, val) => sum + Math.abs(val), 0) / lineSamples.length;
-    console.log(`📊 Demodulated line: avgAmp=${avgAmp.toFixed(1)}, min=${Math.min(...lineSamples).toFixed(1)}, max=${Math.max(...lineSamples).toFixed(1)}`);
+    console.log(`📊 Demodulated line: avgAmp=${avgAmp.toFixed(1)}, slant=${!hasNegativeTiming && this.autoSlant ? ((lineLength / Math.round(this.mode.scanTime * this.sampleRate / 1000) - 1) * 100).toFixed(2) + '%' : 'N/A'}`);
 
     // Decode the scan line (sync pulse is at -beginOffset for negative timing modes, 0 for others)
     const syncPulsePos = hasNegativeTiming ? -beginOffset : 0;
@@ -246,6 +282,26 @@ export class SSTVDecoder {
     } else if (line && line.height === 0) {
       console.log(`Stored even line for interlacing (Robot36)`);
     }
+  }
+
+  /**
+   * Resample line buffer to expected length to correct for clock skew (slant).
+   * Only applied when the correction factor is within ±10% of 1.0.
+   */
+  private applySlantCorrection(samples: Float32Array, measuredSamples: number): Float32Array {
+    const expectedSamples = Math.round(this.mode.scanTime * this.sampleRate / 1000);
+    const corrFactor = measuredSamples / expectedSamples;
+    if (Math.abs(corrFactor - 1.0) < 0.0005 || corrFactor < 0.9 || corrFactor > 1.1) {
+      return samples;
+    }
+    const resampled = new Float32Array(expectedSamples);
+    for (let i = 0; i < expectedSamples; i++) {
+      const srcF = i * corrFactor;
+      const srcI = Math.floor(srcF);
+      const frac = srcF - srcI;
+      resampled[i] = samples[srcI] * (1 - frac) + samples[Math.min(srcI + 1, samples.length - 1)] * frac;
+    }
+    return resampled;
   }
 
   /**
