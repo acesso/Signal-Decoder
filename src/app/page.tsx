@@ -1,10 +1,11 @@
 'use client';
 
 import { useState } from 'react';
-import RTTYDecoder from "@/components/SSTVDecoder";
-import SSTVImageDecoder from "@/components/SSTVImageDecoder";
+import RTTYDecoder from "@/components/RTTYDecoder";
+import SSTVDecoder from "@/components/SSTVDecoder";
+import CWDecoder from "@/components/CWDecoder";
 
-type DecoderMode = 'rtty' | 'sstv';
+type DecoderMode = 'rtty' | 'sstv' | 'cw';
 
 const MODE_META: Record<DecoderMode, { label: string; badge: string; description: string }> = {
   rtty: {
@@ -16,6 +17,11 @@ const MODE_META: Record<DecoderMode, { label: string; badge: string; description
     label: 'SSTV',
     badge: 'SSTV Mode',
     description: 'Slow Scan Television image decoder — Robot, Scottie, PD modes',
+  },
+  cw: {
+    label: 'CW',
+    badge: 'CW Mode',
+    description: 'Continuous Wave (Morse code) decoder — adaptive speed, real-time text output',
   },
 };
 
@@ -39,7 +45,7 @@ export default function Home() {
 
           {/* Mode toggle */}
           <div className="flex items-center gap-1 shrink-0 bg-[#0d1117] border border-[#30363d] rounded-lg p-1">
-            {(['rtty', 'sstv'] as DecoderMode[]).map((m) => (
+            {(['rtty', 'sstv', 'cw'] as DecoderMode[]).map((m) => (
               <button
                 key={m}
                 onClick={() => setMode(m)}
@@ -78,7 +84,7 @@ export default function Home() {
 
       {/* Content */}
       <div className="flex-1 min-h-0 overflow-y-auto px-4 sm:px-6 lg:px-8 pb-8">
-        {mode === 'rtty' ? <RTTYDecoder /> : <SSTVImageDecoder />}
+        {mode === 'rtty' ? <RTTYDecoder /> : mode === 'sstv' ? <SSTVDecoder /> : <CWDecoder />}
       </div>
     </main>
   );
