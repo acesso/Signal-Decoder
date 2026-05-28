@@ -588,6 +588,39 @@ export default function SSTVDecoder() {
         </div>
       )}
 
+      {/* ── How to Use ── */}
+      <details className="bg-[#161b22] border border-[#30363d] rounded-lg">
+        <summary className="cursor-pointer p-4 sm:p-6 font-semibold text-lg sm:text-xl hover:bg-[#21262d] rounded-lg transition-colors select-none">
+          How to Use
+        </summary>
+        <div className="px-4 pb-4 sm:px-6 sm:pb-6">
+          <ol className="list-decimal list-inside space-y-2 text-sm sm:text-base text-[#c9d1d9]">
+            <li>Click <strong>Start Decoding</strong> and allow microphone access when prompted</li>
+            <li>Leave mode on <strong>Auto</strong> to let VIS code detection pick the mode automatically, or select a specific mode from the selector</li>
+            <li>Play or tune to an SSTV signal — the image builds progressively on the canvas</li>
+            <li>Use the spectrum analyser and SNR indicator to optimise audio levels</li>
+            <li>Click <strong>Save Image</strong> to download the decoded image as a PNG file</li>
+            <li>Previously decoded images are kept in the gallery below the canvas</li>
+            <li>Click <strong>Reset</strong> to clear the canvas and start a new decode</li>
+          </ol>
+          <p className="mt-4 text-xs sm:text-sm text-[#8b949e]">
+            Tip: The sync pulses in an SSTV signal appear as periodic bright lines in the spectrogram. A strong, stable signal produces the best image quality.
+          </p>
+        </div>
+      </details>
+
+      {/* ── Privacy ── */}
+      <details className="bg-[#161b22] border border-[#30363d] rounded-lg">
+        <summary className="cursor-pointer p-4 sm:p-6 font-semibold text-lg sm:text-xl hover:bg-[#21262d] rounded-lg transition-colors select-none">
+          Privacy
+        </summary>
+        <div className="px-4 pb-4 sm:px-6 sm:pb-6 space-y-3 text-sm sm:text-base text-[#c9d1d9]">
+          <p>This application runs entirely in your browser. No audio data or decoded images are ever transmitted to any server.</p>
+          <p>The microphone permission is only used to capture and process the audio signal in real-time for SSTV decoding using the Web Audio API.</p>
+          <p className="text-xs sm:text-sm text-[#8b949e]">Your privacy is fully protected — we don&apos;t collect, store, or transmit any of your data.</p>
+        </div>
+      </details>
+
       {/* ── Modals ── */}
       {selectedImage && (
         <ImageModal img={selectedImage} onClose={() => setSelectedImage(null)} />

@@ -9,7 +9,7 @@ const withPWA = require('next-pwa')({
   buildExcludes: [/middleware-manifest\.json$/, /app-build-manifest\.json$/],
   // Fallback to offline page when offline
   fallbacks: {
-    document: '/offline',
+    document: (process.env.BASE_PATH || '') + '/offline',
   },
   // Customize workbox to enable full offline support
   cacheStartUrl: true,
@@ -19,7 +19,7 @@ const withPWA = require('next-pwa')({
   runtimeCaching: [
     // Start URL - Cache first for true offline support
     {
-      urlPattern: ({ url }) => url.pathname === '/',
+      urlPattern: ({ url }) => url.pathname === (process.env.BASE_PATH || '') + '/',
       handler: 'CacheFirst',
       options: {
         cacheName: 'start-url',
@@ -123,12 +123,12 @@ const withPWA = require('next-pwa')({
 
 /** @type {import('next').NextConfig} */
 const nextConfig = {
-  // Enable static export for true offline PWA support
   output: 'export',
-  // Disable image optimization for static export
   images: {
     unoptimized: true,
   },
+  basePath: process.env.BASE_PATH || '',
+  assetPrefix: process.env.BASE_PATH ? process.env.BASE_PATH + '/' : undefined,
 }
 
 module.exports = withPWA(nextConfig)

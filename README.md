@@ -1,140 +1,138 @@
 <h1 align="center">
-    🛰️ SSTV Decoder - Cross-Platform Amateur Radio App
-</h3>
+    📡 RTTY Decoder - Multi-Mode Amateur Radio App
+</h1>
 <p align="center">
-   <strong>Decode SSTV signals in your browser!</strong> Free, open-source web application for real-time SSTV (Slow Scan Television) decoding from microphone input. Supports several modes: Robot36, Robot72, Scottie S1/S2, PD120, PD160, PD180. Perfect for ham radio operators, ISS SSTV events, and satellite image reception. Works offline as a PWA. Based on the <a href="https://github.com/xdsopl/robot36">Robot36 Android app</a> by xdsopl.
+   <strong>Decode radio signals in your browser!</strong> Free, open-source web application for real-time decoding of RTTY (Radio Teletype / Baudot), CW (Morse code), and SSTV (Slow Scan Television) signals from microphone input. Works offline as a PWA. Forked from <a href="https://github.com/smolgroot/sstv-decoder">smolgroot/sstv-decoder</a>.
 </p>
 <br />
 
 <p align="center">
-    <a href="https://github.com/smolgroot/sstv-decoder/stargazers">
-        <img src="https://img.shields.io/github/stars/smolgroot/sstv-decoder?style=social" alt="GitHub stars" />
+    <a href="https://github.com/acesso/rtty-decoder/stargazers">
+        <img src="https://img.shields.io/github/stars/acesso/rtty-decoder?style=social" alt="GitHub stars" />
     </a>
-    <a href="https://github.com/smolgroot/sstv-decoder/network/members">
-        <img src="https://img.shields.io/github/forks/smolgroot/sstv-decoder?style=social" alt="GitHub forks" />
+    <a href="https://github.com/acesso/rtty-decoder/issues">
+        <img src="https://img.shields.io/github/issues/acesso/rtty-decoder" alt="GitHub Issues" />
     </a>
-    <a href="https://github.com/smolgroot/sstv-decoder/watchers">
-        <img src="https://img.shields.io/github/watchers/smolgroot/sstv-decoder?style=social" alt="GitHub watchers" />
-    </a>
-</p>
-
-<p align="center">
-    <!-- <img src="https://img.shields.io/github/v/release/smolgroot/sstv-decoder?include_prereleases" alt="Latest Release" /> -->
-    <a href="https://github.com/smolgroot/sstv-decoder/issues">
-        <img src="https://img.shields.io/github/issues/smolgroot/sstv-decoder" alt="GitHub Issues" />
-    </a>
-    <a href="https://github.com/smolgroot/sstv-decoder/blob/main/LICENSE">
+    <a href="https://github.com/acesso/rtty-decoder/blob/main/LICENSE">
         <img src="https://img.shields.io/badge/license-0BSD-blue" alt="License: 0BSD" />
     </a>
     <img src="https://img.shields.io/badge/PWA-Offline%20Ready-success" alt="PWA Offline Ready" />
-    <a href="https://sstv-decoder.vercel.app">
+    <a href="https://acesso.github.io/rtty-decoder">
         <img src="https://img.shields.io/badge/demo-live-brightgreen" alt="Live Demo" />
     </a>
-    <img src="https://img.shields.io/badge/modes-7%20supported-blue" alt="7 SSTV Modes" />
 </p>
 
 <hr>
 
 <p align="center">
-   <a href="https://sstv-decoder.vercel.app"><b>🚀 Try the Live Demo - No Installation Required!</b></a>
+   <a href="https://acesso.github.io/rtty-decoder"><b>🚀 Try the Live Demo - No Installation Required!</b></a>
 </p>
 
 <p align="center">
    <em>Works on Desktop • Mobile • Tablet | Chrome • Firefox • Safari • Edge</em>
 </p>
 
-## Screenshots
-
-<p float="left">
-<img src="doc/screenshots/1.jpg" width="180" alt="SSTV Decoder Main Interface"/>
-<img src="doc/screenshots/4.jpg" width="180" alt="Real-time Signal Decoding"/>
-<img src="doc/screenshots/3.jpg" width="180" alt="Spectrum Analyzer View"/>
-<img src="doc/screenshots/5.jpg" width="180" alt="Multi-Mode Support"/>
-</p>
-
 ## Quick Start
 
-1. **Visit** → [sstv-decoder.vercel.app](https://sstv-decoder.vercel.app)
+1. **Visit** → [acesso.github.io/rtty-decoder](https://acesso.github.io/rtty-decoder)
 2. **Allow** microphone access when prompted
-3. **Play** an SSTV signal near your microphone
-4. **Watch** the image decode in real-time!
+3. **Play** an RTTY, CW, or SSTV signal near your microphone
+4. **Watch** the text or image decode in real-time!
 
 No installation, no downloads, no setup - just open and decode!
 
 ## Features
 
-- **Multi-Mode Support**: Robot36 Color (320×240), Robot72 (320×240), Scottie S1 (320×256), Scottie S2 (320×256), PD120 (640×496), PD160 (512×400), and PD180 (640×496) with manual mode selection
+- **RTTY Decoding**: Real-time Baudot/ITA2 radioteletype decoding from audio input
+- **CW Decoding**: Morse code decoder with automatic speed detection
+- **SSTV Decoding**: 15 modes — Robot36/72, Scottie S1/S2/DX, Martin M1/M2, PD50/90/120/160/180/240/290, Wraase SC2-180
+- **Mode Auto-Detection**: Automatically identifies the incoming signal type
+- **Session Gallery**: Review and save decoded sessions
 - **Real-time Audio Processing**: Captures microphone input using Web Audio API (auto-detects 44.1 kHz or 48 kHz)
 - **Professional DSP Chain**:
   - FM demodulation with complex baseband conversion
   - Kaiser-windowed FIR lowpass filtering
   - Schmitt trigger sync detection
   - Bidirectional exponential moving average filtering
-- **Sync Detection**: Automatic detection of sync pulses (9ms for Robot36, 20ms for PD modes)
-- **Live Image Display**: Progressive image rendering with real-time spectrum visualization
-- **Mode Selection**: Switch between SSTV modes via settings panel
-- **Save Image**: Export decoded images as PNG files
+- **Live Display**: Progressive rendering with real-time spectrum visualization
+- **Save Output**: Export decoded images as PNG or text sessions
 - **Signal Analysis**: Real-time spectrum analyzer and signal strength indicator
 - **Mobile-Responsive**: Optimized for both desktop and mobile devices
 
 ## Supported SSTV Modes
 
-### Current Implementation
+All 15 modes are fully implemented with VIS code auto-detection.
 
-| Mode | Resolution | Sync Pulse | Line Time | Total Time | VIS Code | Status | Documentation |
-|------|------------|------------|-----------|------------|----------|---------|---------------|
-| **Robot36 Color** | 320×240 | 9ms | ~150ms | ~36s | 8 | ✅ Implemented | [ROBOT36.md](./doc/ROBOT36.md) |
-| **Robot72 Color** | 320×240 | 9ms | ~300ms | ~1m 12s | 12 | ✅ Implemented | [ROBOT72.md](./doc/ROBOT72.md) |
-| **Scottie S1** | 320×256 | 9ms | ~428ms | ~1m 50s | 60 | ✅ Implemented | [SCOTTIE_S1.md](./doc/SCOTTIE_S1.md) |
-| **Scottie S2** | 320×256 | 9ms | ~278ms | ~1m 11s | 56 | ✅ Implemented | [SCOTTIE_S2.md](./doc/SCOTTIE_S2.md) |
-| **PD120** | 640×496 | 20ms | ~508ms | ~2m 6s | 95 | ✅ Implemented | [PD120.md](./doc/PD120.md) |
-| **PD160** | 512×400 | 20ms | ~804ms | ~2m 41s | 98 | ✅ Implemented | [PD160.md](./doc/PD160.md) |
-| **PD180** | 640×496 | 20ms | ~752ms | ~3m 6s | 96 | ✅ Implemented | [PD180.md](./doc/PD180.md) |
+| Mode | Resolution | Sync | Line Time | Total Time | VIS |
+|------|------------|------|-----------|------------|-----|
+| **Robot36** | 320×240 | 9ms | ~150ms | ~36s | 8 |
+| **Robot72** | 320×240 | 9ms | ~300ms | ~1m 12s | 12 |
+| **Scottie S2** | 320×256 | 9ms | ~278ms | ~1m 11s | 56 |
+| **Martin M2** | 320×256 | 5ms | ~226ms | ~58s | 40 |
+| **PD50** | 320×256 | 20ms | ~406ms | ~1m 44s | 93 |
+| **Scottie S1** | 320×256 | 9ms | ~428ms | ~1m 50s | 60 |
+| **Martin M1** | 320×256 | 5ms | ~446ms | ~1m 54s | 44 |
+| **PD120** | 640×496 | 20ms | ~508ms | ~2m 6s | 95 |
+| **PD160** | 512×400 | 20ms | ~804ms | ~2m 41s | 98 |
+| **PD180** | 640×496 | 20ms | ~752ms | ~3m 6s | 96 |
+| **PD90** | 320×256 | 20ms | ~754ms | ~3m 13s | 99 |
+| **Wraase SC2-180** | 320×256 | 5ms | ~734ms | ~3m 8s | 55 |
+| **Scottie DX** | 320×256 | 9ms | ~1069ms | ~4m 34s | 76 |
+| **PD240** | 640×496 | 20ms | ~1018ms | ~4m 13s | 97 |
+| **PD290** | 800×616 | 20ms | ~954ms | ~4m 54s | 94 |
 
-### Future Modes (Planned)
+### Color Encoding Overview
 
-The decoder architecture supports adding these modes in future updates:
+| Family | Color Format | Notes |
+|--------|-------------|-------|
+| Robot36/72 | Interlaced YUV | Standard for QSOs and ISS-style events |
+| Scottie S1/S2/DX, Martin M1/M2 | Sequential RGB/GBR | Clean colors, HF classic |
+| Wraase SC2-180 | Sequential RGB | High fidelity RGB |
+| PD50/90/120/160/180/240/290 | Dual-luma YUV | High resolution, ISS SSTV standard |
 
-| Mode | Resolution | Sync Pulse | Line Time | Total Time | VIS Code | Complexity |
-|------|------------|------------|-----------|------------|----------|------------|
-| **Scottie DX** | 320×256 | 9ms | ~1069ms | ~4m 34s | 76 | Medium (RGB sequential) |
-| **Martin M1** | 320×256 | 5ms | ~446ms | ~1m 54s | 44 | Medium (GBR sequential) |
-| **Martin M2** | 320×256 | 5ms | ~226ms | ~58s | 40 | Medium (GBR sequential) |
-| **PD50** | 320×256 | 20ms | ~406ms | ~1m 44s | 93 | Low (dual-luma like PD120) |
-| **PD90** | 320×256 | 20ms | ~754ms | ~3m 13s | 99 | Low (dual-luma like PD120) |
-| **PD240** | 640×496 | 20ms | ~1018ms | ~4m 13s | 97 | Low (dual-luma like PD120) |
-| **PD290** | 800×616 | 20ms | ~954ms | ~4m 54s | 94 | Low (dual-luma like PD120) |
-| **Wraase SC2-180** | 320×256 | 5ms | ~734ms | ~3m 8s | 55 | Medium (RGB sequential) |
+## RTTY Decoder
 
-### Mode Selection Guide
+Real-time RTTY (Radio Teletype) decoding using Baudot/ITA2 encoding (5-bit characters).
 
-**For Quick Transmissions** (under 1 minute):
-- **Robot36**: 36 seconds, good quality, standard for QSOs
-- **Martin M2**: 58 seconds, RGB sequential, no interlacing
-- **Robot72**: 72 seconds, higher quality than Robot36
+### RTTY Parameters
 
-**For High Quality** (1-3 minutes):
-- **Scottie S2**: 1m 11s, RGB sequential, faster HF mode, clean colors
-- **Scottie S1**: 1m 50s, RGB sequential, original HF classic, clean colors
-- **PD120**: 2m 6s, 640×496, excellent for ISS SSTV events
-- **PD160**: 2m 41s, 512×400, balanced quality and time
-- **PD180**: 3m 9s, 640×496, extended transmission
+| Parameter | Default | Range |
+|-----------|---------|-------|
+| **Center Frequency** | 500 Hz | configurable |
+| **Carrier Shift** | 450 Hz | 170 / 450 / 850 Hz typical |
+| **Baud Rate** | 50 baud | 45 / 50 / 75 / 100 / 110 |
+| **Stop Bits** | 1.5 | 1 / 1.5 / 2 |
+| **Parity** | None | none / even / odd |
+| **Reverse Shift** | Off | for LSB/inverted signals |
 
-**For Maximum Quality** (3+ minutes):
-- **PD240**: 4m 13s, 640×496, very high quality
-- **PD290**: 4m 54s, 800×616, maximum resolution
-- **Scottie DX**: 4m 34s, high quality RGB
+### RTTY Signal Processing
 
-### Technical Comparison
+- **Mark/Space detection**: Dual Goertzel correlators with IIR lowpass smoothing
+- **Baud clock**: Edge-triggered (re-syncs on every mark→space or space→mark transition)
+- **Character framing**: Start bit → 5 data bits → optional parity → stop bit(s)
+- **Shift state**: Full LTRS/FIGS handling per ITA2 standard
+- **Sessions**: Each decoded transmission is stored as a named session
 
-| Feature | Robot36/72 | Scottie/Martin | PD Modes |
-|---------|------------|----------------|----------|
-| **Color Encoding** | Interlaced YUV | Sequential RGB/GBR | Dual-luma YUV |
-| **Chroma Strategy** | Alternating R-Y/B-Y per line | Full RGB per line | Shared U/V per 2 rows |
-| **Rows per Scan** | 1 row | 1 row | 2 rows |
-| **Vertical Subsampling** | 2:1 (interlaced) | None (1:1) | 2:1 (shared chroma) |
-| **Complexity** | Medium (interlacing) | Low (sequential) | Low (dual-luma) |
-| **ISS Usage** | Rare | Occasional | Very Common (PD120) |
+## CW Decoder
+
+Real-time CW (Morse code) decoding with adaptive speed tracking.
+
+### CW Parameters
+
+| Parameter | Default | Notes |
+|-----------|---------|-------|
+| **Tone Frequency** | 700 Hz | adjustable via UI |
+| **Speed** | Auto | adaptive dit-length tracking |
+| **Squelch** | Adjustable | hard gate — suppresses noise decoding |
+
+### CW Signal Processing
+
+- **Bandpass filter**: Biquad (Q=8) centred on the selected tone
+- **Envelope detector**: Asymmetric IIR — fast attack (~3 ms), moderate release (~5 ms)
+- **Peak follower**: Fast rise (~10 ms), slow fall (~300 ms) for stable thresholding
+- **Hysteresis**: 50 % / 25 % against peak to prevent chatter on mark/space transitions
+- **Speed tracking**: Dit length estimated from recent marks and updated continuously
+- **SNR display**: Noise floor tracked separately via slow IIR; real-time dB readout
 
 ## Technology Stack
 
@@ -180,8 +178,8 @@ npm run test:coverage
 
 1. Clone the repository:
 ```bash
-git clone <repository-url>
-cd sstv-decoder
+git clone https://github.com/acesso/rtty-decoder.git
+cd rtty-decoder
 ```
 
 2. Install dependencies:
@@ -205,24 +203,33 @@ npm start
 
 ## How to Use
 
-1. **Select Mode** (Optional): Click the settings icon (bottom-right) to choose between available SSTV modes
-   - Robot36: 320×240, fastest decode (~36 seconds)
-   - Robot72: 320×240, better color than Robot36 (~72 seconds)
-   - Scottie S1: 320×256, HF classic, RGB sequential (~1m 50s)
-   - Scottie S2: 320×256, faster HF mode, RGB sequential (~1m 11s)
-   - PD120: 640×496, high resolution (~2 minutes), used for ISS SSTV
-   - PD160: 512×400, balanced mode (~2m 41s), good SNR
-   - PD180: 640×496, highest quality (~3 minutes), best SNR
-2. **Start Decoding**: Click "Start Decoding" to begin capturing audio from your microphone
-3. **Grant Microphone Permission**: Allow the browser to access your microphone when prompted
-4. **Play SSTV Signal**: Play an SSTV signal near your microphone (from radio, audio file, signal generator, etc.)
-5. **Watch Live Decoding**: The decoded image will appear progressively on the canvas
-6. **Monitor Signal**: Check the spectrum analyzer and signal strength indicator for optimal reception
+Select a mode from the top tab bar (RTTY / CW / SSTV), then click **Start** and allow microphone access when prompted.
+
+### RTTY
+
+1. **Configure**: Set center frequency, carrier shift, and baud rate to match the incoming signal (defaults work for most HF RTTY: 50 baud / 450 Hz shift / 500 Hz center)
+2. **Start**: Click "Start" — the decoder locks on to the first valid start bit it finds
+3. **Read text**: Decoded characters appear in the session panel in real-time
+4. **Sessions**: Each received text block is saved as a named session; switch between them in the session list
+5. **Reverse shift**: Toggle "Rev" if the mark/space tones appear inverted (common when receiving on LSB)
+
+### CW
+
+1. **Tune**: Adjust the tone frequency slider to match the CW note you want to decode (700 Hz is a common CW sidetone)
+2. **Squelch**: Raise the squelch threshold until background noise stops producing output, then lower it until the signal decodes cleanly
+3. **Start**: Click "Start" — decoded characters appear as the decoder tracks speed automatically
+4. **Speed**: WPM is calculated adaptively; no manual entry needed
+
+### SSTV
+
+1. **Mode**: Leave mode on **Auto** to let VIS code detection select the mode automatically, or pick a specific mode from the selector
+2. **Start**: Click "Start Decoding" to begin capturing from the microphone
+3. **Receive**: Play or tune to an SSTV signal — the image builds progressively on the canvas
+4. **Monitor**: Use the spectrum analyzer and SNR indicator to optimise audio levels
+5. **Save**: Click "Save Image" to download the decoded image as a PNG
+   - Filename: `sstv-{mode}-{timestamp}.png`
+6. **Gallery**: Previously decoded images are kept in the gallery below the canvas
 7. **Reset**: Click "Reset" to clear the canvas and start a new decode
-8. **Save Image**: Click "Save Image" to download the decoded image as a PNG file
-   - Filename format: `sstv-decode-{mode}-{TIMESTAMP}.png`
-   - Example: `sstv-decode-robot36-2024-03-15-143022.png`
-9. **Stop**: Click "Stop" to end the decoding session (image remains visible for saving)
 
 ## Technical Details
 
@@ -328,24 +335,34 @@ src/
 │   ├── page.tsx                # Home page with mode state management
 │   └── globals.css             # Global Tailwind styles
 ├── components/
-│   ├── SSTVDecoder.tsx         # Main decoder UI component
-│   └── SettingsPanel.tsx       # Mode selection settings panel
+│   ├── RTTYDecoder.tsx         # RTTY (Baudot) decoder UI
+│   ├── CWDecoder.tsx           # CW (Morse) decoder UI
+│   ├── SSTVDecoder.tsx         # SSTV image decoder UI
+│   ├── SessionCard.tsx         # Decoded session display card
+│   ├── SettingsPanel.tsx       # Mode selection settings panel
+│   └── PWAInstallPrompt.tsx    # PWA install prompt
 ├── hooks/
 │   └── useAudioProcessor.ts    # Web Audio API integration (mode-aware)
 └── lib/
+    ├── rtty/
+    │   ├── decoder.ts          # RTTY Baudot/ITA2 decoder
+    │   ├── baudot.ts           # Baudot character tables
+    │   └── sessions.ts         # Session management
+    ├── cw/
+    │   ├── decoder.ts          # CW Morse code decoder
+    │   └── morse-table.ts      # Morse code lookup table
     └── sstv/
-        ├── constants.ts             # SSTV mode specifications (Robot36, Robot72, Scottie S1, Scottie S2, PD120, PD160, PD180)
+        ├── constants.ts             # SSTV mode specifications
         ├── decoder.ts               # Main decoder orchestration (multi-mode)
         ├── sync-detector.ts         # Sync pulse detection (9ms/20ms)
         ├── robot36-line-decoder.ts  # Robot36 interlaced YUV decoder
-        ├── robot72-line-decoder.ts  # Robot72 sequential YUV decoder (better color)
-        ├── scottie-s1-line-decoder.ts # Scottie S1 RGB sequential decoder (HF classic)
-        ├── scottie-s2-line-decoder.ts # Scottie S2 RGB sequential decoder (faster HF)
+        ├── robot72-line-decoder.ts  # Robot72 sequential YUV decoder
+        ├── scottie-s1-line-decoder.ts # Scottie S1 RGB sequential decoder
+        ├── scottie-s2-line-decoder.ts # Scottie S2 RGB sequential decoder
         ├── pd120-line-decoder.ts    # PD120 dual-luminance decoder
-        ├── pd160-line-decoder.ts    # PD160 dual-luminance decoder (balanced mode)
-        ├── pd180-line-decoder.ts    # PD180 dual-luminance decoder (high quality)
-        ├── fm-demodulator.ts        # DSP primitives (FM demod, filters, EMA)
-        └── dsp.ts                   # Legacy utilities (deprecated)
+        ├── pd160-line-decoder.ts    # PD160 dual-luminance decoder
+        ├── pd180-line-decoder.ts    # PD180 dual-luminance decoder
+        └── fm-demodulator.ts        # DSP primitives (FM demod, filters, EMA)
 
 doc/
 ├── ROBOT36.md                  # Robot36 technical specification
@@ -358,65 +375,6 @@ doc/
 └── ARCHITECTURE.md             # Overall system architecture
 ```
 
-## Browser Compatibility
-
-### Desktop Browsers
-
-| Browser | Status | Notes |
-|---------|--------|-------|
-| **Chrome** 90+ | ✅ Full Support | Uses ScriptProcessorNode for audio processing |
-| **Edge** 90+ | ✅ Full Support | Chromium-based, same as Chrome |
-| **Firefox** 88+ | ✅ Full Support | Automatic sample rate matching (44.1kHz or 48kHz) |
-| **Safari** 14+ | ✅ Full Support | Uses requestAnimationFrame polling fallback |
-| **Opera** 76+ | ✅ Full Support | Chromium-based, same as Chrome |
-
-### Mobile Browsers
-
-| Browser | Status | Notes |
-|---------|--------|-------|
-| **Safari (iOS)** 14.5+ | ✅ Full Support | Uses requestAnimationFrame polling (ScriptProcessorNode deprecated) |
-| **Chrome (Android)** 90+ | ✅ Full Support | Full ScriptProcessorNode support |
-| **Firefox (Android)** 88+ | ✅ Full Support | Automatic sample rate matching |
-| **Samsung Internet** | ✅ Full Support | Chromium-based |
-
-### Requirements
-
-- **HTTPS Required**: Microphone access requires secure context (HTTPS)
-  - Exception: `localhost` works with HTTP for development
-- **Microphone Permission**: User must grant microphone access when prompted
-- **Web Audio API**: All supported browsers have Web Audio API enabled by default
-
-### Technical Implementation
-
-The app uses a **dual-strategy approach** for maximum compatibility:
-
-1. **ScriptProcessorNode** (deprecated but widely supported):
-   - Used in Chrome, Firefox, Edge, and older Safari versions
-   - Processes audio in 4096-sample chunks
-   - Efficient and low-latency
-
-2. **requestAnimationFrame Polling** (modern Safari/iOS fallback):
-   - Automatically used when ScriptProcessorNode is unavailable
-   - Polls `AnalyserNode.getFloatTimeDomainData()` at 60fps
-   - 2048 samples per frame (~34ms latency)
-   - Required for Safari iOS 14+ where ScriptProcessorNode is broken
-
-3. **Dynamic Sample Rate**:
-   - Automatically adapts to browser's native sample rate (44.1kHz or 48kHz)
-   - Required for Firefox compatibility
-   - All DSP calculations scale accordingly
-
-
-## Implementation Notes
-
-This implementation closely follows the [Robot36 Android app](https://github.com/xdsopl/robot36) by Ahmet Inan (xdsopl), translating the Java implementation to TypeScript while maintaining the same DSP algorithms:
-
-- **FM Demodulation**: Complex baseband conversion with phase difference calculation
-- **Lowpass Filtering**: Kaiser-windowed FIR filter matching Java's `ComplexConvolution`
-- **Sync Detection**: Schmitt trigger logic from `Robot_36_Color.java`
-- **Line Decoding**: Bidirectional exponential moving average filter with proper cutoff formula
-- **Color Conversion**: ITU-R BT.601 YUV to RGB transformation with interlaced chrominance
-
 ### Known Issues
 
 - Occasional false sync detections from noise/interference
@@ -427,21 +385,21 @@ This implementation closely follows the [Robot36 Android app](https://github.com
 ## Future Improvements
 
 ### High Priority
-- [ ] **VIS Code Detection**: Automatic mode selection based on VIS header detection
-- [ ] **Additional PD Modes**: PD50, PD90, PD240, PD290 (low complexity, similar to PD120/PD180)
+- [x] **VIS Code Detection**: Automatic mode selection based on VIS header detection
+- [x] **Additional PD Modes**: PD50, PD90, PD240, PD290
 - [ ] **Audio File Upload**: Decode from WAV/MP3 files for offline processing
 
 ### Medium Priority
-- [ ] **Scottie DX Mode**: DX variant with 4m 34s transmission time (RGB sequential encoding)
-- [ ] **Martin Modes**: M1, M2 (GBR sequential encoding)
-- [ ] **Wraase SC2-180**: High-quality RGB mode
+- [x] **Scottie DX Mode**: DX variant with 4m 34s transmission time (RGB sequential encoding)
+- [x] **Martin Modes**: M1, M2 (GBR sequential encoding)
+- [x] **Wraase SC2-180**: High-quality RGB mode
 - [ ] **Improved Noise Reduction**: Advanced filtering for weak signals
-- [ ] **Signal Quality Metrics**: SNR calculation and display
+- [x] **Signal Quality Metrics**: SNR calculation and display
 
 ### Low Priority
 - [ ] **Waterfall Display**: Full spectrogram history
-- [ ] **Multi-image Gallery**: Store and compare multiple decoded images
-- [ ] **Export Metadata**: Include mode, timestamp, signal quality in saved files
+- [x] **Multi-image Gallery**: Store and compare multiple decoded images
+- [ ] **Export Metadata**: Include signal quality in saved filenames
 
 ## Contributing
 
@@ -456,13 +414,10 @@ I welcome contributions! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for guide
 
 ## License
 
-This project is based on [Robot36](https://github.com/xdsopl/robot36) by Ahmet Inan, which is licensed under the 0BSD license (Zero-Clause BSD).
+This project is licensed under the 0BSD license (Zero-Clause BSD).
 
 ## Acknowledgments
 
-- **Ahmet Inan (xdsopl)**: Original [Robot36 Android app](https://github.com/xdsopl/robot36) and DSP algorithms
-- **Amateur Radio SSTV Community**: Protocol specifications and documentation
-
-## Reference Implementation
-
-This web implementation is based on the algorithms from the original [Robot36 Android app](https://github.com/xdsopl/robot36) by Ahmet Inan. If you're interested in the reference Java implementation, please visit the original repository.
+- **smolgroot**: Upstream [sstv-decoder](https://github.com/smolgroot/sstv-decoder) web application this project is forked from
+- **Ahmet Inan (xdsopl)**: Original [Robot36 Android app](https://github.com/xdsopl/robot36) DSP algorithms that informed the SSTV implementation
+- **Amateur Radio Community**: Protocol specifications and documentation for RTTY, CW, and SSTV

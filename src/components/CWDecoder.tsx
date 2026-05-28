@@ -619,6 +619,18 @@ export default function CWDecoder() {
           </p>
         </div>
       </details>
+
+      {/* ── Privacy ── */}
+      <details className="bg-[#161b22] border border-[#30363d] rounded-lg">
+        <summary className="cursor-pointer p-4 sm:p-6 font-semibold text-lg sm:text-xl hover:bg-[#21262d] rounded-lg transition-colors select-none">
+          Privacy
+        </summary>
+        <div className="px-4 pb-4 sm:px-6 sm:pb-6 space-y-3 text-sm sm:text-base text-[#c9d1d9]">
+          <p>This application runs entirely in your browser. No audio data or decoded text is ever transmitted to any server.</p>
+          <p>The microphone permission is only used to capture and process the audio signal in real-time for CW decoding using the Web Audio API.</p>
+          <p className="text-xs sm:text-sm text-[#8b949e]">Your privacy is fully protected — we don&apos;t collect, store, or transmit any of your data.</p>
+        </div>
+      </details>
     </div>
   );
 }
