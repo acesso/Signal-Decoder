@@ -1,5 +1,5 @@
 <h1 align="center">
-    📡 RTTY Decoder - Multi-Mode Amateur Radio App
+    📡 Signal Decoder
 </h1>
 <p align="center">
    <strong>Decode radio signals in your browser!</strong> Free, open-source web application for real-time decoding of RTTY (Radio Teletype / Baudot), CW (Morse code), and SSTV (Slow Scan Television) signals from microphone input. Works offline as a PWA. Forked from <a href="https://github.com/smolgroot/sstv-decoder">smolgroot/sstv-decoder</a>.
@@ -115,24 +115,64 @@ Real-time RTTY (Radio Teletype) decoding using Baudot/ITA2 encoding (5-bit chara
 
 ## CW Decoder
 
-Real-time CW (Morse code) decoding with adaptive speed tracking.
+Real-time CW (Morse code) decoder with a per-sample IIR pipeline, live Morse element visualisation, and dual-channel A/B decoding mode.
 
 ### CW Parameters
 
-| Parameter | Default | Notes |
-|-----------|---------|-------|
-| **Tone Frequency** | 700 Hz | adjustable via UI |
-| **Speed** | Auto | adaptive dit-length tracking |
-| **Squelch** | Adjustable | hard gate — suppresses noise decoding |
+| Parameter | Default | Range | Notes |
+| --------- | ------- | ----- | ----- |
+| **Center Frequency** | 700 Hz | 100 – 1500 Hz | Quick-set input + spectrum drag |
+| **Bandwidth** | 90 Hz | 30 – 500 Hz | Filter width; Q computed as `freq / bw` |
+| **Speed** | 20 WPM | 3 – 70 WPM | Manual or adaptive (see below) |
+| **Squelch** | Adjustable | 0 – 100 % | Compared directly to FFT tone-bin level |
+| **A/B Mode** | Off | — | Two independent decoders on separate frequencies |
 
-### CW Signal Processing
+### CW Signal Processing Pipeline
 
-- **Bandpass filter**: Biquad (Q=8) centred on the selected tone
-- **Envelope detector**: Asymmetric IIR — fast attack (~3 ms), moderate release (~5 ms)
-- **Peak follower**: Fast rise (~10 ms), slow fall (~300 ms) for stable thresholding
-- **Hysteresis**: 50 % / 25 % against peak to prevent chatter on mark/space transitions
-- **Speed tracking**: Dit length estimated from recent marks and updated continuously
-- **SNR display**: Noise floor tracked separately via slow IIR; real-time dB readout
+```text
+microphone → biquad bandpass (adjustable Q = center / bandwidth)
+           → envelope detector  (fast attack ~3 ms, moderate release ~5 ms)
+           → peak follower       (fast rise ~10 ms, slow fall ~300 ms)
+           → 50 % / 25 % hysteresis vs peak → mark / space FSM
+           → symbol buffer (max 6 elements — hard cap, overflow emits '?')
+           → Morse table lookup → character / prosign output
+```
+
+- **Bandpass filter**: Standard biquad, Q computed per-render so `bandwidth_Hz` stays constant as the center frequency is dragged
+- **Squelch**: Applied per audio buffer by comparing the FFT magnitude at the tone bin against the user's visual threshold — the squelch line on the spectrum canvas is the exact gate the decoder uses
+- **Adaptive speed tracker**: Always runs in the background regardless of manual/adaptive mode; the estimated WPM is shown as a live suggestion even when manual mode is active
+- **Manual WPM override**: When adaptive mode is off, the user sets a fixed WPM; toggling adaptive off pre-fills the input with the last detected speed
+- **6-element cap**: No valid Morse character exceeds 6 elements (the longest prosigns, e.g. `<SK>` = `...-.-`, are exactly 6); any sequence longer than this is flushed immediately as `?` to prevent noise from stalling the decoder
+- **SNR display**: Noise floor tracked via a separate slow-fall IIR; real-time dB readout colour-coded (green ≥ 15 dB, amber 6–15 dB, red < 6 dB)
+
+### Morse Display (live visualiser)
+
+A real-time Morse element display sits inside the Audio Analysis panel and reflects the decoder's internal symbol buffer directly:
+
+- **Dots** (blue circles) and **dashes** (green pills) appear with a spring-bounce animation as each element is received
+- **Receiving indicator**: An amber pulsing dot shows while a tone is actively being measured (before dot vs dash is determined)
+- **Character flash**: When the decoder resolves a complete symbol, the decoded character blooms large in the centre, holds for ~1.4 s, then fades — colour and glow match the channel (blue for Ch A, orange for Ch B)
+- **Recent strip**: The last 10 decoded characters are shown in a fading history row with their Morse pattern underneath
+- Element display is driven by `stats.partialSymbol` (decoder source of truth) to avoid React render-batch ordering bugs
+
+### A/B Mode (dual-channel)
+
+Enable **A/B Mode** to run two independent CW decoders simultaneously on different frequencies — useful for monitoring both sides of a QSO or two nearby stations.
+
+- Each channel (A = blue, B = orange) has its own center frequency, squelch gate, and Morse visualiser
+- Decoded text from both channels is interleaved in the output panel with distinct colours
+- Channel B can be enabled/disabled mid-session without restarting audio capture
+- The spectrum shows labelled `A` and `B` markers; both can be dragged independently
+- The spectrogram overlay highlights both filter bands simultaneously
+
+### CW How to Use
+
+1. Click **Start Decoding** and allow microphone access
+2. Drag the **CF** (or **A**) marker on the spectrum to the CW tone peak, or type the frequency in the **Center** input
+3. Adjust **Bandwidth** — narrow (50–80 Hz) for clean signals, wider (150–300 Hz) for drifting or noisy ones
+4. Drag the **SQL** line just above the noise floor to gate noise from decoding
+5. Set **speed**: leave adaptive off and type the known WPM, or enable **Adaptive WPM** to let the decoder track the sender automatically — the live detected WPM is always visible as a suggestion even in manual mode
+6. For a two-station QSO, enable **A/B Mode** and drag the **B** marker to the second tone
 
 ## Technology Stack
 

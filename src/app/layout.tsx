@@ -5,10 +5,10 @@ import PWAInstallPrompt from "@/components/PWAInstallPrompt";
 export const metadata: Metadata = {
   metadataBase: new URL("https://sstv-decoder.vercel.app"),
   title: {
-    default: "SSTV Decoder - Real-time Slow Scan Television Decoder",
-    template: "%s | SSTV Decoder",
+    default: "Signal Decoder",
+    template: "%s | Signal Decoder",
   },
-  description: "Free web-based SSTV (Slow Scan Television) decoder supporting Robot36 mode. Decode amateur radio SSTV signals in real-time from your microphone with professional DSP processing. Works on desktop and mobile. Perfect for ham radio enthusiasts and ISS SSTV events.",
+  description: "Free web-based signal decoder for amateur radio. Decode RTTY (Baudot), CW (Morse code), and SSTV signals in real-time from your microphone. Works offline as a PWA.",
   keywords: [
     "SSTV",
     "Slow Scan Television",
@@ -40,10 +40,10 @@ export const metadata: Metadata = {
   category: "Technology",
   classification: "Radio Communications Software",
   openGraph: {
-    title: "SSTV Decoder - Real-time Slow Scan Television Decoder",
-    description: "Free web-based SSTV decoder for amateur radio enthusiasts. Decode Robot36 SSTV signals in real-time from your microphone. Perfect for ISS SSTV events, ham radio operations, and satellite image reception.",
+    title: "Signal Decoder",
+    description: "Free web-based signal decoder for amateur radio. Decode RTTY, CW, and SSTV signals in real-time from your microphone.",
     url: "https://sstv-decoder.vercel.app",
-    siteName: "SSTV Decoder",
+    siteName: "Signal Decoder",
     images: [
       {
         url: "/og-image.png",
@@ -63,8 +63,8 @@ export const metadata: Metadata = {
     card: "summary_large_image",
     site: "@smolgroot",
     creator: "@smolgroot",
-    title: "SSTV Decoder - Free Online SSTV Signal Decoder",
-    description: "Decode amateur radio SSTV signals in real-time from your microphone. Supports Robot36 mode. Perfect for ISS SSTV events and ham radio operations.",
+    title: "Signal Decoder",
+    description: "Free web-based signal decoder for amateur radio. Decode RTTY, CW, and SSTV signals in real-time from your microphone.",
     images: {
       url: "/og-image.png",
       alt: "SSTV Decoder Interface",
@@ -92,10 +92,10 @@ export const metadata: Metadata = {
   appleWebApp: {
     capable: true,
     statusBarStyle: "black-translucent",
-    title: "SSTV Decoder",
+    title: "Signal Decoder",
     startupImage: "/icon-512.png",
   },
-  applicationName: "SSTV Decoder",
+  applicationName: "Signal Decoder",
   formatDetection: {
     telephone: false,
     email: false,

@@ -16,7 +16,9 @@
 import { MORSE_TABLE } from './morse-table';
 
 export interface CWStats {
-  wpm:           number;
+  wpm:          number;
+  /** WPM estimate from the always-running adaptive tracker (shown as suggestion even when adaptive mode is off) */
+  adaptiveWpm:  number;
   partialSymbol: string;
   toneDetected:  boolean;
   snrDb:         number | null;
@@ -29,8 +31,9 @@ export interface CWStats {
 export class CWDecoder {
   private readonly sampleRate: number;
   private toneFreq:            number;
+  private filterQ:             number;   // Biquad Q — controls bandwidth
 
-  // Biquad bandpass filter coefficients (recomputed on tone change)
+  // Biquad bandpass filter coefficients (recomputed on tone/Q change)
   private bpB0 = 0; private bpB2 = 0;
   private bpA1 = 0; private bpA2 = 0;
   // Biquad state
@@ -63,19 +66,30 @@ export class CWDecoder {
   private spaceSamples  = 0;
   private wordSpaceOut  = false; // prevents duplicate word-space emission
 
-  // Adaptive dit-length estimate (samples)
+  // Fixed or manually-set dit-length (samples) — what the decoder actually uses
   private ditSamples: number;
+  // Background adaptive estimate — always tracks regardless of adaptiveDitLength flag
+  private adaptiveEstSamples: number;
+
+  // Whether the adaptive estimate is also applied to ditSamples
+  private adaptiveDitLength = false;
 
   // Partial symbol for the character being assembled
   private symbolBuffer = '';
 
   /** Called with each decoded character or space */
   onText?: (chars: string) => void;
+  /** Called when a dot or dash element is received */
+  onElement?: (type: 'dot' | 'dash') => void;
+  /** Called when a character is fully decoded, before onText fires */
+  onCharDecoded?: (char: string, symbol: string) => void;
 
-  constructor(sampleRate: number, toneFreq = 700, wpmInit = 20) {
-    this.sampleRate = sampleRate;
-    this.toneFreq   = toneFreq;
-    this.ditSamples = this.wpmToDit(wpmInit);
+  constructor(sampleRate: number, toneFreq = 700, wpmInit = 20, filterQ = 8) {
+    this.sampleRate          = sampleRate;
+    this.toneFreq            = toneFreq;
+    this.filterQ             = filterQ;
+    this.ditSamples          = this.wpmToDit(wpmInit);
+    this.adaptiveEstSamples  = this.wpmToDit(wpmInit);
 
     this.attackAlpha    = 1 - Math.exp(-1 / (0.003 * sampleRate)); // 3 ms
     this.releaseAlpha   = 1 - Math.exp(-1 / (0.005 * sampleRate)); // 5 ms
@@ -94,8 +108,8 @@ export class CWDecoder {
 
   private setupFilter(freq: number): void {
     // Standard biquad bandpass (unity gain at centre frequency)
-    // Q=8 → bandwidth ≈ 88 Hz, passes ±44 Hz around the tone
-    const Q     = 8;
+    // filterQ controls bandwidth: BW ≈ freq/Q
+    const Q     = this.filterQ;
     const w0    = (2 * Math.PI * freq) / this.sampleRate;
     const sinW0 = Math.sin(w0);
     const cosW0 = Math.cos(w0);
@@ -114,6 +128,19 @@ export class CWDecoder {
   }
 
   getToneFreq(): number { return this.toneFreq; }
+
+  setAdaptiveDitLength(enabled: boolean): void {
+    this.adaptiveDitLength = enabled;
+  }
+
+  setWpm(wpm: number): void {
+    this.ditSamples = this.wpmToDit(Math.max(3, Math.min(70, wpm)));
+  }
+
+  setFilterQ(q: number): void {
+    this.filterQ = Math.max(1, Math.min(50, q));
+    this.setupFilter(this.toneFreq);
+  }
 
   // ── Per-sample processing ──────────────────────────────────────────────────
 
@@ -190,6 +217,7 @@ export class CWDecoder {
     const squelchedNow = this.squelchThreshold > 0 && this.envelope < this.squelchThreshold;
     return {
       wpm:           Math.round(1.2 / (this.ditSamples / this.sampleRate)),
+      adaptiveWpm:   Math.round(1.2 / (this.adaptiveEstSamples / this.sampleRate)),
       partialSymbol: this.symbolBuffer,
       toneDetected:  this.isMark,
       snrDb:         this.noiseFloor > 1e-9
@@ -208,12 +236,23 @@ export class CWDecoder {
 
     const isDot = samples < this.ditSamples * 2.0;
     this.symbolBuffer += isDot ? '.' : '-';
+    this.onElement?.(isDot ? 'dot' : 'dash');
 
-    // Adapt dit estimate: dot duration directly, dash duration / 3.
-    // 10 % learning rate converges faster than 5 % while staying smooth.
-    const measured  = isDot ? samples : samples / 3;
-    this.ditSamples = this.ditSamples * 0.90 + measured * 0.10;
-    this.ditSamples = Math.max(this.wpmToDit(70), Math.min(this.wpmToDit(3), this.ditSamples));
+    // No valid Morse character exceeds 6 elements. Flush immediately when the
+    // buffer overflows so accumulated noise never produces a growing dead sequence.
+    if (this.symbolBuffer.length > 6) {
+      this.flushSymbol();
+    }
+
+    // Background adaptive estimator always runs so it can be shown as a suggestion
+    // even when the user has locked the WPM manually.
+    const measured = isDot ? samples : samples / 3;
+    this.adaptiveEstSamples = this.adaptiveEstSamples * 0.90 + measured * 0.10;
+    this.adaptiveEstSamples = Math.max(this.wpmToDit(70), Math.min(this.wpmToDit(3), this.adaptiveEstSamples));
+
+    if (this.adaptiveDitLength) {
+      this.ditSamples = this.adaptiveEstSamples;
+    }
   }
 
   private handleSpaceEnd(samples: number): void {
@@ -231,7 +270,9 @@ export class CWDecoder {
 
   private flushSymbol(): void {
     if (this.symbolBuffer.length === 0) return;
-    const char = MORSE_TABLE[this.symbolBuffer] ?? '?';
+    const sym  = this.symbolBuffer;
+    const char = MORSE_TABLE[sym] ?? '?';
+    this.onCharDecoded?.(char, sym);
     this.onText?.(char);
     this.symbolBuffer = '';
   }
@@ -246,6 +287,7 @@ export class CWDecoder {
     const squelchedNow = this.squelchThreshold > 0 && this.envelope < this.squelchThreshold;
     return {
       wpm:           Math.round(1.2 / (this.ditSamples / this.sampleRate)),
+      adaptiveWpm:   Math.round(1.2 / (this.adaptiveEstSamples / this.sampleRate)),
       partialSymbol: this.symbolBuffer,
       toneDetected:  this.isMark,
       snrDb:         this.noiseFloor > 1e-9
@@ -268,7 +310,8 @@ export class CWDecoder {
     this.isMark       = false;
     this.markSamples  = this.spaceSamples = 0;
     this.wordSpaceOut = false;
-    this.symbolBuffer = '';
-    this.ditSamples   = this.wpmToDit(20);
+    this.symbolBuffer        = '';
+    this.ditSamples          = this.wpmToDit(20);
+    this.adaptiveEstSamples  = this.wpmToDit(20);
   }
 }
