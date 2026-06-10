@@ -2,7 +2,10 @@
     📡 Signal Decoder
 </h1>
 <p align="center">
-   <strong>Decode radio signals in your browser!</strong> Free, open-source web application for real-time decoding of RTTY (Radio Teletype / Baudot), CW (Morse code), and SSTV (Slow Scan Television) signals from microphone input. Works offline as a PWA. Forked from <a href="https://github.com/smolgroot/sstv-decoder">smolgroot/sstv-decoder</a>.
+   <strong>Decode radio signals in your browser!</strong> Free, open-source web application for real-time decoding of RTTY (Radio Teletype / Baudot), CW (Morse code), SSTV (Slow Scan Television), and FT8/FT4 digital signals from microphone input. Works offline as a PWA. Forked from <a href="https://github.com/smolgroot/sstv-decoder">smolgroot/sstv-decoder</a>.
+</p>
+<p align="center">
+   <em>This is a fully vibe coded project — every line was written by an AI coding agent driven by human prompts.</em>
 </p>
 <br />
 
@@ -36,16 +39,17 @@
 
 1. **Visit** → [acesso.github.io/rtty-decoder](https://acesso.github.io/rtty-decoder)
 2. **Allow** microphone access when prompted
-3. **Play** an RTTY, CW, or SSTV signal near your microphone
-4. **Watch** the text or image decode in real-time!
+3. **Play** an RTTY, CW, SSTV, or FT8/FT4 signal near your microphone
+4. **Watch** the text, image, or contacts decode in real-time!
 
 No installation, no downloads, no setup - just open and decode!
 
 ## Features
 
 - **RTTY Decoding**: Real-time Baudot/ITA2 radioteletype decoding from audio input
-- **CW Decoding**: Morse code decoder with automatic speed detection
+- **CW Decoding**: Morse code decoder with automatic speed detection and dual-channel A/B mode
 - **SSTV Decoding**: 15 modes — Robot36/72, Scottie S1/S2/DX, Martin M1/M2, PD50/90/120/160/180/240/290, Wraase SC2-180
+- **FT8/FT4 Decoding**: UTC-synchronized window decoding with QSO contact tracking, world map, and ADIF export
 - **Mode Auto-Detection**: Automatically identifies the incoming signal type
 - **Session Gallery**: Review and save decoded sessions
 - **Real-time Audio Processing**: Captures microphone input using Web Audio API (auto-detects 44.1 kHz or 48 kHz)
@@ -174,6 +178,48 @@ Enable **A/B Mode** to run two independent CW decoders simultaneously on differe
 5. Set **speed**: leave adaptive off and type the known WPM, or enable **Adaptive WPM** to let the decoder track the sender automatically — the live detected WPM is always visible as a suggestion even in manual mode
 6. For a two-station QSO, enable **A/B Mode** and drag the **B** marker to the second tone
 
+## FT8 / FT4 Decoder
+
+Real-time decoding of the WSJT-X FT digital modes, with automatic QSO tracking. Decoding is powered by [ft8ts](https://github.com/e04/ft8ts) (GPL-3.0) and runs entirely in the browser.
+
+### FT Modes
+
+| Mode | Window | Sensitivity | Status |
+|------|--------|-------------|--------|
+| **FT8** | 15 s | −24 dB SNR | Fully supported |
+| **FT4** | 7.5 s | −17 dB SNR | Fully supported |
+| **FT2** | 3.75 s | −12 dB SNR | Experimental — waterfall only, no JS decoder available yet |
+
+The decoder synchronizes to UTC wall-clock windows (your system clock must be NTP-synced within ±1 s), records one full window, then decodes it — exactly like WSJT-X. A clock ring shows the current window progress and REC/DEC state.
+
+### Decoded Messages
+
+Every decode is listed with UTC time, audio frequency (Hz), SNR (dB), and time offset (DT). Messages are classified by type, each with a fixed color used consistently across the UI:
+
+| Tag | Meaning |
+|-----|---------|
+| `CQ` | General call (optionally with directed prefix and grid) |
+| `ANS` | Answer with Maidenhead grid |
+| `RPT` | Signal report |
+| `R+RPT` | Roger + signal report |
+| `RRR` / `RR73` | Roger acknowledgments |
+| `73` | Sign-off |
+
+`RR73` is never interpreted as a grid locator (it is lexically a valid Maidenhead square, but is reserved as a sign-off — same convention as WSJT-X).
+
+### Contacts Panel
+
+Callsigns are extracted from decoded messages and tracked as contacts with full QSO history:
+
+- **Validation**: Only decodes with ≥3 readable words are parsed; `<...>` hashed-callsign placeholders and the literal `CQ` are never treated as callsigns
+- **World map**: Located contacts (from their Maidenhead grid) are plotted on a Leaflet dark map, starting fully zoomed out
+- **Location labels**: Grids are reverse-geocoded asynchronously (OSM Nominatim, throttled and cached) into `🇧🇷 Joao Pessoa - HI72` style labels
+- **Operator lookup**: Name/email looked up asynchronously via hamdb.org (QRZ's API requires a paid authenticated session); the callsign in the list links to its qrz.com profile
+- **QSO history**: Per-contact message log with seconds-precision UTC timestamps, message-type badges, and TX/RX direction; runs of repeated messages collapse into one row with a `×N` counter (hover to see every occurrence)
+- **Cross-linking**: Callsigns are clickable everywhere they appear (worked list, map popups) and jump to the expanded contact
+- **Sorting**: By last activity, TX count, or callsign — click the active sort again to reverse
+- **ADIF export**: Download the session log as a standard `.adi` file for import into any logger
+
 ## Technology Stack
 
 - **Next.js 15**: React framework with App Router
@@ -243,7 +289,7 @@ npm start
 
 ## How to Use
 
-Select a mode from the top tab bar (RTTY / CW / SSTV), then click **Start** and allow microphone access when prompted.
+Select a mode from the top tab bar (RTTY / CW / SSTV / FT), then click **Start** and allow microphone access when prompted.
 
 ### RTTY
 
@@ -270,6 +316,15 @@ Select a mode from the top tab bar (RTTY / CW / SSTV), then click **Start** and 
    - Filename: `sstv-{mode}-{timestamp}.png`
 6. **Gallery**: Previously decoded images are kept in the gallery below the canvas
 7. **Reset**: Click "Reset" to clear the canvas and start a new decode
+
+### FT8 / FT4
+
+1. **Sync your clock**: FT modes require the system clock to be NTP-synchronized within ±1 second
+2. **Mode**: Select **FT8** (15 s windows) or **FT4** (7.5 s windows) in the sub-mode selector
+3. **Tune**: Set your radio to a standard FT frequency in USB mode (e.g. 14.074 MHz for 20m FT8; FT4 14.080 MHz)
+4. **Start**: The decoder waits for the next UTC window boundary, records the full window, then decodes automatically
+5. **Contacts**: Decoded callsigns appear in the Contacts panel with QSO history, location, and the world map; click any callsign to jump to its details
+6. **Export**: Download the session as an ADIF log with the `.adi` button
 
 ## Technical Details
 
@@ -378,11 +433,17 @@ src/
 │   ├── RTTYDecoder.tsx         # RTTY (Baudot) decoder UI
 │   ├── CWDecoder.tsx           # CW (Morse) decoder UI
 │   ├── SSTVDecoder.tsx         # SSTV image decoder UI
+│   ├── FTDecoder.tsx           # FT8/FT4 decoder UI (clock ring, waterfall, messages)
+│   ├── FTContactsPanel.tsx     # FT contact list, QSO history, sorting, ADIF export
+│   ├── FTLeafletMap.tsx        # World map of located FT contacts (Leaflet)
 │   ├── SessionCard.tsx         # Decoded session display card
 │   ├── SettingsPanel.tsx       # Mode selection settings panel
 │   └── PWAInstallPrompt.tsx    # PWA install prompt
 ├── hooks/
-│   └── useAudioProcessor.ts    # Web Audio API integration (mode-aware)
+│   ├── useAudioProcessor.ts    # Web Audio API integration (mode-aware)
+│   ├── useCWProcessor.ts       # CW audio capture + decoder loop
+│   ├── useRTTYProcessor.ts     # RTTY audio capture + decoder loop
+│   └── useFTProcessor.ts       # UTC-windowed FT8/FT4 capture + decode
 └── lib/
     ├── rtty/
     │   ├── decoder.ts          # RTTY Baudot/ITA2 decoder
@@ -391,6 +452,10 @@ src/
     ├── cw/
     │   ├── decoder.ts          # CW Morse code decoder
     │   └── morse-table.ts      # Morse code lookup table
+    ├── ft/
+    │   ├── decoder.ts          # FT8/FT4 window decoding (ft8ts)
+    │   ├── parser.ts           # Message classification, callsign/grid extraction, ADIF
+    │   └── lookup.ts           # Async reverse geocoding + operator lookups
     └── sstv/
         ├── constants.ts             # SSTV mode specifications
         ├── decoder.ts               # Main decoder orchestration (multi-mode)
