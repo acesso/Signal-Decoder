@@ -5,6 +5,9 @@ import { useMultiRTTYProcessor } from '@/hooks/useMultiRTTYProcessor';
 import { SessionCard } from '@/components/SessionCard';
 import { sessionsReducer, makeSession } from '@/lib/rtty/sessions';
 import type { RTTYConfig } from '@/lib/rtty/decoder';
+import GLSpectrogram, { GLSpectrogramHandle, GLView } from './GLSpectrogram';
+
+type SpectrogramView = 'legacy' | GLView;
 
 const DISPLAY_MAX_HZ = 1500;
 
@@ -40,6 +43,9 @@ export default function RTTYDecoder() {
   // Spectrogram display controls
   const [spectrogramGamma, setSpectrogramGamma] = useState(3.0);
   const [spectrogramSpeed, setSpectrogramSpeed] = useState(2);
+  const [spectrogramView,  setSpectrogramView]  = useState<SpectrogramView>('terrain');
+  const [bandAlpha,        setBandAlpha]        = useState(0.3);
+  const glSpectrogramRef = useRef<GLSpectrogramHandle>(null);
   const spectrogramGammaRef = useRef(3.0);
   const spectrogramSpeedRef = useRef(2);
   useEffect(() => { spectrogramGammaRef.current = spectrogramGamma; }, [spectrogramGamma]);
@@ -408,8 +414,10 @@ export default function RTTYDecoder() {
       if (procState.isRecording && spectrumCanvas) {
         const frequencyData = drawSpectrum(spectrumCanvas);
         spectrogramFrameRef.current++;
-        if (spectrogramCanvas && frequencyData && spectrogramFrameRef.current % spectrogramSpeedRef.current === 0) {
-          drawSpectrogram(spectrogramCanvas, frequencyData);
+        if (frequencyData && spectrogramFrameRef.current % spectrogramSpeedRef.current === 0) {
+          // Feed both renderers so history stays warm when switching views
+          if (spectrogramCanvas) drawSpectrogram(spectrogramCanvas, frequencyData);
+          glSpectrogramRef.current?.pushRow(frequencyData);
         }
       } else if (spectrumCanvas) {
         drawIdleSpectrum(spectrumCanvas);
@@ -702,38 +710,80 @@ export default function RTTYDecoder() {
           <div className="flex flex-col flex-1 gap-2 mt-3 sm:mt-4 min-h-0">
             <h3 className="text-sm font-medium text-[#8b949e] shrink-0">Spectrogram</h3>
             <div ref={spectrogramContainerRef} className="relative flex-1 min-h-[150px]">
-              <canvas
-                ref={spectrogramCanvasRef}
-                width={640}
-                height={spectrogramCanvasHeight}
-                style={{ height: spectrogramCanvasHeight }}
-                className="w-full border border-[#30363d] rounded bg-[#0d1117] touch-manipulation block"
-              />
-              <div className="absolute inset-y-0 pointer-events-none" style={{
-                left: `${(spaceBandLow / DISPLAY_MAX_HZ) * 100}%`,
-                width: `${((spaceBandHigh - spaceBandLow) / DISPLAY_MAX_HZ) * 100}%`,
-                backgroundColor: 'rgba(240,136,62,0.07)',
-                borderLeft: '1px solid rgba(240,136,62,0.28)', borderRight: '1px solid rgba(240,136,62,0.28)',
-              }} />
-              <div className="absolute inset-y-0 pointer-events-none" style={{
-                left: `${(markBandLow / DISPLAY_MAX_HZ) * 100}%`,
-                width: `${((markBandHigh - markBandLow) / DISPLAY_MAX_HZ) * 100}%`,
-                backgroundColor: 'rgba(88,166,255,0.07)',
-                borderLeft: '1px solid rgba(88,166,255,0.28)', borderRight: '1px solid rgba(88,166,255,0.28)',
-              }} />
-              {spaceFreq >= 0 && spaceFreq <= DISPLAY_MAX_HZ && (
-                <div className="absolute inset-y-0 pointer-events-none" style={{ left: `${(spaceFreq / DISPLAY_MAX_HZ) * 100}%`, width: '2px', backgroundColor: '#f0883e', opacity: 0.9 }}>
-                  <span className="absolute top-1 left-1 text-[10px] font-mono font-bold text-[#f0883e] leading-none drop-shadow-md">S</span>
-                </div>
-              )}
-              {markFreq >= 0 && markFreq <= DISPLAY_MAX_HZ && (
-                <div className="absolute inset-y-0 pointer-events-none" style={{ left: `${(markFreq / DISPLAY_MAX_HZ) * 100}%`, width: '2px', backgroundColor: '#58a6ff', opacity: 0.9 }}>
-                  <span className="absolute top-1 left-1 text-[10px] font-mono font-bold text-[#58a6ff] leading-none drop-shadow-md">M</span>
-                </div>
-              )}
+              {/* Both renderers stay mounted (hidden via CSS) so history persists across view switches */}
+              <div className={spectrogramView === 'legacy' ? 'block' : 'hidden'}>
+                <canvas
+                  ref={spectrogramCanvasRef}
+                  width={640}
+                  height={spectrogramCanvasHeight}
+                  style={{ height: spectrogramCanvasHeight }}
+                  className="w-full border border-[#30363d] rounded bg-[#0d1117] touch-manipulation block"
+                />
+                <div className="absolute inset-y-0 pointer-events-none" style={{
+                  left: `${(spaceBandLow / DISPLAY_MAX_HZ) * 100}%`,
+                  width: `${((spaceBandHigh - spaceBandLow) / DISPLAY_MAX_HZ) * 100}%`,
+                  backgroundColor: 'rgba(240,136,62,0.07)',
+                  borderLeft: '1px solid rgba(240,136,62,0.28)', borderRight: '1px solid rgba(240,136,62,0.28)',
+                }} />
+                <div className="absolute inset-y-0 pointer-events-none" style={{
+                  left: `${(markBandLow / DISPLAY_MAX_HZ) * 100}%`,
+                  width: `${((markBandHigh - markBandLow) / DISPLAY_MAX_HZ) * 100}%`,
+                  backgroundColor: 'rgba(88,166,255,0.07)',
+                  borderLeft: '1px solid rgba(88,166,255,0.28)', borderRight: '1px solid rgba(88,166,255,0.28)',
+                }} />
+                {spaceFreq >= 0 && spaceFreq <= DISPLAY_MAX_HZ && (
+                  <div className="absolute inset-y-0 pointer-events-none" style={{ left: `${(spaceFreq / DISPLAY_MAX_HZ) * 100}%`, width: '2px', backgroundColor: '#f0883e', opacity: 0.9 }}>
+                    <span className="absolute top-1 left-1 text-[10px] font-mono font-bold text-[#f0883e] leading-none drop-shadow-md">S</span>
+                  </div>
+                )}
+                {markFreq >= 0 && markFreq <= DISPLAY_MAX_HZ && (
+                  <div className="absolute inset-y-0 pointer-events-none" style={{ left: `${(markFreq / DISPLAY_MAX_HZ) * 100}%`, width: '2px', backgroundColor: '#58a6ff', opacity: 0.9 }}>
+                    <span className="absolute top-1 left-1 text-[10px] font-mono font-bold text-[#58a6ff] leading-none drop-shadow-md">M</span>
+                  </div>
+                )}
+              </div>
+              <div className={spectrogramView !== 'legacy' ? 'block' : 'hidden'}>
+                <GLSpectrogram
+                  ref={glSpectrogramRef}
+                  view={spectrogramView === 'legacy' ? 'terrain' : spectrogramView}
+                  gamma={spectrogramGamma}
+                  height={spectrogramCanvasHeight}
+                  maxHz={DISPLAY_MAX_HZ}
+                  bandAlpha={bandAlpha}
+                  bands={[
+                    { fromHz: markBandLow,  toHz: markBandHigh,  color: '#58a6ff' },
+                    { fromHz: spaceBandLow, toHz: spaceBandHigh, color: '#f0883e' },
+                    { fromHz: markFreq - 4,  toHz: markFreq + 4,  color: '#58a6ff', line: true },
+                    { fromHz: spaceFreq - 4, toHz: spaceFreq + 4, color: '#f0883e', line: true },
+                  ]}
+                />
+              </div>
             </div>
-            {/* Contrast + Speed */}
+            {/* View + Contrast + Speed */}
             <div className="flex flex-wrap items-center gap-4 text-xs text-[#8b949e] shrink-0">
+              <label className="flex items-center gap-2">
+                View
+                <select
+                  value={spectrogramView}
+                  onChange={(e) => setSpectrogramView(e.target.value as SpectrogramView)}
+                  className="bg-[#0d1117] border border-[#30363d] rounded px-2 py-0.5 text-[#c9d1d9] focus:outline-none focus:border-[#2ea043] transition-colors cursor-pointer"
+                >
+                  <option value="terrain">3D Terrain</option>
+                  <option value="ridge">Ridgeline</option>
+                  <option value="legacy">Classic 2D</option>
+                </select>
+              </label>
+              {spectrogramView !== 'legacy' && (
+                <label className="flex items-center gap-2" title="Opacity of the mark/space range overlays">
+                  Range
+                  <input
+                    type="range" min={0} max={1} step={0.05}
+                    value={bandAlpha}
+                    onChange={(e) => setBandAlpha(parseFloat(e.target.value))}
+                    className="w-20 accent-[#2ea043] cursor-pointer"
+                  />
+                </label>
+              )}
               <label className="flex items-center gap-2">
                 Contrast
                 <input

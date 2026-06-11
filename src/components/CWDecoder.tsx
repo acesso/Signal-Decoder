@@ -2,6 +2,9 @@
 
 import { useEffect, useRef, useCallback, useState, useMemo } from 'react';
 import { useCWProcessor, TextToken } from '@/hooks/useCWProcessor';
+import GLSpectrogram, { GLSpectrogramHandle, GLView } from './GLSpectrogram';
+
+type SpectrogramView = 'legacy' | GLView;
 
 const DISPLAY_MAX_HZ = 1500;
 const CANVAS_H = 200;
@@ -479,6 +482,10 @@ export default function CWDecoder() {
 
   const [spectrogramGamma, setSpectrogramGamma] = useState(3.0);
   const [spectrogramSpeed, setSpectrogramSpeed] = useState(2);
+  const [spectrogramView,  setSpectrogramView]  = useState<SpectrogramView>('terrain');
+  const [bandAlpha,        setBandAlpha]        = useState(0.3);
+  const [sqlAlpha,         setSqlAlpha]         = useState(0.3);
+  const glSpectrogramRef = useRef<GLSpectrogramHandle>(null);
   const spectrogramGammaRef = useRef(3.0);
   const spectrogramSpeedRef = useRef(2);
   useEffect(() => { spectrogramGammaRef.current = spectrogramGamma; }, [spectrogramGamma]);
@@ -606,8 +613,10 @@ export default function CWDecoder() {
       if (specCanvas) {
         const freqData = drawSpectrum(specCanvas);
         spectrogramFrameRef.current++;
-        if (sgCanvas && freqData && spectrogramFrameRef.current % spectrogramSpeedRef.current === 0) {
-          drawSpectrogram(sgCanvas, freqData);
+        if (freqData && spectrogramFrameRef.current % spectrogramSpeedRef.current === 0) {
+          // Feed both renderers so history stays warm when switching views
+          if (sgCanvas) drawSpectrogram(sgCanvas, freqData);
+          glSpectrogramRef.current?.pushRow(freqData);
         }
       }
       animationFrameRef.current = requestAnimationFrame(tick);
@@ -1099,56 +1108,113 @@ export default function CWDecoder() {
           <div className="flex flex-col flex-1 gap-2 mt-3 sm:mt-4 min-h-0">
             <h3 className="text-sm font-medium text-[#8b949e] shrink-0">Spectrogram</h3>
             <div ref={spectrogramContainerRef} className="relative flex-1 min-h-[150px]">
-              <canvas
-                ref={spectrogramCanvasRef}
-                width={640}
-                height={spectrogramCanvasHeight}
-                style={{ height: spectrogramCanvasHeight }}
-                className="w-full border border-[#30363d] rounded bg-[#0d1117] block"
-              />
+              {/* Both renderers stay mounted (hidden via CSS) so history persists across view switches */}
+              <div className={spectrogramView === 'legacy' ? 'block' : 'hidden'}>
+                <canvas
+                  ref={spectrogramCanvasRef}
+                  width={640}
+                  height={spectrogramCanvasHeight}
+                  style={{ height: spectrogramCanvasHeight }}
+                  className="w-full border border-[#30363d] rounded bg-[#0d1117] block"
+                />
 
-              {/* T1 band overlay */}
-              <div className="absolute inset-y-0 pointer-events-none" style={{
-                left:            `${(tone1BandLo / DISPLAY_MAX_HZ) * 100}%`,
-                width:           `${((tone1BandHi - tone1BandLo) / DISPLAY_MAX_HZ) * 100}%`,
-                backgroundColor: 'rgba(121,192,255,0.07)',
-                borderLeft:      '1px solid rgba(121,192,255,0.28)',
-                borderRight:     '1px solid rgba(121,192,255,0.28)',
-              }} />
-              {toneFreq >= 0 && toneFreq <= DISPLAY_MAX_HZ && (
+                {/* T1 band overlay */}
                 <div className="absolute inset-y-0 pointer-events-none" style={{
-                  left: `${(toneFreq / DISPLAY_MAX_HZ) * 100}%`, width: '2px',
-                  backgroundColor: '#79c0ff', opacity: 0.9,
-                }}>
-                  <span className="absolute top-1 left-1 text-[10px] font-mono font-bold text-[#79c0ff] leading-none drop-shadow-md">
-                    {dualMode ? 'A' : 'CF'}
-                  </span>
-                </div>
-              )}
-
-              {/* T2 band overlay */}
-              {dualMode && (
-                <>
+                  left:            `${(tone1BandLo / DISPLAY_MAX_HZ) * 100}%`,
+                  width:           `${((tone1BandHi - tone1BandLo) / DISPLAY_MAX_HZ) * 100}%`,
+                  backgroundColor: 'rgba(121,192,255,0.07)',
+                  borderLeft:      '1px solid rgba(121,192,255,0.28)',
+                  borderRight:     '1px solid rgba(121,192,255,0.28)',
+                }} />
+                {toneFreq >= 0 && toneFreq <= DISPLAY_MAX_HZ && (
                   <div className="absolute inset-y-0 pointer-events-none" style={{
-                    left:            `${(tone2BandLo / DISPLAY_MAX_HZ) * 100}%`,
-                    width:           `${((tone2BandHi - tone2BandLo) / DISPLAY_MAX_HZ) * 100}%`,
-                    backgroundColor: 'rgba(255,166,87,0.07)',
-                    borderLeft:      '1px solid rgba(255,166,87,0.28)',
-                    borderRight:     '1px solid rgba(255,166,87,0.28)',
-                  }} />
-                  {toneFreq2 >= 0 && toneFreq2 <= DISPLAY_MAX_HZ && (
+                    left: `${(toneFreq / DISPLAY_MAX_HZ) * 100}%`, width: '2px',
+                    backgroundColor: '#79c0ff', opacity: 0.9,
+                  }}>
+                    <span className="absolute top-1 left-1 text-[10px] font-mono font-bold text-[#79c0ff] leading-none drop-shadow-md">
+                      {dualMode ? 'A' : 'CF'}
+                    </span>
+                  </div>
+                )}
+
+                {/* T2 band overlay */}
+                {dualMode && (
+                  <>
                     <div className="absolute inset-y-0 pointer-events-none" style={{
-                      left: `${(toneFreq2 / DISPLAY_MAX_HZ) * 100}%`, width: '2px',
-                      backgroundColor: '#ffa657', opacity: 0.9,
-                    }}>
-                      <span className="absolute top-1 left-1 text-[10px] font-mono font-bold text-[#ffa657] leading-none drop-shadow-md">B</span>
-                    </div>
-                  )}
-                </>
-              )}
+                      left:            `${(tone2BandLo / DISPLAY_MAX_HZ) * 100}%`,
+                      width:           `${((tone2BandHi - tone2BandLo) / DISPLAY_MAX_HZ) * 100}%`,
+                      backgroundColor: 'rgba(255,166,87,0.07)',
+                      borderLeft:      '1px solid rgba(255,166,87,0.28)',
+                      borderRight:     '1px solid rgba(255,166,87,0.28)',
+                    }} />
+                    {toneFreq2 >= 0 && toneFreq2 <= DISPLAY_MAX_HZ && (
+                      <div className="absolute inset-y-0 pointer-events-none" style={{
+                        left: `${(toneFreq2 / DISPLAY_MAX_HZ) * 100}%`, width: '2px',
+                        backgroundColor: '#ffa657', opacity: 0.9,
+                      }}>
+                        <span className="absolute top-1 left-1 text-[10px] font-mono font-bold text-[#ffa657] leading-none drop-shadow-md">B</span>
+                      </div>
+                    )}
+                  </>
+                )}
+              </div>
+              <div className={spectrogramView !== 'legacy' ? 'block' : 'hidden'}>
+                <GLSpectrogram
+                  ref={glSpectrogramRef}
+                  view={spectrogramView === 'legacy' ? 'terrain' : spectrogramView}
+                  gamma={spectrogramGamma}
+                  height={spectrogramCanvasHeight}
+                  maxHz={DISPLAY_MAX_HZ}
+                  bandAlpha={bandAlpha}
+                  sqlLevel={squelch / 100}
+                  sqlAlpha={sqlAlpha}
+                  bands={[
+                    { fromHz: tone1BandLo,   toHz: tone1BandHi,   color: '#79c0ff' },
+                    { fromHz: toneFreq - 4,  toHz: toneFreq + 4,  color: '#79c0ff', line: true },
+                    ...(dualMode ? [
+                      { fromHz: tone2BandLo,  toHz: tone2BandHi,  color: '#ffa657' },
+                      { fromHz: toneFreq2 - 4, toHz: toneFreq2 + 4, color: '#ffa657', line: true },
+                    ] : []),
+                  ]}
+                />
+              </div>
             </div>
 
             <div className="flex flex-wrap items-center gap-4 text-xs text-[#8b949e] shrink-0">
+              <label className="flex items-center gap-2">
+                View
+                <select
+                  value={spectrogramView}
+                  onChange={(e) => setSpectrogramView(e.target.value as SpectrogramView)}
+                  className="bg-[#0d1117] border border-[#30363d] rounded px-2 py-0.5 text-[#c9d1d9] focus:outline-none focus:border-[#2ea043] transition-colors cursor-pointer"
+                >
+                  <option value="terrain">3D Terrain</option>
+                  <option value="ridge">Ridgeline</option>
+                  <option value="legacy">Classic 2D</option>
+                </select>
+              </label>
+              {spectrogramView !== 'legacy' && (
+                <>
+                  <label className="flex items-center gap-2" title="Opacity of the filter band overlays">
+                    Range
+                    <input
+                      type="range" min={0} max={1} step={0.05}
+                      value={bandAlpha}
+                      onChange={(e) => setBandAlpha(parseFloat(e.target.value))}
+                      className="w-20 accent-[#2ea043] cursor-pointer"
+                    />
+                  </label>
+                  <label className="flex items-center gap-2" title="Opacity of the squelch threshold plane">
+                    SQL
+                    <input
+                      type="range" min={0} max={1} step={0.05}
+                      value={sqlAlpha}
+                      onChange={(e) => setSqlAlpha(parseFloat(e.target.value))}
+                      className="w-20 accent-[#e3b341] cursor-pointer"
+                    />
+                  </label>
+                </>
+              )}
               <label className="flex items-center gap-2">
                 Contrast
                 <input

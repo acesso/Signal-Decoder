@@ -5,6 +5,9 @@ import { useAudioProcessor, CapturedImage, SSTVMode } from '@/hooks/useAudioProc
 import SettingsPanel from '@/components/SettingsPanel';
 import { SSTV_MODES } from '@/lib/sstv/constants';
 import { DecoderState } from '@/lib/sstv/decoder';
+import GLSpectrogram, { GLSpectrogramHandle, GLView } from './GLSpectrogram';
+
+type SpectrogramView = 'legacy' | GLView;
 
 const SPECTRUM_MAX_HZ = 3000;
 
@@ -171,6 +174,8 @@ export default function SSTVDecoder() {
   // Spectrogram controls
   const [spectrogramGamma, setSpectrogramGamma] = useState(3.0);
   const [spectrogramSpeed, setSpectrogramSpeed] = useState(2);
+  const [spectrogramView,  setSpectrogramView]  = useState<SpectrogramView>('terrain');
+  const glSpectrogramRef = useRef<GLSpectrogramHandle>(null);
   const spectrogramGammaRef = useRef(3.0);
   const spectrogramSpeedRef = useRef(2);
   useEffect(() => { spectrogramGammaRef.current = spectrogramGamma; }, [spectrogramGamma]);
@@ -289,8 +294,10 @@ export default function SSTVDecoder() {
       if (specCanvas) {
         const freqData = drawSpectrum(specCanvas);
         spectrogramFrameRef.current++;
-        if (sgCanvas && freqData && spectrogramFrameRef.current % spectrogramSpeedRef.current === 0) {
-          drawSpectrogram(sgCanvas, freqData);
+        if (freqData && spectrogramFrameRef.current % spectrogramSpeedRef.current === 0) {
+          // Feed both renderers so history stays warm when switching views
+          if (sgCanvas) drawSpectrogram(sgCanvas, freqData);
+          glSpectrogramRef.current?.pushRow(freqData);
         }
       }
       animFrameRef.current = requestAnimationFrame(tick);
@@ -460,15 +467,39 @@ export default function SSTVDecoder() {
           <div className="flex flex-col flex-1 gap-2 mt-3 sm:mt-4 min-h-0">
             <h3 className="text-sm font-medium text-[#8b949e] shrink-0">Spectrogram</h3>
             <div ref={spectrogramContainerRef} className="relative flex-1 min-h-[150px]">
-              <canvas
-                ref={spectrogramCanvasRef}
-                width={640}
-                height={spectrogramCanvasHeight}
-                style={{ height: spectrogramCanvasHeight }}
-                className="w-full border border-[#30363d] rounded bg-[#0d1117] block"
-              />
+              {/* Both renderers stay mounted (hidden via CSS) so history persists across view switches */}
+              <div className={spectrogramView === 'legacy' ? 'block' : 'hidden'}>
+                <canvas
+                  ref={spectrogramCanvasRef}
+                  width={640}
+                  height={spectrogramCanvasHeight}
+                  style={{ height: spectrogramCanvasHeight }}
+                  className="w-full border border-[#30363d] rounded bg-[#0d1117] block"
+                />
+              </div>
+              <div className={spectrogramView !== 'legacy' ? 'block' : 'hidden'}>
+                <GLSpectrogram
+                  ref={glSpectrogramRef}
+                  view={spectrogramView === 'legacy' ? 'terrain' : spectrogramView}
+                  gamma={spectrogramGamma}
+                  height={spectrogramCanvasHeight}
+                  maxHz={SPECTRUM_MAX_HZ}
+                />
+              </div>
             </div>
             <div className="flex flex-wrap items-center gap-4 text-xs text-[#8b949e] shrink-0">
+              <label className="flex items-center gap-2">
+                View
+                <select
+                  value={spectrogramView}
+                  onChange={(e) => setSpectrogramView(e.target.value as SpectrogramView)}
+                  className="bg-[#0d1117] border border-[#30363d] rounded px-2 py-0.5 text-[#c9d1d9] focus:outline-none focus:border-[#2ea043] transition-colors cursor-pointer"
+                >
+                  <option value="terrain">3D Terrain</option>
+                  <option value="ridge">Ridgeline</option>
+                  <option value="legacy">Classic 2D</option>
+                </select>
+              </label>
               <label className="flex items-center gap-2">
                 Contrast
                 <input

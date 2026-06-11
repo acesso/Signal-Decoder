@@ -10,17 +10,17 @@
 <br />
 
 <p align="center">
-    <a href="https://github.com/acesso/rtty-decoder/stargazers">
-        <img src="https://img.shields.io/github/stars/acesso/rtty-decoder?style=social" alt="GitHub stars" />
+    <a href="https://github.com/acesso/Signal-Decoder/stargazers">
+        <img src="https://img.shields.io/github/stars/acesso/Signal-Decoder?style=social" alt="GitHub stars" />
     </a>
-    <a href="https://github.com/acesso/rtty-decoder/issues">
-        <img src="https://img.shields.io/github/issues/acesso/rtty-decoder" alt="GitHub Issues" />
+    <a href="https://github.com/acesso/Signal-Decoder/issues">
+        <img src="https://img.shields.io/github/issues/acesso/Signal-Decoder" alt="GitHub Issues" />
     </a>
-    <a href="https://github.com/acesso/rtty-decoder/blob/main/LICENSE">
+    <a href="https://github.com/acesso/Signal-Decoder/blob/main/LICENSE">
         <img src="https://img.shields.io/badge/license-0BSD-blue" alt="License: 0BSD" />
     </a>
     <img src="https://img.shields.io/badge/PWA-Offline%20Ready-success" alt="PWA Offline Ready" />
-    <a href="https://acesso.github.io/rtty-decoder">
+    <a href="https://acesso.github.io/Signal-Decoder">
         <img src="https://img.shields.io/badge/demo-live-brightgreen" alt="Live Demo" />
     </a>
 </p>
@@ -28,7 +28,7 @@
 <hr>
 
 <p align="center">
-   <a href="https://acesso.github.io/rtty-decoder"><b>🚀 Try the Live Demo - No Installation Required!</b></a>
+   <a href="https://acesso.github.io/Signal-Decoder"><b>🚀 Try the Live Demo - No Installation Required!</b></a>
 </p>
 
 <p align="center">
@@ -37,7 +37,7 @@
 
 ## Quick Start
 
-1. **Visit** → [acesso.github.io/rtty-decoder](https://acesso.github.io/rtty-decoder)
+1. **Visit** → [acesso.github.io/Signal-Decoder](https://acesso.github.io/Signal-Decoder)
 2. **Allow** microphone access when prompted
 3. **Play** an RTTY, CW, SSTV, or FT8/FT4 signal near your microphone
 4. **Watch** the text, image, or contacts decode in real-time!
@@ -264,8 +264,8 @@ npm run test:coverage
 
 1. Clone the repository:
 ```bash
-git clone https://github.com/acesso/rtty-decoder.git
-cd rtty-decoder
+git clone https://github.com/acesso/Signal-Decoder.git
+cd Signal-Decoder
 ```
 
 2. Install dependencies:

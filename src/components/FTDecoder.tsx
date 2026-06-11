@@ -5,6 +5,9 @@ import { useFTProcessor } from '@/hooks/useFTProcessor';
 import { FTMode, FT_WINDOW_SECONDS } from '@/lib/ft/decoder';
 import { Contact, mergeContacts } from '@/lib/ft/parser';
 import FTContactsPanel from './FTContactsPanel';
+import GLSpectrogram, { GLSpectrogramHandle, GLView } from './GLSpectrogram';
+
+type WaterfallView = 'legacy' | GLView;
 
 const DISPLAY_MAX_HZ = 3000;
 const CANVAS_H = 180;
@@ -188,6 +191,8 @@ export default function FTDecoder({ ftMode }: { ftMode: FTMode }) {
   const spectrogramFrameRef  = useRef(0);
   const [spectrogramGamma, setSpectrogramGamma] = useState(2.5);
   const [spectrogramSpeed, setSpectrogramSpeed] = useState(2);
+  const [waterfallView,    setWaterfallView]    = useState<WaterfallView>('terrain');
+  const glSpectrogramRef = useRef<GLSpectrogramHandle>(null);
   const spectrogramGammaRef = useRef(2.5);
   const spectrogramSpeedRef = useRef(2);
   useEffect(() => { spectrogramGammaRef.current = spectrogramGamma; }, [spectrogramGamma]);
@@ -266,8 +271,10 @@ export default function FTDecoder({ ftMode }: { ftMode: FTMode }) {
       if (sc) {
         const fd = drawSpectrum(sc);
         spectrogramFrameRef.current++;
-        if (sg && fd && spectrogramFrameRef.current % spectrogramSpeedRef.current === 0) {
-          drawSpectrogram(sg, fd);
+        if (fd && spectrogramFrameRef.current % spectrogramSpeedRef.current === 0) {
+          // Feed every view so history stays warm when switching between them
+          if (sg) drawSpectrogram(sg, fd);
+          glSpectrogramRef.current?.pushRow(fd);
         }
       }
       animFrameRef.current = requestAnimationFrame(tick);
@@ -520,6 +527,18 @@ export default function FTDecoder({ ftMode }: { ftMode: FTMode }) {
               <h3 className="text-sm font-medium text-[#8b949e]">Waterfall</h3>
               <div className="flex flex-wrap items-center gap-3 text-xs text-[#8b949e]">
                 <label className="flex items-center gap-1.5">
+                  View
+                  <select
+                    value={waterfallView}
+                    onChange={e => setWaterfallView(e.target.value as WaterfallView)}
+                    className="bg-[#0d1117] border border-[#30363d] rounded px-1 py-0.5 text-[#c9d1d9] focus:outline-none cursor-pointer text-xs"
+                  >
+                    <option value="terrain">3D Terrain</option>
+                    <option value="ridge">Ridgeline</option>
+                    <option value="legacy">Classic 2D</option>
+                  </select>
+                </label>
+                <label className="flex items-center gap-1.5">
                   Contrast
                   <input type="range" min={0.5} max={6} step={0.1}
                     value={spectrogramGamma}
@@ -543,17 +562,31 @@ export default function FTDecoder({ ftMode }: { ftMode: FTMode }) {
               </div>
             </div>
             <div ref={spectrogramContainerRef} className="relative flex-1 min-h-[120px]">
-              <canvas
-                ref={spectrogramCanvasRef}
-                width={640} height={sgHeight}
-                style={{ height: sgHeight }}
-                className="w-full border border-[#30363d] rounded bg-[#0d1117] block"
-              />
-              {[500, 1000, 1500, 2000, 2500].map(hz => (
-                <div key={hz} className="absolute inset-y-0 pointer-events-none"
-                  style={{ left: `${(hz / DISPLAY_MAX_HZ) * 100}%`, width: 1, background: '#21262d', opacity: 0.7 }}
+              {/* Both renderers stay mounted (hidden via CSS) so history persists across view switches */}
+              <div className={waterfallView === 'legacy' ? 'block' : 'hidden'}>
+                <canvas
+                  ref={spectrogramCanvasRef}
+                  width={640} height={sgHeight}
+                  style={{ height: sgHeight }}
+                  className="w-full border border-[#30363d] rounded bg-[#0d1117] block"
                 />
-              ))}
+              </div>
+              <div className={waterfallView !== 'legacy' ? 'block' : 'hidden'}>
+                <GLSpectrogram
+                  ref={glSpectrogramRef}
+                  view={waterfallView === 'legacy' ? 'terrain' : waterfallView}
+                  gamma={spectrogramGamma}
+                  height={sgHeight}
+                  maxHz={DISPLAY_MAX_HZ}
+                />
+              </div>
+              {/* Hz gridlines only make sense on the flat top-down view */}
+              {waterfallView === 'legacy' &&
+                [500, 1000, 1500, 2000, 2500].map(hz => (
+                  <div key={hz} className="absolute inset-y-0 pointer-events-none"
+                    style={{ left: `${(hz / DISPLAY_MAX_HZ) * 100}%`, width: 1, background: '#21262d', opacity: 0.7 }}
+                  />
+                ))}
             </div>
           </div>
 
