@@ -1,11 +1,16 @@
 'use client';
 
 // This file is loaded via dynamic() with { ssr: false } — safe to import Leaflet here
-import { useEffect } from 'react';
-import { MapContainer, TileLayer, Marker, Popup, useMap } from 'react-leaflet';
+import { Fragment, useEffect, useState } from 'react';
+import { MapContainer, TileLayer, Marker, Popup, Polyline, CircleMarker, Tooltip, useMap } from 'react-leaflet';
 import L from 'leaflet';
 import 'leaflet/dist/leaflet.css';
-import type { Contact } from '@/lib/ft/parser';
+import { Contact, haversineKm } from '@/lib/ft/parser';
+import type { GeoInfo } from '@/lib/ft/lookup';
+
+// QSO line colors by direction relative to the hovered station
+const TX_COLOR = '#2ea043'; // hovered station transmitting (solid)
+const RX_COLOR = '#79c0ff'; // hovered station receiving (dashed)
 
 function makeIcon(color: string) {
   return L.divIcon({
@@ -36,13 +41,54 @@ function AutoBounds({ count }: { count: number }) {
   return null;
 }
 
+// Pan/zoom to the selected contact's position
+function FlyTo({ pos }: { pos: [number, number] | null }) {
+  const map = useMap();
+  useEffect(() => {
+    if (pos) map.flyTo(pos, Math.max(map.getZoom(), 3), { duration: 0.8 });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pos?.[0], pos?.[1]]);
+  return null;
+}
+
 interface Props {
   contacts: Map<string, Contact>;
   onSelect?: (callsign: string) => void;
+  geoMap?: Map<string, GeoInfo>;
+  selected?: string | null; // expanded contact — map flies to it when located
 }
 
-export default function FTLeafletMap({ contacts, onSelect }: Props) {
+interface QsoLine {
+  from: [number, number];
+  to: [number, number];
+  dir: 'tx' | 'rx';
+  km: number;
+  peer: string;
+}
+
+export default function FTLeafletMap({ contacts, onSelect, geoMap, selected }: Props) {
+  const [hoverCs, setHoverCs] = useState<string | null>(null);
   const markers = Array.from(contacts.values()).filter(c => c.latLon);
+  const selContact = selected ? contacts.get(selected) : undefined;
+
+  // QSO lines for the hovered contact — one per peer per direction, drawn
+  // from the transmitting end toward the receiving end
+  const lines: QsoLine[] = [];
+  const hovered = hoverCs ? contacts.get(hoverCs) : undefined;
+  if (hovered?.latLon) {
+    for (const p of hovered.peers) {
+      const peer = contacts.get(p);
+      if (!peer?.latLon) continue;
+      const km = haversineKm(hovered.latLon, peer.latLon);
+      if (hovered.msgs.some(m => m.role === 'tx' && m.parsed.callee === p)) {
+        lines.push({ from: hovered.latLon, to: peer.latLon, dir: 'tx', km, peer: p });
+      }
+      if (hovered.msgs.some(m => m.role === 'rx' && m.parsed.caller === p)) {
+        lines.push({ from: peer.latLon, to: hovered.latLon, dir: 'rx', km, peer: p });
+      }
+    }
+  }
+  const maxKm = lines.reduce((m, l) => Math.max(m, l.km), 0);
 
   return (
     <MapContainer
@@ -63,12 +109,65 @@ export default function FTLeafletMap({ contacts, onSelect }: Props) {
       />
       <FitWorld />
       <AutoBounds count={markers.length} />
+      <FlyTo pos={selContact?.latLon ?? null} />
+      {selContact?.latLon && (
+        <CircleMarker
+          center={selContact.latLon}
+          radius={11}
+          pathOptions={{ color: selContact.color, weight: 2, fill: false, opacity: 0.9, dashArray: '4 4' }}
+        />
+      )}
+
+      {lines.map(l => {
+        const color     = l.dir === 'tx' ? TX_COLOR : RX_COLOR;
+        const isLongest = lines.length > 1 && l.km === maxKm;
+        // Direction cue: a dot near the receiving end of the line
+        const head: [number, number] = [
+          l.from[0] + (l.to[0] - l.from[0]) * 0.85,
+          l.from[1] + (l.to[1] - l.from[1]) * 0.85,
+        ];
+        return (
+          <Fragment key={`${l.peer}-${l.dir}`}>
+            <Polyline
+              positions={[l.from, l.to]}
+              pathOptions={{
+                color,
+                weight: isLongest ? 3.5 : 2,
+                opacity: isLongest ? 0.95 : 0.6,
+                dashArray: l.dir === 'rx' ? '6 6' : undefined,
+              }}
+            >
+              <Tooltip sticky>
+                <span style={{ fontFamily: 'monospace', fontSize: 11 }}>
+                  {l.dir === 'tx' ? `${hoverCs} → ${l.peer}` : `${l.peer} → ${hoverCs}`}
+                  {' · '}{Math.round(l.km).toLocaleString('en-US')} km
+                  {isLongest ? ' · longest' : ''}
+                </span>
+              </Tooltip>
+            </Polyline>
+            <CircleMarker
+              center={head}
+              radius={isLongest ? 4 : 3}
+              pathOptions={{ color, fillColor: color, fillOpacity: 1, weight: 1 }}
+            />
+          </Fragment>
+        );
+      })}
+
       {markers.map(c => {
         const [lat, lon] = c.latLon!;
         const txCount = c.msgs.filter(m => m.role === 'tx').length;
         const rxCount = c.msgs.filter(m => m.role === 'rx').length;
         return (
-          <Marker key={c.callsign} position={[lat, lon]} icon={makeIcon(c.color)}>
+          <Marker
+            key={c.callsign}
+            position={[lat, lon]}
+            icon={makeIcon(c.color)}
+            eventHandlers={{
+              mouseover: () => setHoverCs(c.callsign),
+              mouseout:  () => setHoverCs(prev => (prev === c.callsign ? null : prev)),
+            }}
+          >
             <Popup>
               <div style={{ fontFamily: 'monospace', minWidth: 110 }}>
                 <div
@@ -78,7 +177,14 @@ export default function FTLeafletMap({ contacts, onSelect }: Props) {
                 >
                   {c.callsign}
                 </div>
-                {c.grid && <div style={{ color: '#8b949e', fontSize: 11 }}>{c.grid}</div>}
+                {c.grids.length > 0 && (
+                  <div style={{ color: '#8b949e', fontSize: 11 }}>
+                    {c.grids.map(g => {
+                      const flag = geoMap?.get(g)?.flag;
+                      return flag ? `${flag} ${g}` : g;
+                    }).join(' · ')}
+                  </div>
+                )}
                 <div style={{ color: '#484f58', fontSize: 10, marginTop: 3 }}>
                   {txCount > 0 && <span>{txCount} tx</span>}
                   {txCount > 0 && rxCount > 0 && <span> · </span>}
