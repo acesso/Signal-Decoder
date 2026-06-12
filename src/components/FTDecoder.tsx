@@ -1,6 +1,6 @@
 'use client';
 
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { Fragment, useCallback, useEffect, useRef, useState } from 'react';
 import { useFTProcessor } from '@/hooks/useFTProcessor';
 import { FTMode, FT_WINDOW_SECONDS } from '@/lib/ft/decoder';
 import { Contact, mergeContacts } from '@/lib/ft/parser';
@@ -141,9 +141,62 @@ function msgColor(msg: string, snr: number): string {
   return '#c9d1d9';
 }
 
+// Quality colors shared by the dB column and signal reports inside messages
+function snrColor(db: number): string {
+  return db >= -5 ? '#2ea043' : db >= -15 ? '#e3b341' : '#8b949e';
+}
+// Δ (time offset) quality — FT modes need clocks within ~1 s; small is healthy
+function dtColor(dt: number): string {
+  const a = Math.abs(dt);
+  return a <= 0.2 ? '#2ea043' : a <= 0.5 ? '#e3b341' : '#f85149';
+}
+
 function utcTime(d: Date): string { return d.toISOString().slice(11, 19); }
 function formatFreq(hz: number): string { return hz.toFixed(0).padStart(4, ' '); }
 function formatDT(dt: number): string { return (dt >= 0 ? '+' : '') + dt.toFixed(1); }
+
+const RPT_TOKEN = /^R?[+-][0-9]{1,2}$/;
+
+// Message text with known callsigns colored + linked to their contact card,
+// and signal reports colored by the same quality scheme as the dB column
+function MsgText({ msg, contacts, onSelect }: {
+  msg: string;
+  contacts: Map<string, Contact>;
+  onSelect: (cs: string) => void;
+}) {
+  return (
+    <>
+      {msg.trim().split(/\s+/).map((w, i) => {
+        const sep = i > 0 ? ' ' : '';
+        const c = contacts.get(w);
+        if (c) {
+          return (
+            <Fragment key={i}>
+              {sep}
+              <button
+                onClick={() => onSelect(w)}
+                className="hover:underline font-bold"
+                style={{ color: c.color }}
+                title={`Show ${w} in Contacts`}
+              >
+                {w}
+              </button>
+            </Fragment>
+          );
+        }
+        if (RPT_TOKEN.test(w)) {
+          return (
+            <Fragment key={i}>
+              {sep}
+              <span style={{ color: snrColor(parseInt(w.replace(/^R/, ''), 10)) }}>{w}</span>
+            </Fragment>
+          );
+        }
+        return <Fragment key={i}>{sep}{w}</Fragment>;
+      })}
+    </>
+  );
+}
 
 // ── Main component ────────────────────────────────────────────────────────────
 
@@ -154,6 +207,11 @@ export default function FTDecoder({ ftMode }: { ftMode: FTMode }) {
 
   // ── Contact tracking ────────────────────────────────────────────────────────
   const [contacts, setContacts] = useState<Map<string, Contact>>(new Map());
+  const [contactFocus, setContactFocus] = useState<{ cs: string; n: number } | null>(null);
+  const selectContact = useCallback(
+    (cs: string) => setContactFocus(prev => ({ cs, n: (prev?.n ?? 0) + 1 })),
+    [],
+  );
   const prevResultLenRef = useRef(0);
 
   useEffect(() => {
@@ -462,7 +520,7 @@ export default function FTDecoder({ ftMode }: { ftMode: FTMode }) {
                     <th className="text-left py-1.5 px-2 font-semibold whitespace-nowrap">UTC</th>
                     <th className="text-right py-1.5 px-2 font-semibold">Hz</th>
                     <th className="text-right py-1.5 px-2 font-semibold">dB</th>
-                    <th className="text-right py-1.5 px-2 font-semibold">DT</th>
+                    <th className="text-right py-1.5 px-2 font-semibold" title="Time offset vs UTC window">Δ</th>
                     <th className="text-left py-1.5 px-2 font-semibold w-full">Message</th>
                   </tr>
                 </thead>
@@ -479,12 +537,14 @@ export default function FTDecoder({ ftMode }: { ftMode: FTMode }) {
                       <tr key={row.key} className="border-b border-[#21262d]/50 hover:bg-[#21262d]/40 transition-colors">
                         <td className="py-1 px-2 text-[#484f58] whitespace-nowrap">{utcTime(row.time)}</td>
                         <td className="py-1 px-2 text-right text-[#8b949e] whitespace-nowrap">{formatFreq(row.freq)}</td>
-                        <td className={`py-1 px-2 text-right whitespace-nowrap ${
-                          row.snr >= -5 ? 'text-[#2ea043]' : row.snr >= -15 ? 'text-[#e3b341]' : 'text-[#8b949e]'
-                        }`}>{row.snr > 0 ? '+' : ''}{row.snr}</td>
-                        <td className="py-1 px-2 text-right text-[#8b949e] whitespace-nowrap">{formatDT(row.dt)}</td>
+                        <td className="py-1 px-2 text-right whitespace-nowrap" style={{ color: snrColor(row.snr) }}>
+                          {row.snr > 0 ? '+' : ''}{row.snr.toFixed(4)}
+                        </td>
+                        <td className="py-1 px-2 text-right whitespace-nowrap" style={{ color: dtColor(row.dt) }}>
+                          {formatDT(row.dt)}
+                        </td>
                         <td className="py-1 px-2 truncate max-w-0" style={{ color: msgColor(row.msg, row.snr) }}>
-                          {row.msg}
+                          <MsgText msg={row.msg} contacts={contacts} onSelect={selectContact} />
                         </td>
                       </tr>
                     )
@@ -615,6 +675,7 @@ export default function FTDecoder({ ftMode }: { ftMode: FTMode }) {
             contacts={contacts}
             mode={ftMode}
             onClearContacts={() => setContacts(new Map())}
+            focus={contactFocus}
           />
         </div>
       </div>

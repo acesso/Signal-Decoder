@@ -3,7 +3,7 @@
 // cached and surfaced to the UI whenever they arrive, never blocking decode.
 
 export interface GeoInfo {
-  city?: string;
+  country?: string;     // full country name in English
   countryCode?: string; // ISO-3166 alpha-2, uppercase
   flag?: string;        // country flag emoji
 }
@@ -21,7 +21,7 @@ export function flagEmoji(countryCode: string): string {
 
 // ── Grid → City/Country (Nominatim reverse geocoding) ─────────────────────────
 
-const GEO_LS_KEY = 'ft-geo-cache-v1';
+const GEO_LS_KEY = 'ft-geo-cache-v3'; // v3: country-level only (city dropped)
 const geoCache   = new Map<string, GeoInfo | null>();
 const geoPending = new Map<string, Promise<GeoInfo | null>>();
 // Nominatim usage policy caps at 1 request/second — serialize through a queue
@@ -51,16 +51,16 @@ function persistGeoLS() {
 }
 
 async function fetchGeo([lat, lon]: [number, number]): Promise<GeoInfo | null> {
+  // zoom=3 → country-level result; cheaper for Nominatim and all we need
   const res = await fetch(
-    `https://nominatim.openstreetmap.org/reverse?format=jsonv2&lat=${lat}&lon=${lon}&zoom=10&accept-language=en`,
+    `https://nominatim.openstreetmap.org/reverse?format=jsonv2&lat=${lat}&lon=${lon}&zoom=3&accept-language=en`,
   );
   if (!res.ok) return null;
   const data = await res.json();
   const a    = data?.address ?? {};
-  const city = a.city ?? a.town ?? a.village ?? a.municipality ?? a.county ?? a.state;
   const cc: string | undefined = a.country_code?.toUpperCase();
-  if (!city && !cc) return null;
-  return { city, countryCode: cc, flag: cc ? flagEmoji(cc) : undefined };
+  if (!cc) return null;
+  return { country: a.country, countryCode: cc, flag: flagEmoji(cc) };
 }
 
 export function resolveGridLocation(grid: string, latLon: [number, number]): Promise<GeoInfo | null> {

@@ -4,52 +4,78 @@ export type MsgType = 'cq' | 'answer' | 'report' | 'r_report' | 'rrr' | 'rr73' |
 
 export interface ParsedFTMsg {
   type: MsgType;
-  caller: string;
-  callee?: string;
-  grid?: string;    // Maidenhead grid — belongs to the caller (the transmitting station)
+  caller: string;   // the transmitting station (second callsign in standard messages)
+  callee?: string;  // the addressed station (first callsign)
+  grid?: string;    // Maidenhead grid — always belongs to the caller
   report?: number;  // signal report in dB
   raw: string;
+  clean: boolean;   // every word classified as a known FT token — safe to track
 }
 
-const CS   = '[A-Z0-9]{1,3}[0-9][A-Z]{1,4}(?:/[A-Z0-9]+)?';
+const CS = '[A-Z0-9]{1,3}[0-9][A-Z]{1,4}(?:/[A-Z0-9]+)?';
+const CS_EXACT = new RegExp(`^${CS}$`);
 // "RR73" is lexically a valid Maidenhead square but is reserved as a QSO
 // sign-off message and must never be read as a locator (same as WSJT-X)
-const GRID = '(?!RR73)[A-R]{2}[0-9]{2}';
-const RPT  = '([+-][0-9]{2})';
+const GRID_EXACT = /^(?!RR73)[A-R]{2}[0-9]{2}$/;
+// Signal report: optional R (roger) + signed dB value
+const RPT_EXACT = /^(R?)([+-][0-9]{1,2})$/;
 
-const RE: Record<string, RegExp> = {
-  cq_grid:   new RegExp(`^CQ(?:\\s+[A-Z]{1,4})?\\s+(${CS})\\s+(${GRID})$`),
-  cq:        new RegExp(`^CQ(?:\\s+[A-Z]{1,4})?\\s+(${CS})$`),
-  answer:    new RegExp(`^(${CS})\\s+(${CS})\\s+(${GRID})$`),
-  r_report:  new RegExp(`^(${CS})\\s+(${CS})\\s+R${RPT}$`),
-  report:    new RegExp(`^(${CS})\\s+(${CS})\\s+${RPT}$`),
-  rr73:      new RegExp(`^(${CS})\\s+(${CS})\\s+RR73$`),
-  rrr:       new RegExp(`^(${CS})\\s+(${CS})\\s+RRR$`),
-  tx73:      new RegExp(`^(${CS})\\s+(${CS})\\s+73$`),
-};
+// "<...>" hashed-callsign placeholders stand for a callsign that didn't fit the
+// payload — a legitimate token, but not a usable callsign
+const isPlaceholder = (w: string) => w.includes('<') || w.includes('>');
+const isCallsignish = (w: string | undefined): boolean =>
+  !!w && (CS_EXACT.test(w) || isPlaceholder(w));
 
-export function parseFTMsg(raw: string): ParsedFTMsg {
-  let m: RegExpMatchArray | null;
-  if ((m = raw.match(RE.cq_grid)))  return { type: 'cq',      caller: m[1], grid: m[2], raw };
-  if ((m = raw.match(RE.cq)))       return { type: 'cq',      caller: m[1], raw };
-  // Sign-off / roger messages before "answer" so RR73 etc. never read as grids
-  if ((m = raw.match(RE.rr73)))     return { type: 'rr73',    caller: m[1], callee: m[2], raw };
-  if ((m = raw.match(RE.rrr)))      return { type: 'rrr',     caller: m[1], callee: m[2], raw };
-  if ((m = raw.match(RE.tx73)))     return { type: 'tx73',    caller: m[1], callee: m[2], raw };
-  if ((m = raw.match(RE.answer)))   return { type: 'answer',  caller: m[1], callee: m[2], grid: m[3], raw };
-  if ((m = raw.match(RE.r_report))) return { type: 'r_report',caller: m[1], callee: m[2], report: parseInt(m[3]), raw };
-  if ((m = raw.match(RE.report)))   return { type: 'report',  caller: m[1], callee: m[2], report: parseInt(m[3]), raw };
-  const parts = raw.trim().split(/\s+/);
-  return { type: 'other', caller: parts[0] ?? raw, raw };
-}
-
-const CS_EXACT = new RegExp(`^${CS}$`);
-
-// "<...>" hashed-callsign placeholders and the literal "CQ" are not callsigns
+// "<...>" placeholders and the literal "CQ" are not callsigns
 export function isValidCallsign(cs: string | undefined): cs is string {
   if (!cs) return false;
   if (cs === 'CQ' || cs.includes('<') || cs.includes('>')) return false;
   return CS_EXACT.test(cs);
+}
+
+// Every FT message is a handful of words, each one of: a callsign (or <...>
+// placeholder), a Maidenhead grid, a signal report (R±nn / ±nn), or a short
+// sign-off (73 / RRR / RR73). Classify word-by-word instead of whole-message
+// regexes so partially-captured messages still yield their usable parts —
+// e.g. "<...> PU7FTW HI72" must still record PU7FTW's locator.
+export function parseFTMsg(raw: string): ParsedFTMsg {
+  const words = raw.trim().toUpperCase().split(/\s+/).filter(Boolean);
+
+  // CQ form: CQ [DIR] CALLER [GRID]
+  if (words[0] === 'CQ') {
+    let i = 1;
+    // Directed-CQ tag (DX, NA, POTA, …) — letters only, not a callsign or grid
+    if (words[i] && /^[A-Z]{1,4}$/.test(words[i]) && !CS_EXACT.test(words[i]) && !GRID_EXACT.test(words[i])) i++;
+    const caller = words[i] ?? raw;
+    const grid   = words[i + 1] && GRID_EXACT.test(words[i + 1]) ? words[i + 1] : undefined;
+    const clean  = words.length <= i + 2 && isCallsignish(caller) &&
+                   (words[i + 1] === undefined || grid !== undefined);
+    return { type: 'cq', caller, grid, raw, clean };
+  }
+
+  // Partial-capture fragment "CALLER GRID" (e.g. a CQ with the CQ word lost,
+  // or a 3-word message missing its addressee): the locator follows its owner,
+  // so the location info is still usable
+  if (words.length === 2 && isCallsignish(words[0]) && GRID_EXACT.test(words[1])) {
+    return { type: 'answer', caller: words[0], grid: words[1], raw, clean: isValidCallsign(words[0]) };
+  }
+
+  // Standard form: CALLEE CALLER PAYLOAD — the SECOND callsign is the
+  // transmitting station; any grid/report in the payload is theirs
+  const [callee, caller, payload] = words;
+  const clean = words.length === 3 && isCallsignish(callee) && isCallsignish(caller) &&
+                (isValidCallsign(callee) || isValidCallsign(caller));
+  const base = { caller: caller ?? words[0] ?? raw, callee, raw };
+
+  if (payload !== undefined) {
+    let m: RegExpMatchArray | null;
+    if (GRID_EXACT.test(payload))       return { type: 'answer',  ...base, grid: payload, clean };
+    if ((m = payload.match(RPT_EXACT))) return { type: m[1] ? 'r_report' : 'report', ...base, report: parseInt(m[2]), clean };
+    if (payload === 'RR73')             return { type: 'rr73', ...base, clean };
+    if (payload === 'RRR')              return { type: 'rrr',  ...base, clean };
+    if (payload === '73')               return { type: 'tx73', ...base, clean };
+  }
+  return { type: 'other', ...base, clean: false };
 }
 
 export function gridToLatLon(grid: string): [number, number] | null {
@@ -62,6 +88,17 @@ export function gridToLatLon(grid: string): [number, number] | null {
   const n1 = parseInt(g[3]);
   if (c0 < 0 || c0 > 17 || c1 < 0 || c1 > 17 || isNaN(n0) || isNaN(n1)) return null;
   return [c1 * 10 - 90 + n1 + 0.5, c0 * 20 - 180 + n0 * 2 + 1];
+}
+
+// Great-circle distance between two [lat, lon] points
+export function haversineKm(a: [number, number], b: [number, number]): number {
+  const R = 6371;
+  const toRad = (d: number) => (d * Math.PI) / 180;
+  const dLat = toRad(b[0] - a[0]);
+  const dLon = toRad(b[1] - a[1]);
+  const s = Math.sin(dLat / 2) ** 2 +
+    Math.cos(toRad(a[0])) * Math.cos(toRad(b[0])) * Math.sin(dLon / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(s));
 }
 
 export const CONTACT_PALETTE = [
@@ -81,8 +118,9 @@ export interface ContactMsg {
 
 export interface Contact {
   callsign: string;
-  grid?: string;
-  latLon?: [number, number];
+  grid?: string;             // most recently reported locator
+  grids: string[];           // every locator seen, in order of first appearance
+  latLon?: [number, number]; // position of the most recent locator
   color: string;
   msgs: ContactMsg[];
   peers: Set<string>;
@@ -103,6 +141,7 @@ export function mergeContacts(
       const idx = (contacts.size + colorOffset) % CONTACT_PALETTE.length;
       contacts.set(callsign, {
         callsign,
+        grids: [],
         color: CONTACT_PALETTE[idx],
         msgs: [],
         peers: new Set(),
@@ -114,12 +153,11 @@ export function mergeContacts(
   };
 
   for (const { msg: raw, freq, snr } of messages) {
-    // Require ≥3 readable words ("<...>" placeholders don't count) — anything
-    // shorter is a partial/garbled decode not worth tracking as a contact
-    const readable = raw.trim().split(/\s+/).filter(w => !w.includes('<') && !w.includes('>'));
-    if (readable.length < 3) continue;
+    const parsed = parseFTMsg(raw);
+    // Garbled decodes (any unclassifiable word) are not tracked. Partial
+    // captures with <...> placeholders ARE clean — their valid side is used.
+    if (!parsed.clean) continue;
 
-    const parsed      = parseFTMsg(raw);
     const callerValid = isValidCallsign(parsed.caller);
     const calleeValid = isValidCallsign(parsed.callee);
     if (!callerValid && !calleeValid) continue;
@@ -130,9 +168,15 @@ export function mergeContacts(
       caller.msgs.push({ windowStart, raw, parsed, freq, snr, role: 'tx' });
       caller.lastSeen = windowStart;
 
-      if (parsed.grid && !caller.grid) {
-        caller.grid   = parsed.grid;
-        caller.latLon = gridToLatLon(parsed.grid) ?? undefined;
+      // The grid always belongs to the transmitting station. A station can
+      // legitimately report several locators (portable/rover) — keep them all,
+      // with `grid`/`latLon` tracking the most recent one
+      if (parsed.grid) {
+        if (!caller.grids.includes(parsed.grid)) caller.grids.push(parsed.grid);
+        if (caller.grid !== parsed.grid) {
+          caller.grid   = parsed.grid;
+          caller.latLon = gridToLatLon(parsed.grid) ?? undefined;
+        }
       }
       if (calleeValid) caller.peers.add(parsed.callee!);
     }
