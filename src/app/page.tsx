@@ -5,9 +5,10 @@ import RTTYDecoder from "@/components/RTTYDecoder";
 import SSTVDecoder from "@/components/SSTVDecoder";
 import CWDecoder from "@/components/CWDecoder";
 import FTDecoder, { FTModeSelector } from "@/components/FTDecoder";
+import MFSKDecoder from "@/components/MFSKDecoder";
 import { FTMode } from '@/lib/ft/decoder';
 
-type DecoderMode = 'rtty' | 'sstv' | 'cw' | 'ft';
+type DecoderMode = 'rtty' | 'sstv' | 'cw' | 'ft' | 'mfsk';
 
 const MODE_META: Record<DecoderMode, { label: string; description: string }> = {
   rtty: {
@@ -25,6 +26,10 @@ const MODE_META: Record<DecoderMode, { label: string; description: string }> = {
   ft: {
     label: 'FT8/4',
     description: 'FT8 & FT4 weak-signal decoder — UTC clock-synchronized, structured QSO messages',
+  },
+  mfsk: {
+    label: 'MFSK',
+    description: 'Multiple Frequency Shift Keying decoder — configurable tones, live bit-stream grid',
   },
 };
 
@@ -51,7 +56,7 @@ export default function Home() {
           <div className="flex flex-col items-end gap-2 shrink-0">
             {/* Main mode toggle */}
             <div className="flex items-center gap-1 bg-[#0d1117] border border-[#30363d] rounded-lg p-1">
-              {(['rtty', 'sstv', 'cw', 'ft'] as DecoderMode[]).map((m) => (
+              {(['rtty', 'sstv', 'cw', 'ft', 'mfsk'] as DecoderMode[]).map((m) => (
                 <button
                   key={m}
                   onClick={() => setMode(m)}
@@ -79,6 +84,7 @@ export default function Home() {
         {mode === 'rtty' ? <RTTYDecoder /> :
          mode === 'sstv' ? <SSTVDecoder /> :
          mode === 'cw'   ? <CWDecoder /> :
+         mode === 'mfsk' ? <MFSKDecoder /> :
                            <FTDecoder ftMode={ftMode} />}
       </div>
     </main>
