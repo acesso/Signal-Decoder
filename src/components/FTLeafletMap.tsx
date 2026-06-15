@@ -22,14 +22,36 @@ function makeIcon(color: string) {
   });
 }
 
-// Start zoomed out so the entire world fits the container
+// Start zoomed out so the entire world fits the container.
+// Also watches for the container becoming visible (ResizeObserver) so that
+// when the panel is initially hidden the map corrects itself on first show.
 function FitWorld() {
   const map = useMap();
   useEffect(() => {
-    map.invalidateSize();
-    map.fitWorld();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+    const container = map.getContainer();
+    let fitted = false;
+
+    const doFit = () => {
+      map.invalidateSize();
+      map.fitWorld();
+      fitted = true;
+    };
+
+    // Immediate attempt (works when the container is already visible)
+    if (container.offsetWidth > 0 && container.offsetHeight > 0) {
+      doFit();
+      return;
+    }
+
+    // Container is hidden — watch for it to gain non-zero size
+    const ro = new ResizeObserver(() => {
+      if (!fitted && container.offsetWidth > 0 && container.offsetHeight > 0) {
+        doFit();
+      }
+    });
+    ro.observe(container);
+    return () => ro.disconnect();
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
   return null;
 }
 
