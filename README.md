@@ -2,7 +2,7 @@
     📡 Signal Decoder
 </h1>
 <p align="center">
-   <strong>Decode radio signals in your browser!</strong> Free, open-source web application for real-time decoding of RTTY (Radio Teletype / Baudot), CW (Morse code), SSTV (Slow Scan Television), and FT8/FT4 digital signals from microphone input. Works offline as a PWA. Forked from <a href="https://github.com/smolgroot/sstv-decoder">smolgroot/sstv-decoder</a>.
+   <strong>Decode radio signals in your browser!</strong> Free, open-source web application for real-time decoding of RTTY (Radio Teletype / Baudot), CW (Morse code), SSTV (Slow Scan Television), FT8/FT4 digital signals, and MFSK modes from microphone input. Works offline as a PWA. Forked from <a href="https://github.com/smolgroot/sstv-decoder">smolgroot/sstv-decoder</a>.
 </p>
 <p align="center">
    <em>This is a fully vibe coded project — every line was written by an AI coding agent driven by human prompts.</em>
@@ -39,7 +39,7 @@
 
 1. **Visit** → [acesso.github.io/Signal-Decoder](https://acesso.github.io/Signal-Decoder)
 2. **Allow** microphone access when prompted
-3. **Play** an RTTY, CW, SSTV, or FT8/FT4 signal near your microphone
+3. **Play** an RTTY, CW, SSTV, FT8/FT4, or MFSK signal near your microphone
 4. **Watch** the text, image, or contacts decode in real-time!
 
 No installation, no downloads, no setup - just open and decode!
@@ -50,6 +50,7 @@ No installation, no downloads, no setup - just open and decode!
 - **CW Decoding**: Morse code decoder with automatic speed detection and dual-channel A/B mode
 - **SSTV Decoding**: 15 modes — Robot36/72, Scottie S1/S2/DX, Martin M1/M2, PD50/90/120/160/180/240/290, Wraase SC2-180
 - **FT8/FT4 Decoding**: UTC-synchronized window decoding with QSO contact tracking, world map, and ADIF export
+- **MFSK Decoding**: All fldigi MFSK modes (MFSK4 through MFSK128) with K=7 R=1/2 FEC and IZ8BLY varicode
 - **Mode Auto-Detection**: Automatically identifies the incoming signal type
 - **Session Gallery**: Review and save decoded sessions
 - **Real-time Audio Processing**: Captures microphone input using Web Audio API (auto-detects 44.1 kHz or 48 kHz)
@@ -178,6 +179,50 @@ Enable **A/B Mode** to run two independent CW decoders simultaneously on differe
 5. Set **speed**: leave adaptive off and type the known WPM, or enable **Adaptive WPM** to let the decoder track the sender automatically — the live detected WPM is always visible as a suggestion even in manual mode
 6. For a two-station QSO, enable **A/B Mode** and drag the **B** marker to the second tone
 
+## MFSK Decoder
+
+Real-time decoding of MFSK (Multiple Frequency Shift Keying) modes using Goertzel-based tone detection, K=7 R=1/2 Viterbi FEC, and IZ8BLY varicode character decoding — matching fldigi's implementation exactly.
+
+### Supported MFSK Presets
+
+| Preset | Tones | Baud Rate | FEC | Center |
+|--------|-------|-----------|-----|--------|
+| **fldigi MFSK4** | 32 | 3.9 Bd | K=7 R=1/2, depth 5 | 1500 Hz |
+| **fldigi MFSK8** | 32 | 7.8 Bd | K=7 R=1/2, depth 5 | 1500 Hz |
+| **fldigi MFSK16** | 16 | 15.6 Bd | K=7 R=1/2, depth 10 | 1500 Hz |
+| **fldigi MFSK32** | 16 | 31.25 Bd | K=7 R=1/2, depth 10 | 1500 Hz |
+| **fldigi MFSK64** | 16 | 62.5 Bd | K=7 R=1/2, depth 10 | 1500 Hz |
+| **fldigi MFSK128** | 16 | 125 Bd | K=7 R=1/2, depth 20 | 1500 Hz |
+| **Classic MFSK-4/8/16/32** | 4–32 | varies | None (IZ8BLY only) | 1500 Hz |
+
+### MFSK Parameters
+
+| Parameter | Default | Notes |
+|-----------|---------|-------|
+| **Center Frequency** | 1500 Hz | Move all tones as a group |
+| **Baud Rate** | preset | Goertzel block size = sampleRate / baudRate |
+| **Squelch** | 0% | Gate against noise floor |
+| **FEC** | K=7 R=1/2 | Convolutional code + de-interleaving |
+
+### MFSK Signal Processing
+
+- **Goertzel detection**: Per-tone power computed over each symbol block (block size = sampleRate / baudRate)
+- **Gray code**: Tone index decoded with Gray coding (matching fldigi's `mfsk.cxx`)
+- **Soft decisions**: Raw Goertzel power scaled to 8-bit soft bits for Viterbi input
+- **De-interleaver**: Reverse cascade interleaver, depth varies by mode
+- **Viterbi decoder**: K=7, polynomials 0x6d / 0x4f, traceback 84 steps
+- **Varicode**: IZ8BLY varicode bit stream → ASCII characters
+
+### MFSK How to Use
+
+1. Select **MFSK** from the top tab bar
+2. Click **— load preset —** and select the matching mode (e.g. *fldigi MFSK16 — 16 tones / 15.6 Bd*)
+3. Use the **Center** input to shift all tones to the signal's center frequency
+4. Click **Start** and allow microphone access
+5. Adjust **Squelch** to suppress noise between transmissions
+6. Decoded text appears in the output panel in real-time
+7. Switch presets at any time — the decoder resets automatically
+
 ## FT8 / FT4 Decoder
 
 Real-time decoding of the WSJT-X FT digital modes, with automatic QSO tracking. Decoding is powered by [ft8ts](https://github.com/e04/ft8ts) (GPL-3.0) and runs entirely in the browser.
@@ -289,7 +334,7 @@ npm start
 
 ## How to Use
 
-Select a mode from the top tab bar (RTTY / CW / SSTV / FT), then click **Start** and allow microphone access when prompted.
+Select a mode from the top tab bar (RTTY / CW / SSTV / FT / MFSK), then click **Start** and allow microphone access when prompted.
 
 ### RTTY
 
@@ -436,6 +481,8 @@ src/
 │   ├── FTDecoder.tsx           # FT8/FT4 decoder UI (clock ring, waterfall, messages)
 │   ├── FTContactsPanel.tsx     # FT contact list, QSO history, sorting, ADIF export
 │   ├── FTLeafletMap.tsx        # World map of located FT contacts (Leaflet)
+│   ├── MFSKDecoder.tsx         # MFSK decoder UI (bit grid, spectrum, channel manager)
+│   ├── GLSpectrogram.tsx       # WebGL 3D spectrogram (terrain + ridge views)
 │   ├── SessionCard.tsx         # Decoded session display card
 │   ├── SettingsPanel.tsx       # Mode selection settings panel
 │   └── PWAInstallPrompt.tsx    # PWA install prompt
@@ -443,7 +490,8 @@ src/
 │   ├── useAudioProcessor.ts    # Web Audio API integration (mode-aware)
 │   ├── useCWProcessor.ts       # CW audio capture + decoder loop
 │   ├── useRTTYProcessor.ts     # RTTY audio capture + decoder loop
-│   └── useFTProcessor.ts       # UTC-windowed FT8/FT4 capture + decode
+│   ├── useFTProcessor.ts       # UTC-windowed FT8/FT4 capture + decode
+│   └── useMFSKProcessor.ts     # MFSK audio capture + Goertzel decoder loop
 └── lib/
     ├── rtty/
     │   ├── decoder.ts          # RTTY Baudot/ITA2 decoder
@@ -456,6 +504,10 @@ src/
     │   ├── decoder.ts          # FT8/FT4 window decoding (ft8ts)
     │   ├── parser.ts           # Message classification, callsign/grid extraction, ADIF
     │   └── lookup.ts           # Async reverse geocoding + operator lookups
+    ├── mfsk/
+    │   ├── decoder.ts          # MFSKDecoder: Goertzel-based tone detection
+    │   ├── fec.ts              # FEC pipeline: de-interleaver + Viterbi + varicode
+    │   └── varicode.ts         # IZ8BLY varicode lookup table and bit-stream decoder
     └── sstv/
         ├── constants.ts             # SSTV mode specifications
         ├── decoder.ts               # Main decoder orchestration (multi-mode)
@@ -486,25 +538,6 @@ doc/
 - Stack overflow on very long lines (>6 seconds) - indicates lost sync
 - Best results with clean, strong signals from radio or audio playback
 - Safari iOS may have slightly higher latency (~34ms) due to polling approach
-
-## Future Improvements
-
-### High Priority
-- [x] **VIS Code Detection**: Automatic mode selection based on VIS header detection
-- [x] **Additional PD Modes**: PD50, PD90, PD240, PD290
-- [ ] **Audio File Upload**: Decode from WAV/MP3 files for offline processing
-
-### Medium Priority
-- [x] **Scottie DX Mode**: DX variant with 4m 34s transmission time (RGB sequential encoding)
-- [x] **Martin Modes**: M1, M2 (GBR sequential encoding)
-- [x] **Wraase SC2-180**: High-quality RGB mode
-- [ ] **Improved Noise Reduction**: Advanced filtering for weak signals
-- [x] **Signal Quality Metrics**: SNR calculation and display
-
-### Low Priority
-- [ ] **Waterfall Display**: Full spectrogram history
-- [x] **Multi-image Gallery**: Store and compare multiple decoded images
-- [ ] **Export Metadata**: Include signal quality in saved filenames
 
 ## Contributing
 

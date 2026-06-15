@@ -22,11 +22,14 @@ interface Props {
   view: GLView;
   gamma: number;
   height: number;
-  maxHz: number;           // frequency span of incoming rows (display range)
+  minHz?: number;          // lower bound of the display window (default 0)
+  maxHz: number;           // upper bound of the display window
   bands?: SpectroBand[];
   bandAlpha?: number;      // 0..1 opacity of the band overlays
+  markers?: SpectroBand[]; // screen-space center-line markers (projected to front edge)
   sqlLevel?: number;       // 0..1 squelch threshold — rendered as a cutting plane
   sqlAlpha?: number;       // 0..1 opacity of the squelch plane
+  sqlGridSize?: number;    // grid resolution (cols = size*2, rows = size); enables grid mode
 }
 
 // History texture: TEX_W frequency bins × TEX_H rows, written as a ring buffer
@@ -35,7 +38,7 @@ const TEX_W = 512;
 const TEX_H = 256;
 const BG: [number, number, number] = [0.051, 0.067, 0.09]; // #0d1117
 const SQL_COLOR: [number, number, number] = [0.89, 0.70, 0.25]; // #e3b341
-const MAX_BANDS = 4;
+const MAX_BANDS = 8;
 const HEIGHT_SCALE = 0.55;
 
 const TERRAIN_X = 96;   // mesh columns (frequency)
@@ -92,6 +95,77 @@ vec3 applyGrid(vec3 c, float x) {
   float minor = gridK(x, uGrid.x, 0.0025);
   float major = gridK(x, uGrid.y, 0.0035);
   return mix(c, vec3(0.55, 0.60, 0.66), minor * 0.10 + major * 0.18);
+}
+`;
+
+// ── SQL grid shaders (terrain mode only) ────────────────────────────────────
+// The plane at the squelch height is replaced by a grid of cells. Each cell
+// is snapped to a centre sample from the ring-buffer texture; if that sample
+// exceeds the raw squelch level the cell lights up in the channel's colour.
+
+const SQL_GRID_VS = `
+precision mediump float;
+attribute vec2 aPos; // x = freq [0,1], y = depth/time [0,1]
+uniform mat4 uMVP;
+uniform float uY;
+varying float vX;
+varying float vZ;
+void main() {
+  vX = aPos.x;
+  vZ = aPos.y;
+  gl_Position = uMVP * vec4(aPos.x * 2.0 - 1.0, uY, -aPos.y * 2.0, 1.0);
+}
+`;
+
+const SQL_GRID_FS = `
+precision mediump float;
+varying float vX;
+varying float vZ;
+uniform sampler2D uTex;
+uniform float uHead, uDepth, uSqlLvl, uAlpha;
+uniform vec2  uGridCells;
+uniform int   uBandCount;
+uniform vec2  uBandRange[${MAX_BANDS}];
+uniform vec3  uBandColor[${MAX_BANDS}];
+uniform float uBandStrength[${MAX_BANDS}];
+uniform float uBandAlpha;
+
+vec3 channelCol(float x) {
+  for (int i = 0; i < ${MAX_BANDS}; i++) {
+    if (i >= uBandCount) break;
+    if (x >= uBandRange[i].x && x <= uBandRange[i].y) {
+      return uBandColor[i];
+    }
+  }
+  return vec3(0.89, 0.70, 0.25); // amber default
+}
+
+void main() {
+  // Snap to cell centre so every fragment in a cell shares the same sample
+  vec2 cc = (floor(vec2(vX, vZ) * uGridCells) + 0.5) / uGridCells;
+
+  // Sample history at cell centre
+  float texV = fract(uHead - cc.y * uDepth);
+  float raw  = texture2D(uTex, vec2(cc.x, texV)).r;
+
+  // Grid line mask (thin border around each cell)
+  vec2  cellFrac = fract(vec2(vX, vZ) * uGridCells);
+  float lineW    = 0.055;
+  float isLine   = max(step(1.0 - lineW, cellFrac.x), step(1.0 - lineW, cellFrac.y));
+
+  bool  lit    = raw > uSqlLvl;
+  vec3  litCol = channelCol(cc.x);
+
+  vec3 cellCol;
+  if (lit) {
+    float t = clamp((raw - uSqlLvl) / max(1.0 - uSqlLvl, 0.01) * 0.6 + 0.38, 0.15, 1.0);
+    cellCol = litCol * t;
+  } else {
+    cellCol = vec3(0.04, 0.055, 0.08);
+  }
+
+  vec3 lineCol = lit ? litCol * 0.22 : vec3(0.11, 0.14, 0.19);
+  gl_FragColor = vec4(mix(cellCol, lineCol, isLine), uAlpha);
 }
 `;
 
@@ -327,7 +401,7 @@ interface BandUniforms {
 // ── Component ─────────────────────────────────────────────────────────────────
 
 const GLSpectrogram = forwardRef<GLSpectrogramHandle, Props>(function GLSpectrogram(
-  { view, gamma, height, maxHz, bands, bandAlpha = 0.3, sqlLevel, sqlAlpha = 0.3 }, ref,
+  { view, gamma, height, minHz = 0, maxHz, bands, bandAlpha = 0.3, markers, sqlLevel, sqlAlpha = 0.3, sqlGridSize }, ref,
 ) {
   const canvasRef  = useRef<HTMLCanvasElement>(null);
   const glRef      = useRef<WebGLRenderingContext | null>(null);
@@ -342,44 +416,63 @@ const GLSpectrogram = forwardRef<GLSpectrogramHandle, Props>(function GLSpectrog
     count: 0,
     alpha: bandAlpha,
   });
-  const sqlRef     = useRef<{ level?: number; alpha: number }>({ level: sqlLevel, alpha: sqlAlpha });
+  const sqlRef         = useRef<{ level?: number; alpha: number }>({ level: sqlLevel, alpha: sqlAlpha });
+  const sqlGridSizeRef = useRef<number | undefined>(sqlGridSize);
   const gridRef    = useRef<[number, number]>([0.1, 0.2]); // normalized (minor, major) steps
+  const minHzRef   = useRef(minHz);
+  const maxHzRef   = useRef(maxHz);
   const terrainCam = useRef({ ...TERRAIN_CAM });
   const ridgeCam   = useRef({ ...RIDGE_CAM });
   const rowScratch = useRef(new Uint8Array(TEX_W));
   const labelElsRef = useRef<(HTMLSpanElement | null)[]>([]);
+  const markerElsRef = useRef<(HTMLDivElement | null)[]>([]);
+  const markersRef = useRef<SpectroBand[]>([]);
   const [failed, setFailed] = useState(false);
 
   // Frequency reference grid: minor lines + labelled major lines
-  const gridMinorHz = maxHz > 2000 ? 250 : 125;
-  const gridMajorHz = maxHz > 2000 ? 1000 : 500;
+  const span = maxHz - minHz;
+  const gridMinorHz = span > 2000 ? 250 : 125;
+  const gridMajorHz = span > 2000 ? 1000 : 500;
   const labels = useMemo(() => {
     const out: { x: number; text: string }[] = [];
-    for (let hz = gridMajorHz; hz < maxHz; hz += gridMajorHz) {
-      out.push({ x: hz / maxHz, text: formatHz(hz) });
+    const firstMaj = Math.ceil(minHz / gridMajorHz) * gridMajorHz;
+    for (let hz = firstMaj; hz < maxHz; hz += gridMajorHz) {
+      out.push({ x: (hz - minHz) / span, text: formatHz(hz) });
     }
     return out;
-  }, [maxHz, gridMajorHz]);
+  }, [minHz, maxHz, gridMajorHz, span]);
   const labelsRef = useRef(labels);
   useEffect(() => {
     labelsRef.current = labels;
-    gridRef.current = [gridMinorHz / maxHz, gridMajorHz / maxHz];
+    gridRef.current = [gridMinorHz / span, gridMajorHz / span];
+    minHzRef.current = minHz;
+    maxHzRef.current = maxHz;
     renderRef.current?.();
-  }, [labels, gridMinorHz, gridMajorHz, maxHz]);
+  }, [labels, gridMinorHz, gridMajorHz, span, minHz, maxHz]);
 
+  useEffect(() => {
+    const list = markers ?? [];
+    markersRef.current = list;
+    markerElsRef.current = markerElsRef.current.slice(0, list.length);
+    renderRef.current?.();
+  }, [markers]);
   useEffect(() => { gammaRef.current = gamma; renderRef.current?.(); }, [gamma]);
   useEffect(() => {
     sqlRef.current = { level: sqlLevel, alpha: sqlAlpha };
     renderRef.current?.();
   }, [sqlLevel, sqlAlpha]);
+  useEffect(() => {
+    sqlGridSizeRef.current = sqlGridSize;
+    renderRef.current?.();
+  }, [sqlGridSize]);
 
   // Pack band props into uniform-ready arrays
   useEffect(() => {
     const b = bandsRef.current;
     const list = (bands ?? []).slice(0, MAX_BANDS);
     list.forEach((band, i) => {
-      b.ranges[i * 2]     = Math.max(0, band.fromHz / maxHz);
-      b.ranges[i * 2 + 1] = Math.min(1, band.toHz / maxHz);
+      b.ranges[i * 2]     = Math.max(0, (band.fromHz - minHz) / span);
+      b.ranges[i * 2 + 1] = Math.min(1, (band.toHz - minHz) / span);
       const [r, g, bl] = hexToRgb(band.color);
       b.colors[i * 3] = r; b.colors[i * 3 + 1] = g; b.colors[i * 3 + 2] = bl;
       b.strengths[i] = band.line ? 1.0 : 0.45;
@@ -387,7 +480,7 @@ const GLSpectrogram = forwardRef<GLSpectrogramHandle, Props>(function GLSpectrog
     b.count = list.length;
     b.alpha = bandAlpha;
     renderRef.current?.();
-  }, [bands, bandAlpha, maxHz]);
+  }, [bands, bandAlpha, minHz, maxHz, span]);
 
   // Context + shared history texture — created once, survives view switches
   useEffect(() => {
@@ -482,7 +575,7 @@ const GLSpectrogram = forwardRef<GLSpectrogramHandle, Props>(function GLSpectrog
     };
     const sqlHeight = () => Math.pow(sqlRef.current.level ?? 0, gammaRef.current) * HEIGHT_SCALE;
 
-    // Position the HTML frequency labels using the active projection
+    // Position the HTML frequency labels and channel markers using the active projection
     const placeLabels = (project: (xNorm: number) => [number, number] | null) => {
       const W = canvas.clientWidth, H = canvas.clientHeight;
       labelsRef.current.forEach((lb, i) => {
@@ -496,6 +589,18 @@ const GLSpectrogram = forwardRef<GLSpectrogramHandle, Props>(function GLSpectrog
         el.style.display = 'block';
         el.style.left = `${pos[0]}px`;
         el.style.top  = `${Math.min(H - 14, pos[1])}px`;
+      });
+      // Channel center markers: full-height vertical lines at the projected front-edge x
+      const spanLocal = maxHzRef.current - minHzRef.current;
+      markersRef.current.forEach((mk, i) => {
+        const el = markerElsRef.current[i];
+        if (!el) return;
+        const centerHz = (mk.fromHz + mk.toHz) / 2;
+        const xNorm = (centerHz - minHzRef.current) / spanLocal;
+        const pos = project(xNorm);
+        if (!pos || pos[0] < 0 || pos[0] > W) { el.style.display = 'none'; return; }
+        el.style.display = 'block';
+        el.style.left = `${pos[0]}px`;
       });
     };
 
@@ -532,6 +637,52 @@ const GLSpectrogram = forwardRef<GLSpectrogramHandle, Props>(function GLSpectrog
         grid: gl.getUniformLocation(prog, 'uGrid'),
         bands: bandLocs(prog),
       };
+
+      // SQL grid program — replaces the solid plane with an animated cell grid
+      const sqlGridProg = mkProgram(SQL_GRID_VS, SQL_GRID_FS);
+      const sqlGridLoc = sqlGridProg ? {
+        aPos:      gl.getAttribLocation(sqlGridProg, 'aPos'),
+        mvp:       gl.getUniformLocation(sqlGridProg, 'uMVP'),
+        y:         gl.getUniformLocation(sqlGridProg, 'uY'),
+        tex:       gl.getUniformLocation(sqlGridProg, 'uTex'),
+        head:      gl.getUniformLocation(sqlGridProg, 'uHead'),
+        depth:     gl.getUniformLocation(sqlGridProg, 'uDepth'),
+        sqlLvl:    gl.getUniformLocation(sqlGridProg, 'uSqlLvl'),
+        alpha:     gl.getUniformLocation(sqlGridProg, 'uAlpha'),
+        gridCells: gl.getUniformLocation(sqlGridProg, 'uGridCells'),
+        bands:     bandLocs(sqlGridProg),
+      } : null;
+
+      const drawSqlGrid = (mvp: Float32Array) => {
+        const sql = sqlRef.current;
+        if (sql.level === undefined || sql.alpha <= 0) return;
+        const gs = sqlGridSizeRef.current;
+        if (!gs || !sqlGridProg || !sqlGridLoc) {
+          drawSql(0, sqlHeight(), mvp); // fallback to solid plane
+          return;
+        }
+        gl.useProgram(sqlGridProg);
+        gl.enable(gl.BLEND);
+        gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+        gl.depthMask(false);
+        gl.bindBuffer(gl.ARRAY_BUFFER, sqlQuad);
+        gl.enableVertexAttribArray(sqlGridLoc.aPos);
+        gl.vertexAttribPointer(sqlGridLoc.aPos, 2, gl.FLOAT, false, 0, 0);
+        gl.uniformMatrix4fv(sqlGridLoc.mvp, false, mvp);
+        gl.uniform1f(sqlGridLoc.y, sqlHeight());
+        gl.bindTexture(gl.TEXTURE_2D, texRef.current);
+        gl.uniform1i(sqlGridLoc.tex, 0);
+        gl.uniform1f(sqlGridLoc.head, headNorm());
+        gl.uniform1f(sqlGridLoc.depth, DEPTH);
+        gl.uniform1f(sqlGridLoc.sqlLvl, sql.level);
+        gl.uniform1f(sqlGridLoc.alpha, sql.alpha);
+        gl.uniform2f(sqlGridLoc.gridCells, gs * 2, gs);
+        setBandUniforms(sqlGridLoc.bands);
+        gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+        gl.disable(gl.BLEND);
+        gl.depthMask(true);
+      };
+
       renderRef.current = () => {
         const cam = terrainCam.current;
         gl.viewport(0, 0, canvas.width, canvas.height);
@@ -559,7 +710,7 @@ const GLSpectrogram = forwardRef<GLSpectrogramHandle, Props>(function GLSpectrog
         gl.uniform2f(loc.grid, gridRef.current[0], gridRef.current[1]);
         setBandUniforms(loc.bands);
         gl.drawElements(gl.TRIANGLES, idx.length, gl.UNSIGNED_SHORT, 0);
-        drawSql(0, sqlHeight(), mvp);
+        drawSqlGrid(mvp);
         // Labels track the front edge of the mesh (y=0, z=0)
         placeLabels(xNorm => {
           const px = xNorm * 2 - 1;
@@ -775,6 +926,21 @@ const GLSpectrogram = forwardRef<GLSpectrogramHandle, Props>(function GLSpectrog
         >
           {lb.text}
         </span>
+      ))}
+      {(markers ?? []).map((mk, i) => (
+        <div
+          key={i}
+          ref={el => { markerElsRef.current[i] = el; }}
+          className="absolute top-0 bottom-0 pointer-events-none"
+          style={{
+            display: 'none',
+            width: '1px',
+            transform: 'translateX(-50%)',
+            background: mk.color,
+            opacity: 0.55,
+            boxShadow: `0 0 3px ${mk.color}`,
+          }}
+        />
       ))}
       <div className="absolute bottom-1.5 right-2 text-[9px] font-mono text-[#484f58] pointer-events-none select-none">
         {view === 'terrain' ? 'drag rotate · shift+drag pan · scroll zoom · dblclick reset' : 'drag pan · scroll zoom · dblclick reset'}
