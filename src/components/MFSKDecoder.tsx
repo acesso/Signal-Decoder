@@ -1,15 +1,14 @@
 'use client';
 
-import { useEffect, useRef, useCallback, useState, useMemo } from 'react';
+import { useEffect, useRef, useCallback, useState, forwardRef, useImperativeHandle } from 'react';
+import type { DecoderControls, DecoderProps } from './DecoderControls';
+import AudioAnalysisPanel from './AudioAnalysisPanel';
 import { useMFSKProcessor } from '@/hooks/useMFSKProcessor';
 import type { MFSKSymbol, MFSKWord } from '@/hooks/useMFSKProcessor';
 import { MFSKChannel, MFSKDecoderOptions, DEFAULT_DECODER_OPTIONS } from '@/lib/mfsk/decoder';
 import { bitsToBaudotCode, decodeBaudotCodePoints } from '@/lib/mfsk/baudot';
 import { decodeMFSKVaricode } from '@/lib/mfsk/varicode';
 import { decodeMFSKWithFECIncremental, makeFECCursor, FECCursor } from '@/lib/mfsk/fec';
-import GLSpectrogram, { GLSpectrogramHandle, GLView } from './GLSpectrogram';
-
-type SpectrogramView = 'legacy' | GLView;
 type Encoding = 'ascii' | 'baudot' | 'varicode';
 
 const CANVAS_H       = 200;
@@ -541,7 +540,7 @@ function ToneRow({
 
 // ── Main component ────────────────────────────────────────────────────────────
 
-export default function MFSKDecoder() {
+const MFSKDecoder = forwardRef<DecoderControls, DecoderProps>(function MFSKDecoder({ onStateChange, analyser }, ref) {
 
   // ── Core params ───────────────────────────────────────────────────────────
   const [channels,  setChannels]  = useState<MFSKChannel[]>(DEFAULT_CHANNELS);
@@ -550,7 +549,6 @@ export default function MFSKDecoder() {
   const [channelBw, setChannelBw] = useState(80);
   const [gridSize,  setGridSize]  = useState(48);
   const [showGrid,       setShowGrid]       = useState(true);
-  const [lockChannels,   setLockChannels]   = useState(true);
 
   // ── Decoder options ───────────────────────────────────────────────────────
   const [decoderOpts, setDecoderOpts] = useState<Partial<MFSKDecoderOptions>>({
@@ -584,27 +582,6 @@ export default function MFSKDecoder() {
   // ── Active preset label ───────────────────────────────────────────────────
   const [activePresetLabel, setActivePresetLabel] = useState<string | null>(null);
 
-  // ── Center frequency display when dragging ────────────────────────────────
-  const [draggingCenterFreq, setDraggingCenterFreq] = useState<number | null>(null);
-  const [centerFreqInput, setCenterFreqInput] = useState('');
-
-  // Compute center frequency from current channels
-  const centerFreq = useMemo(() => {
-    if (channels.length === 0) return 0;
-    const freqs = channels.map(c => c.freq);
-    return Math.round((Math.min(...freqs) + Math.max(...freqs)) / 2);
-  }, [channels]);
-
-  // ── Display frequency range ───────────────────────────────────────────────
-  const [displayMinHz, setDisplayMinHz] = useState(0);
-  const [displayMaxHz, setDisplayMaxHz] = useState(3000);
-
-  // ── Spectrogram ───────────────────────────────────────────────────────────
-  const [sgView,  setSgView]  = useState<SpectrogramView>('terrain');
-  const [sgGamma, setSgGamma] = useState(3.0);
-  const [sgSpeed, setSgSpeed] = useState(2);
-  const [bandAlpha, setBandAlpha] = useState(0.3);
-
   // ── Hook ──────────────────────────────────────────────────────────────────
   const { state, startRecording, stopRecording, clearSymbols, getAnalyser, getSymbols, getWords, getSymbolCount } =
     useMFSKProcessor(channels, baudRate, squelch, decoderOpts);
@@ -621,32 +598,15 @@ export default function MFSKDecoder() {
   }, [state.clearId]);
 
   // ── Canvas refs ───────────────────────────────────────────────────────────
-  const specRef    = useRef<HTMLCanvasElement>(null);
-  const sgCanvRef  = useRef<HTMLCanvasElement>(null);
   const bitRef      = useRef<HTMLCanvasElement>(null);
   const hoverCanvRef = useRef<HTMLCanvasElement>(null);
   const hoverPosRef  = useRef<{x:number;y:number}|null>(null);
-  const glSgRef    = useRef<GLSpectrogramHandle>(null);
   const txtRef     = useRef<HTMLPreElement>(null);
   const txtBufRef  = useRef(''); // rolling text buffer for the decoded output box
   const rafRef     = useRef<number | null>(null);
-  const sgFrmRef   = useRef(0);
   const lastDecRef = useRef(0);
   const lastWrdRef = useRef(0);
   const lastRowRef = useRef(-1);
-
-  // Spectrogram container height
-  const sgContainerRef     = useRef<HTMLDivElement>(null);
-  const [sgH, setSgH]      = useState(300);
-  const sgHRef             = useRef(300);
-  useEffect(() => {
-    const el = sgContainerRef.current; if (!el) return;
-    const ro = new ResizeObserver(e => {
-      const h = Math.round(e[0].contentRect.height);
-      if (h>60 && Math.abs(h-sgHRef.current)>4) { sgHRef.current=h; setSgH(h); }
-    });
-    ro.observe(el); return () => ro.disconnect();
-  }, []);
 
   // Panel resize
   const containerRef    = useRef<HTMLDivElement>(null);
@@ -672,10 +632,6 @@ export default function MFSKDecoder() {
 
   // Anim-loop refs
   const chRef    = useRef(channels);      useEffect(()=>{chRef.current=channels;},[channels]);
-  const sqlRef   = useRef(squelch);       useEffect(()=>{sqlRef.current=squelch;},[squelch]);
-  const gsRef    = useRef(gridSize);      useEffect(()=>{gsRef.current=gridSize;},[gridSize]);
-  const bwRef    = useRef(channelBw);     useEffect(()=>{bwRef.current=channelBw;},[channelBw]);
-  const shGRef   = useRef(showGrid);      useEffect(()=>{shGRef.current=showGrid;},[showGrid]);
   const fwRef    = useRef(frameWidth);    useEffect(()=>{fwRef.current=frameWidth;},[frameWidth]);
   const fhRef    = useRef(frameHeight);   useEffect(()=>{fhRef.current=frameHeight;},[frameHeight]);
   const wwRef    = useRef(wordWidth);     useEffect(()=>{wwRef.current=wordWidth;},[wordWidth]);
@@ -684,76 +640,16 @@ export default function MFSKDecoder() {
   const swmRef   = useRef(showWordMarkers);  useEffect(()=>{swmRef.current=showWordMarkers;},[showWordMarkers]);
   const sbmRef   = useRef(showBitMarkers);   useEffect(()=>{sbmRef.current=showBitMarkers;},[showBitMarkers]);
   const sfmRef   = useRef(showFrameMarkers); useEffect(()=>{sfmRef.current=showFrameMarkers;},[showFrameMarkers]);
-  const sgGRef   = useRef(sgGamma);       useEffect(()=>{sgGRef.current=sgGamma;},[sgGamma]);
-  const sgSpRef  = useRef(sgSpeed);       useEffect(()=>{sgSpRef.current=sgSpeed;},[sgSpeed]);
   const encRef   = useRef(encoding);      useEffect(()=>{encRef.current=encoding;},[encoding]);
   const fecRef   = useRef(fec);           useEffect(()=>{fecRef.current=fec;},[fec]);
   const ildRef   = useRef(interleaverDepth); useEffect(()=>{ildRef.current=interleaverDepth;},[interleaverDepth]);
   const doRef    = useRef(decoderOpts);   useEffect(()=>{doRef.current=decoderOpts;},[decoderOpts]);
-  const lockRef  = useRef(lockChannels);  useEffect(()=>{lockRef.current=lockChannels;},[lockChannels]);
   const brRef    = useRef(baudRate);      useEffect(()=>{brRef.current=baudRate;},[baudRate]);
-  const minHzRef = useRef(displayMinHz);  useEffect(()=>{minHzRef.current=displayMinHz;},[displayMinHz]);
-  const maxHzRef = useRef(displayMaxHz);  useEffect(()=>{maxHzRef.current=displayMaxHz;},[displayMaxHz]);
   const selCandRef = useRef(selectedCandidate); useEffect(()=>{selCandRef.current=selectedCandidate;},[selectedCandidate]);
   const candOffsRef  = useRef(candidateOffsets); useEffect(()=>{candOffsRef.current=candidateOffsets;},[candidateOffsets]);
   const setCandTextsRef = useRef(setCandidateTexts);
 
   const pwrRefs = useRef<Record<string,HTMLDivElement|null>>({});
-
-  // ── drawSpectrum ──────────────────────────────────────────────────────────
-
-  const drawSpectrum = useCallback((canvas: HTMLCanvasElement): Uint8Array|null => {
-    const an=getAnalyser(); const ctx=canvas.getContext('2d'); if(!ctx) return null;
-    const minHz=minHzRef.current, maxHz=maxHzRef.current;
-    ctx.fillStyle='#0a0a0a'; ctx.fillRect(0,0,canvas.width,CANVAS_H);
-    if (!an) { drawAxisLabels(ctx,canvas.width,PLOT_H,minHz,maxHz); return null; }
-    const bc=an.frequencyBinCount, d=new Uint8Array(bc);
-    an.getByteFrequencyData(d);
-    const nq=an.context.sampleRate/2;
-    // Map the full FFT to just the [minHz, maxHz] window
-    const bin0=Math.floor((minHz/nq)*bc);
-    const bin1=Math.min(Math.floor((maxHz/nq)*bc), bc);
-    const vis=d.subarray(bin0, bin1);
-    ctx.globalAlpha=shGRef.current?.30:1;
-    ctx.strokeStyle='#2ea043';ctx.lineWidth=1.5;ctx.beginPath();
-    const bw=canvas.width/Math.max(1,vis.length);
-    for(let i=0;i<vis.length;i++){const x=i*bw,y=PLOT_H-(vis[i]/255)*PLOT_H;i===0?ctx.moveTo(x,y):ctx.lineTo(x,y);}
-    ctx.stroke(); ctx.globalAlpha=1;
-    const hbw=bwRef.current/2;
-    if (shGRef.current) {
-      const gs=gsRef.current;
-      drawSqGrid(ctx,canvas.width,PLOT_H,vis,sqlRef.current,gs*2,gs,chRef.current,minHz,maxHz,hbw);
-    } else if (sqlRef.current>0) {
-      const sy=PLOT_H*(1-sqlRef.current/100);
-      ctx.lineWidth=1;ctx.setLineDash([4,3]);ctx.strokeStyle='#e3b341';
-      ctx.beginPath();ctx.moveTo(0,sy);ctx.lineTo(canvas.width,sy);ctx.stroke();ctx.setLineDash([]);
-      ctx.fillStyle='#e3b341';ctx.font='9px monospace';ctx.textAlign='left';
-      ctx.fillText(`SQL ${sqlRef.current}%`,12,sy>12?sy-3:sy+12);
-    }
-    for (const ch of chRef.current) {
-      const relBin=Math.round(((ch.freq-minHz)/(maxHz-minHz))*vis.length);
-      const tb=Math.max(0,Math.min(vis.length-1,relBin));
-      const bar=pwrRefs.current[ch.id]; if(bar) bar.style.width=`${((vis[tb]??0)/255)*100}%`;
-      drawChannelMarker(ctx,canvas.width,PLOT_H,ch.freq,ch.color,ch.label,hbw,minHz,maxHz);
-    }
-    drawAxisLabels(ctx,canvas.width,PLOT_H,minHz,maxHz);
-    return vis;
-  }, [getAnalyser]);
-
-  const drawSpectrogram = useCallback((canvas: HTMLCanvasElement, fd: Uint8Array) => {
-    const ctx=canvas.getContext('2d'); if(!ctx) return;
-    const row=ctx.createImageData(canvas.width,1);
-    for(let px=0;px<canvas.width;px++){
-      const bf=(px/canvas.width)*(fd.length-1),b0=Math.floor(bf),b1=Math.min(b0+1,fd.length-1);
-      const v=fd[b0]*(1-(bf-b0))+fd[b1]*(bf-b0),g=sgGRef.current;
-      const a=g===1?v:Math.pow(v/255,g)*255;
-      let r:number,gr:number,bl:number;
-      if(a<128){r=0;gr=0;bl=Math.round(a*2);}else{r=Math.round((a-128)*2);gr=0;bl=Math.round(255-(a-128)*2);}
-      const i=px*4; row.data[i]=r;row.data[i+1]=gr;row.data[i+2]=bl;row.data[i+3]=255;
-    }
-    ctx.putImageData(ctx.getImageData(0,0,canvas.width,canvas.height-1),0,1);
-    ctx.putImageData(row,0,0);
-  }, []);
 
   const drawBitCanvas = useCallback((canvas: HTMLCanvasElement) => {
     const ctx=canvas.getContext('2d'); if(!ctx) return;
@@ -953,69 +849,21 @@ export default function MFSKDecoder() {
 
   useEffect(() => {
     const tick=()=>{
-      const sp=specRef.current,sg=sgCanvRef.current,bg=bitRef.current,hc=hoverCanvRef.current;
-      if(sp){const fd=drawSpectrum(sp);sgFrmRef.current++;
-        if(fd&&sgFrmRef.current%sgSpRef.current===0){if(sg)drawSpectrogram(sg,fd);glSgRef.current?.pushRow(fd);}
-      }
+      const bg=bitRef.current,hc=hoverCanvRef.current;
       if(bg)drawBitCanvas(bg);
       if(hc)drawHoverOverlay(hc);
       rafRef.current=requestAnimationFrame(tick);
     };
     rafRef.current=requestAnimationFrame(tick);
     return ()=>{if(rafRef.current)cancelAnimationFrame(rafRef.current);};
-  }, [drawSpectrum,drawSpectrogram,drawBitCanvas,drawHoverOverlay]);
-
-  // ── Spectrum drag ─────────────────────────────────────────────────────────
-
-  type DM = {type:'squelch'}|{type:'channel';id:string;sf:number;af:Record<string,number>}|null;
-  const dmRef=useRef<DM>(null);
-  useEffect(()=>{
-    const cv=specRef.current; if(!cv) return;
-    const sy=()=>{const r=cv.getBoundingClientRect();return r.top+PLOT_H*(1-sqlRef.current/100)*(r.height/CANVAS_H);};
-    const nSq=(cy:number)=>sqlRef.current>0&&Math.abs(cy-sy())<10;
-    const chX=(f:number)=>{const r=cv.getBoundingClientRect();const mn=minHzRef.current,mx=maxHzRef.current;return r.left+((f-mn)/(mx-mn))*r.width;};
-    const nCh=(cx:number)=>{let b:MFSKChannel|null=null,bd=18;for(const ch of chRef.current){const d=Math.abs(cx-chX(ch.freq));if(d<bd){bd=d;b=ch;}}return b;};
-    const fX=(cx:number)=>{const r=cv.getBoundingClientRect();const mn=minHzRef.current,mx=maxHzRef.current;return Math.max(mn,Math.min(mx,mn+Math.round((cx-r.left)/r.width*(mx-mn))));};
-    const aSq=(cy:number)=>{const r=cv.getBoundingClientRect();const pp=r.height*(PLOT_H/CANVAS_H);setSquelch(Math.max(0,Math.min(100,Math.round((1-Math.max(0,Math.min(1,(cy-r.top)/pp)))*100))));};
-    const aF=(id:string,cx:number,sf:number,af:Record<string,number>)=>{
-      const nf=fX(cx);
-      const mx=maxHzRef.current;
-      if(lockRef.current){
-        const delta=nf-sf;
-        setChannels(p=>p.map(ch=>({...ch,freq:Math.max(50,Math.min(mx,Math.round((af[ch.id]??ch.freq)+delta)))})));
-        // compute center for overlay
-        const freqs=Object.values(af).map(f=>Math.max(50,Math.min(mx,Math.round(f+delta))));
-        if(freqs.length>0) setDraggingCenterFreq(Math.round((Math.min(...freqs)+Math.max(...freqs))/2));
-      } else {
-        setChannels(p=>p.map(ch=>ch.id===id?{...ch,freq:nf}:ch));
-      }
-    };
-    const startDragCh=(cx:number)=>{
-      const ch=nCh(cx); if(!ch) return false;
-      const af=Object.fromEntries(chRef.current.map(c=>[c.id,c.freq]));
-      dmRef.current={type:'channel',id:ch.id,sf:ch.freq,af};
-      aF(ch.id,cx,ch.freq,af); return true;
-    };
-    const dn=(e:MouseEvent)=>{if(nSq(e.clientY)){dmRef.current={type:'squelch'};aSq(e.clientY);}else startDragCh(e.clientX);};
-    const mv=(e:MouseEvent)=>{const m=dmRef.current;if(m?.type==='squelch')aSq(e.clientY);else if(m?.type==='channel')aF(m.id,e.clientX,m.sf,m.af);else{if(nSq(e.clientY))cv.style.cursor='ns-resize';else if(nCh(e.clientX))cv.style.cursor='ew-resize';else cv.style.cursor='crosshair';}};
-    const up=()=>{dmRef.current=null; setDraggingCenterFreq(null);};
-    const td=(e:TouchEvent)=>{e.preventDefault();const t=e.touches[0];if(nSq(t.clientY)){dmRef.current={type:'squelch'};aSq(t.clientY);}else startDragCh(t.clientX);};
-    const tm=(e:TouchEvent)=>{e.preventDefault();const t=e.touches[0];const m=dmRef.current;if(m?.type==='squelch')aSq(t.clientY);else if(m?.type==='channel')aF(m.id,t.clientX,m.sf,m.af);};
-    const tu=()=>{dmRef.current=null; setDraggingCenterFreq(null);};
-    cv.addEventListener('mousedown',dn);cv.addEventListener('touchstart',td,{passive:false});
-    window.addEventListener('mousemove',mv);window.addEventListener('mouseup',up);
-    window.addEventListener('touchmove',tm as EventListener,{passive:false});window.addEventListener('touchend',tu);
-    return ()=>{cv.removeEventListener('mousedown',dn);cv.removeEventListener('touchstart',td);
-      window.removeEventListener('mousemove',mv);window.removeEventListener('mouseup',up);
-      window.removeEventListener('touchmove',tm as EventListener);window.removeEventListener('touchend',tu);};
-  }, []);
+  }, [drawBitCanvas,drawHoverOverlay]);
 
   // ── Channels ──────────────────────────────────────────────────────────────
 
   const addChannel = () => {
     const i=channels.length;
     const base=channels.length>0?Math.max(...channels.map(c=>c.freq))+200:800;
-    setChannels(p=>[...p,{id:makeId(),freq:Math.min(displayMaxHz-100,base),color:DEFAULT_TONE_COLOR,label:`T${i}`}]);
+    setChannels(p=>[...p,{id:makeId(),freq:Math.min(2900,base),color:DEFAULT_TONE_COLOR,label:`T${i}`}]);
   };
   const removeChannel = (id:string) =>
     setChannels(p=>p.filter(c=>c.id!==id).map((c,i)=>({...c,label:`T${i}`})));
@@ -1023,19 +871,6 @@ export default function MFSKDecoder() {
     setChannels(p=>p.map(c=>c.id===id?{...c,freq:f}:c));
   const updColor = (id:string,color:string) =>
     setChannels(p=>p.map(c=>c.id===id?{...c,color}:c));
-
-  // Move all channels by setting center frequency
-  const applyCenterFreq = (newCenter: number) => {
-    const current = channels;
-    if (current.length === 0) return;
-    const freqs = current.map(c => c.freq);
-    const curCenter = (Math.min(...freqs) + Math.max(...freqs)) / 2;
-    const delta = newCenter - curCenter;
-    setChannels(current.map(ch => ({
-      ...ch,
-      freq: Math.max(50, Math.min(displayMaxHz, Math.round(ch.freq + delta))),
-    })));
-  };
 
   // ── Preset apply ──────────────────────────────────────────────────────────
 
@@ -1067,65 +902,39 @@ export default function MFSKDecoder() {
   // ── Derived ───────────────────────────────────────────────────────────────
 
   const bps       = Math.max(1,Math.ceil(Math.log2(Math.max(2,channels.length))));
-  const halfBw    = channelBw/2;
-  const glBands   = channels.map(ch=>({fromHz:ch.freq-halfBw,toHz:ch.freq+halfBw,color:ch.color}));
-  const glMarkers = channels.map(ch=>({fromHz:ch.freq,toHz:ch.freq,color:ch.color}));
   const dataBits  = Math.max(0,wordWidth-startBits-stopBits)*bps;
   const opts      = decoderOpts;
   const isSyncMode = opts.syncMode==='start-bit';
+
+  const handleReset = useCallback(() => {
+    clearSymbols();
+    lastDecRef.current = 0;
+    lastWrdRef.current = 0;
+    candCursorsRef.current = [];
+    txtBufRef.current = '';
+    setCandidateTexts([]);
+    if (txtRef.current) txtRef.current.textContent = '';
+  }, [clearSymbols]);
+
+  const controls: DecoderControls = {
+    isRecording: state.isRecording,
+    isSupported: state.isSupported,
+    error: state.error ?? null,
+    start: startRecording,
+    stop: stopRecording,
+    reset: handleReset,
+  };
+  useImperativeHandle(ref, () => controls, [state.isRecording, state.isSupported, state.error, startRecording, stopRecording, handleReset]); // eslint-disable-line react-hooks/exhaustive-deps
+  const onStateChangeRef = useRef(onStateChange);
+  onStateChangeRef.current = onStateChange;
+  useEffect(() => { onStateChangeRef.current?.(controls); }, [state.isRecording, state.isSupported, state.error]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // ── Render ────────────────────────────────────────────────────────────────
 
   return (
     <div className="space-y-3">
 
-      {/* ── Top bar ── */}
-      <div className="bg-[#161b22] border border-[#30363d] rounded-lg p-3 sm:p-4">
-        <div className="flex flex-col sm:flex-row gap-2 sm:items-center">
-          <div className="flex gap-2">
-            {!state.isRecording ? (
-              <button onClick={startRecording} disabled={!state.isSupported}
-                className="flex-1 sm:flex-none bg-[#238636] hover:bg-[#2ea043] disabled:opacity-50 text-white font-semibold px-5 py-2.5 rounded-md transition-colors text-sm flex items-center gap-2">
-                <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" viewBox="0 0 20 20" fill="currentColor"><path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zM9.555 7.168A1 1 0 008 8v4a1 1 0 001.555.832l3-2a1 1 0 000-1.664l-3-2z" clipRule="evenodd"/></svg>
-                Start
-              </button>
-            ) : (
-              <button onClick={stopRecording}
-                className="flex-1 sm:flex-none bg-[#da3633] hover:bg-[#f85149] text-white font-semibold px-5 py-2.5 rounded-md transition-colors text-sm flex items-center gap-2">
-                <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" viewBox="0 0 20 20" fill="currentColor"><path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zM8 7a1 1 0 00-1 1v4a1 1 0 001 1h4a1 1 0 001-1V8a1 1 0 00-1-1H8z" clipRule="evenodd"/></svg>
-                Stop
-              </button>
-            )}
-            <button onClick={() => {
-              clearSymbols();
-              lastDecRef.current=0; lastWrdRef.current=0;
-              candCursorsRef.current=[]; txtBufRef.current='';
-              setCandidateTexts([]);
-              if (txtRef.current) txtRef.current.textContent='';
-            }}
-              className="flex-1 sm:flex-none bg-[#21262d] hover:bg-[#30363d] text-white font-semibold px-4 py-2.5 rounded-md transition-colors text-sm border border-[#30363d] flex items-center gap-1.5">
-              <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" viewBox="0 0 20 20" fill="currentColor"><path fillRule="evenodd" d="M4 2a1 1 0 011 1v2.101a7.002 7.002 0 0111.601 2.566 1 1 0 11-1.885.666A5.002 5.002 0 005.999 7H9a1 1 0 010 2H4a1 1 0 01-1-1V3a1 1 0 011-1zm.008 9.057a1 1 0 011.276.61A5.002 5.002 0 0014.001 13H11a1 1 0 110-2h5a1 1 0 011 1v5a1 1 0 11-2 0v-2.101a7.002 7.002 0 01-11.601-2.566 1 1 0 01.61-1.276z" clipRule="evenodd"/></svg>
-              Clear
-            </button>
-          </div>
-          {(state.isRecording || activePresetLabel) && (
-            <div className="text-xs font-mono text-[#8b949e]">
-              <span className="text-[#56d364]">{activePresetLabel ?? `MFSK${channels.length}`}</span>
-              {state.isRecording && (
-                <>
-                  {` · ${baudRate} Bd · ${bps} bit/symbol`}
-                  {opts.oversampleFactor && opts.oversampleFactor > 1 ? ` · ${opts.oversampleFactor}× OVS` : ''}
-                  {isSyncMode ? ` · sync` : ''}
-                  {` · ${state.totalSymbols.toLocaleString()} symbols`}
-                </>
-              )}
-            </div>
-          )}
-          {state.error && <div className="text-[#f85149] text-xs">{state.error}</div>}
-        </div>
-      </div>
-
-      {/* ── Three panels ── */}
+      {/* ── Two panels ── */}
       <div ref={containerRef}
         className="flex flex-col lg:flex-row lg:items-stretch gap-4 lg:gap-0"
         style={{height:'calc(100vh - 260px)',minHeight:'520px'}}>
@@ -1324,125 +1133,37 @@ export default function MFSKDecoder() {
           </div>
         </div>
 
-        {/* Handle 0↔1 */}
+        {/* Drag handle 0↔1 */}
         <div className="hidden lg:flex w-3 self-stretch cursor-col-resize items-center justify-center group shrink-0" onMouseDown={e=>startDrag(e,0)}>
           <div className="w-px h-full bg-[#30363d] group-hover:bg-[#2ea043]/50 transition-colors"/>
         </div>
 
-        {/* ── Panel 2: Audio ── */}
-        <div className="bg-[#161b22] border border-[#30363d] rounded-lg p-3 sm:p-4 flex flex-col min-w-0 min-h-[350px] lg:min-h-0"
-          style={{flex:pW[1]}}>
-          <h2 className="text-sm font-semibold text-[#c9d1d9] mb-2 shrink-0">Audio Analysis</h2>
-          <div className="shrink-0">
-            {/* Center freq input */}
-            <div className="flex items-center gap-2 mb-1.5 text-xs text-[#8b949e]">
-              <span className="shrink-0">Center</span>
-              <input
-                type="number" min={50} max={displayMaxHz} step={1}
-                value={draggingCenterFreq !== null ? draggingCenterFreq : centerFreqInput || centerFreq}
-                onChange={e => {
-                  setCenterFreqInput(e.target.value);
-                }}
-                onBlur={e => {
-                  const v = parseFloat(e.target.value);
-                  if (!isNaN(v)) applyCenterFreq(Math.max(50, Math.min(displayMaxHz, v)));
-                  setCenterFreqInput('');
-                }}
-                onKeyDown={e => {
-                  if (e.key === 'Enter') {
-                    const v = parseFloat((e.target as HTMLInputElement).value);
-                    if (!isNaN(v)) applyCenterFreq(Math.max(50, Math.min(displayMaxHz, v)));
-                    setCenterFreqInput('');
-                  }
-                }}
-                className={`w-20 bg-[#0d1117] border rounded px-2 py-0.5 font-mono text-[#c9d1d9] focus:outline-none focus:border-[#2ea043] ${
-                  draggingCenterFreq !== null ? 'border-[#2ea043] shadow-[0_0_0_1px_rgba(46,160,67,0.3)]' : 'border-[#30363d]'
-                }`}
-              />
-              <span className="shrink-0 text-[#484f58]">Hz</span>
-              {draggingCenterFreq !== null && (
-                <span className="text-[#2ea043] text-[10px] font-mono animate-pulse">dragging…</span>
-              )}
-              <span className="text-[#484f58] text-[10px] ml-auto">
-                {channels.length} tone{channels.length !== 1 ? 's' : ''}
-              </span>
-            </div>
-            <canvas ref={specRef} width={640} height={CANVAS_H}
-              className="w-full border border-[#30363d] rounded bg-[#0a0a0a] touch-manipulation block cursor-crosshair"/>
-            {/* Frequency view range */}
-            <div className="flex items-center gap-1.5 mt-1 text-[10px] text-[#8b949e]">
-              <span className="shrink-0">View</span>
-              <input type="number" min={0} max={displayMaxHz-100} step={100}
-                value={displayMinHz}
-                onChange={e=>{const v=parseInt(e.target.value);if(!isNaN(v))setDisplayMinHz(Math.max(0,Math.min(displayMaxHz-100,v)));}}
-                className="w-16 bg-[#0d1117] border border-[#30363d] rounded px-1.5 py-0.5 font-mono text-[#c9d1d9] focus:outline-none focus:border-[#2ea043]"/>
-              <span className="shrink-0 text-[#484f58]">–</span>
-              <input type="number" min={displayMinHz+100} max={24000} step={100}
-                value={displayMaxHz}
-                onChange={e=>{const v=parseInt(e.target.value);if(!isNaN(v))setDisplayMaxHz(Math.max(displayMinHz+100,Math.min(24000,v)));}}
-                className="w-16 bg-[#0d1117] border border-[#30363d] rounded px-1.5 py-0.5 font-mono text-[#c9d1d9] focus:outline-none focus:border-[#2ea043]"/>
-              <span className="shrink-0 text-[#484f58]">Hz</span>
-              {[1000,2000,3000,4000].map(mx=>(
-                <button key={mx} onClick={()=>{setDisplayMinHz(0);setDisplayMaxHz(mx);}}
-                  className={`px-1.5 py-0.5 rounded border text-[9px] transition-colors ${displayMinHz===0&&displayMaxHz===mx?'border-[#2ea043]/50 bg-[#238636]/20 text-[#2ea043]':'border-[#30363d] text-[#484f58] hover:text-[#8b949e]'}`}>
-                  {mx/1000}k
-                </button>
-              ))}
-            </div>
-            <div className="flex items-center justify-between mt-0.5">
-              <p className="text-[10px] text-[#484f58]">Drag channel markers (↔) · Drag squelch boundary (↕)</p>
-              <button onClick={()=>setLockChannels(v=>!v)}
-                title={lockChannels?'Channels move together — click to unlock':'Channels move independently — click to lock'}
-                className={`flex items-center gap-1 px-1.5 py-0.5 rounded border text-[10px] transition-colors ${
-                  lockChannels?'border-[#2ea043]/50 bg-[#238636]/20 text-[#2ea043]':'border-[#30363d] text-[#484f58] hover:text-[#8b949e]'
-                }`}>
-                {lockChannels ? (
-                  <svg xmlns="http://www.w3.org/2000/svg" className="h-3 w-3" viewBox="0 0 20 20" fill="currentColor"><path fillRule="evenodd" d="M5 9V7a5 5 0 0110 0v2a2 2 0 012 2v5a2 2 0 01-2 2H5a2 2 0 01-2-2v-5a2 2 0 012-2zm8-2v2H7V7a3 3 0 016 0z" clipRule="evenodd"/></svg>
-                ) : (
-                  <svg xmlns="http://www.w3.org/2000/svg" className="h-3 w-3" viewBox="0 0 20 20" fill="currentColor"><path d="M10 2a5 5 0 00-5 5v2a2 2 0 00-2 2v5a2 2 0 002 2h10a2 2 0 002-2v-5a2 2 0 00-2-2H7V7a3 3 0 015.905-.75 1 1 0 001.937-.5A5.002 5.002 0 0010 2z"/></svg>
-                )}
-                {lockChannels ? 'Locked' : 'Free'}
-              </button>
-            </div>
-          </div>
-          <div className="flex flex-col flex-1 gap-2 mt-3 min-h-0">
-            <h3 className="text-xs font-medium text-[#8b949e] shrink-0">Spectrogram</h3>
-            <div ref={sgContainerRef} className="relative flex-1 min-h-[100px]">
-              <div className={sgView==='legacy'?'block':'hidden'}>
-                <canvas ref={sgCanvRef} width={640} height={sgH} style={{height:sgH}} className="w-full border border-[#30363d] rounded bg-[#0d1117] block"/>
-                {channels.map(ch=>{const span=displayMaxHz-displayMinHz;const pct=((ch.freq-displayMinHz)/span)*100,bwP=(channelBw/span)*100,[r,g,b]=hexToRgb(ch.color);return(
-                  <div key={ch.id} className="absolute inset-y-0 pointer-events-none" style={{left:`${Math.max(0,pct-bwP/2)}%`,width:`${bwP}%`,backgroundColor:`rgba(${r},${g},${b},.07)`,borderLeft:`1px solid rgba(${r},${g},${b},.28)`,borderRight:`1px solid rgba(${r},${g},${b},.28)`}}/>
-                );})}
-              </div>
-              <div className={sgView!=='legacy'?'block':'hidden'}>
-                <GLSpectrogram ref={glSgRef} view={sgView==='legacy'?'terrain':sgView}
-                  gamma={sgGamma} height={sgH} maxHz={displayMaxHz} minHz={displayMinHz} bands={glBands}
-                  bandAlpha={bandAlpha} markers={glMarkers} sqlLevel={squelch/100} sqlAlpha={0.6}
-                  sqlGridSize={showGrid?gridSize:undefined}/>
-              </div>
-            </div>
-            <div className="flex flex-wrap items-center gap-3 text-xs text-[#8b949e] shrink-0">
-              <label className="flex items-center gap-1.5">View
-                <select value={sgView} onChange={e=>setSgView(e.target.value as SpectrogramView)}
-                  className="bg-[#0d1117] border border-[#30363d] rounded px-1.5 py-0.5 text-[#c9d1d9] focus:outline-none focus:border-[#2ea043] cursor-pointer">
-                  <option value="terrain">3D Terrain</option>
-                  <option value="ridge">Ridgeline</option>
-                  <option value="legacy">Classic 2D</option>
-                </select>
-              </label>
-              {sgView!=='legacy'&&<label className="flex items-center gap-1.5">Range<input type="range" min={0} max={1} step={0.05} value={bandAlpha} onChange={e=>setBandAlpha(parseFloat(e.target.value))} className="w-14 accent-[#2ea043]"/></label>}
-              <label className="flex items-center gap-1.5">Contrast<input type="range" min={0.5} max={6} step={0.25} value={sgGamma} onChange={e=>setSgGamma(parseFloat(e.target.value))} className="w-14 accent-[#2ea043]"/></label>
-              <label className="flex items-center gap-1.5">Speed
-                <select value={sgSpeed} onChange={e=>setSgSpeed(parseInt(e.target.value))}
-                  className="bg-[#0d1117] border border-[#30363d] rounded px-1.5 py-0.5 text-[#c9d1d9] focus:outline-none focus:border-[#2ea043] cursor-pointer">
-                  <option value={1}>1×</option><option value={2}>2×</option><option value={4}>4×</option><option value={8}>8×</option>
-                </select>
-              </label>
-            </div>
-          </div>
-        </div>
+        {/* ── Panel 2: Audio Analysis ── */}
+        <AudioAnalysisPanel
+          analyser={analyser ?? null}
+          isRecording={state.isRecording}
+          markers={channels.map(ch => ({ freq: ch.freq, color: ch.color, label: ch.label }))}
+          onMarkerDrag={(idx, newHz) => {
+            const ch = channels[idx];
+            if (!ch) return;
+            let delta = Math.round(newHz) - ch.freq;
+            // Clamp delta so no channel escapes [50, 24000] — preserves spacing
+            const minFreq = Math.min(...channels.map(c => c.freq));
+            const maxFreq = Math.max(...channels.map(c => c.freq));
+            delta = Math.max(50 - minFreq, Math.min(24000 - maxFreq, delta));
+            if (delta === 0) return;
+            setChannels(p => p.map(c => ({ ...c, freq: c.freq + delta })));
+          }}
+          showGrid={showGrid}
+          gridSize={gridSize}
+          squelch={squelch}
+          onSquelchChange={setSquelch}
+          glBands={channels}
+          className="min-w-0"
+          style={{flex:pW[1]}}
+        />
 
-        {/* Handle 1↔2 */}
+        {/* Drag handle 1↔2 */}
         <div className="hidden lg:flex w-3 self-stretch cursor-col-resize items-center justify-center group shrink-0" onMouseDown={e=>startDrag(e,1)}>
           <div className="w-px h-full bg-[#30363d] group-hover:bg-[#2ea043]/50 transition-colors"/>
         </div>
@@ -1619,7 +1340,7 @@ export default function MFSKDecoder() {
                 ch={ch}
                 index={i}
                 total={channels.length}
-                maxHz={displayMaxHz}
+                maxHz={3000}
                 onRemove={() => removeChannel(ch.id)}
                 onFreqChange={f => updFreq(ch.id, f)}
                 onColorChange={c => updColor(ch.id, c)}
@@ -1638,4 +1359,6 @@ export default function MFSKDecoder() {
       </div>
     </div>
   );
-}
+});
+
+export default MFSKDecoder;

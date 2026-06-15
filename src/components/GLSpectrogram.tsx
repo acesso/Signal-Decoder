@@ -590,7 +590,7 @@ const GLSpectrogram = forwardRef<GLSpectrogramHandle, Props>(function GLSpectrog
         el.style.left = `${pos[0]}px`;
         el.style.top  = `${Math.min(H - 14, pos[1])}px`;
       });
-      // Channel center markers: full-height vertical lines at the projected front-edge x
+      // Channel center markers: vertical lines anchored to the projected front-edge y position
       const spanLocal = maxHzRef.current - minHzRef.current;
       markersRef.current.forEach((mk, i) => {
         const el = markerElsRef.current[i];
@@ -601,6 +601,8 @@ const GLSpectrogram = forwardRef<GLSpectrogramHandle, Props>(function GLSpectrog
         if (!pos || pos[0] < 0 || pos[0] > W) { el.style.display = 'none'; return; }
         el.style.display = 'block';
         el.style.left = `${pos[0]}px`;
+        el.style.top = '0';
+        el.style.bottom = '0';
       });
     };
 
@@ -931,7 +933,7 @@ const GLSpectrogram = forwardRef<GLSpectrogramHandle, Props>(function GLSpectrog
         <div
           key={i}
           ref={el => { markerElsRef.current[i] = el; }}
-          className="absolute top-0 bottom-0 pointer-events-none"
+          className="absolute pointer-events-none"
           style={{
             display: 'none',
             width: '1px',

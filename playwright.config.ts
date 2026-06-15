@@ -29,10 +29,15 @@ export default defineConfig({
 
   projects: [
     {
-      name: 'chromium',
+      name: 'firefox',
       use: {
-        ...devices['Desktop Chrome'],
-        channel: undefined, // use playwright's own chromium build
+        ...devices['Desktop Firefox'],
+        launchOptions: {
+          firefoxUserPrefs: {
+            // Auto-grant microphone access — avoids permission prompts in headless mode
+            'permissions.default.microphone': 1,
+          },
+        },
       },
     },
   ],

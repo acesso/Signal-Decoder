@@ -1,37 +1,12 @@
 'use client';
 
-import { Fragment, useCallback, useEffect, useRef, useState } from 'react';
+import { Fragment, forwardRef, useCallback, useEffect, useImperativeHandle, useRef, useState } from 'react';
+import type { DecoderControls, DecoderProps } from './DecoderControls';
+import AudioAnalysisPanel from './AudioAnalysisPanel';
 import { useFTProcessor } from '@/hooks/useFTProcessor';
 import { FTMode, FT_WINDOW_SECONDS } from '@/lib/ft/decoder';
 import { Contact, mergeContacts } from '@/lib/ft/parser';
 import FTContactsPanel from './FTContactsPanel';
-import GLSpectrogram, { GLSpectrogramHandle, GLView } from './GLSpectrogram';
-
-type WaterfallView = 'legacy' | GLView;
-
-const DISPLAY_MAX_HZ = 3000;
-const CANVAS_H = 180;
-const AXIS_H   = 22;
-const PLOT_H   = CANVAS_H - AXIS_H;
-
-// ── Freq axis ─────────────────────────────────────────────────────────────────
-
-function drawFreqAxis(ctx: CanvasRenderingContext2D, w: number, plotH: number) {
-  ctx.strokeStyle = '#30363d'; ctx.lineWidth = 1;
-  ctx.beginPath(); ctx.moveTo(0, plotH); ctx.lineTo(w, plotH); ctx.stroke();
-  for (let f = 0; f <= DISPLAY_MAX_HZ; f += 200) {
-    const x       = (f / DISPLAY_MAX_HZ) * w;
-    const isMajor = f % 1000 === 0;
-    const isMed   = !isMajor && f % 500 === 0;
-    const tick    = isMajor ? 6 : isMed ? 4 : 2;
-    ctx.strokeStyle = isMajor ? '#8b949e' : '#30363d';
-    ctx.beginPath(); ctx.moveTo(x, plotH); ctx.lineTo(x, plotH + tick); ctx.stroke();
-    if (isMajor || isMed) {
-      ctx.fillStyle = '#8b949e'; ctx.font = '9px monospace'; ctx.textAlign = 'center';
-      ctx.fillText(f >= 1000 ? `${f / 1000}k` : `${f}`, x, plotH + 17);
-    }
-  }
-}
 
 // ── Clock ring (rAF-driven, no setState) ──────────────────────────────────────
 
@@ -200,9 +175,9 @@ function MsgText({ msg, contacts, onSelect }: {
 
 // ── Main component ────────────────────────────────────────────────────────────
 
-export default function FTDecoder({ ftMode }: { ftMode: FTMode }) {
+const FTDecoder = forwardRef<DecoderControls, { ftMode: FTMode } & DecoderProps>(function FTDecoder({ ftMode, onStateChange, analyser }, ref) {
   const {
-    state, startRecording, stopRecording, clearResults, getAnalyser, ftSupported,
+    state, startRecording, stopRecording, clearResults, ftSupported,
   } = useFTProcessor(ftMode);
 
   // ── Contact tracking ────────────────────────────────────────────────────────
@@ -242,106 +217,7 @@ export default function FTDecoder({ ftMode }: { ftMode: FTMode }) {
     prevResultLenRef.current = 0;
   }, [clearResults]);
 
-  // ── Canvas / spectrogram ────────────────────────────────────────────────────
-  const spectrumCanvasRef    = useRef<HTMLCanvasElement>(null);
-  const spectrogramCanvasRef = useRef<HTMLCanvasElement>(null);
-  const animFrameRef         = useRef<number | null>(null);
-  const spectrogramFrameRef  = useRef(0);
-  const [spectrogramGamma, setSpectrogramGamma] = useState(2.5);
-  const [spectrogramSpeed, setSpectrogramSpeed] = useState(2);
-  const [waterfallView,    setWaterfallView]    = useState<WaterfallView>('terrain');
-  const glSpectrogramRef = useRef<GLSpectrogramHandle>(null);
-  const spectrogramGammaRef = useRef(2.5);
-  const spectrogramSpeedRef = useRef(2);
-  useEffect(() => { spectrogramGammaRef.current = spectrogramGamma; }, [spectrogramGamma]);
-  useEffect(() => { spectrogramSpeedRef.current = spectrogramSpeed; }, [spectrogramSpeed]);
-
-  const spectrogramContainerRef = useRef<HTMLDivElement>(null);
-  const [sgHeight, setSgHeight]  = useState(200);
-  const sgHeightRef = useRef(200);
-  useEffect(() => {
-    const el = spectrogramContainerRef.current;
-    if (!el) return;
-    const ro = new ResizeObserver(entries => {
-      const h = Math.round(entries[0].contentRect.height);
-      if (h > 60 && Math.abs(h - sgHeightRef.current) > 4) {
-        sgHeightRef.current = h;
-        setSgHeight(h);
-      }
-    });
-    ro.observe(el);
-    return () => ro.disconnect();
-  }, []);
-
-  const drawSpectrum = useCallback((canvas: HTMLCanvasElement): Uint8Array | undefined => {
-    const analyser = getAnalyser();
-    const ctx      = canvas.getContext('2d');
-    if (!ctx) return;
-    ctx.fillStyle = 'rgb(10,10,10)';
-    ctx.fillRect(0, 0, canvas.width, canvas.height);
-    if (!analyser) { drawFreqAxis(ctx, canvas.width, PLOT_H); return; }
-    const bufLen   = analyser.frequencyBinCount;
-    const data     = new Uint8Array(bufLen);
-    analyser.getByteFrequencyData(data);
-    const nq       = analyser.context.sampleRate / 2;
-    const binsShow = Math.max(1, Math.floor((DISPLAY_MAX_HZ / nq) * bufLen));
-    const visible  = data.subarray(0, binsShow);
-    ctx.strokeStyle = '#2ea043'; ctx.lineWidth = 1.5;
-    ctx.beginPath();
-    const bw = canvas.width / binsShow;
-    for (let i = 0; i < binsShow; i++) {
-      const x = i * bw;
-      const y = PLOT_H - (visible[i] / 255) * PLOT_H;
-      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
-    }
-    ctx.stroke();
-    drawFreqAxis(ctx, canvas.width, PLOT_H);
-    return visible;
-  }, [getAnalyser]);
-
-  const drawSpectrogram = useCallback((canvas: HTMLCanvasElement, freqData: Uint8Array) => {
-    const ctx = canvas.getContext('2d');
-    if (!ctx) return;
-    const row = ctx.createImageData(canvas.width, 1);
-    for (let px = 0; px < canvas.width; px++) {
-      const bf    = (px / canvas.width) * (freqData.length - 1);
-      const b0    = Math.floor(bf);
-      const b1    = Math.min(b0 + 1, freqData.length - 1);
-      const v     = freqData[b0] * (1 - (bf - b0)) + freqData[b1] * (bf - b0);
-      const gamma = spectrogramGammaRef.current;
-      const adj   = gamma === 1 ? v : Math.pow(v / 255, gamma) * 255;
-      let r: number, g: number, b: number;
-      if (adj < 64)       { r = 0;    g = 0;    b = Math.round(adj * 4); }
-      else if (adj < 128) { r = 0;    g = Math.round((adj - 64) * 4); b = 255; }
-      else if (adj < 192) { r = Math.round((adj - 128) * 4); g = 255; b = Math.round(255 - (adj - 128) * 4); }
-      else                { r = 255;  g = Math.round(255 - (adj - 192) * 4); b = 0; }
-      const i = px * 4;
-      row.data[i] = r; row.data[i+1] = g; row.data[i+2] = b; row.data[i+3] = 255;
-    }
-    ctx.putImageData(ctx.getImageData(0, 0, canvas.width, canvas.height - 1), 0, 1);
-    ctx.putImageData(row, 0, 0);
-  }, []);
-
-  useEffect(() => {
-    const tick = () => {
-      const sc = spectrumCanvasRef.current;
-      const sg = spectrogramCanvasRef.current;
-      if (sc) {
-        const fd = drawSpectrum(sc);
-        spectrogramFrameRef.current++;
-        if (fd && spectrogramFrameRef.current % spectrogramSpeedRef.current === 0) {
-          // Feed every view so history stays warm when switching between them
-          if (sg) drawSpectrogram(sg, fd);
-          glSpectrogramRef.current?.pushRow(fd);
-        }
-      }
-      animFrameRef.current = requestAnimationFrame(tick);
-    };
-    animFrameRef.current = requestAnimationFrame(tick);
-    return () => { if (animFrameRef.current) cancelAnimationFrame(animFrameRef.current); };
-  }, [drawSpectrum, drawSpectrogram]);
-
-  // ── 3-panel drag ────────────────────────────────────────────────────────────
+  // ── 2-panel drag ────────────────────────────────────────────────────────────
   const containerRef    = useRef<HTMLDivElement>(null);
   const [panelWeights, setPanelWeights] = useState([0.8, 0.6, 1.2]);
   const panelWeightsRef = useRef([0.8, 0.6, 1.2]);
@@ -388,102 +264,21 @@ export default function FTDecoder({ ftMode }: { ftMode: FTMode }) {
     })),
   ]);
 
+  const controls: DecoderControls = {
+    isRecording: state.isRecording,
+    isSupported: ftSupported,
+    error: state.error ?? null,
+    start: startRecording,
+    stop: stopRecording,
+    reset: handleReset,
+  };
+  useImperativeHandle(ref, () => controls, [state.isRecording, ftSupported, state.error, startRecording, stopRecording, handleReset]); // eslint-disable-line react-hooks/exhaustive-deps
+  const onStateChangeRef = useRef(onStateChange);
+  onStateChangeRef.current = onStateChange;
+  useEffect(() => { onStateChangeRef.current?.(controls); }, [state.isRecording, ftSupported, state.error]); // eslint-disable-line react-hooks/exhaustive-deps
+
   return (
     <div className="space-y-3 sm:space-y-4">
-
-      {/* ── Slim control bar ────────────────────────────────────────────────── */}
-      <div className="bg-[#161b22] border border-[#30363d] rounded-lg px-3 py-2 shrink-0">
-        <div className="flex items-center gap-2 flex-wrap">
-
-          {/* LEFT: clock + counters when recording, otherwise empty spacer */}
-          {state.isRecording ? (
-            <div className="flex items-center gap-3 flex-wrap flex-1 min-w-0">
-              <div className="flex items-center gap-2">
-                <ClockRing status={status} windowSec={windowSec} />
-                <div className="space-y-0.5">
-                  <div className="text-[10px] text-[#8b949e] font-mono">
-                    Window: <span className="text-[#c9d1d9]">{windowSec}s</span>
-                  </div>
-                  <div className="text-[10px] text-[#8b949e] font-mono">
-                    Mode: <span className="text-[#79c0ff]">{ftMode}</span>
-                  </div>
-                  <div className="text-[10px] text-[#8b949e] font-mono">
-                    Msgs: <span className="text-[#c9d1d9]">{totalMsgs}</span>
-                  </div>
-                </div>
-              </div>
-              <div className="flex flex-wrap gap-1.5">
-                {[
-                  { label: 'Windows', value: results.length },
-                  { label: 'Total',   value: totalMsgs },
-                  { label: 'Last ms', value: results[0] ? `${results[0].decodeMs.toFixed(0)}` : '—' },
-                  { label: 'Last #',  value: results[0] ? results[0].messages.length : '—' },
-                ].map(({ label, value }) => (
-                  <div key={label} className="bg-[#0d1117] border border-[#21262d] rounded px-2 py-1">
-                    <div className="text-[#484f58] text-[9px]">{label}</div>
-                    <div className="font-mono font-semibold text-xs text-[#c9d1d9]">{value}</div>
-                  </div>
-                ))}
-              </div>
-            </div>
-          ) : (
-            <div className="flex-1 min-w-0" />
-          )}
-
-          {/* RIGHT: Reset then Start/Stop */}
-          <button
-            onClick={handleReset}
-            disabled={!hasData}
-            className="bg-[#21262d] hover:bg-[#30363d] disabled:opacity-40 disabled:cursor-not-allowed text-[#c9d1d9] font-semibold px-4 py-1.5 rounded-md text-sm transition-colors border border-[#30363d] flex items-center gap-1.5 shrink-0"
-          >
-            <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" viewBox="0 0 20 20" fill="currentColor">
-              <path fillRule="evenodd" d="M4 2a1 1 0 011 1v2.101a7.002 7.002 0 0111.601 2.566 1 1 0 11-1.885.666A5.002 5.002 0 005.999 7H9a1 1 0 010 2H4a1 1 0 01-1-1V3a1 1 0 011-1zm.008 9.057a1 1 0 011.276.61A5.002 5.002 0 0014.001 13H11a1 1 0 110-2h5a1 1 0 011 1v5a1 1 0 11-2 0v-2.101a7.002 7.002 0 01-11.601-2.566 1 1 0 01.61-1.276z" clipRule="evenodd" />
-            </svg>
-            Reset
-          </button>
-
-          {!state.isRecording ? (
-            <button
-              onClick={startRecording}
-              disabled={!state.isSupported}
-              className="bg-[#238636] hover:bg-[#2ea043] disabled:opacity-50 text-white font-semibold px-4 py-1.5 rounded-md text-sm transition-colors flex items-center gap-1.5 shrink-0"
-            >
-              <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" viewBox="0 0 20 20" fill="currentColor">
-                <path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zM9.555 7.168A1 1 0 008 8v4a1 1 0 001.555.832l3-2a1 1 0 000-1.664l-3-2z" clipRule="evenodd" />
-              </svg>
-              Start
-            </button>
-          ) : (
-            <button
-              onClick={stopRecording}
-              className="bg-[#da3633] hover:bg-[#f85149] text-white font-semibold px-4 py-1.5 rounded-md text-sm transition-colors flex items-center gap-1.5 shrink-0"
-            >
-              <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" viewBox="0 0 20 20" fill="currentColor">
-                <path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zM8 7a1 1 0 00-1 1v4a1 1 0 001 1h4a1 1 0 001-1V8a1 1 0 00-1-1H8z" clipRule="evenodd" />
-              </svg>
-              Stop
-            </button>
-          )}
-        </div>
-
-        {state.error && (
-          <div className="mt-2 bg-[#da3633]/10 border border-[#f85149]/30 rounded-md p-2 text-[#f85149] text-xs">
-            {state.error}
-          </div>
-        )}
-
-        {!ftSupported && (
-          <div className="mt-2 bg-[#e3b341]/10 border border-[#e3b341]/30 rounded-md p-2 text-[#e3b341] text-xs flex items-start gap-2">
-            <svg xmlns="http://www.w3.org/2000/svg" className="h-3.5 w-3.5 mt-0.5 shrink-0" viewBox="0 0 20 20" fill="currentColor">
-              <path fillRule="evenodd" d="M8.257 3.099c.765-1.36 2.722-1.36 3.486 0l5.58 9.92c.75 1.334-.213 2.98-1.742 2.98H4.42c-1.53 0-2.493-1.646-1.743-2.98l5.58-9.92zM11 13a1 1 0 11-2 0 1 1 0 012 0zm-1-8a1 1 0 00-1 1v3a1 1 0 002 0V6a1 1 0 00-1-1z" clipRule="evenodd" />
-            </svg>
-            <span>
-              <strong>FT2 is experimental</strong> (first signals February 2026) — no JS decoder available yet.
-              Waterfall still works. Switch to FT8 or FT4 to decode.
-            </span>
-          </div>
-        )}
-      </div>
 
       {/* ── 3-panel layout ───────────────────────────────────────────────────── */}
       {/* Bounded height on lg so panel content scrolls instead of growing the page */}
@@ -494,10 +289,44 @@ export default function FTDecoder({ ftMode }: { ftMode: FTMode }) {
           className="bg-[#161b22] border border-[#30363d] rounded-lg p-3 sm:p-4 flex flex-col min-w-0"
           style={{ flex: panelWeights[0] }}
         >
-          <div className="flex items-center justify-between mb-3 shrink-0">
+          <div className="flex items-start justify-between mb-3 shrink-0 gap-3">
             <h2 className="text-lg sm:text-xl font-semibold">Decoded Messages</h2>
-            <span className="text-xs font-mono text-[#8b949e]">{totalMsgs} total</span>
+            {/* Clock + counters — always visible, dimmed when idle */}
+            <div className={`flex items-center gap-2 shrink-0 transition-opacity ${!state.isRecording ? 'opacity-30' : ''}`}>
+              <ClockRing status={status} windowSec={windowSec} />
+              <div className="flex flex-wrap gap-1.5">
+                {[
+                  { label: 'Mode',    value: ftMode },
+                  { label: 'Windows', value: results.length },
+                  { label: 'Total',   value: totalMsgs },
+                  { label: 'Last #',  value: results[0] ? results[0].messages.length : '—' },
+                ].map(({ label, value }) => (
+                  <div key={label} className="bg-[#0d1117] border border-[#21262d] rounded px-2 py-1">
+                    <div className="text-[#484f58] text-[9px]">{label}</div>
+                    <div className="font-mono font-semibold text-xs text-[#c9d1d9]">{value}</div>
+                  </div>
+                ))}
+              </div>
+            </div>
           </div>
+
+          {state.error && (
+            <div className="mb-2 bg-[#da3633]/10 border border-[#f85149]/30 rounded-md p-2 text-[#f85149] text-xs shrink-0">
+              {state.error}
+            </div>
+          )}
+
+          {!ftSupported && (
+            <div className="mb-2 bg-[#e3b341]/10 border border-[#e3b341]/30 rounded-md p-2 text-[#e3b341] text-xs flex items-start gap-2 shrink-0">
+              <svg xmlns="http://www.w3.org/2000/svg" className="h-3.5 w-3.5 mt-0.5 shrink-0" viewBox="0 0 20 20" fill="currentColor">
+                <path fillRule="evenodd" d="M8.257 3.099c.765-1.36 2.722-1.36 3.486 0l5.58 9.92c.75 1.334-.213 2.98-1.742 2.98H4.42c-1.53 0-2.493-1.646-1.743-2.98l5.58-9.92zM11 13a1 1 0 11-2 0 1 1 0 012 0zm-1-8a1 1 0 00-1 1v3a1 1 0 002 0V6a1 1 0 00-1-1z" clipRule="evenodd" />
+              </svg>
+              <span>
+                <strong>FT2 is experimental</strong> — no JS decoder available yet. Switch to FT8 or FT4 to decode.
+              </span>
+            </div>
+          )}
+
 
           <div className="flex-1 overflow-y-auto min-h-0 max-h-[60vh] lg:max-h-none font-mono text-xs">
             {results.length === 0 ? (
@@ -555,7 +384,7 @@ export default function FTDecoder({ ftMode }: { ftMode: FTMode }) {
           </div>
         </div>
 
-        {/* Drag handle 1 */}
+        {/* Drag handle 0↔1 */}
         <div
           className="hidden lg:flex w-3 self-stretch cursor-col-resize items-center justify-center group shrink-0"
           onMouseDown={startPanelDrag(0)}
@@ -564,101 +393,14 @@ export default function FTDecoder({ ftMode }: { ftMode: FTMode }) {
         </div>
 
         {/* Panel 2 — Audio Analysis */}
-        <div
-          className="bg-[#161b22] border border-[#30363d] rounded-lg p-3 sm:p-4 min-w-0 flex flex-col"
+        <AudioAnalysisPanel
+          analyser={analyser ?? null}
+          isRecording={state.isRecording}
+          className="min-w-0"
           style={{ flex: panelWeights[1] }}
-        >
-          <h2 className="text-lg sm:text-xl font-semibold mb-3 shrink-0">Audio Analysis</h2>
+        />
 
-          <div className="space-y-1 shrink-0">
-            <div className="flex items-center justify-between">
-              <h3 className="text-sm font-medium text-[#8b949e]">Spectrum</h3>
-              <span className="text-xs text-[#484f58] font-mono">0–3 kHz</span>
-            </div>
-            <canvas
-              ref={spectrumCanvasRef}
-              width={640} height={CANVAS_H}
-              className="w-full border border-[#30363d] rounded bg-[#0d1117]"
-            />
-          </div>
-
-          <div className="flex flex-col flex-1 gap-2 mt-3 min-h-0">
-            <div className="flex items-center justify-between shrink-0">
-              <h3 className="text-sm font-medium text-[#8b949e]">Waterfall</h3>
-              <div className="flex flex-wrap items-center gap-3 text-xs text-[#8b949e]">
-                <label className="flex items-center gap-1.5">
-                  View
-                  <select
-                    value={waterfallView}
-                    onChange={e => setWaterfallView(e.target.value as WaterfallView)}
-                    className="bg-[#0d1117] border border-[#30363d] rounded px-1 py-0.5 text-[#c9d1d9] focus:outline-none cursor-pointer text-xs"
-                  >
-                    <option value="terrain">3D Terrain</option>
-                    <option value="ridge">Ridgeline</option>
-                    <option value="legacy">Classic 2D</option>
-                  </select>
-                </label>
-                <label className="flex items-center gap-1.5">
-                  Contrast
-                  <input type="range" min={0.5} max={6} step={0.1}
-                    value={spectrogramGamma}
-                    onChange={e => setSpectrogramGamma(parseFloat(e.target.value))}
-                    className="w-16 accent-[#2ea043] cursor-pointer"
-                  />
-                </label>
-                <label className="flex items-center gap-1.5">
-                  Speed
-                  <select
-                    value={spectrogramSpeed}
-                    onChange={e => setSpectrogramSpeed(parseInt(e.target.value))}
-                    className="bg-[#0d1117] border border-[#30363d] rounded px-1 py-0.5 text-[#c9d1d9] focus:outline-none cursor-pointer text-xs"
-                  >
-                    <option value={1}>Fast</option>
-                    <option value={2}>Normal</option>
-                    <option value={4}>Slow</option>
-                    <option value={8}>V.Slow</option>
-                  </select>
-                </label>
-              </div>
-            </div>
-            <div ref={spectrogramContainerRef} className="relative flex-1 min-h-[120px]">
-              {/* Both renderers stay mounted (hidden via CSS) so history persists across view switches */}
-              <div className={waterfallView === 'legacy' ? 'block' : 'hidden'}>
-                <canvas
-                  ref={spectrogramCanvasRef}
-                  width={640} height={sgHeight}
-                  style={{ height: sgHeight }}
-                  className="w-full border border-[#30363d] rounded bg-[#0d1117] block"
-                />
-              </div>
-              <div className={waterfallView !== 'legacy' ? 'block' : 'hidden'}>
-                <GLSpectrogram
-                  ref={glSpectrogramRef}
-                  view={waterfallView === 'legacy' ? 'terrain' : waterfallView}
-                  gamma={spectrogramGamma}
-                  height={sgHeight}
-                  maxHz={DISPLAY_MAX_HZ}
-                />
-              </div>
-              {/* Hz gridlines only make sense on the flat top-down view */}
-              {waterfallView === 'legacy' &&
-                [500, 1000, 1500, 2000, 2500].map(hz => (
-                  <div key={hz} className="absolute inset-y-0 pointer-events-none"
-                    style={{ left: `${(hz / DISPLAY_MAX_HZ) * 100}%`, width: 1, background: '#21262d', opacity: 0.7 }}
-                  />
-                ))}
-            </div>
-          </div>
-
-          <div className="mt-2 pt-2 border-t border-[#21262d] text-[10px] text-[#484f58] font-mono space-y-0.5 shrink-0">
-            <div><span className="text-[#30363d]">window:</span> {windowSec}s · UTC-synced</div>
-            {ftMode === 'FT8' && <div><span className="text-[#30363d]">sensitivity:</span> −24 dB SNR</div>}
-            {ftMode === 'FT4' && <div><span className="text-[#30363d]">sensitivity:</span> −17 dB SNR (faster)</div>}
-            {ftMode === 'FT2' && <div><span className="text-[#30363d]">sensitivity:</span> −12 dB SNR (experimental)</div>}
-          </div>
-        </div>
-
-        {/* Drag handle 2 */}
+        {/* Drag handle 1↔2 */}
         <div
           className="hidden lg:flex w-3 self-stretch cursor-col-resize items-center justify-center group shrink-0"
           onMouseDown={startPanelDrag(1)}
@@ -713,4 +455,6 @@ export default function FTDecoder({ ftMode }: { ftMode: FTMode }) {
       </details>
     </div>
   );
-}
+});
+
+export default FTDecoder;

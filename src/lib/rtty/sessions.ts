@@ -37,7 +37,8 @@ export type SessionsAction =
   | { type: 'APPEND_TEXT';    id: string; chars: string }
   | { type: 'UPDATE_LABEL';   id: string; label: string }
   | { type: 'UPDATE_COLOR';   id: string; color: string }
-  | { type: 'CLEAR_TEXT';     id: string };
+  | { type: 'CLEAR_TEXT';     id: string }
+  | { type: 'CLEAR_ALL_TEXT' };
 
 let _counter = 0;
 export function makeSession(config: RTTYConfig): DecoderSession {
@@ -120,6 +121,12 @@ export function sessionsReducer(state: SessionsState, action: SessionsAction): S
         sessions: state.sessions.map(s =>
           s.id === action.id ? { ...s, fullText: '', preview: '' } : s
         ),
+      };
+
+    case 'CLEAR_ALL_TEXT':
+      return {
+        ...state,
+        sessions: state.sessions.map(s => ({ ...s, fullText: '', preview: '' })),
       };
 
     default:
