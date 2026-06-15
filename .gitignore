@@ -49,3 +49,11 @@ robot36/
 .vscode/
 .idea/
 .github/
+
+# Source packages and extracted source trees
+*.rpm
+*.src.rpm
+*.tar.gz
+*.tar.bz2
+fldigi-*/
+fldigi_src/
