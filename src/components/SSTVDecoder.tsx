@@ -1,30 +1,11 @@
 'use client';
 
-import { useEffect, useRef, useCallback, useState } from 'react';
+import { useEffect, useRef, useCallback, useState, forwardRef, useImperativeHandle } from 'react';
+import type { DecoderControls, DecoderProps } from './DecoderControls';
+import AudioAnalysisPanel from './AudioAnalysisPanel';
 import { useAudioProcessor, CapturedImage, SSTVMode } from '@/hooks/useAudioProcessor';
-import SettingsPanel from '@/components/SettingsPanel';
 import { SSTV_MODES } from '@/lib/sstv/constants';
 import { DecoderState } from '@/lib/sstv/decoder';
-import GLSpectrogram, { GLSpectrogramHandle, GLView } from './GLSpectrogram';
-
-type SpectrogramView = 'legacy' | GLView;
-
-const SPECTRUM_MAX_HZ = 3000;
-
-function drawFreqAxis(ctx: CanvasRenderingContext2D, w: number, plotH: number) {
-  ctx.strokeStyle = '#30363d'; ctx.lineWidth = 1;
-  ctx.beginPath(); ctx.moveTo(0, plotH); ctx.lineTo(w, plotH); ctx.stroke();
-  for (let f = 0; f <= SPECTRUM_MAX_HZ; f += 100) {
-    const x   = (f / SPECTRUM_MAX_HZ) * w;
-    const maj = f % 500 === 0;
-    ctx.strokeStyle = maj ? '#8b949e' : '#30363d';
-    ctx.beginPath(); ctx.moveTo(x, plotH); ctx.lineTo(x, plotH + (maj ? 6 : 2)); ctx.stroke();
-    if (maj) {
-      ctx.fillStyle = '#8b949e'; ctx.font = '10px monospace'; ctx.textAlign = 'center';
-      ctx.fillText(f >= 1000 ? `${f / 1000}k` : `${f}`, x, plotH + 17);
-    }
-  }
-}
 
 // ── Gallery thumbnail card ────────────────────────────────────────────────────
 
@@ -139,47 +120,14 @@ function ImageModal({ img, onClose }: { img: CapturedImage; onClose: () => void 
 
 // ── Main component ────────────────────────────────────────────────────────────
 
-export default function SSTVDecoder() {
+const SSTVDecoder = forwardRef<DecoderControls, DecoderProps>(function SSTVDecoder({ onStateChange, analyser }, ref) {
   const [manualMode, setManualMode] = useState<SSTVMode>('ROBOT36');
   const [autoDetect, setAutoDetect] = useState(true);
   const [autoSlant, setAutoSlant] = useState(true);
   const [selectedImage, setSelectedImage] = useState<CapturedImage | null>(null);
 
   // Canvas refs
-  const imageCanvasRef       = useRef<HTMLCanvasElement>(null);
-  const spectrumCanvasRef    = useRef<HTMLCanvasElement>(null);
-  const spectrogramCanvasRef = useRef<HTMLCanvasElement>(null);
-  const animFrameRef         = useRef<number | null>(null);
-  const spectrogramFrameRef  = useRef(0);
-
-  // Dynamic spectrogram height
-  const spectrogramContainerRef    = useRef<HTMLDivElement>(null);
-  const [spectrogramCanvasHeight, setSpectrogramCanvasHeight] = useState(500);
-  const spectrogramCanvasHeightRef = useRef(500);
-
-  useEffect(() => {
-    const el = spectrogramContainerRef.current;
-    if (!el) return;
-    const ro = new ResizeObserver(entries => {
-      const h = Math.round(entries[0].contentRect.height);
-      if (h > 80 && Math.abs(h - spectrogramCanvasHeightRef.current) > 4) {
-        spectrogramCanvasHeightRef.current = h;
-        setSpectrogramCanvasHeight(h);
-      }
-    });
-    ro.observe(el);
-    return () => ro.disconnect();
-  }, []);
-
-  // Spectrogram controls
-  const [spectrogramGamma, setSpectrogramGamma] = useState(3.0);
-  const [spectrogramSpeed, setSpectrogramSpeed] = useState(2);
-  const [spectrogramView,  setSpectrogramView]  = useState<SpectrogramView>('terrain');
-  const glSpectrogramRef = useRef<GLSpectrogramHandle>(null);
-  const spectrogramGammaRef = useRef(3.0);
-  const spectrogramSpeedRef = useRef(2);
-  useEffect(() => { spectrogramGammaRef.current = spectrogramGamma; }, [spectrogramGamma]);
-  useEffect(() => { spectrogramSpeedRef.current = spectrogramSpeed; }, [spectrogramSpeed]);
+  const imageCanvasRef = useRef<HTMLCanvasElement>(null);
 
   // Resizable panels
   const containerRef    = useRef<HTMLDivElement>(null);
@@ -212,7 +160,7 @@ export default function SSTVDecoder() {
 
   // ── Audio hook ───────────────────────────────────────────────────────────────
 
-  const { state, startRecording, stopRecording, resetDecoder, clearImages, getImageData, getDimensions, getAnalyser } =
+  const { state, startRecording, stopRecording, resetDecoder, clearImages, getImageData, getDimensions } =
     useAudioProcessor(manualMode, autoDetect, autoSlant);
 
   // Used only for canvas element sizing and the header label — NOT passed into the draw callback
@@ -235,81 +183,19 @@ export default function SSTVDecoder() {
     }
   }, [getImageData, getDimensions]);
 
-  const drawSpectrum = useCallback((canvas: HTMLCanvasElement): Uint8Array | undefined => {
-    const ctx = canvas.getContext('2d');
-    if (!ctx) return;
-    const axisH = 25;
-    const plotH = canvas.height - axisH;
-    ctx.fillStyle = 'rgb(10,10,10)';
-    ctx.fillRect(0, 0, canvas.width, canvas.height);
-
-    const analyser = getAnalyser();
-    let visibleData: Uint8Array | undefined;
-    if (analyser) {
-      const bufLen  = analyser.frequencyBinCount;
-      const data    = new Uint8Array(bufLen);
-      analyser.getByteFrequencyData(data);
-      const nyquist = analyser.context.sampleRate / 2;
-      const binsShow = Math.max(1, Math.floor((SPECTRUM_MAX_HZ / nyquist) * bufLen));
-      visibleData   = data.subarray(0, binsShow);
-      ctx.strokeStyle = '#2ea043'; ctx.lineWidth = 2;
-      ctx.beginPath();
-      for (let i = 0; i < binsShow; i++) {
-        const x = (i / binsShow) * canvas.width;
-        const y = plotH - (visibleData[i] / 255) * plotH;
-        if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
-      }
-      ctx.stroke();
-    }
-    drawFreqAxis(ctx, canvas.width, plotH);
-    return visibleData;
-  }, [getAnalyser]);
-
-  const drawSpectrogram = useCallback((canvas: HTMLCanvasElement, freqData: Uint8Array) => {
-    const ctx = canvas.getContext('2d');
-    if (!ctx) return;
-    const newRow = ctx.createImageData(canvas.width, 1);
-    for (let px = 0; px < canvas.width; px++) {
-      const binF  = (px / canvas.width) * (freqData.length - 1);
-      const b0    = Math.floor(binF);
-      const b1    = Math.min(b0 + 1, freqData.length - 1);
-      const value = freqData[b0] * (1 - (binF - b0)) + freqData[b1] * (binF - b0);
-      const gamma = spectrogramGammaRef.current;
-      const adj   = gamma === 1 ? value : Math.pow(value / 255, gamma) * 255;
-      let r: number, g: number, b: number;
-      if (adj < 128) { r = 0; g = 0; b = Math.round(adj * 2); }
-      else           { r = Math.round((adj - 128) * 2); g = 0; b = Math.round(255 - (adj - 128) * 2); }
-      const i = px * 4;
-      newRow.data[i] = r; newRow.data[i+1] = g; newRow.data[i+2] = b; newRow.data[i+3] = 255;
-    }
-    ctx.putImageData(ctx.getImageData(0, 0, canvas.width, canvas.height - 1), 0, 1);
-    ctx.putImageData(newRow, 0, 0);
-  }, []);
-
   useEffect(() => {
+    let animFrameRef: number | null = null;
     const tick = () => {
       drawImage();
-      const specCanvas = spectrumCanvasRef.current;
-      const sgCanvas   = spectrogramCanvasRef.current;
-      if (specCanvas) {
-        const freqData = drawSpectrum(specCanvas);
-        spectrogramFrameRef.current++;
-        if (freqData && spectrogramFrameRef.current % spectrogramSpeedRef.current === 0) {
-          // Feed both renderers so history stays warm when switching views
-          if (sgCanvas) drawSpectrogram(sgCanvas, freqData);
-          glSpectrogramRef.current?.pushRow(freqData);
-        }
-      }
-      animFrameRef.current = requestAnimationFrame(tick);
+      animFrameRef = requestAnimationFrame(tick);
     };
-    animFrameRef.current = requestAnimationFrame(tick);
-    return () => { if (animFrameRef.current) cancelAnimationFrame(animFrameRef.current); };
-  }, [drawImage, drawSpectrum, drawSpectrogram]);
+    animFrameRef = requestAnimationFrame(tick);
+    return () => { if (animFrameRef) cancelAnimationFrame(animFrameRef); };
+  }, [drawImage]);
 
   // ── Handlers ─────────────────────────────────────────────────────────────────
 
   const handleModeChange = (newMode: SSTVMode) => {
-    if (state.isRecording) stopRecording();
     setManualMode(newMode);
   };
 
@@ -325,95 +211,23 @@ export default function SSTVDecoder() {
     : stats.snr < 18 ? 'text-[#e3b341]'
     : 'text-[#2ea043]';
 
+  const handleReset = useCallback(() => { resetDecoder(); }, [resetDecoder]);
+
+  const controls: DecoderControls = {
+    isRecording: state.isRecording,
+    isSupported: state.isSupported,
+    error: state.error,
+    start: startRecording,
+    stop: stopRecording,
+    reset: handleReset,
+  };
+  useImperativeHandle(ref, () => controls, [state.isRecording, state.isSupported, state.error, startRecording, stopRecording, handleReset]); // eslint-disable-line react-hooks/exhaustive-deps
+  const onStateChangeRef = useRef(onStateChange);
+  onStateChangeRef.current = onStateChange;
+  useEffect(() => { onStateChangeRef.current?.(controls); }, [state.isRecording, state.isSupported, state.error]); // eslint-disable-line react-hooks/exhaustive-deps
+
   return (
     <div className="space-y-4 sm:space-y-6">
-
-      {/* ── Controls ── */}
-      <div className="bg-[#161b22] border border-[#30363d] rounded-lg p-4 sm:p-6 space-y-4">
-        <div className="flex flex-col sm:flex-row gap-3 sm:gap-4">
-          {/* Auto-detect toggle */}
-          <button
-            onClick={() => { if (state.isRecording) stopRecording(); setAutoDetect(v => !v); }}
-            className={`shrink-0 px-4 py-3 rounded-md text-sm font-semibold border transition-colors flex items-center gap-2 ${
-              autoDetect
-                ? 'bg-[#1f6feb]/20 border-[#1f6feb]/50 text-[#58a6ff] hover:bg-[#1f6feb]/30'
-                : 'bg-[#21262d] border-[#30363d] text-[#8b949e] hover:text-[#c9d1d9] hover:bg-[#30363d]'
-            }`}
-          >
-            <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" viewBox="0 0 20 20" fill="currentColor">
-              <path fillRule="evenodd" d="M11.3 1.046A1 1 0 0112 2v5h4a1 1 0 01.82 1.573l-7 10A1 1 0 018 18v-5H4a1 1 0 01-.82-1.573l7-10a1 1 0 011.12-.38z" clipRule="evenodd" />
-            </svg>
-            {autoDetect ? 'Auto-detect ON' : 'Auto-detect OFF'}
-          </button>
-
-          {/* Auto Slant toggle */}
-          <button
-            onClick={() => setAutoSlant(v => !v)}
-            title="Auto Slant corrects clock skew between transmitter and receiver. Disable if images appear correct but blurry."
-            className={`shrink-0 px-4 py-3 rounded-md text-sm font-semibold border transition-colors flex items-center gap-2 ${
-              autoSlant
-                ? 'bg-[#388bfd]/20 border-[#388bfd]/50 text-[#79c0ff] hover:bg-[#388bfd]/30'
-                : 'bg-[#21262d] border-[#30363d] text-[#8b949e] hover:text-[#c9d1d9] hover:bg-[#30363d]'
-            }`}
-          >
-            <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" viewBox="0 0 20 20" fill="currentColor">
-              <path d="M3 4a1 1 0 011-1h12a1 1 0 011 1v2a1 1 0 01-1 1H4a1 1 0 01-1-1V4zM3 10a1 1 0 011-1h6a1 1 0 011 1v6a1 1 0 01-1 1H4a1 1 0 01-1-1v-6zM14 9a1 1 0 00-1 1v6a1 1 0 001 1h2a1 1 0 001-1v-6a1 1 0 00-1-1h-2z" />
-            </svg>
-            {autoSlant ? 'Auto Slant ON' : 'Auto Slant OFF'}
-          </button>
-
-          {!state.isRecording ? (
-            <button
-              onClick={startRecording}
-              disabled={!state.isSupported}
-              className="flex-1 bg-[#238636] hover:bg-[#2ea043] disabled:opacity-50 text-white font-semibold px-6 py-3 rounded-md transition-colors text-base border border-transparent flex items-center justify-center gap-2"
-            >
-              <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" viewBox="0 0 20 20" fill="currentColor">
-                <path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zM9.555 7.168A1 1 0 008 8v4a1 1 0 001.555.832l3-2a1 1 0 000-1.664l-3-2z" clipRule="evenodd" />
-              </svg>
-              Start Decoding
-            </button>
-          ) : (
-            <button
-              onClick={stopRecording}
-              className="flex-1 bg-[#da3633] hover:bg-[#f85149] text-white font-semibold px-6 py-3 rounded-md transition-colors text-base flex items-center justify-center gap-2"
-            >
-              <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" viewBox="0 0 20 20" fill="currentColor">
-                <path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zM8 7a1 1 0 00-1 1v4a1 1 0 001 1h4a1 1 0 001-1V8a1 1 0 00-1-1H8z" clipRule="evenodd" />
-              </svg>
-              Stop
-            </button>
-          )}
-
-          <button
-            onClick={resetDecoder}
-            className="shrink-0 bg-[#21262d] hover:bg-[#30363d] text-white font-semibold px-6 py-3 rounded-md transition-colors text-base border border-[#30363d] flex items-center justify-center gap-2"
-          >
-            <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" viewBox="0 0 20 20" fill="currentColor">
-              <path fillRule="evenodd" d="M4 2a1 1 0 011 1v2.101a7.002 7.002 0 0111.601 2.566 1 1 0 11-1.885.666A5.002 5.002 0 005.999 7H9a1 1 0 010 2H4a1 1 0 01-1-1V3a1 1 0 011-1zm.008 9.057a1 1 0 011.276.61A5.002 5.002 0 0014.001 13H11a1 1 0 110-2h5a1 1 0 011 1v5a1 1 0 11-2 0v-2.101a7.002 7.002 0 01-11.601-2.566 1 1 0 01.61-1.276z" clipRule="evenodd" />
-            </svg>
-            Reset
-          </button>
-        </div>
-
-        {/* Auto-detect status */}
-        {state.isRecording && autoDetect && (
-          <div className={`flex items-center gap-2 text-sm px-3 py-2 rounded-md border ${
-            state.isListeningForVIS
-              ? 'bg-[#1f6feb]/10 border-[#1f6feb]/30 text-[#58a6ff]'
-              : 'bg-[#238636]/10 border-[#238636]/30 text-[#2ea043]'
-          }`}>
-            <span className={`inline-block w-2 h-2 rounded-full ${state.isListeningForVIS ? 'bg-[#58a6ff] animate-pulse' : 'bg-[#2ea043]'}`} />
-            {state.detectionStatus || (state.isListeningForVIS ? 'Listening for VIS…' : 'Decoding')}
-          </div>
-        )}
-
-        {state.error && (
-          <div className="bg-[#da3633]/10 border border-[#f85149]/30 rounded-md p-3 text-[#f85149] text-sm">
-            {state.error}
-          </div>
-        )}
-      </div>
 
       {/* ── Main display — resizable columns ── */}
       <div ref={containerRef} className="flex flex-col lg:flex-row lg:items-stretch gap-4 lg:gap-0">
@@ -446,85 +260,12 @@ export default function SSTVDecoder() {
         </div>
 
         {/* Panel 2 — Audio Analysis */}
-        <div
-          className="bg-[#161b22] border border-[#30363d] rounded-lg p-3 sm:p-4 min-w-0 flex flex-col"
+        <AudioAnalysisPanel
+          analyser={analyser ?? null}
+          isRecording={state.isRecording}
+          className="min-w-0"
           style={{ flex: panelWeights[1] }}
-        >
-          <h2 className="text-lg sm:text-xl font-semibold mb-2 sm:mb-3">Audio Analysis</h2>
-
-          <div className="space-y-1">
-            <div className="flex items-center justify-between">
-              <h3 className="text-sm font-medium text-[#8b949e]">Spectrum</h3>
-              <span className="text-xs text-[#8b949e] font-mono">SSTV: 1.2–2.3 kHz</span>
-            </div>
-            <canvas
-              ref={spectrumCanvasRef}
-              width={640} height={200}
-              className="w-full border border-[#30363d] rounded bg-[#0d1117]"
-            />
-          </div>
-
-          <div className="flex flex-col flex-1 gap-2 mt-3 sm:mt-4 min-h-0">
-            <h3 className="text-sm font-medium text-[#8b949e] shrink-0">Spectrogram</h3>
-            <div ref={spectrogramContainerRef} className="relative flex-1 min-h-[150px]">
-              {/* Both renderers stay mounted (hidden via CSS) so history persists across view switches */}
-              <div className={spectrogramView === 'legacy' ? 'block' : 'hidden'}>
-                <canvas
-                  ref={spectrogramCanvasRef}
-                  width={640}
-                  height={spectrogramCanvasHeight}
-                  style={{ height: spectrogramCanvasHeight }}
-                  className="w-full border border-[#30363d] rounded bg-[#0d1117] block"
-                />
-              </div>
-              <div className={spectrogramView !== 'legacy' ? 'block' : 'hidden'}>
-                <GLSpectrogram
-                  ref={glSpectrogramRef}
-                  view={spectrogramView === 'legacy' ? 'terrain' : spectrogramView}
-                  gamma={spectrogramGamma}
-                  height={spectrogramCanvasHeight}
-                  maxHz={SPECTRUM_MAX_HZ}
-                />
-              </div>
-            </div>
-            <div className="flex flex-wrap items-center gap-4 text-xs text-[#8b949e] shrink-0">
-              <label className="flex items-center gap-2">
-                View
-                <select
-                  value={spectrogramView}
-                  onChange={(e) => setSpectrogramView(e.target.value as SpectrogramView)}
-                  className="bg-[#0d1117] border border-[#30363d] rounded px-2 py-0.5 text-[#c9d1d9] focus:outline-none focus:border-[#2ea043] transition-colors cursor-pointer"
-                >
-                  <option value="terrain">3D Terrain</option>
-                  <option value="ridge">Ridgeline</option>
-                  <option value="legacy">Classic 2D</option>
-                </select>
-              </label>
-              <label className="flex items-center gap-2">
-                Contrast
-                <input
-                  type="range" min={0.5} max={6} step={0.1}
-                  value={spectrogramGamma}
-                  onChange={(e) => setSpectrogramGamma(parseFloat(e.target.value))}
-                  className="w-32 accent-[#2ea043] cursor-pointer"
-                />
-              </label>
-              <label className="flex items-center gap-2">
-                Speed
-                <select
-                  value={spectrogramSpeed}
-                  onChange={(e) => setSpectrogramSpeed(parseInt(e.target.value))}
-                  className="bg-[#0d1117] border border-[#30363d] rounded px-2 py-0.5 text-[#c9d1d9] focus:outline-none focus:border-[#2ea043] transition-colors cursor-pointer"
-                >
-                  <option value={1}>Fast</option>
-                  <option value={2}>Normal</option>
-                  <option value={4}>Slow</option>
-                  <option value={8}>Very Slow</option>
-                </select>
-              </label>
-            </div>
-          </div>
-        </div>
+        />
 
         {/* Drag handle 1↔2 */}
         <div
@@ -541,8 +282,58 @@ export default function SSTVDecoder() {
         >
           <h2 className="text-lg sm:text-xl font-semibold">Reception Info</h2>
 
+          {/* Auto-detect toggle */}
+          <div className="flex items-center gap-2.5">
+            <button
+              role="switch"
+              aria-checked={autoDetect}
+              onClick={() => setAutoDetect(v => !v)}
+              className={`relative inline-flex h-5 w-9 shrink-0 items-center rounded-full border transition-colors focus:outline-none ${
+                autoDetect ? 'bg-[#238636] border-[#2ea043]' : 'bg-[#21262d] border-[#30363d]'
+              }`}
+            >
+              <span className={`inline-block h-4 w-4 transform rounded-full bg-white shadow-sm transition-transform ${
+                autoDetect ? 'translate-x-4' : 'translate-x-0.5'
+              }`} />
+            </button>
+            <span className="text-sm text-[#c9d1d9] cursor-default select-none">Auto Detect</span>
+          </div>
+
+          {/* Auto-slant toggle */}
+          <div className="flex items-center gap-2.5">
+            <button
+              role="switch"
+              aria-checked={autoSlant}
+              onClick={() => setAutoSlant(v => !v)}
+              className={`relative inline-flex h-5 w-9 shrink-0 items-center rounded-full border transition-colors focus:outline-none ${
+                autoSlant ? 'bg-[#238636] border-[#2ea043]' : 'bg-[#21262d] border-[#30363d]'
+              }`}
+            >
+              <span className={`inline-block h-4 w-4 transform rounded-full bg-white shadow-sm transition-transform ${
+                autoSlant ? 'translate-x-4' : 'translate-x-0.5'
+              }`} />
+            </button>
+            <span className="text-sm text-[#c9d1d9] cursor-default select-none">Auto Slant</span>
+          </div>
+
+          {/* Manual mode selector — always visible, locked when auto-detect is on */}
+          <div className={`space-y-1.5 transition-opacity ${autoDetect ? 'opacity-40' : 'opacity-100'}`}>
+            <div className="text-xs text-[#8b949e]">Manual Mode</div>
+            <select
+              disabled={autoDetect}
+              value={manualMode}
+              onChange={(e) => handleModeChange(e.target.value as SSTVMode)}
+              className="w-full bg-[#0d1117] border border-[#30363d] rounded px-2 py-1.5 text-[#c9d1d9] font-mono text-xs focus:outline-none focus:border-[#2ea043] transition-colors disabled:cursor-not-allowed"
+            >
+              {(Object.keys(SSTV_MODES) as SSTVMode[]).map(k => (
+                <option key={k} value={k}>{SSTV_MODES[k].name}</option>
+              ))}
+            </select>
+          </div>
+
+          {/* Active mode box */}
           <div className="bg-[#0d1117] border border-[#30363d] rounded-lg p-3">
-            <div className="text-[#8b949e] text-xs mb-1">Mode</div>
+            <div className="text-[#8b949e] text-xs mb-1">Active Mode</div>
             <div className="font-mono font-semibold text-sm text-[#2ea043]">{modeCfg.name}</div>
             <div className="text-xs text-[#8b949e] mt-0.5">{modeCfg.width}×{modeCfg.height} px</div>
             {autoDetect && (
@@ -585,12 +376,6 @@ export default function SSTVDecoder() {
                   style={{ width: `${Math.min(progress, 100)}%` }}
                 />
               </div>
-            </div>
-          )}
-
-          {!autoDetect && (
-            <div className="text-xs text-[#8b949e] leading-relaxed mt-auto pt-2 border-t border-[#30363d]">
-              Use the <span className="text-[#c9d1d9]">settings button</span> (bottom-right) to change SSTV mode manually.
             </div>
           )}
         </div>
@@ -657,14 +442,8 @@ export default function SSTVDecoder() {
         <ImageModal img={selectedImage} onClose={() => setSelectedImage(null)} />
       )}
 
-      {/* SSTV mode selector — MUI floating action button (manual mode only) */}
-      {!autoDetect && (
-        <SettingsPanel
-          currentMode={manualMode}
-          onModeChange={handleModeChange}
-          disabled={state.isRecording}
-        />
-      )}
     </div>
   );
-}
+});
+
+export default SSTVDecoder;

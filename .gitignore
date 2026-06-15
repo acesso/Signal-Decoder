@@ -8,6 +8,8 @@
 
 # testing
 /coverage
+/test-results
+/playwright-report
 
 # next.js
 /.next/
@@ -49,6 +51,9 @@ robot36/
 .vscode/
 .idea/
 .github/
+
+# Claude Code
+.claude/
 
 # Source packages and extracted source trees
 *.rpm

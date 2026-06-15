@@ -1,13 +1,12 @@
 'use client';
 
-import { useEffect, useRef, useState, useCallback, useReducer } from 'react';
+import { useEffect, useRef, useState, useCallback, useReducer, forwardRef, useImperativeHandle } from 'react';
+import type { DecoderControls, DecoderProps } from './DecoderControls';
 import { useMultiRTTYProcessor } from '@/hooks/useMultiRTTYProcessor';
 import { SessionCard } from '@/components/SessionCard';
 import { sessionsReducer, makeSession } from '@/lib/rtty/sessions';
 import type { RTTYConfig } from '@/lib/rtty/decoder';
-import GLSpectrogram, { GLSpectrogramHandle, GLView } from './GLSpectrogram';
-
-type SpectrogramView = 'legacy' | GLView;
+import AudioAnalysisPanel from './AudioAnalysisPanel';
 
 const DISPLAY_MAX_HZ = 1500;
 
@@ -25,50 +24,15 @@ const DEFAULT_CONFIG: RTTYConfig = {
 const _initialSession = makeSession(DEFAULT_CONFIG);
 const _initialState = { sessions: [_initialSession], activeSessionId: _initialSession.id };
 
-export default function RTTYDecoder() {
+const RTTYDecoder = forwardRef<DecoderControls, DecoderProps>(function RTTYDecoder({ onStateChange, analyser }, ref) {
   // Canvas / animation refs
-  const spectrumCanvasRef    = useRef<HTMLCanvasElement>(null);
-  const spectrogramCanvasRef = useRef<HTMLCanvasElement>(null);
-  const animationFrameRef    = useRef<number | null>(null);
   const textareaRef          = useRef<HTMLTextAreaElement>(null);
-  const isDraggingRef        = useRef(false);
-  const spectrogramFrameRef  = useRef(0);
 
   // Sessions state
   const [sessionState, dispatch] = useReducer(sessionsReducer, _initialState);
   const { sessions, activeSessionId } = sessionState;
   const activeSession = sessions.find(s => s.id === activeSessionId) ?? sessions[0];
   const activeConfig  = activeSession.config;
-
-  // Spectrogram display controls
-  const [spectrogramGamma, setSpectrogramGamma] = useState(3.0);
-  const [spectrogramSpeed, setSpectrogramSpeed] = useState(2);
-  const [spectrogramView,  setSpectrogramView]  = useState<SpectrogramView>('terrain');
-  const [bandAlpha,        setBandAlpha]        = useState(0.3);
-  const glSpectrogramRef = useRef<GLSpectrogramHandle>(null);
-  const spectrogramGammaRef = useRef(3.0);
-  const spectrogramSpeedRef = useRef(2);
-  useEffect(() => { spectrogramGammaRef.current = spectrogramGamma; }, [spectrogramGamma]);
-  useEffect(() => { spectrogramSpeedRef.current = spectrogramSpeed; }, [spectrogramSpeed]);
-
-  // Dynamic spectrogram height — follows the Audio Analysis panel's available space
-  const spectrogramContainerRef = useRef<HTMLDivElement>(null);
-  const [spectrogramCanvasHeight, setSpectrogramCanvasHeight] = useState(500);
-  const spectrogramCanvasHeightRef = useRef(500);
-
-  useEffect(() => {
-    const el = spectrogramContainerRef.current;
-    if (!el) return;
-    const ro = new ResizeObserver(entries => {
-      const h = Math.round(entries[0].contentRect.height);
-      if (h > 80 && Math.abs(h - spectrogramCanvasHeightRef.current) > 4) {
-        spectrogramCanvasHeightRef.current = h;
-        setSpectrogramCanvasHeight(h);
-      }
-    });
-    ro.observe(el);
-    return () => ro.disconnect();
-  }, []);
 
   // Resizable panels
   const containerRef    = useRef<HTMLDivElement>(null);
@@ -151,6 +115,8 @@ export default function RTTYDecoder() {
     setActiveSession:    hookSetActive,
     getAnalyser,
   } = useMultiRTTYProcessor(handleText);
+
+  const isRecording = procState?.isRecording ?? false;
 
   // Register initial session with the hook on mount
   useEffect(() => {
@@ -311,163 +277,6 @@ export default function RTTYDecoder() {
     }
   }, []);
 
-  const drawSpectrum = useCallback((canvas: HTMLCanvasElement) => {
-    const analyser = getAnalyser();
-    if (!analyser) return;
-    const ctx = canvas.getContext('2d');
-    if (!ctx) return;
-
-    const bufferLength = analyser.frequencyBinCount;
-    const dataArray    = new Uint8Array(bufferLength);
-    analyser.getByteFrequencyData(dataArray);
-
-    const nq = analyser.context.sampleRate / 2;
-    nyquistRef.current = nq;
-
-    const binsToShow  = Math.max(1, Math.floor((DISPLAY_MAX_HZ / nq) * bufferLength));
-    const visibleData = dataArray.subarray(0, binsToShow);
-    const axisHeight  = 25;
-    const plotHeight  = canvas.height - axisHeight;
-
-    ctx.fillStyle = 'rgb(10, 10, 10)';
-    ctx.fillRect(0, 0, canvas.width, canvas.height);
-
-    ctx.strokeStyle = '#2ea043'; ctx.lineWidth = 2;
-    ctx.beginPath();
-    const barWidth = canvas.width / binsToShow;
-    for (let i = 0; i < binsToShow; i++) {
-      const x = i * barWidth;
-      const y = plotHeight - (visibleData[i] / 255) * plotHeight;
-      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
-    }
-    ctx.stroke();
-
-    const PEAK_DECAY = 0.4;
-    const _half  = carrierShiftRef.current / 2;
-    const mark   = reverseShiftRef.current ? centerFreqRef.current + _half : centerFreqRef.current - _half;
-    const space  = reverseShiftRef.current ? centerFreqRef.current - _half : centerFreqRef.current + _half;
-    const mBin   = Math.min(Math.round((mark  / DISPLAY_MAX_HZ) * (binsToShow - 1)), binsToShow - 1);
-    const sBin   = Math.min(Math.round((space / DISPLAY_MAX_HZ) * (binsToShow - 1)), binsToShow - 1);
-    const mLvl   = mBin >= 0 ? (visibleData[mBin]  ?? 0) : 0;
-    const sLvl   = sBin >= 0 ? (visibleData[sBin]  ?? 0) : 0;
-    markPeakRef.current  = mLvl > markPeakRef.current  ? mLvl  : Math.max(0, markPeakRef.current  - PEAK_DECAY);
-    spacePeakRef.current = sLvl > spacePeakRef.current ? sLvl  : Math.max(0, spacePeakRef.current - PEAK_DECAY);
-
-    drawFrequencyMarkers(ctx, canvas.width, plotHeight, DISPLAY_MAX_HZ);
-    drawAxisLabels(ctx, canvas.width, plotHeight, DISPLAY_MAX_HZ);
-    return visibleData;
-  }, [getAnalyser, drawFrequencyMarkers, drawAxisLabels]);
-
-  const drawIdleSpectrum = useCallback((canvas: HTMLCanvasElement) => {
-    const ctx = canvas.getContext('2d');
-    if (!ctx) return;
-    const axisHeight = 25;
-    const plotHeight = canvas.height - axisHeight;
-    markPeakRef.current  = Math.max(0, markPeakRef.current  - 0.4);
-    spacePeakRef.current = Math.max(0, spacePeakRef.current - 0.4);
-    ctx.fillStyle = 'rgb(10, 10, 10)';
-    ctx.fillRect(0, 0, canvas.width, canvas.height);
-    drawFrequencyMarkers(ctx, canvas.width, plotHeight, DISPLAY_MAX_HZ);
-    drawAxisLabels(ctx, canvas.width, plotHeight, DISPLAY_MAX_HZ);
-  }, [drawFrequencyMarkers, drawAxisLabels]);
-
-  const drawSpectrogram = useCallback((canvas: HTMLCanvasElement, frequencyData: Uint8Array) => {
-    const ctx = canvas.getContext('2d');
-    if (!ctx) return;
-
-    const binCount = frequencyData.length;
-    const newRow   = ctx.createImageData(canvas.width, 1);
-
-    for (let px = 0; px < canvas.width; px++) {
-      const binF  = (px / canvas.width) * (binCount - 1);
-      const b0    = Math.floor(binF);
-      const b1    = Math.min(b0 + 1, binCount - 1);
-      const t     = binF - b0;
-      const value = frequencyData[b0] * (1 - t) + frequencyData[b1] * t;
-
-      const gamma    = spectrogramGammaRef.current;
-      const adjusted = gamma === 1 ? value : Math.pow(value / 255, gamma) * 255;
-      const v = adjusted;
-      let r: number, g: number, b: number;
-      // black → deep blue → purple → red
-      if (v < 128) { r = 0;                    g = 0; b = Math.round(v * 2); }
-      else         { r = Math.round((v-128)*2); g = 0; b = Math.round(255-(v-128)*2); }
-
-      const i = px * 4;
-      newRow.data[i]     = r;
-      newRow.data[i + 1] = g;
-      newRow.data[i + 2] = b;
-      newRow.data[i + 3] = 255;
-    }
-
-    const existing = ctx.getImageData(0, 0, canvas.width, canvas.height - 1);
-    ctx.putImageData(existing, 0, 1);
-    ctx.putImageData(newRow, 0, 0);
-  }, []);
-
-  // Animation loop
-  useEffect(() => {
-    const tick = () => {
-      const spectrumCanvas    = spectrumCanvasRef.current;
-      const spectrogramCanvas = spectrogramCanvasRef.current;
-
-      if (procState.isRecording && spectrumCanvas) {
-        const frequencyData = drawSpectrum(spectrumCanvas);
-        spectrogramFrameRef.current++;
-        if (frequencyData && spectrogramFrameRef.current % spectrogramSpeedRef.current === 0) {
-          // Feed both renderers so history stays warm when switching views
-          if (spectrogramCanvas) drawSpectrogram(spectrogramCanvas, frequencyData);
-          glSpectrogramRef.current?.pushRow(frequencyData);
-        }
-      } else if (spectrumCanvas) {
-        drawIdleSpectrum(spectrumCanvas);
-      }
-
-      animationFrameRef.current = requestAnimationFrame(tick);
-    };
-    animationFrameRef.current = requestAnimationFrame(tick);
-    return () => { if (animationFrameRef.current) cancelAnimationFrame(animationFrameRef.current); };
-  }, [procState.isRecording, drawSpectrum, drawSpectrogram, drawIdleSpectrum]);
-
-  // Spectrum click / drag — reposition center freq of active session
-  useEffect(() => {
-    const canvas = spectrumCanvasRef.current;
-    if (!canvas) return;
-
-    const applyFreq = (clientX: number) => {
-      const rect = canvas.getBoundingClientRect();
-      const relX = Math.max(0, Math.min(1, (clientX - rect.left) / rect.width));
-      dispatchRef.current({
-        type: 'UPDATE_CONFIG',
-        id: activeSessionIdRef.current,
-        patch: { centerFreq: Math.round(relX * DISPLAY_MAX_HZ) },
-      });
-    };
-
-    const onMouseDown  = (e: MouseEvent)  => { isDraggingRef.current = true; applyFreq(e.clientX); };
-    const onMouseMove  = (e: MouseEvent)  => { if (isDraggingRef.current) applyFreq(e.clientX); };
-    const onMouseUp    = ()               => { isDraggingRef.current = false; };
-    const onTouchStart = (e: TouchEvent)  => { e.preventDefault(); isDraggingRef.current = true; applyFreq(e.touches[0].clientX); };
-    const onTouchMove  = (e: TouchEvent)  => { e.preventDefault(); if (isDraggingRef.current) applyFreq(e.touches[0].clientX); };
-    const onTouchEnd   = ()               => { isDraggingRef.current = false; };
-
-    canvas.addEventListener('mousedown',  onMouseDown);
-    canvas.addEventListener('touchstart', onTouchStart, { passive: false });
-    window.addEventListener('mousemove',  onMouseMove);
-    window.addEventListener('mouseup',    onMouseUp);
-    window.addEventListener('touchmove',  onTouchMove as EventListener, { passive: false });
-    window.addEventListener('touchend',   onTouchEnd);
-
-    return () => {
-      canvas.removeEventListener('mousedown',  onMouseDown);
-      canvas.removeEventListener('touchstart', onTouchStart);
-      window.removeEventListener('mousemove',  onMouseMove);
-      window.removeEventListener('mouseup',    onMouseUp);
-      window.removeEventListener('touchmove',  onTouchMove as EventListener);
-      window.removeEventListener('touchend',   onTouchEnd);
-    };
-  }, []);
-
   // Auto-scroll textarea when active session text changes
   useEffect(() => {
     const t = textareaRef.current;
@@ -501,95 +310,21 @@ export default function RTTYDecoder() {
     }
   };
 
-  const signalStrengthPct = Math.round(procState.signalStrength * 100);
-
-  const inputCls = "bg-[#0d1117] border border-[#30363d] rounded px-3 py-2 font-mono text-sm text-[#c9d1d9] focus:outline-none focus:border-[#2ea043] w-full transition-colors";
-  const labelCls = "text-[#8b949e] text-xs mb-1 block";
+  const controls: DecoderControls = {
+    isRecording: procState.isRecording,
+    isSupported: typeof window !== 'undefined' && !!(window.AudioContext ?? (window as unknown as Record<string, unknown>).webkitAudioContext),
+    error: procState.errorMessage ?? null,
+    start: startRecording,
+    stop: stopRecording,
+    reset: handleReset,
+  };
+  useImperativeHandle(ref, () => controls, [procState.isRecording, procState.errorMessage, startRecording, stopRecording, handleReset]); // eslint-disable-line react-hooks/exhaustive-deps
+  const onStateChangeRef = useRef(onStateChange);
+  onStateChangeRef.current = onStateChange;
+  useEffect(() => { onStateChangeRef.current?.(controls); }, [procState.isRecording, procState.errorMessage]); // eslint-disable-line react-hooks/exhaustive-deps
 
   return (
     <div className="space-y-4 sm:space-y-6">
-
-      {/* ── Controls ── */}
-      <div className="bg-[#161b22] border border-[#30363d] rounded-lg p-4 sm:p-6 space-y-4">
-        <div className="flex flex-col sm:flex-row gap-3 sm:gap-4">
-          {!procState.isRecording ? (
-            <button
-              onClick={handleStart}
-              className="w-full sm:flex-1 bg-[#238636] hover:bg-[#2ea043] text-white font-semibold px-6 py-3 rounded-md transition-colors text-base border border-transparent flex items-center justify-center gap-2"
-            >
-              <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" viewBox="0 0 20 20" fill="currentColor">
-                <path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zM9.555 7.168A1 1 0 008 8v4a1 1 0 001.555.832l3-2a1 1 0 000-1.664l-3-2z" clipRule="evenodd" />
-              </svg>
-              Start Decoding
-            </button>
-          ) : (
-            <button
-              onClick={handleStop}
-              className="w-full sm:flex-1 bg-[#da3633] hover:bg-[#f85149] text-white font-semibold px-6 py-3 rounded-md transition-colors text-base flex items-center justify-center gap-2"
-            >
-              <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" viewBox="0 0 20 20" fill="currentColor">
-                <path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zM8 7a1 1 0 00-1 1v4a1 1 0 001 1h4a1 1 0 001-1V8a1 1 0 00-1-1H8z" clipRule="evenodd" />
-              </svg>
-              Stop
-            </button>
-          )}
-
-          <button
-            onClick={handleReset}
-            className="w-full sm:flex-1 bg-[#21262d] hover:bg-[#30363d] text-white font-semibold px-6 py-3 rounded-md transition-colors text-base border border-[#30363d] flex items-center justify-center gap-2"
-          >
-            <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" viewBox="0 0 20 20" fill="currentColor">
-              <path fillRule="evenodd" d="M4 2a1 1 0 011 1v2.101a7.002 7.002 0 0111.601 2.566 1 1 0 11-1.885.666A5.002 5.002 0 005.999 7H9a1 1 0 010 2H4a1 1 0 01-1-1V3a1 1 0 011-1zm.008 9.057a1 1 0 011.276.61A5.002 5.002 0 0014.001 13H11a1 1 0 110-2h5a1 1 0 011 1v5a1 1 0 11-2 0v-2.101a7.002 7.002 0 01-11.601-2.566 1 1 0 01.61-1.276z" clipRule="evenodd" />
-            </svg>
-            Reset
-          </button>
-
-          <button
-            onClick={handleCopyText}
-            disabled={!activeSession.fullText}
-            className="w-full sm:flex-1 bg-[#21262d] hover:bg-[#30363d] disabled:opacity-40 disabled:cursor-not-allowed text-white font-semibold px-6 py-3 rounded-md transition-colors text-base border border-[#30363d] flex items-center justify-center gap-2"
-          >
-            <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" viewBox="0 0 20 20" fill="currentColor">
-              <path d="M8 3a1 1 0 011-1h2a1 1 0 110 2H9a1 1 0 01-1-1z" />
-              <path d="M6 3a2 2 0 00-2 2v11a2 2 0 002 2h8a2 2 0 002-2V5a2 2 0 00-2-2 3 3 0 01-3 3H9a3 3 0 01-3-3z" />
-            </svg>
-            Copy Text
-          </button>
-        </div>
-
-        {procState.errorMessage && (
-          <div className="bg-[#da3633]/10 border border-[#f85149]/30 rounded-md p-3 text-[#f85149] text-sm">
-            {procState.errorMessage}
-          </div>
-        )}
-
-        {procState.isRecording && (
-          <div className="grid grid-cols-2 lg:grid-cols-4 gap-3 sm:gap-4 text-sm">
-            <div className="bg-[#0d1117] border border-[#30363d] rounded-lg p-3">
-              <div className="text-[#8b949e] text-xs mb-1">State</div>
-              <div className={`font-mono font-semibold text-sm ${getStateColor()}`}>{procState.status.toUpperCase()}</div>
-            </div>
-            <div className="bg-[#0d1117] border border-[#30363d] rounded-lg p-3">
-              <div className="text-[#8b949e] text-xs mb-1">Mode</div>
-              <div className="font-mono font-semibold text-sm text-[#2ea043]">RTTY</div>
-            </div>
-            <div className="bg-[#0d1117] border border-[#30363d] rounded-lg p-3">
-              <div className="text-[#8b949e] text-xs mb-1">Chars</div>
-              <div className="font-mono font-semibold text-sm">{activeSession.fullText.length}</div>
-            </div>
-            <div className="bg-[#0d1117] border border-[#30363d] rounded-lg p-3">
-              <div className="text-[#8b949e] text-xs mb-1">SNR</div>
-              <div className={`font-mono font-semibold text-sm ${
-                procState.snr === null ? 'text-[#8b949e]' :
-                procState.snr < 10    ? 'text-[#da3633]' :
-                procState.snr < 18    ? 'text-[#e3b341]' : 'text-[#2ea043]'
-              }`}>
-                {procState.snr !== null ? `${procState.snr.toFixed(1)} dB` : '-- dB'}
-              </div>
-            </div>
-          </div>
-        )}
-      </div>
 
       {/* ── Main display — fluid resizable columns ── */}
       <div ref={containerRef} className="flex flex-col lg:flex-row lg:items-stretch gap-4 lg:gap-0">
@@ -628,194 +363,31 @@ export default function RTTYDecoder() {
         </div>
 
         {/* Drag handle 0↔1 */}
-        <div
-          className="hidden lg:flex w-3 self-stretch cursor-col-resize items-center justify-center group shrink-0"
-          onMouseDown={(e) => startDrag(e, 0)}
-        >
-          <div className="w-px h-full bg-[#30363d] group-hover:bg-[#2ea043]/50 transition-colors" />
-        </div>
+        <div className="hidden lg:flex w-3 self-stretch cursor-col-resize items-center justify-center group shrink-0" onMouseDown={(e) => startDrag(e, 0)}><div className="w-px h-full bg-[#30363d] group-hover:bg-[#2ea043]/50 transition-colors" /></div>
 
-        {/* Audio Analysis */}
-        <div
-          className="bg-[#161b22] border border-[#30363d] rounded-lg p-3 sm:p-4 min-w-0 flex flex-col"
+        {/* Audio Analysis — 2nd column */}
+        <AudioAnalysisPanel
+          analyser={analyser ?? null}
+          isRecording={isRecording}
+          defaultMaxHz={DISPLAY_MAX_HZ}
+          markers={[
+            { freq: markFreq,  color: '#58a6ff', label: 'M', bandwidthHz: halfBW * 2 },
+            { freq: spaceFreq, color: '#f0883e', label: 'S', bandwidthHz: halfBW * 2 },
+          ]}
+          onMarkerDrag={(idx, newHz) => {
+            // Both markers share a fixed shift — drag either one to re-center
+            const half = carrierShift / 2;
+            const newCenter = idx === 0
+              ? (reverseShift ? newHz - half : newHz + half)   // dragged M
+              : (reverseShift ? newHz + half : newHz - half);  // dragged S
+            updateSessionConfig(activeSessionId, { centerFreq: Math.round(newCenter) });
+          }}
+          className="min-w-0"
           style={{ flex: panelWeights[1] }}
-        >
-          <div className="flex items-center justify-between mb-2 sm:mb-3">
-            <h2 className="text-lg sm:text-xl font-semibold">Audio Analysis</h2>
-            {procState.isRecording && (
-              <div className="flex items-center gap-2">
-                <span className="text-xs text-[#8b949e]">Signal</span>
-                <div className="flex items-center gap-1">
-                  {[0, 1, 2, 3, 4].map((bar) => {
-                    const isActive = signalStrengthPct > bar * 20;
-                    const color = !isActive ? 'bg-[#21262d]'
-                      : signalStrengthPct < 30 ? 'bg-[#da3633]'
-                      : signalStrengthPct < 60 ? 'bg-[#e3b341]'
-                      : 'bg-[#2ea043]';
-                    return <div key={bar} className={`w-1.5 sm:w-2 rounded-sm transition-colors ${color}`} style={{ height: `${8 + bar * 3}px` }} />;
-                  })}
-                </div>
-                <span className="text-xs font-mono text-[#c9d1d9] min-w-[3ch]">{signalStrengthPct}%</span>
-              </div>
-            )}
-          </div>
+        />
 
-          {/* Spectrum */}
-          <div className="space-y-1">
-            <div className="flex items-center justify-between">
-              <h3 className="text-sm font-medium text-[#8b949e]">Spectrum</h3>
-              <span className="text-xs text-[#8b949e] font-mono">click &amp; drag to tune</span>
-            </div>
-            <canvas
-              ref={spectrumCanvasRef}
-              width={640} height={200}
-              className="w-full border border-[#30363d] rounded bg-[#0d1117] touch-manipulation cursor-crosshair select-none"
-            />
-          </div>
-
-          {/* Freq readout + center + sideband */}
-          <div className="flex flex-wrap items-center gap-4 mt-2 text-xs font-mono text-[#8b949e]">
-            <span>Mark:&nbsp;<span className="text-[#58a6ff]">{markFreq} Hz</span></span>
-            <span>Space:&nbsp;<span className="text-[#f0883e]">{spaceFreq} Hz</span></span>
-            <label className="flex items-center gap-1">
-              Center:
-              <input
-                type="number"
-                value={centerFreq}
-                min={0} max={DISPLAY_MAX_HZ}
-                onChange={(e) => {
-                  const v = parseInt(e.target.value);
-                  if (!isNaN(v)) patchActive({ centerFreq: Math.max(0, Math.min(DISPLAY_MAX_HZ, v)) });
-                }}
-                className="bg-[#0d1117] border border-[#30363d] rounded px-2 py-0.5 w-20 text-[#c9d1d9] focus:outline-none focus:border-[#2ea043] transition-colors"
-              />
-              <span>Hz</span>
-            </label>
-            <span className="flex items-center gap-1">
-              Sideband:
-              <button
-                onClick={() => patchActive({ reverseShift: !reverseShift })}
-                className={`px-2 py-0.5 rounded border transition-colors ${
-                  reverseShift
-                    ? 'bg-[#f0883e]/10 border-[#f0883e]/50 text-[#f0883e]'
-                    : 'bg-[#0d1117] border-[#30363d] text-[#8b949e] hover:border-[#58a6ff]/40 hover:text-[#58a6ff]'
-                }`}
-              >
-                {reverseShift ? 'LSB' : 'USB'}
-              </button>
-            </span>
-          </div>
-
-          {/* Spectrogram — flex-1 so it fills remaining panel height */}
-          <div className="flex flex-col flex-1 gap-2 mt-3 sm:mt-4 min-h-0">
-            <h3 className="text-sm font-medium text-[#8b949e] shrink-0">Spectrogram</h3>
-            <div ref={spectrogramContainerRef} className="relative flex-1 min-h-[150px]">
-              {/* Both renderers stay mounted (hidden via CSS) so history persists across view switches */}
-              <div className={spectrogramView === 'legacy' ? 'block' : 'hidden'}>
-                <canvas
-                  ref={spectrogramCanvasRef}
-                  width={640}
-                  height={spectrogramCanvasHeight}
-                  style={{ height: spectrogramCanvasHeight }}
-                  className="w-full border border-[#30363d] rounded bg-[#0d1117] touch-manipulation block"
-                />
-                <div className="absolute inset-y-0 pointer-events-none" style={{
-                  left: `${(spaceBandLow / DISPLAY_MAX_HZ) * 100}%`,
-                  width: `${((spaceBandHigh - spaceBandLow) / DISPLAY_MAX_HZ) * 100}%`,
-                  backgroundColor: 'rgba(240,136,62,0.07)',
-                  borderLeft: '1px solid rgba(240,136,62,0.28)', borderRight: '1px solid rgba(240,136,62,0.28)',
-                }} />
-                <div className="absolute inset-y-0 pointer-events-none" style={{
-                  left: `${(markBandLow / DISPLAY_MAX_HZ) * 100}%`,
-                  width: `${((markBandHigh - markBandLow) / DISPLAY_MAX_HZ) * 100}%`,
-                  backgroundColor: 'rgba(88,166,255,0.07)',
-                  borderLeft: '1px solid rgba(88,166,255,0.28)', borderRight: '1px solid rgba(88,166,255,0.28)',
-                }} />
-                {spaceFreq >= 0 && spaceFreq <= DISPLAY_MAX_HZ && (
-                  <div className="absolute inset-y-0 pointer-events-none" style={{ left: `${(spaceFreq / DISPLAY_MAX_HZ) * 100}%`, width: '2px', backgroundColor: '#f0883e', opacity: 0.9 }}>
-                    <span className="absolute top-1 left-1 text-[10px] font-mono font-bold text-[#f0883e] leading-none drop-shadow-md">S</span>
-                  </div>
-                )}
-                {markFreq >= 0 && markFreq <= DISPLAY_MAX_HZ && (
-                  <div className="absolute inset-y-0 pointer-events-none" style={{ left: `${(markFreq / DISPLAY_MAX_HZ) * 100}%`, width: '2px', backgroundColor: '#58a6ff', opacity: 0.9 }}>
-                    <span className="absolute top-1 left-1 text-[10px] font-mono font-bold text-[#58a6ff] leading-none drop-shadow-md">M</span>
-                  </div>
-                )}
-              </div>
-              <div className={spectrogramView !== 'legacy' ? 'block' : 'hidden'}>
-                <GLSpectrogram
-                  ref={glSpectrogramRef}
-                  view={spectrogramView === 'legacy' ? 'terrain' : spectrogramView}
-                  gamma={spectrogramGamma}
-                  height={spectrogramCanvasHeight}
-                  maxHz={DISPLAY_MAX_HZ}
-                  bandAlpha={bandAlpha}
-                  bands={[
-                    { fromHz: markBandLow,  toHz: markBandHigh,  color: '#58a6ff' },
-                    { fromHz: spaceBandLow, toHz: spaceBandHigh, color: '#f0883e' },
-                    { fromHz: markFreq - 4,  toHz: markFreq + 4,  color: '#58a6ff', line: true },
-                    { fromHz: spaceFreq - 4, toHz: spaceFreq + 4, color: '#f0883e', line: true },
-                  ]}
-                />
-              </div>
-            </div>
-            {/* View + Contrast + Speed */}
-            <div className="flex flex-wrap items-center gap-4 text-xs text-[#8b949e] shrink-0">
-              <label className="flex items-center gap-2">
-                View
-                <select
-                  value={spectrogramView}
-                  onChange={(e) => setSpectrogramView(e.target.value as SpectrogramView)}
-                  className="bg-[#0d1117] border border-[#30363d] rounded px-2 py-0.5 text-[#c9d1d9] focus:outline-none focus:border-[#2ea043] transition-colors cursor-pointer"
-                >
-                  <option value="terrain">3D Terrain</option>
-                  <option value="ridge">Ridgeline</option>
-                  <option value="legacy">Classic 2D</option>
-                </select>
-              </label>
-              {spectrogramView !== 'legacy' && (
-                <label className="flex items-center gap-2" title="Opacity of the mark/space range overlays">
-                  Range
-                  <input
-                    type="range" min={0} max={1} step={0.05}
-                    value={bandAlpha}
-                    onChange={(e) => setBandAlpha(parseFloat(e.target.value))}
-                    className="w-20 accent-[#2ea043] cursor-pointer"
-                  />
-                </label>
-              )}
-              <label className="flex items-center gap-2">
-                Contrast
-                <input
-                  type="range" min={0.5} max={6} step={0.1}
-                  value={spectrogramGamma}
-                  onChange={(e) => setSpectrogramGamma(parseFloat(e.target.value))}
-                  className="w-32 accent-[#2ea043] cursor-pointer"
-                />
-              </label>
-              <label className="flex items-center gap-2">
-                Speed
-                <select
-                  value={spectrogramSpeed}
-                  onChange={(e) => setSpectrogramSpeed(parseInt(e.target.value))}
-                  className="bg-[#0d1117] border border-[#30363d] rounded px-2 py-0.5 text-[#c9d1d9] focus:outline-none focus:border-[#2ea043] transition-colors cursor-pointer"
-                >
-                  <option value={1}>Fast</option>
-                  <option value={2}>Normal</option>
-                  <option value={4}>Slow</option>
-                  <option value={8}>Very Slow</option>
-                </select>
-              </label>
-            </div>
-          </div>
-        </div>
         {/* Drag handle 1↔2 */}
-        <div
-          className="hidden lg:flex w-3 self-stretch cursor-col-resize items-center justify-center group shrink-0"
-          onMouseDown={(e) => startDrag(e, 1)}
-        >
-          <div className="w-px h-full bg-[#30363d] group-hover:bg-[#2ea043]/50 transition-colors" />
-        </div>
+        <div className="hidden lg:flex w-3 self-stretch cursor-col-resize items-center justify-center group shrink-0" onMouseDown={(e) => startDrag(e, 1)}><div className="w-px h-full bg-[#30363d] group-hover:bg-[#2ea043]/50 transition-colors" /></div>
 
         {/* Decoder Sessions — 3rd column */}
         <div
@@ -930,4 +502,6 @@ export default function RTTYDecoder() {
       </details>
     </div>
   );
-}
+});
+
+export default RTTYDecoder;
