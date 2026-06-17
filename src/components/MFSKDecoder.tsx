@@ -2,6 +2,7 @@
 
 import { useEffect, useRef, useCallback, useState, forwardRef, useImperativeHandle } from 'react';
 import type { DecoderControls, DecoderProps } from './DecoderControls';
+import { fmtAbsHz } from '@/lib/formatFreq';
 import AudioAnalysisPanel from './AudioAnalysisPanel';
 import { useMFSKProcessor } from '@/hooks/useMFSKProcessor';
 import type { MFSKSymbol, MFSKWord } from '@/hooks/useMFSKProcessor';
@@ -455,7 +456,7 @@ function SegBtn<T extends string | number>({
 // ── Tone row (collapsed / expanded) ──────────────────────────────────────────
 
 function ToneRow({
-  ch, index, total, maxHz,
+  ch, index, total, maxHz, vfoFrequency,
   onRemove, onFreqChange, onColorChange,
   pwrRef,
 }: {
@@ -463,6 +464,7 @@ function ToneRow({
   index: number;
   total: number;
   maxHz: number;
+  vfoFrequency?: number;
   onRemove: () => void;
   onFreqChange: (f: number) => void;
   onColorChange: (c: string) => void;
@@ -495,7 +497,11 @@ function ToneRow({
         {/* label */}
         <span className="font-mono text-[10px] w-7 shrink-0" style={{color: ch.color}}>{ch.label}</span>
         {/* freq inline */}
-        <span className="font-mono text-[10px] text-[#8b949e] flex-1 min-w-0 truncate">{ch.freq} Hz</span>
+        <span className="font-mono text-[10px] text-[#8b949e] flex-1 min-w-0 truncate">
+          {vfoFrequency
+            ? `${fmtAbsHz(vfoFrequency+ch.freq)} Hz`
+            : `${ch.freq} Hz`}
+        </span>
         {/* power bar */}
         <div className="w-12 bg-[#21262d] rounded-full h-1 overflow-hidden shrink-0">
           <div ref={pwrRef} className="h-full rounded-full" style={{width:'0%', backgroundColor: ch.color}}/>
@@ -521,12 +527,18 @@ function ToneRow({
           </div>
           <div className="flex items-center gap-2">
             <label className="text-[#484f58] text-[10px] w-8 shrink-0">Freq</label>
-            <input type="number" value={freqInput} min={50} max={maxHz} step={1}
-              onChange={e => setFreqInput(e.target.value)}
-              onBlur={commitFreq}
-              onKeyDown={e => { if (e.key === 'Enter') commitFreq(); }}
-              className="flex-1 bg-[#161b22] border border-[#30363d] rounded px-1.5 py-0.5 text-[10px] font-mono focus:outline-none focus:border-[#2ea043] min-w-0"
-              style={{color: ch.color}}/>
+            {vfoFrequency ? (
+              <span className="flex-1 bg-[#161b22] border border-[#30363d] rounded px-1.5 py-0.5 text-[10px] font-mono min-w-0" style={{color: ch.color}}>
+                {fmtAbsHz(vfoFrequency+ch.freq)}
+              </span>
+            ) : (
+              <input type="number" value={freqInput} min={50} max={maxHz} step={1}
+                onChange={e => setFreqInput(e.target.value)}
+                onBlur={commitFreq}
+                onKeyDown={e => { if (e.key === 'Enter') commitFreq(); }}
+                className="flex-1 bg-[#161b22] border border-[#30363d] rounded px-1.5 py-0.5 text-[10px] font-mono focus:outline-none focus:border-[#2ea043] min-w-0"
+                style={{color: ch.color}}/>
+            )}
             <span className="text-[#484f58] text-[10px] shrink-0">Hz</span>
           </div>
           <input type="range" min={50} max={maxHz} step={5} value={ch.freq}
@@ -540,7 +552,7 @@ function ToneRow({
 
 // ── Main component ────────────────────────────────────────────────────────────
 
-const MFSKDecoder = forwardRef<DecoderControls, DecoderProps>(function MFSKDecoder({ onStateChange, analyser }, ref) {
+const MFSKDecoder = forwardRef<DecoderControls, DecoderProps>(function MFSKDecoder({ onStateChange, analyser, vfoFrequency }, ref) {
 
   // ── Core params ───────────────────────────────────────────────────────────
   const [channels,  setChannels]  = useState<MFSKChannel[]>(DEFAULT_CHANNELS);
@@ -1159,6 +1171,7 @@ const MFSKDecoder = forwardRef<DecoderControls, DecoderProps>(function MFSKDecod
           squelch={squelch}
           onSquelchChange={setSquelch}
           glBands={channels}
+          vfoFrequency={vfoFrequency}
           className="min-w-0"
           style={{flex:pW[1]}}
         />
@@ -1341,6 +1354,7 @@ const MFSKDecoder = forwardRef<DecoderControls, DecoderProps>(function MFSKDecod
                 index={i}
                 total={channels.length}
                 maxHz={3000}
+                vfoFrequency={vfoFrequency}
                 onRemove={() => removeChannel(ch.id)}
                 onFreqChange={f => updFreq(ch.id, f)}
                 onColorChange={c => updColor(ch.id, c)}

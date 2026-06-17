@@ -2,6 +2,7 @@
 
 import { useEffect, useRef, useCallback, useState, useMemo, forwardRef, useImperativeHandle } from 'react';
 import type { DecoderControls, DecoderProps } from './DecoderControls';
+import { fmtAbsHz } from '@/lib/formatFreq';
 import AudioAnalysisPanel from './AudioAnalysisPanel';
 import { useCWProcessor, TextToken } from '@/hooks/useCWProcessor';
 
@@ -193,7 +194,7 @@ function MorseVisualizer({
 
 // ── Main component ────────────────────────────────────────────────────────────
 
-const CWDecoder = forwardRef<DecoderControls, DecoderProps>(function CWDecoder({ onStateChange, analyser }, ref) {
+const CWDecoder = forwardRef<DecoderControls, DecoderProps>(function CWDecoder({ onStateChange, analyser, vfoFrequency }, ref) {
   const [toneFreq,          setToneFreq]          = useState(700);
   const [toneFreq2,         setToneFreq2]         = useState(800);
   const [squelch,           setSquelch]           = useState(20);
@@ -529,6 +530,7 @@ const CWDecoder = forwardRef<DecoderControls, DecoderProps>(function CWDecoder({
           }}
           squelch={squelch}
           onSquelchChange={setSquelch}
+          vfoFrequency={vfoFrequency}
           className="min-w-0"
           style={{ flex: panelWeights[1] }}
         />
@@ -599,16 +601,22 @@ const CWDecoder = forwardRef<DecoderControls, DecoderProps>(function CWDecoder({
           <div className="space-y-1">
             <div className="text-xs text-[#8b949e]">Center Ch A</div>
             <div className="flex items-center gap-2">
-              <input
-                type="number"
-                value={toneFreq}
-                min={50}
-                onChange={(e) => {
-                  const v = parseInt(e.target.value);
-                  if (!isNaN(v) && v >= 50) setToneFreq(v);
-                }}
-                className="bg-[#0d1117] border border-[#30363d] rounded px-2 py-0.5 w-20 text-[#79c0ff] font-mono text-sm focus:outline-none focus:border-[#79c0ff] transition-colors"
-              />
+              {vfoFrequency ? (
+                <span className="bg-[#0d1117] border border-[#30363d] rounded px-2 py-0.5 w-24 text-[#79c0ff] font-mono text-sm block">
+                  {fmtAbsHz(vfoFrequency + toneFreq)}
+                </span>
+              ) : (
+                <input
+                  type="number"
+                  value={toneFreq}
+                  min={50}
+                  onChange={(e) => {
+                    const v = parseInt(e.target.value);
+                    if (!isNaN(v) && v >= 50) setToneFreq(v);
+                  }}
+                  className="bg-[#0d1117] border border-[#30363d] rounded px-2 py-0.5 w-20 text-[#79c0ff] font-mono text-sm focus:outline-none focus:border-[#79c0ff] transition-colors"
+                />
+              )}
               <span className="text-xs text-[#8b949e]">Hz</span>
             </div>
           </div>
@@ -617,17 +625,23 @@ const CWDecoder = forwardRef<DecoderControls, DecoderProps>(function CWDecoder({
           <div className={`space-y-1 transition-opacity ${dualMode ? 'opacity-100' : 'opacity-30'}`}>
             <div className="text-xs text-[#8b949e]">Center Ch B</div>
             <div className="flex items-center gap-2">
-              <input
-                type="number"
-                value={toneFreq2}
-                min={50}
-                disabled={!dualMode}
-                onChange={(e) => {
-                  const v = parseInt(e.target.value);
-                  if (!isNaN(v) && v >= 50) setToneFreq2(v);
-                }}
-                className="bg-[#0d1117] border border-[#30363d] rounded px-2 py-0.5 w-20 text-[#ffa657] font-mono text-sm focus:outline-none focus:border-[#ffa657] transition-colors disabled:cursor-not-allowed"
-              />
+              {vfoFrequency ? (
+                <span className="bg-[#0d1117] border border-[#30363d] rounded px-2 py-0.5 w-24 text-[#ffa657] font-mono text-sm block">
+                  {fmtAbsHz(vfoFrequency + toneFreq2)}
+                </span>
+              ) : (
+                <input
+                  type="number"
+                  value={toneFreq2}
+                  min={50}
+                  disabled={!dualMode}
+                  onChange={(e) => {
+                    const v = parseInt(e.target.value);
+                    if (!isNaN(v) && v >= 50) setToneFreq2(v);
+                  }}
+                  className="bg-[#0d1117] border border-[#30363d] rounded px-2 py-0.5 w-20 text-[#ffa657] font-mono text-sm focus:outline-none focus:border-[#ffa657] transition-colors disabled:cursor-not-allowed"
+                />
+              )}
               <span className="text-xs text-[#8b949e]">Hz</span>
             </div>
           </div>

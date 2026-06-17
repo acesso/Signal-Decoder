@@ -2,6 +2,7 @@
 
 import { Fragment, forwardRef, useCallback, useEffect, useImperativeHandle, useRef, useState } from 'react';
 import type { DecoderControls, DecoderProps } from './DecoderControls';
+import { fmtAbsHz } from '@/lib/formatFreq';
 import AudioAnalysisPanel from './AudioAnalysisPanel';
 import { useFTProcessor } from '@/hooks/useFTProcessor';
 import { FTMode, FT_WINDOW_SECONDS } from '@/lib/ft/decoder';
@@ -127,7 +128,10 @@ function dtColor(dt: number): string {
 }
 
 function utcTime(d: Date): string { return d.toISOString().slice(11, 19); }
-function formatFreq(hz: number): string { return hz.toFixed(0).padStart(4, ' '); }
+function formatFreq(hz: number, vfoHz = 0): string {
+  if (vfoHz > 0) return fmtAbsHz(vfoHz + hz);
+  return hz.toFixed(0).padStart(4, ' ');
+}
 function formatDT(dt: number): string { return (dt >= 0 ? '+' : '') + dt.toFixed(1); }
 
 const RPT_TOKEN = /^R?[+-][0-9]{1,2}$/;
@@ -175,7 +179,7 @@ function MsgText({ msg, contacts, onSelect }: {
 
 // ── Main component ────────────────────────────────────────────────────────────
 
-const FTDecoder = forwardRef<DecoderControls, { ftMode: FTMode } & DecoderProps>(function FTDecoder({ ftMode, onStateChange, analyser }, ref) {
+const FTDecoder = forwardRef<DecoderControls, { ftMode: FTMode } & DecoderProps>(function FTDecoder({ ftMode, onStateChange, analyser, vfoFrequency }, ref) {
   const {
     state, startRecording, stopRecording, clearResults, ftSupported,
   } = useFTProcessor(ftMode);
@@ -365,7 +369,7 @@ const FTDecoder = forwardRef<DecoderControls, { ftMode: FTMode } & DecoderProps>
                     ) : (
                       <tr key={row.key} className="border-b border-[#21262d]/50 hover:bg-[#21262d]/40 transition-colors">
                         <td className="py-1 px-2 text-[#484f58] whitespace-nowrap">{utcTime(row.time)}</td>
-                        <td className="py-1 px-2 text-right text-[#8b949e] whitespace-nowrap">{formatFreq(row.freq)}</td>
+                        <td className="py-1 px-2 text-right text-[#8b949e] whitespace-nowrap">{formatFreq(row.freq, vfoFrequency ?? 0)}</td>
                         <td className="py-1 px-2 text-right whitespace-nowrap" style={{ color: snrColor(row.snr) }}>
                           {row.snr > 0 ? '+' : ''}{row.snr.toFixed(4)}
                         </td>
@@ -396,6 +400,7 @@ const FTDecoder = forwardRef<DecoderControls, { ftMode: FTMode } & DecoderProps>
         <AudioAnalysisPanel
           analyser={analyser ?? null}
           isRecording={state.isRecording}
+          vfoFrequency={vfoFrequency}
           className="min-w-0"
           style={{ flex: panelWeights[1] }}
         />

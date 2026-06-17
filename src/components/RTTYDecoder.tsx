@@ -24,7 +24,7 @@ const DEFAULT_CONFIG: RTTYConfig = {
 const _initialSession = makeSession(DEFAULT_CONFIG);
 const _initialState = { sessions: [_initialSession], activeSessionId: _initialSession.id };
 
-const RTTYDecoder = forwardRef<DecoderControls, DecoderProps>(function RTTYDecoder({ onStateChange, analyser }, ref) {
+const RTTYDecoder = forwardRef<DecoderControls, DecoderProps>(function RTTYDecoder({ onStateChange, analyser, vfoFrequency }, ref) {
   // Canvas / animation refs
   const textareaRef          = useRef<HTMLTextAreaElement>(null);
 
@@ -382,6 +382,7 @@ const RTTYDecoder = forwardRef<DecoderControls, DecoderProps>(function RTTYDecod
               : (reverseShift ? newHz + half : newHz - half);  // dragged S
             updateSessionConfig(activeSessionId, { centerFreq: Math.round(newCenter) });
           }}
+          vfoFrequency={vfoFrequency}
           className="min-w-0"
           style={{ flex: panelWeights[1] }}
         />
@@ -457,6 +458,7 @@ const RTTYDecoder = forwardRef<DecoderControls, DecoderProps>(function RTTYDecod
                 session={session}
                 isActive={session.id === activeSessionId}
                 canRemove={sessions.length > 1}
+                vfoFrequency={vfoFrequency}
                 onActivate={promoteSession}
                 onRemove={removeSession}
                 onConfigChange={updateSessionConfig}
