@@ -33,6 +33,7 @@ interface Props {
   sqlLevel?: number;       // 0..1 squelch threshold — rendered as a cutting plane
   sqlAlpha?: number;       // 0..1 opacity of the squelch plane
   sqlGridSize?: number;    // grid resolution (cols = size*2, rows = size); enables grid mode
+  vfoFrequency?: number;   // radio VFO in Hz — offsets frequency labels to show absolute freq
 }
 
 // History texture: TEX_W frequency bins × TEX_H rows, written as a ring buffer
@@ -169,6 +170,26 @@ void main() {
 
   vec3 lineCol = lit ? litCol * 0.22 : vec3(0.11, 0.14, 0.19);
   gl_FragColor = vec4(mix(cellCol, lineCol, isLine), uAlpha);
+}
+`;
+
+// Floor grid lines drawn just below the terrain mesh as GL_LINES
+const FLOOR_VS = `
+precision mediump float;
+attribute vec3 aPos; // world-space xz line endpoint, y fixed in shader
+uniform mat4 uMVP;
+varying float vFade;
+void main() {
+  vFade = aPos.z; // z carries fade [0=front,1=back]
+  gl_Position = uMVP * vec4(aPos.x, -0.003, aPos.y, 1.0);
+}
+`;
+const FLOOR_FS = `
+precision mediump float;
+varying float vFade;
+void main() {
+  float fade = 1.0 - smoothstep(0.4, 1.0, vFade);
+  gl_FragColor = vec4(0.50, 0.58, 0.72, 0.75 * fade);
 }
 `;
 
@@ -403,7 +424,7 @@ interface BandUniforms {
 // ── Component ─────────────────────────────────────────────────────────────────
 
 const GLSpectrogram = forwardRef<GLSpectrogramHandle, Props>(function GLSpectrogram(
-  { view, gamma, height, minHz = 0, maxHz, bands, bandAlpha = 0.3, markers, sqlLevel, sqlAlpha = 0.3, sqlGridSize }, ref,
+  { view, gamma, height, minHz = 0, maxHz, bands, bandAlpha = 0.3, markers, sqlLevel, sqlAlpha = 0.3, sqlGridSize, vfoFrequency = 0 }, ref,
 ) {
   const canvasRef      = useRef<HTMLCanvasElement>(null);
   const glRef          = useRef<WebGLRenderingContext | null>(null);
@@ -448,10 +469,19 @@ const GLSpectrogram = forwardRef<GLSpectrogramHandle, Props>(function GLSpectrog
     const out: { x: number; text: string }[] = [];
     const firstMaj = Math.ceil(minHz / gridMajorHz) * gridMajorHz;
     for (let hz = firstMaj; hz < maxHz; hz += gridMajorHz) {
-      out.push({ x: (hz - minHz) / span, text: formatHz(hz) });
+      let text: string;
+      if (vfoFrequency > 0) {
+        const absHz  = vfoFrequency + hz;
+        const mhzInt = Math.floor(absHz / 1_000_000);
+        const khzFrac = Math.round((absHz % 1_000_000) / 1000);
+        text = `${mhzInt}.${String(khzFrac).padStart(3, '0')}`;
+      } else {
+        text = formatHz(hz);
+      }
+      out.push({ x: (hz - minHz) / span, text });
     }
     return out;
-  }, [minHz, maxHz, gridMajorHz, span]);
+  }, [minHz, maxHz, gridMajorHz, span, vfoFrequency]);
   const labelsRef = useRef(labels);
   useEffect(() => {
     labelsRef.current = labels;
@@ -660,6 +690,62 @@ const GLSpectrogram = forwardRef<GLSpectrogramHandle, Props>(function GLSpectrog
         bands: bandLocs(prog),
       };
 
+      // Floor grid lines — rebuilt whenever grid steps change
+      const floorProg = mkProgram(FLOOR_VS, FLOOR_FS);
+      const floorLoc = floorProg ? {
+        aPos: gl.getAttribLocation(floorProg, 'aPos'),
+        mvp:  gl.getUniformLocation(floorProg, 'uMVP'),
+      } : null;
+      const floorBuf = floorProg ? gl.createBuffer()! : null;
+      if (floorBuf) buffers.push(floorBuf);
+      let floorVertCount = 0;
+      const buildFloorLines = () => {
+        // Major frequency lines (vertical stripes along Z) + depth lines along X edges
+        const [minorStep, majorStep] = gridRef.current; // normalised [0,1]
+        const verts: number[] = [];
+        // Frequency lines: for each major step, a line from z=0 to z=1
+        const firstMaj = Math.ceil(0 / majorStep) * majorStep;
+        for (let x = firstMaj; x <= 1.0 + 1e-5; x += majorStep) {
+          const wx = x * 2.0 - 1.0;
+          verts.push(wx, 0.0, 0,  wx, -2.0, 1); // (worldX, worldZ, fade)
+        }
+        // Minor frequency lines at half opacity — same structure
+        const firstMin = Math.ceil(0 / minorStep) * minorStep;
+        for (let x = firstMin; x <= 1.0 + 1e-5; x += minorStep) {
+          // Skip if coincides with a major line
+          const onMajor = Math.abs(x % majorStep) < minorStep * 0.1 || Math.abs(x % majorStep - majorStep) < minorStep * 0.1;
+          if (onMajor) continue;
+          const wx = x * 2.0 - 1.0;
+          verts.push(wx, 0.0, 0,  wx, -2.0, 0.4); // fade encodes minor dimness
+        }
+        // Depth lines: front edge (z=0) and a few along depth for perspective
+        const DEPTH_STEPS = 5;
+        for (let di = 0; di <= DEPTH_STEPS; di++) {
+          const wz = -(di / DEPTH_STEPS) * 2.0;
+          const fade = di / DEPTH_STEPS;
+          verts.push(-1.0, wz, fade,  1.0, wz, fade);
+        }
+        const data = new Float32Array(verts);
+        floorVertCount = data.length / 3;
+        gl.bindBuffer(gl.ARRAY_BUFFER, floorBuf!);
+        gl.bufferData(gl.ARRAY_BUFFER, data, gl.DYNAMIC_DRAW);
+      };
+      buildFloorLines();
+
+      const drawFloor = (mvp: Float32Array) => {
+        if (!floorProg || !floorBuf || !floorLoc || floorVertCount === 0) return;
+        buildFloorLines();
+        gl.useProgram(floorProg);
+        gl.enable(gl.BLEND);
+        gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+        gl.bindBuffer(gl.ARRAY_BUFFER, floorBuf);
+        gl.enableVertexAttribArray(floorLoc.aPos);
+        gl.vertexAttribPointer(floorLoc.aPos, 3, gl.FLOAT, false, 0, 0);
+        gl.uniformMatrix4fv(floorLoc.mvp, false, mvp);
+        gl.drawArrays(gl.LINES, 0, floorVertCount);
+        gl.disable(gl.BLEND);
+      };
+
       // SQL grid program — replaces the solid plane with an animated cell grid
       const sqlGridProg = mkProgram(SQL_GRID_VS, SQL_GRID_FS);
       const sqlGridLoc = sqlGridProg ? {
@@ -711,23 +797,6 @@ const GLSpectrogram = forwardRef<GLSpectrogramHandle, Props>(function GLSpectrog
         gl.enable(gl.DEPTH_TEST);
         gl.clearColor(BG[0], BG[1], BG[2], 1);
         gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
-        gl.useProgram(prog);
-
-        // Upload interpolated heights every frame (render() always sets dirty)
-        if (terrainDirty.current) {
-          gl.bindBuffer(gl.ARRAY_BUFFER, hbuf);
-          gl.bufferSubData(gl.ARRAY_BUFFER, 0, terrainLerped.current);
-          terrainDirty.current = false;
-        } else {
-          gl.bindBuffer(gl.ARRAY_BUFFER, hbuf);
-        }
-        gl.enableVertexAttribArray(aHeight);
-        gl.vertexAttribPointer(aHeight, 1, gl.FLOAT, false, 0, 0);
-
-        gl.bindBuffer(gl.ARRAY_BUFFER, vbuf);
-        gl.enableVertexAttribArray(aPos);
-        gl.vertexAttribPointer(aPos, 2, gl.FLOAT, false, 0, 0);
-        gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ibuf);
 
         const target: [number, number, number] = [cam.tx, 0.15, -0.9 + cam.tz];
         const eye: [number, number, number] = [
@@ -737,6 +806,24 @@ const GLSpectrogram = forwardRef<GLSpectrogramHandle, Props>(function GLSpectrog
         ];
         const proj = mat4Perspective(Math.PI / 3, canvas.width / canvas.height, 0.05, 20);
         const mvp  = mat4Multiply(proj, mat4LookAt(eye, target));
+
+        drawFloor(mvp);
+
+        gl.useProgram(prog);
+        // Upload interpolated heights when dirty
+        if (terrainDirty.current) {
+          gl.bindBuffer(gl.ARRAY_BUFFER, hbuf);
+          gl.bufferSubData(gl.ARRAY_BUFFER, 0, terrainLerped.current);
+          terrainDirty.current = false;
+        } else {
+          gl.bindBuffer(gl.ARRAY_BUFFER, hbuf);
+        }
+        gl.enableVertexAttribArray(aHeight);
+        gl.vertexAttribPointer(aHeight, 1, gl.FLOAT, false, 0, 0);
+        gl.bindBuffer(gl.ARRAY_BUFFER, vbuf);
+        gl.enableVertexAttribArray(aPos);
+        gl.vertexAttribPointer(aPos, 2, gl.FLOAT, false, 0, 0);
+        gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ibuf);
         gl.uniformMatrix4fv(loc.mvp, false, mvp);
         gl.uniform1f(loc.gamma, gammaRef.current);
         gl.uniform2f(loc.grid, gridRef.current[0], gridRef.current[1]);
@@ -985,7 +1072,7 @@ const GLSpectrogram = forwardRef<GLSpectrogramHandle, Props>(function GLSpectrog
       />
       {labels.map((lb, i) => (
         <span
-          key={lb.text}
+          key={i}
           ref={el => { labelElsRef.current[i] = el; }}
           className="absolute text-[9px] font-mono text-[#8b949e] pointer-events-none select-none"
           style={{ display: 'none', transform: 'translateX(-50%)', textShadow: '0 0 4px #0d1117, 0 0 4px #0d1117' }}

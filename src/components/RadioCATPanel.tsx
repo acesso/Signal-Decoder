@@ -2,6 +2,7 @@
 
 import { useState, useCallback, useRef } from 'react';
 import { useRadioCAT, type CATMode, type CATConnectionConfig } from '@/hooks/useRadioCAT';
+export { useRadioCAT };
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -331,8 +332,8 @@ const DEFAULT_CONFIG: CATConnectionConfig & { presetIdx: number } = {
   timeoutMs: 50, pollIntervalMs: 100, debug: false,
 };
 
-export default function RadioCATPanel() {
-  const { state, connect, disconnect, setFrequency, setMode, setPTT } = useRadioCAT();
+export default function RadioCATPanel({ cat }: { cat: ReturnType<typeof useRadioCAT> }) {
+  const { state, connect, disconnect, setFrequency, setMode, setPTT } = cat;
   const { connected, frequency, mode, ptt, error, isSupported } = state;
 
   const [showSettings, setShowSettings] = useState(false);
