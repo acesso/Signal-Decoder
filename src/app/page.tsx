@@ -9,6 +9,7 @@ import MFSKDecoder from "@/components/MFSKDecoder";
 import type { DecoderControls } from '@/components/DecoderControls';
 import { useGlobalAudio } from '@/hooks/useGlobalAudio';
 import { FTMode } from '@/lib/ft/decoder';
+import RadioCATPanel from '@/components/RadioCATPanel';
 
 type DecoderMode = 'rtty' | 'sstv' | 'cw' | 'ft' | 'mfsk';
 
@@ -218,13 +219,18 @@ export default function Home() {
       </div>
 
       {/* Shared top bar — Start/Stop/Reset + FT sub-mode when active */}
-      <div className="px-4 sm:px-6 lg:px-8 pb-3 shrink-0">
+      <div className="px-4 sm:px-6 lg:px-8 pb-2 shrink-0">
         <TopBar
           controls={globalControls}
           mode={mode}
           ftMode={ftMode}
           onFTModeChange={setFTMode}
         />
+      </div>
+
+      {/* CAT radio control panel */}
+      <div className="px-4 sm:px-6 lg:px-8 pb-3 shrink-0">
+        <RadioCATPanel />
       </div>
 
       {/* Content — all decoders mounted persistently, toggled via CSS */}
