@@ -4,6 +4,7 @@ import { useRef, useEffect } from 'react';
 import type { DecoderSession } from '@/lib/rtty/sessions';
 import { PASTEL_COLORS } from '@/lib/rtty/sessions';
 import type { RTTYConfig } from '@/lib/rtty/decoder';
+import { fmtAbsHz } from '@/lib/formatFreq';
 
 const BAUD_RATES = [45, 45.45, 50, 65, 75, 100, 110, 150, 200, 300];
 
@@ -11,6 +12,7 @@ interface Props {
   session: DecoderSession;
   isActive: boolean;
   canRemove: boolean;
+  vfoFrequency?: number;
   onActivate: (id: string) => void;
   onRemove: (id: string) => void;
   onConfigChange: (id: string, patch: Partial<RTTYConfig>) => void;
@@ -24,6 +26,7 @@ export function SessionCard({
   session,
   isActive,
   canRemove,
+  vfoFrequency,
   onActivate,
   onRemove,
   onConfigChange,
@@ -108,14 +111,20 @@ export function SessionCard({
 
         <label className="flex flex-col gap-0.5">
           <span className="text-[10px] text-[#8b949e]">Center Freq (Hz)</span>
-          <input
-            type="number"
-            value={config.centerFreq}
-            min={0} max={1500}
-            onChange={(e) => { stopProp(e); onConfigChange(id, { centerFreq: parseInt(e.target.value) || 0 }); }}
-            onClick={stopProp}
-            className={inputCls}
-          />
+          {vfoFrequency ? (
+            <span className={inputCls + ' block'}>
+              {fmtAbsHz(vfoFrequency + config.centerFreq)}
+            </span>
+          ) : (
+            <input
+              type="number"
+              value={config.centerFreq}
+              min={0} max={1500}
+              onChange={(e) => { stopProp(e); onConfigChange(id, { centerFreq: parseInt(e.target.value) || 0 }); }}
+              onClick={stopProp}
+              className={inputCls}
+            />
+          )}
         </label>
 
         <label className="flex flex-col gap-0.5">

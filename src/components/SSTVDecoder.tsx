@@ -120,7 +120,7 @@ function ImageModal({ img, onClose }: { img: CapturedImage; onClose: () => void 
 
 // ── Main component ────────────────────────────────────────────────────────────
 
-const SSTVDecoder = forwardRef<DecoderControls, DecoderProps>(function SSTVDecoder({ onStateChange, analyser }, ref) {
+const SSTVDecoder = forwardRef<DecoderControls, DecoderProps>(function SSTVDecoder({ onStateChange, analyser, vfoFrequency }, ref) {
   const [manualMode, setManualMode] = useState<SSTVMode>('ROBOT36');
   const [autoDetect, setAutoDetect] = useState(true);
   const [autoSlant, setAutoSlant] = useState(true);
@@ -263,6 +263,7 @@ const SSTVDecoder = forwardRef<DecoderControls, DecoderProps>(function SSTVDecod
         <AudioAnalysisPanel
           analyser={analyser ?? null}
           isRecording={state.isRecording}
+          vfoFrequency={vfoFrequency}
           className="min-w-0"
           style={{ flex: panelWeights[1] }}
         />

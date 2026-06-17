@@ -21,4 +21,5 @@ export interface AudioPanelInfo {
 export interface DecoderProps {
   onStateChange?: (controls: DecoderControls) => void;
   analyser?: AnalyserNode | null;
+  vfoFrequency?: number;
 }

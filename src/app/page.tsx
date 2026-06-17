@@ -9,6 +9,7 @@ import MFSKDecoder from "@/components/MFSKDecoder";
 import type { DecoderControls } from '@/components/DecoderControls';
 import { useGlobalAudio } from '@/hooks/useGlobalAudio';
 import { FTMode } from '@/lib/ft/decoder';
+import RadioCATPanel, { useRadioCAT } from '@/components/RadioCATPanel';
 
 type DecoderMode = 'rtty' | 'sstv' | 'cw' | 'ft' | 'mfsk';
 
@@ -109,6 +110,10 @@ function TopBar({
 export default function Home() {
   const [mode, setMode]   = useState<DecoderMode>('rtty');
   const [ftMode, setFTMode] = useState<FTMode>('FT8');
+
+  // ── Radio CAT — lifted here so VFO frequency flows to all decoders ────────
+  const cat = useRadioCAT();
+  const vfoFrequency = cat.state.connected ? (cat.state.frequency ?? undefined) : undefined;
 
   // ── Global audio — single shared AudioContext + AnalyserNode ─────────────
   const { state: audioState, analyser, analyserRef, start: audioStart, stop: audioStop } = useGlobalAudio();
@@ -218,7 +223,7 @@ export default function Home() {
       </div>
 
       {/* Shared top bar — Start/Stop/Reset + FT sub-mode when active */}
-      <div className="px-4 sm:px-6 lg:px-8 pb-3 shrink-0">
+      <div className="px-4 sm:px-6 lg:px-8 pb-2 shrink-0">
         <TopBar
           controls={globalControls}
           mode={mode}
@@ -227,22 +232,27 @@ export default function Home() {
         />
       </div>
 
+      {/* CAT radio control panel */}
+      <div className="px-4 sm:px-6 lg:px-8 pb-3 shrink-0">
+        <RadioCATPanel cat={cat} />
+      </div>
+
       {/* Content — all decoders mounted persistently, toggled via CSS */}
       <div className="flex-1 min-h-0 overflow-y-auto px-4 sm:px-6 lg:px-8 pb-8">
         <div className={mode === 'rtty' ? '' : 'hidden'}>
-          <RTTYDecoder ref={rttyRef} onStateChange={onStateChangeCbs.rtty} analyser={analyser} />
+          <RTTYDecoder ref={rttyRef} onStateChange={onStateChangeCbs.rtty} analyser={analyser} vfoFrequency={vfoFrequency} />
         </div>
         <div className={mode === 'sstv' ? '' : 'hidden'}>
-          <SSTVDecoder ref={sstvRef} onStateChange={onStateChangeCbs.sstv} analyser={analyser} />
+          <SSTVDecoder ref={sstvRef} onStateChange={onStateChangeCbs.sstv} analyser={analyser} vfoFrequency={vfoFrequency} />
         </div>
         <div className={mode === 'cw' ? '' : 'hidden'}>
-          <CWDecoder ref={cwRef} onStateChange={onStateChangeCbs.cw} analyser={analyser} />
+          <CWDecoder ref={cwRef} onStateChange={onStateChangeCbs.cw} analyser={analyser} vfoFrequency={vfoFrequency} />
         </div>
         <div className={mode === 'mfsk' ? '' : 'hidden'}>
-          <MFSKDecoder ref={mfskRef} onStateChange={onStateChangeCbs.mfsk} analyser={analyser} />
+          <MFSKDecoder ref={mfskRef} onStateChange={onStateChangeCbs.mfsk} analyser={analyser} vfoFrequency={vfoFrequency} />
         </div>
         <div className={mode === 'ft' ? '' : 'hidden'}>
-          <FTDecoder ref={ftRef} ftMode={ftMode} onStateChange={onStateChangeCbs.ft} analyser={analyser} />
+          <FTDecoder ref={ftRef} ftMode={ftMode} onStateChange={onStateChangeCbs.ft} analyser={analyser} vfoFrequency={vfoFrequency} />
         </div>
       </div>
     </main>

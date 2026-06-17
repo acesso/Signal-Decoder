@@ -20,11 +20,10 @@ function hexToRgb(hex: string): [number, number, number] {
   return [isNaN(r) ? 100 : r, isNaN(g) ? 100 : g, isNaN(b) ? 100 : b];
 }
 
-function drawAxisLabels(ctx: CanvasRenderingContext2D, w: number, pH: number, minF: number, maxF: number) {
+function drawAxisLabels(ctx: CanvasRenderingContext2D, w: number, pH: number, minF: number, maxF: number, vfoHz = 0) {
   const span = maxF - minF;
   ctx.strokeStyle = '#30363d'; ctx.lineWidth = 1;
   ctx.beginPath(); ctx.moveTo(0, pH); ctx.lineTo(w, pH); ctx.stroke();
-  // Choose tick step based on span
   const step = span <= 500 ? 50 : span <= 1000 ? 100 : span <= 2000 ? 200 : 500;
   const majMult = step * 5;
   const medMult = step * 2;
@@ -36,7 +35,14 @@ function drawAxisLabels(ctx: CanvasRenderingContext2D, w: number, pH: number, mi
     ctx.beginPath(); ctx.moveTo(x, pH); ctx.lineTo(x, pH + (maj ? 6 : med ? 4 : 2)); ctx.stroke();
     if (maj) {
       ctx.fillStyle = '#8b949e'; ctx.font = '10px monospace'; ctx.textAlign = 'center';
-      ctx.fillText(f >= 1000 ? `${f/1000}k` : `${f}`, x, pH + 17);
+      if (vfoHz > 0) {
+        const absHz = vfoHz + f;
+        const mhzInt  = Math.floor(absHz / 1_000_000);
+        const khzFrac = Math.round((absHz % 1_000_000) / 1000);
+        ctx.fillText(`${mhzInt}.${String(khzFrac).padStart(3, '0')}`, x, pH + 17);
+      } else {
+        ctx.fillText(f >= 1000 ? `${f/1000}k` : `${f}`, x, pH + 17);
+      }
     }
   }
 }
@@ -157,6 +163,8 @@ export interface AudioAnalysisPanelProps {
   defaultMaxHz?: number;
   /** Optional MFSKChannel array for the GL spectrogram bands (advanced usage) */
   glBands?: MFSKChannel[];
+  /** VFO frequency from radio CAT in Hz — when set, axis labels show absolute frequency */
+  vfoFrequency?: number;
   /** Extra CSS classes applied to the root card div (e.g. flex sizing) */
   className?: string;
   style?: React.CSSProperties;
@@ -176,6 +184,7 @@ export default function AudioAnalysisPanel({
   signalLevel = 0,
   defaultMaxHz = 3000,
   glBands,
+  vfoFrequency,
   className,
   style,
 }: AudioAnalysisPanelProps) {
@@ -184,9 +193,10 @@ export default function AudioAnalysisPanel({
   const [lockCenter,   setLockCenter]   = useState(true);
   const [centerFreqInput, setCenterFreqInput] = useState('');
   const [sgView,    setSgView]    = useState<SpectrogramView>('terrain');
-  const [sgGamma,   setSgGamma]   = useState(3.0);
-  const [sg3dSpeed, setSg3dSpeed] = useState(33);     // GL/3D: ms between rows, default Fast
-  const [sg2dSpeed, setSg2dSpeed] = useState(1000);  // 2D canvas: ms between rows, default Slow
+  const [sgGamma,   setSgGamma]   = useState(1.0);
+  const [sg3dSpeed, setSg3dSpeed] = useState(80);    // GL/3D: ms between rows, default Normal
+  const [sg2dSpeed, setSg2dSpeed] = useState(50);    // 2D canvas: ms between rows, default Normal
+  const [sg3dSmooth, setSg3dSmooth] = useState(0.35);
   const [bandAlpha, setBandAlpha] = useState(0.3);
 
   const specRef        = useRef<HTMLCanvasElement>(null);
@@ -204,9 +214,10 @@ export default function AudioAnalysisPanel({
   const squelchRef  = useRef(squelch);
   const showGridRef = useRef(showGrid);
   const gridSzRef   = useRef(gridSize);
+  const vfoHzRef    = useRef(vfoFrequency ?? 0);
   const sgGRef        = useRef(sgGamma);
-  const sg3dSpRef     = useRef(33);    // GL rows
-  const sg2dSpRef     = useRef(1000);  // 2D canvas rows
+  const sg3dSpRef     = useRef(80);   // GL rows
+  const sg2dSpRef     = useRef(50);   // 2D canvas rows
   const sg3dLastTs    = useRef(0);
   const sg2dLastTs    = useRef(0);
   const spLastTs      = useRef(0);
@@ -225,9 +236,11 @@ export default function AudioAnalysisPanel({
   useEffect(() => { squelchRef.current = squelch; }, [squelch]);
   useEffect(() => { showGridRef.current = showGrid; }, [showGrid]);
   useEffect(() => { gridSzRef.current  = gridSize; }, [gridSize]);
+  useEffect(() => { vfoHzRef.current   = vfoFrequency ?? 0; }, [vfoFrequency]);
   useEffect(() => { sgGRef.current         = sgGamma;    }, [sgGamma]);
-  useEffect(() => { sg3dSpRef.current      = sg3dSpeed;  }, [sg3dSpeed]);
+  useEffect(() => { sg3dSpRef.current = sg3dSpeed; glSgRef.current?.setRowInterval(sg3dSpeed); }, [sg3dSpeed]);
   useEffect(() => { sg2dSpRef.current      = sg2dSpeed;  }, [sg2dSpeed]);
+  useEffect(() => { glSgRef.current?.setSmooth(sg3dSmooth); }, [sg3dSmooth]);
   useEffect(() => { onSquelchChangeRef.current = onSquelchChange; }, [onSquelchChange]);
 
   // Spectrum canvas mouse handlers — marker drag + squelch line drag
@@ -320,7 +333,7 @@ export default function AudioAnalysisPanel({
     const ctx = canvas.getContext('2d'); if (!ctx) return null;
     const minHz = minHzRef.current, maxHz = maxHzRef.current;
     ctx.fillStyle = '#0a0a0a'; ctx.fillRect(0, 0, canvas.width, CANVAS_H);
-    if (!analyser) { drawAxisLabels(ctx, canvas.width, PLOT_H, minHz, maxHz); return null; }
+    if (!analyser) { drawAxisLabels(ctx, canvas.width, PLOT_H, minHz, maxHz, vfoHzRef.current); return null; }
 
     const bc = analyser.frequencyBinCount;
     if (!fftBuf.current || fftBuf.current.length !== bc) fftBuf.current = new Uint8Array(bc) as Uint8Array<ArrayBuffer>;
@@ -360,7 +373,7 @@ export default function AudioAnalysisPanel({
       const halfBw = m.bandwidthHz != null ? m.bandwidthHz / 2 : 40;
       drawChannelMarker(ctx, canvas.width, PLOT_H, m.freq, m.color, m.label, halfBw, minHz, maxHz);
     }
-    drawAxisLabels(ctx, canvas.width, PLOT_H, minHz, maxHz);
+    drawAxisLabels(ctx, canvas.width, PLOT_H, minHz, maxHz, vfoHzRef.current);
     return vis;
   }, [analyser]);
 
@@ -394,13 +407,15 @@ export default function AudioAnalysisPanel({
             sg2dLastTs.current = now;
             drawSpectrogram(sg, fd);
           }
-          // 3D GL spectrogram
+          // 3D GL spectrogram: upload a new row on the configured interval
           if (now - sg3dLastTs.current >= sg3dSpRef.current) {
             sg3dLastTs.current = now;
             glSgRef.current?.pushRow(fd);
           }
         }
       }
+      // Redraw the 3D terrain every rAF frame so the view is always smooth
+      glSgRef.current?.render();
       rafRef.current = requestAnimationFrame(tick);
     };
     rafRef.current = requestAnimationFrame(tick);
@@ -433,39 +448,51 @@ export default function AudioAnalysisPanel({
         {markers.length > 0 && (
           <div className="flex items-center gap-2 mb-1.5 text-xs text-[#8b949e]">
             <span className="shrink-0">Center</span>
-            <input
-              type="number" min={50} max={displayMaxHz} step={1}
-              value={centerFreqInput !== '' ? centerFreqInput : centerFreq}
-              onChange={e => setCenterFreqInput(e.target.value)}
-              onBlur={() => {
-                if (centerFreqInput !== '' && onMarkerDragRef.current) {
-                  const newCenter = parseInt(centerFreqInput);
-                  if (!isNaN(newCenter)) {
-                    const delta = newCenter - centerFreq;
-                    markers.forEach((_, i) => {
-                      onMarkerDragRef.current!(i, markers[i].freq + delta);
-                    });
-                  }
-                }
-                setCenterFreqInput('');
-              }}
-              onKeyDown={e => {
-                if (e.key === 'Enter' && centerFreqInput !== '' && onMarkerDragRef.current) {
-                  const newCenter = parseInt(centerFreqInput);
-                  if (!isNaN(newCenter)) {
-                    const delta = newCenter - centerFreq;
-                    markers.forEach((_, i) => {
-                      onMarkerDragRef.current!(i, markers[i].freq + delta);
-                    });
+            {vfoFrequency ? (
+              /* VFO connected — show absolute MHz, read-only display */
+              <span className="w-24 bg-[#0d1117] border border-[#30363d] rounded px-2 py-0.5 font-mono text-[#c9d1d9] text-xs">
+                {(() => {
+                  const absHz = vfoFrequency + centerFreq;
+                  const mhzInt  = Math.floor(absHz / 1_000_000);
+                  const khzFrac = Math.round((absHz % 1_000_000) / 1000);
+                  return `${mhzInt}.${String(khzFrac).padStart(3, '0')}`;
+                })()}
+              </span>
+            ) : (
+              <input
+                type="number" min={50} max={displayMaxHz} step={1}
+                value={centerFreqInput !== '' ? centerFreqInput : centerFreq}
+                onChange={e => setCenterFreqInput(e.target.value)}
+                onBlur={() => {
+                  if (centerFreqInput !== '' && onMarkerDragRef.current) {
+                    const newCenter = parseInt(centerFreqInput);
+                    if (!isNaN(newCenter)) {
+                      const delta = newCenter - centerFreq;
+                      markers.forEach((_, i) => {
+                        onMarkerDragRef.current!(i, markers[i].freq + delta);
+                      });
+                    }
                   }
                   setCenterFreqInput('');
-                  (e.target as HTMLInputElement).blur();
-                }
-              }}
-              readOnly={!onMarkerDrag}
-              className={`w-20 bg-[#0d1117] border border-[#30363d] rounded px-2 py-0.5 font-mono text-[#c9d1d9] focus:outline-none focus:border-[#2ea043] ${!onMarkerDrag ? 'opacity-60 cursor-default' : ''}`}
-            />
-            <span className="shrink-0 text-[#484f58]">Hz</span>
+                }}
+                onKeyDown={e => {
+                  if (e.key === 'Enter' && centerFreqInput !== '' && onMarkerDragRef.current) {
+                    const newCenter = parseInt(centerFreqInput);
+                    if (!isNaN(newCenter)) {
+                      const delta = newCenter - centerFreq;
+                      markers.forEach((_, i) => {
+                        onMarkerDragRef.current!(i, markers[i].freq + delta);
+                      });
+                    }
+                    setCenterFreqInput('');
+                    (e.target as HTMLInputElement).blur();
+                  }
+                }}
+                readOnly={!onMarkerDrag}
+                className={`w-20 bg-[#0d1117] border border-[#30363d] rounded px-2 py-0.5 font-mono text-[#c9d1d9] focus:outline-none focus:border-[#2ea043] ${!onMarkerDrag ? 'opacity-60 cursor-default' : ''}`}
+              />
+            )}
+            <span className="shrink-0 text-[#484f58]">{vfoFrequency ? 'MHz' : 'Hz'}</span>
             <span className="text-[#484f58] text-[10px] ml-auto">
               {markers.length} marker{markers.length !== 1 ? 's' : ''}
             </span>
@@ -559,6 +586,7 @@ export default function AudioAnalysisPanel({
               sqlLevel={onSquelchChange != null ? squelch / 100 : undefined}
               sqlAlpha={0.6}
               sqlGridSize={showGrid ? gridSize : undefined}
+              vfoFrequency={vfoFrequency}
             />
           </div>
         </div>
@@ -579,7 +607,7 @@ export default function AudioAnalysisPanel({
             </label>
           )}
           <label className="flex items-center gap-1.5">Contrast
-            <input type="range" min={0.5} max={6} step={0.25} value={sgGamma}
+            <input type="range" min={0.2} max={2.0} step={0.1} value={sgGamma}
               onChange={e => setSgGamma(parseFloat(e.target.value))}
               className="w-14 accent-[#2ea043]"/>
           </label>
@@ -587,22 +615,29 @@ export default function AudioAnalysisPanel({
             <label className="flex items-center gap-1.5">Speed
               <select value={sg2dSpeed} onChange={e => setSg2dSpeed(parseInt(e.target.value))}
                 className="bg-[#0d1117] border border-[#30363d] rounded px-1.5 py-0.5 text-[#c9d1d9] focus:outline-none focus:border-[#2ea043] cursor-pointer">
-                <option value={200}>Fast</option>
-                <option value={500}>Normal</option>
-                <option value={1000}>Slow</option>
-                <option value={3000}>Very Slow</option>
+                <option value={16}>Fast</option>
+                <option value={50}>Normal</option>
+                <option value={150}>Slow</option>
+                <option value={500}>Very Slow</option>
               </select>
             </label>
           ) : (
-            <label className="flex items-center gap-1.5">Speed
-              <select value={sg3dSpeed} onChange={e => setSg3dSpeed(parseInt(e.target.value))}
-                className="bg-[#0d1117] border border-[#30363d] rounded px-1.5 py-0.5 text-[#c9d1d9] focus:outline-none focus:border-[#2ea043] cursor-pointer">
-                <option value={33}>Normal</option>
-                <option value={100}>Slow</option>
-                <option value={200}>Very Slow</option>
-                <option value={500}>Paused</option>
-              </select>
-            </label>
+            <>
+              <label className="flex items-center gap-1.5">Speed
+                <select value={sg3dSpeed} onChange={e => setSg3dSpeed(parseInt(e.target.value))}
+                  className="bg-[#0d1117] border border-[#30363d] rounded px-1.5 py-0.5 text-[#c9d1d9] focus:outline-none focus:border-[#2ea043] cursor-pointer">
+                  <option value={80}>Normal</option>
+                  <option value={200}>Slow</option>
+                  <option value={500}>Very Slow</option>
+                  <option value={1200}>Paused</option>
+                </select>
+              </label>
+              <label className="flex items-center gap-1.5">Smooth
+                <input type="range" min={0.05} max={1} step={0.05} value={sg3dSmooth}
+                  onChange={e => setSg3dSmooth(parseFloat(e.target.value))}
+                  className="w-14 accent-[#2ea043]"/>
+              </label>
+            </>
           )}
         </div>
       </div>
