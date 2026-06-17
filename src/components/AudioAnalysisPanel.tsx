@@ -184,9 +184,10 @@ export default function AudioAnalysisPanel({
   const [lockCenter,   setLockCenter]   = useState(true);
   const [centerFreqInput, setCenterFreqInput] = useState('');
   const [sgView,    setSgView]    = useState<SpectrogramView>('terrain');
-  const [sgGamma,   setSgGamma]   = useState(3.0);
-  const [sg3dSpeed, setSg3dSpeed] = useState(33);     // GL/3D: ms between rows, default Fast
-  const [sg2dSpeed, setSg2dSpeed] = useState(1000);  // 2D canvas: ms between rows, default Slow
+  const [sgGamma,   setSgGamma]   = useState(1.0);
+  const [sg3dSpeed, setSg3dSpeed] = useState(80);    // GL/3D: ms between rows, default Normal
+  const [sg2dSpeed, setSg2dSpeed] = useState(50);    // 2D canvas: ms between rows, default Normal
+  const [sg3dSmooth, setSg3dSmooth] = useState(0.35);
   const [bandAlpha, setBandAlpha] = useState(0.3);
 
   const specRef        = useRef<HTMLCanvasElement>(null);
@@ -205,8 +206,8 @@ export default function AudioAnalysisPanel({
   const showGridRef = useRef(showGrid);
   const gridSzRef   = useRef(gridSize);
   const sgGRef        = useRef(sgGamma);
-  const sg3dSpRef     = useRef(33);    // GL rows
-  const sg2dSpRef     = useRef(1000);  // 2D canvas rows
+  const sg3dSpRef     = useRef(80);   // GL rows
+  const sg2dSpRef     = useRef(50);   // 2D canvas rows
   const sg3dLastTs    = useRef(0);
   const sg2dLastTs    = useRef(0);
   const spLastTs      = useRef(0);
@@ -226,8 +227,9 @@ export default function AudioAnalysisPanel({
   useEffect(() => { showGridRef.current = showGrid; }, [showGrid]);
   useEffect(() => { gridSzRef.current  = gridSize; }, [gridSize]);
   useEffect(() => { sgGRef.current         = sgGamma;    }, [sgGamma]);
-  useEffect(() => { sg3dSpRef.current      = sg3dSpeed;  }, [sg3dSpeed]);
+  useEffect(() => { sg3dSpRef.current = sg3dSpeed; glSgRef.current?.setRowInterval(sg3dSpeed); }, [sg3dSpeed]);
   useEffect(() => { sg2dSpRef.current      = sg2dSpeed;  }, [sg2dSpeed]);
+  useEffect(() => { glSgRef.current?.setSmooth(sg3dSmooth); }, [sg3dSmooth]);
   useEffect(() => { onSquelchChangeRef.current = onSquelchChange; }, [onSquelchChange]);
 
   // Spectrum canvas mouse handlers — marker drag + squelch line drag
@@ -394,13 +396,15 @@ export default function AudioAnalysisPanel({
             sg2dLastTs.current = now;
             drawSpectrogram(sg, fd);
           }
-          // 3D GL spectrogram
+          // 3D GL spectrogram: upload a new row on the configured interval
           if (now - sg3dLastTs.current >= sg3dSpRef.current) {
             sg3dLastTs.current = now;
             glSgRef.current?.pushRow(fd);
           }
         }
       }
+      // Redraw the 3D terrain every rAF frame so the view is always smooth
+      glSgRef.current?.render();
       rafRef.current = requestAnimationFrame(tick);
     };
     rafRef.current = requestAnimationFrame(tick);
@@ -579,7 +583,7 @@ export default function AudioAnalysisPanel({
             </label>
           )}
           <label className="flex items-center gap-1.5">Contrast
-            <input type="range" min={0.5} max={6} step={0.25} value={sgGamma}
+            <input type="range" min={0.2} max={2.0} step={0.1} value={sgGamma}
               onChange={e => setSgGamma(parseFloat(e.target.value))}
               className="w-14 accent-[#2ea043]"/>
           </label>
@@ -587,22 +591,29 @@ export default function AudioAnalysisPanel({
             <label className="flex items-center gap-1.5">Speed
               <select value={sg2dSpeed} onChange={e => setSg2dSpeed(parseInt(e.target.value))}
                 className="bg-[#0d1117] border border-[#30363d] rounded px-1.5 py-0.5 text-[#c9d1d9] focus:outline-none focus:border-[#2ea043] cursor-pointer">
-                <option value={200}>Fast</option>
-                <option value={500}>Normal</option>
-                <option value={1000}>Slow</option>
-                <option value={3000}>Very Slow</option>
+                <option value={16}>Fast</option>
+                <option value={50}>Normal</option>
+                <option value={150}>Slow</option>
+                <option value={500}>Very Slow</option>
               </select>
             </label>
           ) : (
-            <label className="flex items-center gap-1.5">Speed
-              <select value={sg3dSpeed} onChange={e => setSg3dSpeed(parseInt(e.target.value))}
-                className="bg-[#0d1117] border border-[#30363d] rounded px-1.5 py-0.5 text-[#c9d1d9] focus:outline-none focus:border-[#2ea043] cursor-pointer">
-                <option value={33}>Normal</option>
-                <option value={100}>Slow</option>
-                <option value={200}>Very Slow</option>
-                <option value={500}>Paused</option>
-              </select>
-            </label>
+            <>
+              <label className="flex items-center gap-1.5">Speed
+                <select value={sg3dSpeed} onChange={e => setSg3dSpeed(parseInt(e.target.value))}
+                  className="bg-[#0d1117] border border-[#30363d] rounded px-1.5 py-0.5 text-[#c9d1d9] focus:outline-none focus:border-[#2ea043] cursor-pointer">
+                  <option value={80}>Normal</option>
+                  <option value={200}>Slow</option>
+                  <option value={500}>Very Slow</option>
+                  <option value={1200}>Paused</option>
+                </select>
+              </label>
+              <label className="flex items-center gap-1.5">Smooth
+                <input type="range" min={0.05} max={1} step={0.05} value={sg3dSmooth}
+                  onChange={e => setSg3dSmooth(parseFloat(e.target.value))}
+                  className="w-14 accent-[#2ea043]"/>
+              </label>
+            </>
           )}
         </div>
       </div>

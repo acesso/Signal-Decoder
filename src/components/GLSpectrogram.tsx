@@ -6,6 +6,9 @@ export type GLView = 'terrain' | 'ridge';
 
 export interface GLSpectrogramHandle {
   pushRow(data: Uint8Array): void;
+  render(): void;
+  setSmooth(alpha: number): void;
+  setRowInterval(ms: number): void;
 }
 
 // A frequency range of interest rendered over the spectrogram (decoder filter
@@ -41,8 +44,8 @@ const SQL_COLOR: [number, number, number] = [0.89, 0.70, 0.25]; // #e3b341
 const MAX_BANDS = 8;
 const HEIGHT_SCALE = 0.55;
 
-const TERRAIN_X = 96;   // mesh columns (frequency)
-const TERRAIN_Z = 112;  // mesh rows (time) — keeps indices under the Uint16 limit
+const TERRAIN_X = 192;  // mesh columns (frequency)
+const TERRAIN_Z = 56;   // mesh rows (time) — TERRAIN_X*TERRAIN_Z*6 must stay under Uint16 limit (65535)
 const RIDGE_COUNT = 56; // ridgeline rows
 const RIDGE_SEGS  = 180;
 const RIDGE_BASE_NEW = -0.85;
@@ -175,16 +178,15 @@ void main() {
 
 const TERRAIN_VS = `
 precision mediump float;
-attribute vec2 aPos; // x = freq [0,1], y = depth [0,1] (0 = front/newest)
-uniform sampler2D uTex;
-uniform float uHead, uDepth, uGamma;
+attribute float aHeight; // pre-computed height [0,1] per vertex, updated CPU-side each frame
+attribute vec2 aPos;     // x = freq [0,1], y = depth [0,1] (0 = front/newest)
+uniform float uGamma;
 uniform mat4 uMVP;
 varying float vV;
 varying float vZ;
 varying float vX;
 void main() {
-  float texV = fract(uHead - aPos.y * uDepth);
-  float v = pow(texture2D(uTex, vec2(aPos.x, texV)).r, uGamma);
+  float v = pow(aHeight, uGamma);
   vV = v;
   vZ = aPos.y;
   vX = aPos.x;
@@ -403,11 +405,18 @@ interface BandUniforms {
 const GLSpectrogram = forwardRef<GLSpectrogramHandle, Props>(function GLSpectrogram(
   { view, gamma, height, minHz = 0, maxHz, bands, bandAlpha = 0.3, markers, sqlLevel, sqlAlpha = 0.3, sqlGridSize }, ref,
 ) {
-  const canvasRef  = useRef<HTMLCanvasElement>(null);
-  const glRef      = useRef<WebGLRenderingContext | null>(null);
-  const texRef     = useRef<WebGLTexture | null>(null);
-  const headRef    = useRef(0); // next ring-buffer row to write
-  const renderRef  = useRef<(() => void) | null>(null);
+  const canvasRef      = useRef<HTMLCanvasElement>(null);
+  const glRef          = useRef<WebGLRenderingContext | null>(null);
+  const texRef         = useRef<WebGLTexture | null>(null);
+  const headRef        = useRef(0);
+  const rowIntervalRef = useRef(33);
+  const renderRef      = useRef<(() => void) | null>(null);
+  // CPU height grid for terrain: row 0 = newest (front), row TERRAIN_Z-1 = oldest (back)
+  const terrainHeights  = useRef(new Float32Array(TERRAIN_X * TERRAIN_Z));
+  const terrainPrev     = useRef(new Float32Array(TERRAIN_X * TERRAIN_Z)); // snapshot before last push
+  const terrainLerped   = useRef(new Float32Array(TERRAIN_X * TERRAIN_Z)); // interpolated for upload
+  const terrainDirty    = useRef(false);
+  const lastPushTimeRef = useRef(0);
   const gammaRef   = useRef(gamma);
   const bandsRef   = useRef<{ ranges: Float32Array; colors: Float32Array; strengths: Float32Array; count: number; alpha: number }>({
     ranges: new Float32Array(MAX_BANDS * 2),
@@ -423,7 +432,9 @@ const GLSpectrogram = forwardRef<GLSpectrogramHandle, Props>(function GLSpectrog
   const maxHzRef   = useRef(maxHz);
   const terrainCam = useRef({ ...TERRAIN_CAM });
   const ridgeCam   = useRef({ ...RIDGE_CAM });
-  const rowScratch = useRef(new Uint8Array(TEX_W));
+  const rowScratch  = useRef(new Uint8Array(TEX_W));
+  const rowSmoothed = useRef(new Float32Array(TEX_W));
+  const smoothAlpha = useRef(0.35);
   const labelElsRef = useRef<(HTMLSpanElement | null)[]>([]);
   const markerElsRef = useRef<(HTMLDivElement | null)[]>([]);
   const markersRef = useRef<SpectroBand[]>([]);
@@ -609,6 +620,8 @@ const GLSpectrogram = forwardRef<GLSpectrogramHandle, Props>(function GLSpectrog
     if (view === 'terrain') {
       const prog = mkProgram(TERRAIN_VS, TERRAIN_FS);
       if (!prog) { setFailed(true); return; }
+
+      // Static position buffer: (x [0,1], y [0,1]) per vertex — never changes
       const verts = new Float32Array(TERRAIN_X * TERRAIN_Z * 2);
       for (let j = 0; j < TERRAIN_Z; j++) {
         for (let i = 0; i < TERRAIN_X; i++) {
@@ -626,17 +639,24 @@ const GLSpectrogram = forwardRef<GLSpectrogramHandle, Props>(function GLSpectrog
         }
       }
       const vbuf = mkBuffer(verts);
+
+      // Dynamic height buffer: one float per vertex, updated CPU-side on each pushRow
+      const hbuf = gl.createBuffer()!;
+      buffers.push(hbuf);
+      gl.bindBuffer(gl.ARRAY_BUFFER, hbuf);
+      gl.bufferData(gl.ARRAY_BUFFER, terrainHeights.current, gl.DYNAMIC_DRAW);
+
       const ibuf = gl.createBuffer()!;
       buffers.push(ibuf);
       gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ibuf);
       gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, idx, gl.STATIC_DRAW);
-      const aPos = gl.getAttribLocation(prog, 'aPos');
+
+      const aPos    = gl.getAttribLocation(prog, 'aPos');
+      const aHeight = gl.getAttribLocation(prog, 'aHeight');
       const loc = {
-        head: gl.getUniformLocation(prog, 'uHead'),
-        depth: gl.getUniformLocation(prog, 'uDepth'),
         gamma: gl.getUniformLocation(prog, 'uGamma'),
-        mvp: gl.getUniformLocation(prog, 'uMVP'),
-        grid: gl.getUniformLocation(prog, 'uGrid'),
+        mvp:   gl.getUniformLocation(prog, 'uMVP'),
+        grid:  gl.getUniformLocation(prog, 'uGrid'),
         bands: bandLocs(prog),
       };
 
@@ -692,11 +712,23 @@ const GLSpectrogram = forwardRef<GLSpectrogramHandle, Props>(function GLSpectrog
         gl.clearColor(BG[0], BG[1], BG[2], 1);
         gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
         gl.useProgram(prog);
+
+        // Upload interpolated heights every frame (render() always sets dirty)
+        if (terrainDirty.current) {
+          gl.bindBuffer(gl.ARRAY_BUFFER, hbuf);
+          gl.bufferSubData(gl.ARRAY_BUFFER, 0, terrainLerped.current);
+          terrainDirty.current = false;
+        } else {
+          gl.bindBuffer(gl.ARRAY_BUFFER, hbuf);
+        }
+        gl.enableVertexAttribArray(aHeight);
+        gl.vertexAttribPointer(aHeight, 1, gl.FLOAT, false, 0, 0);
+
         gl.bindBuffer(gl.ARRAY_BUFFER, vbuf);
         gl.enableVertexAttribArray(aPos);
         gl.vertexAttribPointer(aPos, 2, gl.FLOAT, false, 0, 0);
         gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ibuf);
-        gl.bindTexture(gl.TEXTURE_2D, texRef.current);
+
         const target: [number, number, number] = [cam.tx, 0.15, -0.9 + cam.tz];
         const eye: [number, number, number] = [
           target[0] + cam.dist * Math.sin(cam.az) * Math.cos(cam.el),
@@ -706,8 +738,6 @@ const GLSpectrogram = forwardRef<GLSpectrogramHandle, Props>(function GLSpectrog
         const proj = mat4Perspective(Math.PI / 3, canvas.width / canvas.height, 0.05, 20);
         const mvp  = mat4Multiply(proj, mat4LookAt(eye, target));
         gl.uniformMatrix4fv(loc.mvp, false, mvp);
-        gl.uniform1f(loc.head, headNorm());
-        gl.uniform1f(loc.depth, DEPTH);
         gl.uniform1f(loc.gamma, gammaRef.current);
         gl.uniform2f(loc.grid, gridRef.current[0], gridRef.current[1]);
         setBandUniforms(loc.bands);
@@ -893,20 +923,54 @@ const GLSpectrogram = forwardRef<GLSpectrogramHandle, Props>(function GLSpectrog
   useImperativeHandle(ref, () => ({
     pushRow(data: Uint8Array) {
       const gl = glRef.current;
-      if (!gl || !texRef.current || data.length === 0) return;
-      // Resample incoming bins to the fixed texture width
-      const out = rowScratch.current;
+      if (!gl || data.length === 0) return;
+      const smooth = rowSmoothed.current;
+      const heights = terrainHeights.current;
       const n = data.length;
-      for (let i = 0; i < TEX_W; i++) {
-        const f  = (i / (TEX_W - 1)) * (n - 1);
+      const alpha = smoothAlpha.current;
+
+      terrainDirty.current = true;
+      lastPushTimeRef.current = performance.now();
+      // Snapshot current state before shifting so render() can lerp from it
+      terrainPrev.current.set(heights);
+      // Shift all rows back by one: row 0 = newest, TERRAIN_Z-1 = oldest
+      heights.copyWithin(TERRAIN_X, 0, TERRAIN_X * (TERRAIN_Z - 1));
+
+      // Resample + smooth new FFT into row 0
+      for (let i = 0; i < TERRAIN_X; i++) {
+        const f  = (i / (TERRAIN_X - 1)) * (n - 1);
         const i0 = f | 0;
         const i1 = Math.min(i0 + 1, n - 1);
-        out[i] = data[i0] * (1 - (f - i0)) + data[i1] * (f - i0);
+        const raw = (data[i0] * (1 - (f - i0)) + data[i1] * (f - i0)) / 255;
+        smooth[i] = smooth[i] * (1 - alpha) + raw * alpha;
+        heights[i] = smooth[i];
       }
-      gl.bindTexture(gl.TEXTURE_2D, texRef.current);
-      gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, headRef.current, TEX_W, 1, gl.LUMINANCE, gl.UNSIGNED_BYTE, out);
-      headRef.current = (headRef.current + 1) % TEX_H;
+
+      // Also keep the ring-buffer texture updated for ridge/squelch views
+      const out = rowScratch.current;
+      for (let i = 0; i < TEX_W; i++) out[i] = heights[i] * 255;
+      if (texRef.current) {
+        gl.bindTexture(gl.TEXTURE_2D, texRef.current);
+        gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, headRef.current, TEX_W, 1, gl.LUMINANCE, gl.UNSIGNED_BYTE, out);
+        headRef.current = (headRef.current + 1) % TEX_H;
+      }
+    },
+    render() {
+      // Lerp between prev and current heights so the terrain glides smoothly
+      // between row pushes rather than snapping. t goes 0→1 over one row interval.
+      const t = Math.min((performance.now() - lastPushTimeRef.current) / rowIntervalRef.current, 1);
+      const cur  = terrainHeights.current;
+      const prev = terrainPrev.current;
+      const out  = terrainLerped.current;
+      for (let i = 0; i < out.length; i++) out[i] = prev[i] + (cur[i] - prev[i]) * t;
+      terrainDirty.current = true;
       renderRef.current?.();
+    },
+    setSmooth(alpha: number) {
+      smoothAlpha.current = alpha;
+    },
+    setRowInterval(ms: number) {
+      rowIntervalRef.current = ms;
     },
   }), []);
 
