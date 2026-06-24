@@ -192,23 +192,40 @@ const FTDecoder = forwardRef<DecoderControls, { ftMode: FTMode } & DecoderProps>
     [],
   );
   const prevResultLenRef = useRef(0);
+  // Always-current VFO ref — readable synchronously inside effects without stale closure
+  const vfoRef = useRef<number>(0);
+  useEffect(() => { vfoRef.current = vfoFrequency ?? 0; }, [vfoFrequency]);
+
+  // Frozen VFO per decoded window: windowStart.getTime() → vfoHz at that moment.
+  // Keyed by timestamp so entries survive result-array prepends without index shifting.
+  const frozenVfoRef = useRef<Map<number, number>>(new Map());
 
   useEffect(() => {
     const { results } = state;
     if (results.length < prevResultLenRef.current) {
-      // clearResults() was called
       prevResultLenRef.current = 0;
+      frozenVfoRef.current.clear();
       return;
     }
     const newCount = results.length - prevResultLenRef.current;
     if (newCount <= 0) return;
 
-    // results is newest-first; reverse to process oldest → newest
-    const fresh = results.slice(0, newCount).slice().reverse();
+    // Snapshot VFO for each new window (results is newest-first)
+    const currentVfo = vfoRef.current;
+    const fresh = results.slice(0, newCount);
+    for (const r of fresh) {
+      frozenVfoRef.current.set(r.windowStart.getTime(), currentVfo);
+    }
+
+    // Bake absolute freq into ContactMsg so contacts panel never needs VFO
     setContacts(prev => {
       let m = prev;
-      for (const r of fresh) {
-        m = mergeContacts(m, r.windowStart, r.messages, 0);
+      for (const r of fresh.slice().reverse()) {
+        const msgsWithAbsFreq = r.messages.map(msg => ({
+          ...msg,
+          freq: currentVfo > 0 ? currentVfo + msg.freq : msg.freq,
+        }));
+        m = mergeContacts(m, r.windowStart, msgsWithAbsFreq, 0);
       }
       return m;
     });
@@ -219,6 +236,7 @@ const FTDecoder = forwardRef<DecoderControls, { ftMode: FTMode } & DecoderProps>
     clearResults();
     setContacts(new Map());
     prevResultLenRef.current = 0;
+    frozenVfoRef.current.clear();
   }, [clearResults]);
 
   // ── 2-panel drag ────────────────────────────────────────────────────────────
@@ -256,17 +274,22 @@ const FTDecoder = forwardRef<DecoderControls, { ftMode: FTMode } & DecoderProps>
   const hasData   = results.length > 0 || contacts.size > 0;
 
   type SepRow = { kind: 'sep'; time: Date; mode: FTMode; empty: boolean; key: string };
-  type MsgRow = { kind: 'msg'; freq: number; dt: number; snr: number; msg: string; time: Date; key: string };
+  type MsgRow = { kind: 'msg'; absFreq: string; dt: number; snr: number; msg: string; time: Date; key: string };
   type TableRow = SepRow | MsgRow;
 
-  const tableRows: TableRow[] = results.flatMap((r, ri) => [
-    { kind: 'sep' as const, time: r.windowStart, mode: r.mode, empty: r.messages.length === 0, key: `sep-${ri}` },
-    ...r.messages.map((m, mi) => ({
-      kind: 'msg' as const,
-      freq: m.freq, dt: m.dt, snr: m.snr, msg: m.msg,
-      time: r.windowStart, key: `msg-${ri}-${mi}`,
-    })),
-  ]);
+  // Use the VFO that was active at the moment each window was decoded (frozen).
+  const tableRows: TableRow[] = results.flatMap((r, ri) => {
+    const frozenVfo = frozenVfoRef.current.get(r.windowStart.getTime()) ?? 0;
+    return [
+      { kind: 'sep' as const, time: r.windowStart, mode: r.mode, empty: r.messages.length === 0, key: `sep-${ri}` },
+      ...r.messages.map((m, mi) => ({
+        kind: 'msg' as const,
+        absFreq: formatFreq(m.freq, frozenVfo),
+        dt: m.dt, snr: m.snr, msg: m.msg,
+        time: r.windowStart, key: `msg-${ri}-${mi}`,
+      })),
+    ];
+  });
 
   const controls: DecoderControls = {
     isRecording: state.isRecording,
@@ -369,7 +392,7 @@ const FTDecoder = forwardRef<DecoderControls, { ftMode: FTMode } & DecoderProps>
                     ) : (
                       <tr key={row.key} className="border-b border-[#21262d]/50 hover:bg-[#21262d]/40 transition-colors">
                         <td className="py-1 px-2 text-[#484f58] whitespace-nowrap">{utcTime(row.time)}</td>
-                        <td className="py-1 px-2 text-right text-[#8b949e] whitespace-nowrap">{formatFreq(row.freq, vfoFrequency ?? 0)}</td>
+                        <td className="py-1 px-2 text-right text-[#8b949e] whitespace-nowrap">{row.absFreq}</td>
                         <td className="py-1 px-2 text-right whitespace-nowrap" style={{ color: snrColor(row.snr) }}>
                           {row.snr > 0 ? '+' : ''}{row.snr.toFixed(4)}
                         </td>

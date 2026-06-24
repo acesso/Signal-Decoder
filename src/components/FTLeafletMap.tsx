@@ -22,31 +22,18 @@ function makeIcon(color: string) {
   });
 }
 
-// Start zoomed out so the entire world fits the container.
-// Also watches for the container becoming visible (ResizeObserver) so that
-// when the panel is initially hidden the map corrects itself on first show.
-function FitWorld() {
+// Invalidate size when the container becomes visible (handles hidden-panel mount).
+function InvalidateOnShow() {
   const map = useMap();
   useEffect(() => {
     const container = map.getContainer();
-    let fitted = false;
-
-    const doFit = () => {
-      map.invalidateSize();
-      map.fitWorld();
-      fitted = true;
-    };
-
-    // Immediate attempt (works when the container is already visible)
     if (container.offsetWidth > 0 && container.offsetHeight > 0) {
-      doFit();
+      map.invalidateSize();
       return;
     }
-
-    // Container is hidden — watch for it to gain non-zero size
     const ro = new ResizeObserver(() => {
-      if (!fitted && container.offsetWidth > 0 && container.offsetHeight > 0) {
-        doFit();
+      if (container.offsetWidth > 0 && container.offsetHeight > 0) {
+        map.invalidateSize();
       }
     });
     ro.observe(container);
@@ -114,11 +101,11 @@ export default function FTLeafletMap({ contacts, onSelect, geoMap, selected }: P
 
   return (
     <MapContainer
-      center={[20, 0]}
-      zoom={1}
+      center={[20, 10]}
+      zoom={1.5}
       minZoom={0}
       maxZoom={12}
-      zoomSnap={0.25}
+      zoomSnap={0.5}
       style={{ height: '100%', width: '100%' }}
       zoomControl={false}
       scrollWheelZoom={true}
@@ -129,7 +116,7 @@ export default function FTLeafletMap({ contacts, onSelect, geoMap, selected }: P
         subdomains="abcd"
         maxZoom={19}
       />
-      <FitWorld />
+      <InvalidateOnShow />
       <AutoBounds count={markers.length} />
       <FlyTo pos={selContact?.latLon ?? null} />
       {selContact?.latLon && (
