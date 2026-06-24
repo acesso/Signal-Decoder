@@ -192,10 +192,10 @@ export default function AudioAnalysisPanel({
   const [displayMaxHz, setDisplayMaxHz] = useState(defaultMaxHz);
   const [lockCenter,   setLockCenter]   = useState(true);
   const [centerFreqInput, setCenterFreqInput] = useState('');
-  const [sgView,    setSgView]    = useState<SpectrogramView>('terrain');
-  const [sgGamma,   setSgGamma]   = useState(1.0);
+  const [sgView,    setSgView]    = useState<SpectrogramView>('legacy');
+  const [sgGamma,   setSgGamma]   = useState(2.0);
   const [sg3dSpeed, setSg3dSpeed] = useState(80);    // GL/3D: ms between rows, default Normal
-  const [sg2dSpeed, setSg2dSpeed] = useState(50);    // 2D canvas: ms between rows, default Normal
+  const [sg2dSpeed, setSg2dSpeed] = useState(16);    // 2D canvas: ms between rows, Fast
   const [sg3dSmooth, setSg3dSmooth] = useState(0.35);
   const [bandAlpha, setBandAlpha] = useState(0.3);
 
