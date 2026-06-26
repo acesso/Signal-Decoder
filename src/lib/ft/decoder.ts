@@ -27,14 +27,22 @@ export const FT_SUPPORTED: Record<FTMode, boolean> = {
   FT2: false,
 };
 
-// Shared callbook persists across windows to resolve hashed callsigns
-let sharedBookPromise: Promise<import('@e04/ft8ts').HashCallBook> | null = null;
+// ── Worker-backed decoder ─────────────────────────────────────────────────────
+// Lazily created; one worker persists for the page lifetime.
+let worker: Worker | null = null;
+let nextId = 0;
+const pending = new Map<number, (msgs: FTMessage[]) => void>();
 
-function getSharedBook() {
-  if (!sharedBookPromise) {
-    sharedBookPromise = import('@e04/ft8ts').then(({ HashCallBook }) => new HashCallBook());
+function getWorker(): Worker {
+  if (!worker) {
+    worker = new Worker(new URL('./decoder.worker.ts', import.meta.url));
+    worker.onmessage = (e: MessageEvent) => {
+      const { id, messages } = e.data;
+      pending.get(id)?.(messages);
+      pending.delete(id);
+    };
   }
-  return sharedBookPromise;
+  return worker;
 }
 
 export async function decodeFTAudio(
@@ -44,21 +52,10 @@ export async function decodeFTAudio(
 ): Promise<FTMessage[]> {
   if (!FT_SUPPORTED[mode]) return [];
 
-  const [{ decodeFT8, decodeFT4 }, book] = await Promise.all([
-    import('@e04/ft8ts'),
-    getSharedBook(),
-  ]);
-
-  const options = { sampleRate, hashCallBook: book };
-  const results = mode === 'FT8'
-    ? decodeFT8(samples, options)
-    : decodeFT4(samples, options);
-
-  return results.map(r => ({
-    freq: r.freq,
-    dt: r.dt,
-    snr: r.snr,
-    msg: r.msg,
-    sync: r.sync,
-  }));
+  const id = nextId++;
+  return new Promise(resolve => {
+    pending.set(id, resolve);
+    // Transfer the buffer — zero-copy, avoids serialisation overhead
+    getWorker().postMessage({ id, samples, sampleRate, mode }, [samples.buffer]);
+  });
 }
