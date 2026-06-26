@@ -67,14 +67,22 @@ function conversationWith(contact: Contact, peer: string): ContactMsg[] {
     .sort((a, b) => a.windowStart.getTime() - b.windowStart.getTime());
 }
 
-// Complete handshake: both sides appeared and exchanged a report+confirmation
+// Partial handshake: the contact transmitted to the peer AND received from the peer
 function isHandshake(contact: Contact, peer: string): boolean {
   const msgs = conversationWith(contact, peer);
-  const types = msgs.map(m => m.parsed.type);
+  const sentToPeer       = msgs.some(m => m.role === 'tx' && m.parsed.callee === peer);
+  const receivedFromPeer = msgs.some(m => m.role === 'rx' && m.parsed.caller === peer);
+  return sentToPeer && receivedFromPeer;
+}
+
+// Full QSO: handshake confirmed AND a signal report was exchanged AND the
+// conversation ended with a sign-off (RR73 / RRR / 73)
+function isFullQSO(contact: Contact, peer: string): boolean {
+  if (!isHandshake(contact, peer)) return false;
+  const types = conversationWith(contact, peer).map(m => m.parsed.type);
   const hasReport  = types.includes('report') || types.includes('r_report');
-  const hasConfirm = types.includes('r_report') || types.includes('rrr') || types.includes('rr73') || types.includes('tx73');
-  const bothRoles  = msgs.some(m => m.role === 'tx') && msgs.some(m => m.role === 'rx');
-  return bothRoles && hasReport && hasConfirm;
+  const hasSignOff = types.includes('rr73') || types.includes('rrr') || types.includes('tx73');
+  return hasReport && hasSignOff;
 }
 
 function longestDistances(contact: Contact, contactMap: Map<string, Contact>) {
@@ -105,6 +113,7 @@ function ConversationBalloon({
   const msgs        = conversationWith(contact, peer);
   const peerContact = contactMap.get(peer);
   const handshake   = isHandshake(contact, peer);
+  const fullQSO     = isFullQSO(contact, peer);
 
   if (!msgs.length) return null;
 
@@ -121,9 +130,11 @@ function ConversationBalloon({
         <span className="font-mono font-bold text-[11px]" style={{ color: peerContact?.color ?? '#8b949e' }}>
           {peer}
         </span>
-        {handshake && (
-          <span className="ml-auto text-[10px]" title="Complete QSO handshake">🤝</span>
-        )}
+        {fullQSO ? (
+          <span className="ml-auto text-[10px]" title="Full QSO — report exchanged and signed off">⭐</span>
+        ) : handshake ? (
+          <span className="ml-auto text-[10px]" title="Partial handshake — both sides transmitted">🤝</span>
+        ) : null}
       </div>
       <div className="space-y-0.5 max-h-52 overflow-y-auto">
         {msgs.map((m, i) => {
@@ -227,6 +238,9 @@ function ContactCard({
   }
   const handshakes = new Set(
     Array.from(repliedTo).filter(p => receivedFrom.has(p) && isHandshake(contact, p))
+  );
+  const fullQSOs = new Set(
+    Array.from(handshakes).filter(p => isFullQSO(contact, p))
   );
 
   function PeerChip({ peer }: { peer: string }) {
@@ -427,16 +441,27 @@ function ContactCard({
             </div>
           )}
 
-          {/* Peers — grouped as Handshakes / Received from / Replied to */}
+          {/* Peers — grouped as Full QSOs / Handshakes / Received from / Replied to */}
           {contact.peers.size > 0 && (
             <div className="mt-2 pt-1.5 border-t border-[#21262d] space-y-1.5">
-              {handshakes.size > 0 && (
+              {fullQSOs.size > 0 && (
                 <div>
-                  <span className="text-[9px] text-[#d2a8ff] font-mono font-semibold block mb-0.5">
-                    🤝 handshake ({handshakes.size})
+                  <span className="text-[9px] text-[#e3b341] font-mono font-semibold block mb-0.5">
+                    ⭐ full QSO ({fullQSOs.size})
                   </span>
                   <div className="flex flex-wrap gap-x-2 gap-y-0.5 pl-3">
-                    {Array.from(handshakes).map(p => <PeerChip key={p} peer={p} />)}
+                    {Array.from(fullQSOs).map(p => <PeerChip key={p} peer={p} />)}
+                  </div>
+                </div>
+              )}
+
+              {Array.from(handshakes).some(p => !fullQSOs.has(p)) && (
+                <div>
+                  <span className="text-[9px] text-[#d2a8ff] font-mono font-semibold block mb-0.5">
+                    🤝 handshake ({Array.from(handshakes).filter(p => !fullQSOs.has(p)).length})
+                  </span>
+                  <div className="flex flex-wrap gap-x-2 gap-y-0.5 pl-3">
+                    {Array.from(handshakes).filter(p => !fullQSOs.has(p)).map(p => <PeerChip key={p} peer={p} />)}
                   </div>
                 </div>
               )}
@@ -480,7 +505,7 @@ interface Props {
 }
 
 type SortKey = 'date' | 'tx' | 'rx' | 'worked' | 'alpha';
-type QuickFilter = 'handshake' | 'tx-only' | 'rx-only' | string; // string = country code
+type QuickFilter = 'full-qso' | 'handshake' | 'tx-only' | 'rx-only' | string; // string = country code
 
 const SORT_OPTIONS: Array<{ key: SortKey; label: string }> = [
   { key: 'date',   label: 'time' },
@@ -592,8 +617,11 @@ export default function FTContactsPanel({ contacts, mode, onClearContacts, focus
   // Apply quick filter
   const quickFiltered = quickFilter
     ? sorted.filter(c => {
+        if (quickFilter === 'full-qso') {
+          return Array.from(c.peers).some(p => isFullQSO(c, p));
+        }
         if (quickFilter === 'handshake') {
-          return Array.from(c.peers).some(p => isHandshake(c, p));
+          return Array.from(c.peers).some(p => isHandshake(c, p) && !isFullQSO(c, p));
         }
         if (quickFilter === 'tx-only') {
           return txCount(c) > 0 && rxCount(c) === 0;
@@ -625,7 +653,8 @@ export default function FTContactsPanel({ contacts, mode, onClearContacts, focus
     : quickFiltered;
 
   const withLocation   = sorted.filter(c => c.latLon).length;
-  const handshakeCount = sorted.filter(c => Array.from(c.peers).some(p => isHandshake(c, p))).length;
+  const fullQSOCount   = sorted.filter(c => Array.from(c.peers).some(p => isFullQSO(c, p))).length;
+  const handshakeCount = sorted.filter(c => Array.from(c.peers).some(p => isHandshake(c, p) && !isFullQSO(c, p))).length;
   const txOnlyCount    = sorted.filter(c => txCount(c) > 0 && rxCount(c) === 0).length;
   const rxOnlyCount    = sorted.filter(c => rxCount(c) > 0 && txCount(c) === 0).length;
 
@@ -720,6 +749,19 @@ export default function FTContactsPanel({ contacts, mode, onClearContacts, focus
       {/* Quick filter chips */}
       {contacts.size > 0 && (
         <div className="mb-1.5 shrink-0 flex flex-wrap gap-1">
+          {fullQSOCount > 0 && (
+            <button
+              onClick={() => setQuickFilter(f => f === 'full-qso' ? null : 'full-qso')}
+              className={`text-[9px] font-mono px-1.5 py-0.5 rounded border transition-colors ${
+                quickFilter === 'full-qso'
+                  ? 'border-[#e3b341]/50 text-[#e3b341] bg-[#e3b341]/10'
+                  : 'border-[#30363d] text-[#8b949e] hover:text-[#e3b341] hover:border-[#e3b341]/30'
+              }`}
+              title="Show contacts with a complete QSO (report exchanged and signed off)"
+            >
+              ⭐ full QSO <span className="opacity-60">{fullQSOCount}</span>
+            </button>
+          )}
           {handshakeCount > 0 && (
             <button
               onClick={() => setQuickFilter(f => f === 'handshake' ? null : 'handshake')}
@@ -728,7 +770,7 @@ export default function FTContactsPanel({ contacts, mode, onClearContacts, focus
                   ? 'border-[#d2a8ff]/50 text-[#d2a8ff] bg-[#d2a8ff]/10'
                   : 'border-[#30363d] text-[#8b949e] hover:text-[#d2a8ff] hover:border-[#d2a8ff]/30'
               }`}
-              title="Show contacts with a confirmed QSO handshake"
+              title="Show contacts with a partial handshake (both sides transmitted, not yet complete)"
             >
               🤝 handshake <span className="opacity-60">{handshakeCount}</span>
             </button>
