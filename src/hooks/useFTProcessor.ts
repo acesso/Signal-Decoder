@@ -68,49 +68,51 @@ export function useFTProcessor(mode: FTMode) {
     });
 
   const runLoop = useCallback(async () => {
-    while (isRunningRef.current) {
-      const windowSec = FT_WINDOW_SECONDS[modeRef.current];
-      const waitMs    = msUntilNextWindow(windowSec);
+    // Kick off decode of a captured buffer in the background; does not block the record loop.
+    const dispatchDecode = (captured: Float32Array, sampleRate: number, windowStart: Date) => {
+      const t0 = performance.now();
+      decodeFTAudio(captured, sampleRate, modeRef.current)
+        .then(messages => ({ messages, decodeMs: performance.now() - t0 }))
+        .catch(() => ({ messages: [], decodeMs: performance.now() - t0 }))
+        .then(({ messages, decodeMs }) => {
+          if (!isRunningRef.current) return;
+          const result: FTDecodeResult = { windowStart, mode: modeRef.current, messages, decodeMs };
+          setState(prev => ({
+            ...prev,
+            results: [result, ...prev.results].slice(0, 300),
+          }));
+        });
+    };
 
-      if (waitMs > 100) {
-        setState(prev => ({ ...prev, status: 'waiting' }));
-        await sleep(waitMs);
-      }
-      if (!isRunningRef.current) break;
+    // Wait for the very first UTC boundary before starting
+    const windowSec = FT_WINDOW_SECONDS[modeRef.current];
+    const waitMs    = msUntilNextWindow(windowSec);
+    if (waitMs > 100) {
+      setState(prev => ({ ...prev, status: 'waiting' }));
+      await sleep(waitMs);
+    }
+
+    while (isRunningRef.current) {
+      const curWindowSec = FT_WINDOW_SECONDS[modeRef.current];
 
       // Arm accumulation buffer for this window
       const sampleRate = audioContextRef.current?.sampleRate ?? 48000;
-      const capacity   = Math.ceil(windowSec * sampleRate) + 8192;
+      const capacity   = Math.ceil(curWindowSec * sampleRate) + 8192;
       sampleBufRef.current   = new Float32Array(capacity);
       sampleCountRef.current = 0;
       windowStartRef.current = new Date();
       setState(prev => ({ ...prev, status: 'recording' }));
 
-      await sleep(windowSec * 1000);
+      await sleep(curWindowSec * 1000);
       if (!isRunningRef.current) break;
 
-      // Snapshot captured audio
+      // Snapshot captured audio, then immediately start next window's recording
       const captured    = sampleBufRef.current.slice(0, sampleCountRef.current);
       const windowStart = windowStartRef.current!;
       sampleBufRef.current = null;
 
-      setState(prev => ({ ...prev, status: 'decoding' }));
-
-      let result: FTDecodeResult;
-      const t0 = performance.now();
-      try {
-        const messages = await decodeFTAudio(captured, sampleRate, modeRef.current);
-        result = { windowStart, mode: modeRef.current, messages, decodeMs: performance.now() - t0 };
-      } catch {
-        result = { windowStart, mode: modeRef.current, messages: [], decodeMs: performance.now() - t0 };
-      }
-
-      if (!isRunningRef.current) break;
-      setState(prev => ({
-        ...prev,
-        status:  'waiting',
-        results: [result, ...prev.results].slice(0, 300),
-      }));
+      // Kick off decode concurrently — next iteration arms the buffer immediately
+      dispatchDecode(captured, sampleRate, windowStart);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
