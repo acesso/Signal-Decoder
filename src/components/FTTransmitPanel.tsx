@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   useFTTransmit, TxQueueEntry, loadMyCall, saveMyCall, loadMyGrid, saveMyGrid,
+  loadAutoReply, saveAutoReply,
 } from '@/hooks/useFTTransmit';
 import { buildFTMessage, nextTxMsgType, parseFTMsg, isValidCallsign, Contact, MsgType, gridToLatLon, haversineKm } from '@/lib/ft/parser';
 import { callsignCountry } from '@/lib/ft/prefixes';
@@ -330,7 +331,7 @@ export default function FTTransmitPanel({ mode, contacts, vfoFrequency = 0, onMy
   const [isRunning, setIsRunning]  = useState(false);
   const [geoStatus, setGeoStatus]  = useState<'idle' | 'loading' | 'done' | 'denied'>('idle');
 
-  const { state, start, stop, enqueue, dequeue, moveUp, setAutoCQ, setAutoCQMessage, setOutputDevice, setTxGain, setAutoPTT, setAllowConsecutiveTx } =
+  const { state, start, stop, enqueue, enqueueFirst, dequeue, moveUp, setAutoCQ, setAutoCQMessage, setOutputDevice, setTxGain, setAutoPTT, setAllowConsecutiveTx } =
     useFTTransmit(mode, baseFreq, vfoFrequency, onSetPTT);
 
   // dB ↔ linear helpers (slider operates in dB, GainNode needs linear)
@@ -379,6 +380,64 @@ export default function FTTransmitPanel({ mode, contacts, vfoFrequency = 0, onMy
 
   const handleStart = async () => { if (!canOperate) return; setIsRunning(true); await start(); };
   const handleStop  = () => { setIsRunning(false); stop(); };
+
+  // ── Auto-reply ───────────────────────────────────────────────────────────────
+  const [autoReply, setAutoReplyState] = useState(() => loadAutoReply());
+  // Track callsigns we've already auto-enqueued this session to avoid duplicates
+  const autoRepliedRef = useRef(new Set<string>());
+
+  const setAutoReply = useCallback((v: boolean) => {
+    setAutoReplyState(v);
+    saveAutoReply(v);
+    if (!v) autoRepliedRef.current.clear();
+  }, []);
+
+  // Reset seen-set when TX engine stops so replies fire again next session
+  useEffect(() => {
+    if (!isRunning) autoRepliedRef.current.clear();
+  }, [isRunning]);
+
+  useEffect(() => {
+    if (!autoReply || !isRunning || !canOperate) return;
+    const myCallUp = myCall.toUpperCase();
+    const myGridUp = myGrid.toUpperCase();
+
+    for (const contact of contacts.values()) {
+      const callsign = contact.callsign.toUpperCase();
+      if (callsign === myCallUp) continue;
+      if (autoRepliedRef.current.has(callsign)) continue;
+
+      // Check if this contact has transmitted to us
+      const theirMsgsToUs = contact.msgs.filter(m =>
+        m.role === 'tx' && parseFTMsg(m.raw).callee?.toUpperCase() === myCallUp
+      );
+      if (theirMsgsToUs.length === 0) continue;
+
+      // Don't auto-reply if we already have this callsign queued
+      if (state.queue.some(e => e.message.includes(callsign))) continue;
+
+      // Determine what we've already sent them
+      const ourMsgs = contact.msgs.filter(m =>
+        m.role === 'rx' && parseFTMsg(m.raw).caller?.toUpperCase() === myCallUp
+      );
+      const lastOurType  = ourMsgs.length ? parseFTMsg(ourMsgs[ourMsgs.length - 1].raw).type : null;
+      const lastTheirMsg = theirMsgsToUs[theirMsgsToUs.length - 1];
+      const lastTheirType = parseFTMsg(lastTheirMsg.raw).type;
+
+      const nextType = nextTxMsgType(lastOurType ?? 'cq', lastTheirType);
+      // 'cq' means the exchange is complete — nothing to send
+      if (nextType === 'cq') continue;
+
+      const reportDb = Math.round(lastTheirMsg.snr);
+      const message  = buildFTMessage(nextType, myCallUp, callsign, reportDb, myGridUp);
+      const labelMap: Record<string, string> = {
+        answer: 'Answer', report: 'Report', r_report: 'R+Report', rr73: 'RR73', tx73: '73',
+      };
+
+      autoRepliedRef.current.add(callsign);
+      enqueueFirst({ id: uid(), message, label: `Auto → ${contact.callsign} (${labelMap[nextType] ?? nextType})` });
+    }
+  }, [contacts, autoReply, isRunning, canOperate, myCall, myGrid, state.queue, enqueueFirst]);
 
   // ── Suggestion sort / filter state ──────────────────────────────────────────
   type SugSort = 'default' | 'snr-hi' | 'snr-lo' | 'near' | 'far';
@@ -559,6 +618,21 @@ export default function FTTransmitPanel({ mode, contacts, vfoFrequency = 0, onMy
                 <div className={`absolute top-0.5 w-2 h-2 rounded-full bg-white transition-transform ${state.allowConsecutiveTx ? 'translate-x-3' : 'translate-x-0.5'}`} />
               </div>
               <span className="text-[10px] text-[#8b949e] whitespace-nowrap">Consecutive TX</span>
+            </div>
+            {/* Auto-Reply */}
+            <div onClick={() => setAutoReply(!autoReply)}
+              title={autoReply
+                ? 'Auto-Reply on — automatically enqueues a reply when someone responds to your CQ'
+                : 'Auto-Reply off — manually pick replies from suggestions'}
+              className="flex items-center gap-1.5 cursor-pointer select-none px-2 py-1.5 rounded border transition-colors"
+              style={{
+                borderColor: autoReply ? 'rgba(88,166,255,0.5)' : 'rgba(48,54,61,1)',
+                background:  autoReply ? 'rgba(88,166,255,0.08)' : 'transparent',
+              }}>
+              <div className={`w-6 h-3 rounded-full transition-colors relative shrink-0 ${autoReply ? 'bg-[#58a6ff]' : 'bg-[#30363d]'}`}>
+                <div className={`absolute top-0.5 w-2 h-2 rounded-full bg-white transition-transform ${autoReply ? 'translate-x-3' : 'translate-x-0.5'}`} />
+              </div>
+              <span className="text-[10px] text-[#8b949e] whitespace-nowrap">Auto-Reply</span>
             </div>
           </div>
         </div>
