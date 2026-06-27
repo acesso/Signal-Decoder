@@ -114,6 +114,7 @@ export default function Home() {
   const [ftMode, setFTMode] = useState<FTMode>('FT8');
   const [ftContacts, setFtContacts] = useState<Map<string, Contact>>(new Map());
   const [ftMyCall, setFtMyCall] = useState('');
+  const [ftMyGrid, setFtMyGrid] = useState('');
 
   // ── Radio CAT — lifted here so VFO frequency flows to all decoders ────────
   const cat = useRadioCAT();
@@ -257,6 +258,7 @@ export default function Home() {
                 contacts={ftContacts}
                 vfoFrequency={vfoFrequency}
                 onMyCallChange={setFtMyCall}
+                onMyGridChange={setFtMyGrid}
                 onSetPTT={cat.state.connected ? cat.setPTT : undefined}
               />
               </div>
@@ -278,7 +280,7 @@ export default function Home() {
           <MFSKDecoder ref={mfskRef} onStateChange={onStateChangeCbs.mfsk} analyser={analyser} vfoFrequency={vfoFrequency} />
         </div>
         <div className={mode === 'ft' ? '' : 'hidden'}>
-          <FTDecoder ref={ftRef} ftMode={ftMode} myCall={ftMyCall} onStateChange={onStateChangeCbs.ft} onContactsChange={setFtContacts} analyser={analyser} vfoFrequency={vfoFrequency} />
+          <FTDecoder ref={ftRef} ftMode={ftMode} myCall={ftMyCall} myGrid={ftMyGrid} onStateChange={onStateChangeCbs.ft} onContactsChange={setFtContacts} analyser={analyser} vfoFrequency={vfoFrequency} />
         </div>
 
       </div>
