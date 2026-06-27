@@ -1,6 +1,6 @@
 'use client';
 
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   useFTTransmit, TxQueueEntry, loadMyCall, saveMyCall, loadMyGrid, saveMyGrid,
   loadAutoReply, saveAutoReply,
@@ -447,11 +447,21 @@ export default function FTTransmitPanel({ mode, contacts, vfoFrequency = 0, onMy
 
   const DISPLAY_LIMIT = 8;
 
-  const allSuggestions = buildSuggestions(myCall.toUpperCase(), myGrid.toUpperCase(), contacts);
-  const myLatLon = myGrid ? (gridToLatLon(myGrid.toUpperCase()) ?? null) : null;
+  const myCallUp = myCall.toUpperCase();
+  const myGridUp = myGrid.toUpperCase();
 
-  // Build country list from non-CQ suggestions
-  const sugCountryOptions = Array.from(
+  const allSuggestions = useMemo(
+    () => buildSuggestions(myCallUp, myGridUp, contacts),
+    [myCallUp, myGridUp, contacts],
+  );
+
+  const myLatLon = useMemo(
+    () => myGridUp ? (gridToLatLon(myGridUp) ?? null) : null,
+    [myGridUp],
+  );
+
+  // Build country list from non-CQ suggestions — only recomputes when suggestions change
+  const sugCountryOptions = useMemo(() => Array.from(
     allSuggestions.filter(s => s.callsign && s.countryCode).reduce((acc, s) => {
       const pfx = callsignCountry(s.callsign!);
       if (pfx?.countryCode && pfx.country && pfx.flag) {
@@ -462,26 +472,31 @@ export default function FTTransmitPanel({ mode, contacts, vfoFrequency = 0, onMy
       }
       return acc;
     }, new Map<string, { code: string; country: string; flag: string; count: number }>())
-  .values()).sort((a, b) => b.count - a.count || a.country.localeCompare(b.country));
+  .values()).sort((a, b) => b.count - a.count || a.country.localeCompare(b.country)),
+  [allSuggestions]);
 
-  const distKm = (s: Suggestion): number =>
-    (myLatLon && s.latLon) ? haversineKm(myLatLon, s.latLon) : Infinity;
+  const distKm = useCallback((s: Suggestion): number =>
+    (myLatLon && s.latLon) ? haversineKm(myLatLon, s.latLon) : Infinity,
+  [myLatLon]);
 
   // Separate CQ (always first, never reordered/filtered) from contact suggestions
   const [cqSug, ...contactSugs] = allSuggestions;
-  const filteredSugs = contactSugs.filter(s => {
-    if (sugMyOnly && s.thread.length === 0) return false;
-    if (sugCountryFilter && s.countryCode !== sugCountryFilter) return false;
-    return true;
-  });
-  const sortedSugs = [...filteredSugs].sort((a, b) => {
-    if (sugSort === 'snr-hi') return b.maxSnr - a.maxSnr;
-    if (sugSort === 'snr-lo') return a.maxSnr - b.maxSnr;
-    if (sugSort === 'near')   return distKm(a) - distKm(b);
-    if (sugSort === 'far')    return distKm(b) - distKm(a);
-    return 0; // default: keep buildSuggestions order (priority + recency)
-  });
-  const suggestions = [cqSug, ...sortedSugs.slice(0, DISPLAY_LIMIT - 1)];
+  const suggestions = useMemo(() => {
+    const filteredSugs = contactSugs.filter(s => {
+      if (sugMyOnly && s.thread.length === 0) return false;
+      if (sugCountryFilter && s.countryCode !== sugCountryFilter) return false;
+      return true;
+    });
+    const sortedSugs = [...filteredSugs].sort((a, b) => {
+      if (sugSort === 'snr-hi') return b.maxSnr - a.maxSnr;
+      if (sugSort === 'snr-lo') return a.maxSnr - b.maxSnr;
+      if (sugSort === 'near')   return distKm(a) - distKm(b);
+      if (sugSort === 'far')    return distKm(b) - distKm(a);
+      return 0; // default: keep buildSuggestions order (priority + recency)
+    });
+    return [cqSug, ...sortedSugs.slice(0, DISPLAY_LIMIT - 1)];
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [allSuggestions, sugSort, sugCountryFilter, sugMyOnly, distKm]);
 
   const addSuggestion = (sug: Suggestion) => {
     if (!canOperate) return;
