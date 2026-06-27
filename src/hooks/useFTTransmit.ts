@@ -46,6 +46,17 @@ const LS_OUTPUT          = 'ft_output_device';
 const LS_GAIN            = 'ft_tx_gain';
 const LS_AUTOPTT         = 'ft_auto_ptt';
 const LS_CONSECUTIVE_TX  = 'ft_consecutive_tx';
+const LS_BASE_FREQ       = 'ft_base_freq';
+
+export const DEFAULT_BASE_FREQ = 1850;
+export function loadBaseFreq(): number {
+  if (typeof window === 'undefined') return DEFAULT_BASE_FREQ;
+  const stored = localStorage.getItem(LS_BASE_FREQ);
+  return stored !== null ? parseInt(stored, 10) : DEFAULT_BASE_FREQ;
+}
+export function saveBaseFreq(v: number) {
+  if (typeof window !== 'undefined') localStorage.setItem(LS_BASE_FREQ, String(v));
+}
 
 export function loadMyCall(): string {
   if (typeof window === 'undefined') return '';
@@ -68,7 +79,7 @@ export function loadOutputDevice(): string {
 export function saveOutputDevice(v: string) {
   if (typeof window !== 'undefined') localStorage.setItem(LS_OUTPUT, v);
 }
-const DEFAULT_GAIN = Math.pow(10, -15 / 20); // -15 dB
+const DEFAULT_GAIN = Math.pow(10, -20 / 20); // -20 dB
 export function loadTxGain(): number {
   if (typeof window === 'undefined') return DEFAULT_GAIN;
   const stored = localStorage.getItem(LS_GAIN);

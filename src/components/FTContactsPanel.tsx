@@ -4,7 +4,7 @@ import dynamic from 'next/dynamic';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import {
-  Contact, ContactMsg, MSG_TYPE_LABEL, MSG_TYPE_COLOR, generateADIF, gridToLatLon, haversineKm,
+  Contact, ContactMsg, MSG_TYPE_LABEL, MSG_TYPE_COLOR, generateADIF, parseADIF, gridToLatLon, haversineKm,
 } from '@/lib/ft/parser';
 import { GeoInfo, OperatorInfo, resolveGridLocation, lookupOperator } from '@/lib/ft/lookup';
 import { callsignCountry } from '@/lib/ft/prefixes';
@@ -546,6 +546,7 @@ interface Props {
   myCall?: string;
   myGrid?: string;
   onClearContacts: () => void;
+  onImportADIF?: (content: string) => void;
   focus?: { cs: string; n: number } | null;
 }
 
@@ -564,7 +565,7 @@ const SORT_OPTIONS: Array<{ key: SortKey; label: string; title: string }> = [
   { key: 'alpha',  label: 'A–Z',      title: 'Alphabetical by callsign' },
 ];
 
-export default function FTContactsPanel({ contacts, mode, myCall = '', myGrid = '', onClearContacts, focus }: Props) {
+export default function FTContactsPanel({ contacts, mode, myCall = '', myGrid = '', onClearContacts, onImportADIF, focus }: Props) {
   const [expanded,       setExpanded]      = useState<string | null>(null);
   const [sortKey,        setSortKey]       = useState<SortKey>('date');
   const [sortRev,        setSortRev]       = useState(false);
@@ -749,6 +750,9 @@ export default function FTContactsPanel({ contacts, mode, myCall = '', myGrid = 
 
   const hasAnyFilter   = !!quickFilter || !!countryFilter;
 
+  const importFileRef = useRef<HTMLInputElement>(null);
+  const [importStatus, setImportStatus] = useState<{ count: number; err?: string } | null>(null);
+
   function downloadADIF() {
     const content = generateADIF(contacts, mode);
     const blob = new Blob([content], { type: 'text/plain;charset=utf-8' });
@@ -762,6 +766,26 @@ export default function FTContactsPanel({ contacts, mode, myCall = '', myGrid = 
     URL.revokeObjectURL(url);
   }
 
+  function handleImportFile(e: React.ChangeEvent<HTMLInputElement>) {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    e.target.value = '';
+    const reader = new FileReader();
+    reader.onload = ev => {
+      const content = ev.target?.result as string;
+      try {
+        const records = parseADIF(content);
+        if (records.length === 0) { setImportStatus({ count: 0, err: 'No valid QSO records found' }); return; }
+        onImportADIF?.(content);
+        setImportStatus({ count: records.length });
+        setTimeout(() => setImportStatus(null), 4000);
+      } catch {
+        setImportStatus({ count: 0, err: 'Failed to parse ADIF file' });
+      }
+    };
+    reader.readAsText(file);
+  }
+
   return (
     <div ref={panelRef} className="flex flex-col h-full min-h-0">
       {/* Header */}
@@ -772,6 +796,26 @@ export default function FTContactsPanel({ contacts, mode, myCall = '', myGrid = 
             {q || hasAnyFilter ? `${filtered.length}/${contacts.size} shown` : `${contacts.size} found`}
             {withLocation > 0 && <span className="text-[#484f58]"> · {withLocation} located</span>}
           </span>
+          {importStatus && (
+            <span className={`text-[10px] font-mono ${importStatus.err ? 'text-[#f85149]' : 'text-[#2ea043]'}`}>
+              {importStatus.err ?? `+${importStatus.count} imported`}
+            </span>
+          )}
+          {/* Hidden file input */}
+          <input
+            ref={importFileRef}
+            type="file"
+            accept=".adi,.adif"
+            className="hidden"
+            onChange={handleImportFile}
+          />
+          <button
+            onClick={() => importFileRef.current?.click()}
+            className="text-xs px-2 py-0.5 rounded border border-[#30363d] text-[#8b949e] hover:text-[#2ea043] hover:border-[#2ea043]/40 transition-colors font-mono"
+            title="Import ADIF log (.adi / .adif)"
+          >
+            import
+          </button>
           {contacts.size > 0 && (
             <>
               <button
@@ -779,7 +823,7 @@ export default function FTContactsPanel({ contacts, mode, myCall = '', myGrid = 
                 className="text-xs px-2 py-0.5 rounded border border-[#30363d] text-[#8b949e] hover:text-[#79c0ff] hover:border-[#79c0ff]/40 transition-colors font-mono"
                 title="Download ADIF log (.adi)"
               >
-                .adi
+                export
               </button>
               <button
                 onClick={onClearContacts}

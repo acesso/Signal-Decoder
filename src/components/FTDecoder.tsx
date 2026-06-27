@@ -6,7 +6,7 @@ import { fmtAbsHz } from '@/lib/formatFreq';
 import AudioAnalysisPanel from './AudioAnalysisPanel';
 import { useFTProcessor } from '@/hooks/useFTProcessor';
 import { FTMode, FT_WINDOW_SECONDS } from '@/lib/ft/decoder';
-import { Contact, mergeContacts, parseFTMsg } from '@/lib/ft/parser';
+import { Contact, mergeContacts, parseFTMsg, parseADIF, isValidCallsign, gridToLatLon, CONTACT_PALETTE } from '@/lib/ft/parser';
 import FTContactsPanel from './FTContactsPanel';
 
 // ── Clock ring (rAF-driven, no setState) ──────────────────────────────────────
@@ -261,6 +261,43 @@ const FTDecoder = forwardRef<DecoderControls, { ftMode: FTMode; myCall?: string;
     frozenVfoRef.current.clear();
   }, [clearResults]);
 
+  const handleImportADIF = useCallback((content: string) => {
+    const records = parseADIF(content);
+    if (!records.length) return;
+    setContacts(prev => {
+      const next = new Map(prev);
+      for (const r of records) {
+        if (next.has(r.call)) continue; // don't overwrite contacts we've already heard live
+        const ts = r.qsoDate && r.timeOn
+          ? new Date(
+              parseInt(r.qsoDate.slice(0, 4)),
+              parseInt(r.qsoDate.slice(4, 6)) - 1,
+              parseInt(r.qsoDate.slice(6, 8)),
+              parseInt(r.timeOn.slice(0, 2)),
+              parseInt(r.timeOn.slice(2, 4)),
+              parseInt(r.timeOn.slice(4, 6)),
+            )
+          : new Date();
+        const idx = next.size % CONTACT_PALETTE.length;
+        const c: Contact = {
+          callsign: r.call,
+          grid: r.gridsquare?.toUpperCase(),
+          grids: r.gridsquare ? [r.gridsquare.toUpperCase()] : [],
+          latLon: r.gridsquare ? (gridToLatLon(r.gridsquare.toUpperCase()) ?? undefined) : undefined,
+          color: CONTACT_PALETTE[idx],
+          msgs: [],
+          peers: new Set<string>(),
+          firstSeen: ts,
+          lastSeen: ts,
+        };
+        next.set(r.call, c);
+      }
+      onContactsChange?.(next);
+      return next;
+    });
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   // ── 2-panel drag ────────────────────────────────────────────────────────────
   const containerRef    = useRef<HTMLDivElement>(null);
   const [panelWeights, setPanelWeights] = useState([0.8, 0.6, 1.2]);
@@ -485,6 +522,7 @@ const FTDecoder = forwardRef<DecoderControls, { ftMode: FTMode; myCall?: string;
             myCall={myCall}
             myGrid={myGrid}
             onClearContacts={() => setContacts(new Map())}
+            onImportADIF={handleImportADIF}
             focus={contactFocus}
           />
         </div>
