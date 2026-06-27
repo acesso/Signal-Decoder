@@ -6,7 +6,7 @@ import { fmtAbsHz } from '@/lib/formatFreq';
 import AudioAnalysisPanel from './AudioAnalysisPanel';
 import { useFTProcessor } from '@/hooks/useFTProcessor';
 import { FTMode, FT_WINDOW_SECONDS } from '@/lib/ft/decoder';
-import { Contact, mergeContacts } from '@/lib/ft/parser';
+import { Contact, mergeContacts, parseFTMsg } from '@/lib/ft/parser';
 import FTContactsPanel from './FTContactsPanel';
 
 // ── Clock ring (rAF-driven, no setState) ──────────────────────────────────────
@@ -138,15 +138,25 @@ const RPT_TOKEN = /^R?[+-][0-9]{1,2}$/;
 
 // Message text with known callsigns colored + linked to their contact card,
 // and signal reports colored by the same quality scheme as the dB column
-function MsgText({ msg, contacts, onSelect }: {
+function MsgText({ msg, contacts, myCall, onSelect }: {
   msg: string;
   contacts: Map<string, Contact>;
+  myCall: string;
   onSelect: (cs: string) => void;
 }) {
   return (
     <>
       {msg.trim().split(/\s+/).map((w, i) => {
         const sep = i > 0 ? ' ' : '';
+        const isMe = myCall && w.toUpperCase() === myCall.toUpperCase();
+        if (isMe) {
+          return (
+            <Fragment key={i}>
+              {sep}
+              <span className="font-bold px-0.5 rounded" style={{ color: '#f0e68c', background: 'rgba(240,230,140,0.12)' }}>{w}</span>
+            </Fragment>
+          );
+        }
         const c = contacts.get(w);
         if (c) {
           return (
@@ -179,7 +189,7 @@ function MsgText({ msg, contacts, onSelect }: {
 
 // ── Main component ────────────────────────────────────────────────────────────
 
-const FTDecoder = forwardRef<DecoderControls, { ftMode: FTMode } & DecoderProps>(function FTDecoder({ ftMode, onStateChange, analyser, vfoFrequency }, ref) {
+const FTDecoder = forwardRef<DecoderControls, { ftMode: FTMode; myCall?: string; onContactsChange?: (c: Map<string, Contact>) => void } & DecoderProps>(function FTDecoder({ ftMode, myCall = '', onStateChange, onContactsChange, analyser, vfoFrequency }, ref) {
   const {
     state, startRecording, stopRecording, clearResults, ftSupported,
   } = useFTProcessor(ftMode);
@@ -217,24 +227,27 @@ const FTDecoder = forwardRef<DecoderControls, { ftMode: FTMode } & DecoderProps>
       frozenVfoRef.current.set(r.windowStart.getTime(), currentVfo);
     }
 
-    // Bake absolute freq into ContactMsg so contacts panel never needs VFO
-    setContacts(prev => {
-      let m = prev;
-      for (const r of fresh.slice().reverse()) {
-        const msgsWithAbsFreq = r.messages.map(msg => ({
-          ...msg,
-          freq: currentVfo > 0 ? currentVfo + msg.freq : msg.freq,
-        }));
-        m = mergeContacts(m, r.windowStart, msgsWithAbsFreq, 0);
-      }
-      return m;
-    });
+    // Bake absolute freq into ContactMsg so contacts panel never needs VFO.
+    // Compute next outside setContacts so we can pass the same value to
+    // onContactsChange without running the merge twice or calling a side-effect
+    // inside the updater (which React may call during render).
+    let next = contacts;
+    for (const r of fresh.slice().reverse()) {
+      const msgsWithAbsFreq = r.messages.map(msg => ({
+        ...msg,
+        freq: currentVfo > 0 ? currentVfo + msg.freq : msg.freq,
+      }));
+      next = mergeContacts(next, r.windowStart, msgsWithAbsFreq, 0);
+    }
+    setContacts(next);
+    onContactsChange?.(next);
     prevResultLenRef.current = results.length;
   }, [state.results]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const handleReset = useCallback(() => {
     clearResults();
     setContacts(new Map());
+    onContactsChange?.(new Map());
     prevResultLenRef.current = 0;
     frozenVfoRef.current.clear();
   }, [clearResults]);
@@ -274,20 +287,27 @@ const FTDecoder = forwardRef<DecoderControls, { ftMode: FTMode } & DecoderProps>
   const hasData   = results.length > 0 || contacts.size > 0;
 
   type SepRow = { kind: 'sep'; time: Date; mode: FTMode; empty: boolean; key: string };
-  type MsgRow = { kind: 'msg'; absFreq: string; dt: number; snr: number; msg: string; time: Date; key: string };
+  type MsgRow = { kind: 'msg'; absFreq: string; dt: number; snr: number; msg: string; time: Date; addressedToMe: boolean; key: string };
   type TableRow = SepRow | MsgRow;
+
+  const myCallUpper = myCall.toUpperCase();
 
   // Use the VFO that was active at the moment each window was decoded (frozen).
   const tableRows: TableRow[] = results.flatMap((r, ri) => {
     const frozenVfo = frozenVfoRef.current.get(r.windowStart.getTime()) ?? 0;
     return [
       { kind: 'sep' as const, time: r.windowStart, mode: r.mode, empty: r.messages.length === 0, key: `sep-${ri}` },
-      ...r.messages.map((m, mi) => ({
-        kind: 'msg' as const,
-        absFreq: formatFreq(m.freq, frozenVfo),
-        dt: m.dt, snr: m.snr, msg: m.msg,
-        time: r.windowStart, key: `msg-${ri}-${mi}`,
-      })),
+      ...r.messages.map((m, mi) => {
+        const parsed = parseFTMsg(m.msg);
+        const addressedToMe = !!myCallUpper && parsed.callee?.toUpperCase() === myCallUpper;
+        return {
+          kind: 'msg' as const,
+          absFreq: formatFreq(m.freq, frozenVfo),
+          dt: m.dt, snr: m.snr, msg: m.msg,
+          time: r.windowStart, addressedToMe,
+          key: `msg-${ri}-${mi}`,
+        };
+      }),
     ];
   });
 
@@ -390,17 +410,24 @@ const FTDecoder = forwardRef<DecoderControls, { ftMode: FTMode } & DecoderProps>
                         </td>
                       </tr>
                     ) : (
-                      <tr key={row.key} className="border-b border-[#21262d]/50 hover:bg-[#21262d]/40 transition-colors">
-                        <td className="py-1 px-2 text-[#484f58] whitespace-nowrap">{utcTime(row.time)}</td>
+                      <tr key={row.key} className={`border-b border-[#21262d]/50 transition-colors ${
+                        row.addressedToMe
+                          ? 'bg-[#f0e68c]/5 hover:bg-[#f0e68c]/10'
+                          : 'hover:bg-[#21262d]/40'
+                      }`}>
+                        <td className="py-1 px-2 whitespace-nowrap" style={{ color: row.addressedToMe ? '#f0e68c' : '#484f58' }}>
+                          {row.addressedToMe && <span className="mr-1 text-[10px]">▶</span>}
+                          {utcTime(row.time)}
+                        </td>
                         <td className="py-1 px-2 text-right text-[#8b949e] whitespace-nowrap">{row.absFreq}</td>
                         <td className="py-1 px-2 text-right whitespace-nowrap" style={{ color: snrColor(row.snr) }}>
-                          {row.snr > 0 ? '+' : ''}{row.snr.toFixed(4)}
+                          {row.snr > 0 ? '+' : ''}{row.snr.toFixed(1)}
                         </td>
                         <td className="py-1 px-2 text-right whitespace-nowrap" style={{ color: dtColor(row.dt) }}>
                           {formatDT(row.dt)}
                         </td>
                         <td className="py-1 px-2 truncate max-w-0" style={{ color: msgColor(row.msg, row.snr) }}>
-                          <MsgText msg={row.msg} contacts={contacts} onSelect={selectContact} />
+                          <MsgText msg={row.msg} contacts={contacts} myCall={myCall} onSelect={selectContact} />
                         </td>
                       </tr>
                     )
@@ -444,6 +471,7 @@ const FTDecoder = forwardRef<DecoderControls, { ftMode: FTMode } & DecoderProps>
           <FTContactsPanel
             contacts={contacts}
             mode={ftMode}
+            myCall={myCall}
             onClearContacts={() => setContacts(new Map())}
             focus={contactFocus}
           />

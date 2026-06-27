@@ -128,7 +128,13 @@ export function useRadioCAT(): RadioCATControls {
   // ── Queue machinery ───────────────────────────────────────────────────────
 
   const drainQueue = useCallback(() => {
-    if (inflightRef.current || queueRef.current.length === 0 || !writerRef.current) return;
+    // If no writer, reject all queued commands immediately rather than letting them hang
+    if (!writerRef.current) {
+      const err = new Error('CAT not connected');
+      while (queueRef.current.length > 0) queueRef.current.shift()!.reject(err);
+      return;
+    }
+    if (inflightRef.current || queueRef.current.length === 0) return;
     const entry = queueRef.current.shift()!;
     inflightRef.current = entry;
 
