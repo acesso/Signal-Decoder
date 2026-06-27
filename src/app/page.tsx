@@ -6,10 +6,12 @@ import SSTVDecoder from "@/components/SSTVDecoder";
 import CWDecoder from "@/components/CWDecoder";
 import FTDecoder, { FTModeSelector } from "@/components/FTDecoder";
 import MFSKDecoder from "@/components/MFSKDecoder";
+import FTTransmitPanel from "@/components/FTTransmitPanel";
 import type { DecoderControls } from '@/components/DecoderControls';
 import { useGlobalAudio } from '@/hooks/useGlobalAudio';
 import { FTMode } from '@/lib/ft/decoder';
 import RadioCATPanel, { useRadioCAT } from '@/components/RadioCATPanel';
+import type { Contact } from '@/lib/ft/parser';
 
 type DecoderMode = 'rtty' | 'sstv' | 'cw' | 'ft' | 'mfsk';
 
@@ -108,8 +110,10 @@ function TopBar({
 // ── Page ────────────────────────────────────────────────────────────────────
 
 export default function Home() {
-  const [mode, setMode]   = useState<DecoderMode>('rtty');
+  const [mode, setMode]     = useState<DecoderMode>('rtty');
   const [ftMode, setFTMode] = useState<FTMode>('FT8');
+  const [ftContacts, setFtContacts] = useState<Map<string, Contact>>(new Map());
+  const [ftMyCall, setFtMyCall] = useState('');
 
   // ── Radio CAT — lifted here so VFO frequency flows to all decoders ────────
   const cat = useRadioCAT();
@@ -232,13 +236,35 @@ export default function Home() {
         />
       </div>
 
-      {/* CAT radio control panel */}
-      <div className="px-4 sm:px-6 lg:px-8 pb-3 shrink-0">
-        <RadioCATPanel cat={cat} />
-      </div>
-
-      {/* Content — all decoders mounted persistently, toggled via CSS */}
+      {/* Scrollable body — CAT + TX panel + decoder content */}
       <div className="flex-1 min-h-0 overflow-y-auto px-4 sm:px-6 lg:px-8 pb-8">
+
+        {/* CAT radio control panel */}
+        <div className="pb-3">
+          <RadioCATPanel cat={cat} />
+        </div>
+
+        {/* FT Transmit panel — only shown when FT mode is active */}
+        {mode === 'ft' && (
+          <div className="pb-3">
+            <details className="bg-[#161b22] border border-[#30363d] rounded-lg" open>
+              <summary className="cursor-pointer px-4 py-3 sm:px-5 font-semibold text-sm hover:bg-[#21262d] rounded-lg transition-colors select-none">
+                Transmit
+              </summary>
+              <div className="px-4 pb-4 sm:px-5 sm:pb-5">
+                <FTTransmitPanel
+                mode={ftMode}
+                contacts={ftContacts}
+                vfoFrequency={vfoFrequency}
+                onMyCallChange={setFtMyCall}
+                onSetPTT={cat.state.connected ? cat.setPTT : undefined}
+              />
+              </div>
+            </details>
+          </div>
+        )}
+
+        {/* All decoders mounted persistently, toggled via CSS */}
         <div className={mode === 'rtty' ? '' : 'hidden'}>
           <RTTYDecoder ref={rttyRef} onStateChange={onStateChangeCbs.rtty} analyser={analyser} vfoFrequency={vfoFrequency} />
         </div>
@@ -252,8 +278,9 @@ export default function Home() {
           <MFSKDecoder ref={mfskRef} onStateChange={onStateChangeCbs.mfsk} analyser={analyser} vfoFrequency={vfoFrequency} />
         </div>
         <div className={mode === 'ft' ? '' : 'hidden'}>
-          <FTDecoder ref={ftRef} ftMode={ftMode} onStateChange={onStateChangeCbs.ft} analyser={analyser} vfoFrequency={vfoFrequency} />
+          <FTDecoder ref={ftRef} ftMode={ftMode} myCall={ftMyCall} onStateChange={onStateChangeCbs.ft} onContactsChange={setFtContacts} analyser={analyser} vfoFrequency={vfoFrequency} />
         </div>
+
       </div>
     </main>
   );

@@ -216,6 +216,66 @@ export const MSG_TYPE_COLOR: Record<MsgType, string> = {
   other:    '#8b949e', // grey — unclassified
 };
 
+// ── Message builder ───────────────────────────────────────────────────────────
+// Produces valid FT8/FT4 message strings for transmission.
+
+export type TxMsgType = 'cq' | 'answer' | 'report' | 'r_report' | 'rr73' | 'tx73';
+
+export function buildFTMessage(
+  type: TxMsgType,
+  myCall: string,
+  theirCall = '',
+  reportDb?: number,
+  myGrid = '',
+): string {
+  const rpt = reportDb !== undefined
+    ? (reportDb >= 0 ? `+${String(reportDb).padStart(2, '0')}` : `-${String(Math.abs(reportDb)).padStart(2, '0')}`)
+    : '+00';
+  switch (type) {
+    case 'cq':       return myGrid ? `CQ ${myCall} ${myGrid}` : `CQ ${myCall}`;
+    case 'answer':   return myGrid ? `${theirCall} ${myCall} ${myGrid}` : `${theirCall} ${myCall}`;
+    case 'report':   return `${theirCall} ${myCall} ${rpt}`;
+    case 'r_report': return `${theirCall} ${myCall} R${rpt}`;
+    case 'rr73':     return `${theirCall} ${myCall} RR73`;
+    case 'tx73':     return `${theirCall} ${myCall} 73`;
+  }
+}
+
+// Derive the natural next message type given the last message we sent and the
+// last message received from that station.
+// Rules follow the standard FT8 QSO flow:
+//   CQ → (they answer) → report → (they r_report) → rr73 → tx73
+//   (we answer their CQ) → answer → (they report) → r_report → (they rr73) → tx73
+export function nextTxMsgType(lastSent: MsgType | null, lastRx: MsgType | null): TxMsgType {
+  if (!lastSent)                                                  return 'cq';
+
+  // We sent CQ — they answered, send them our report
+  if (lastSent === 'cq' && lastRx === 'answer')                   return 'report';
+  // We sent CQ — no reply yet, keep waiting (resend report if they already replied)
+  if (lastSent === 'cq')                                          return 'report';
+
+  // We answered their CQ with our grid — they sent us a report
+  if (lastSent === 'answer' && lastRx === 'report')               return 'r_report';
+  if (lastSent === 'answer' && lastRx === 'r_report')             return 'r_report';
+  // We answered but no response yet — resend answer
+  if (lastSent === 'answer')                                      return 'answer';
+
+  // We sent a report — they r_report'd or RRR'd back → send RR73
+  if (lastSent === 'report' && (lastRx === 'r_report' || lastRx === 'rrr')) return 'rr73';
+  // We sent a report — no reply yet, or they sent another answer — keep waiting
+  if (lastSent === 'report')                                      return 'rr73';
+
+  // We sent r_report — they haven't confirmed yet or sent something — send RR73
+  if (lastSent === 'r_report' && lastRx === 'rr73')               return 'tx73';
+  if (lastSent === 'r_report')                                    return 'rr73';
+
+  // We sent RR73 — wrap up
+  if (lastSent === 'rr73')                                        return 'tx73';
+
+  // QSO complete or unrecognised state — default to CQ
+  return 'cq';
+}
+
 // ── ADIF export ───────────────────────────────────────────────────────────────
 
 function adifDate(d: Date): string {

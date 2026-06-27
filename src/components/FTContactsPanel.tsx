@@ -36,15 +36,29 @@ function gridWithFlag(grid: string, geoMap: Map<string, GeoInfo>): string {
   return flag ? `${flag} ${grid}` : grid;
 }
 
-function locationLabel(contact: Contact, geoMap: Map<string, GeoInfo>): string | null {
-  const geo = contact.grid ? geoMap.get(contact.grid) : undefined;
-  const pfx = callsignCountry(contact.callsign);
-  const flag    = geo?.flag ?? pfx?.flag;
-  const country = geo?.country ?? pfx?.country;
+interface LocationParts {
+  flag: string;
+  country: string;
+  grids: string;
+}
+
+function locationParts(contact: Contact, geoMap: Map<string, GeoInfo>): LocationParts | null {
+  const geo     = contact.grid ? geoMap.get(contact.grid) : undefined;
+  const pfx     = callsignCountry(contact.callsign);
+  const flag    = geo?.flag ?? pfx?.flag ?? '';
+  const country = geo?.country ?? pfx?.country ?? '';
   const grids   = contact.grid
     ? contact.grid + (contact.grids.length > 1 ? ` +${contact.grids.length - 1}` : '')
     : '';
-  const parts = [flag, country, grids].filter(Boolean);
+  if (!flag && !country && !grids) return null;
+  return { flag, country, grids };
+}
+
+// Keep the string version for places that already use it as text
+function locationLabel(contact: Contact, geoMap: Map<string, GeoInfo>): string | null {
+  const p = locationParts(contact, geoMap);
+  if (!p) return null;
+  const parts = [p.flag, p.country, p.grids].filter(Boolean);
   return parts.length ? parts.join(' ') : null;
 }
 
@@ -172,7 +186,7 @@ function ConversationBalloon({
 // ── Contact card ──────────────────────────────────────────────────────────────
 
 function ContactCard({
-  contact, expanded, onToggle, onSelect, contactMap, geoMap, op,
+  contact, expanded, onToggle, onSelect, contactMap, geoMap, op, myCall = '',
 }: {
   contact: Contact;
   expanded: boolean;
@@ -181,6 +195,7 @@ function ContactCard({
   contactMap: Map<string, Contact>;
   geoMap: Map<string, GeoInfo>;
   op?: OperatorInfo;
+  myCall?: string;
 }) {
   const [hoveredPeer, setHoveredPeer] = useState<string | null>(null);
   const [balloonPos,  setBalloonPos]  = useState<{ top: number; left: number } | null>(null);
@@ -225,6 +240,7 @@ function ContactCard({
   const history = groups.slice(-12);
 
   const loc     = locationLabel(contact, geoMap);
+  const locParts = locationParts(contact, geoMap);
   const longest = expanded ? longestDistances(contact, contactMap) : { tx: null, rx: null };
 
   // Split peers into groups
@@ -242,6 +258,11 @@ function ContactCard({
   const fullQSOs = new Set(
     Array.from(handshakes).filter(p => isFullQSO(contact, p))
   );
+
+  // QSO status with the local operator
+  const myCallUp   = myCall.toUpperCase();
+  const myQSOFull  = myCallUp ? isFullQSO(contact, myCallUp) : false;
+  const myQSOPart  = myCallUp && !myQSOFull ? isHandshake(contact, myCallUp) : false;
 
   function PeerChip({ peer }: { peer: string }) {
     const pc = contactMap.get(peer);
@@ -292,12 +313,32 @@ function ContactCard({
         >
           {contact.callsign}
         </a>
-        {loc && (
+        {/* QSO badge — only shown when the local operator has exchanged with this station */}
+        {myQSOFull && (
           <span
-            className="font-mono text-[10px] text-[#484f58] truncate min-w-0"
-            title={contact.grids.map(g => gridWithFlag(g, geoMap)).join(' · ')}
+            className="shrink-0 text-[9px] font-bold font-mono px-1 py-px rounded"
+            style={{ background: 'rgba(46,160,67,0.15)', color: '#2ea043', border: '1px solid rgba(46,160,67,0.4)' }}
+            title="Full QSO completed with you (signal reports + sign-off exchanged)"
           >
-            ({loc})
+            QSO✓
+          </span>
+        )}
+        {myQSOPart && (
+          <span
+            className="shrink-0 text-[9px] font-bold font-mono px-1 py-px rounded"
+            style={{ background: 'rgba(227,179,65,0.15)', color: '#e3b341', border: '1px solid rgba(227,179,65,0.4)' }}
+            title="Partial QSO — exchange started but not fully signed off"
+          >
+            QSO…
+          </span>
+        )}
+        {locParts && (
+          <span className="font-mono text-[10px] text-[#484f58] flex items-center gap-1 truncate min-w-0"
+            title={contact.grids.map(g => gridWithFlag(g, geoMap)).join(' · ')}>
+            {locParts.flag && (
+              <span title={locParts.country} className="not-italic">{locParts.flag}</span>
+            )}
+            {locParts.grids && <span>({locParts.grids})</span>}
           </span>
         )}
         <span className="flex-1 min-w-0" />
@@ -500,6 +541,7 @@ function ContactCard({
 interface Props {
   contacts: Map<string, Contact>;
   mode: FTMode;
+  myCall?: string;
   onClearContacts: () => void;
   focus?: { cs: string; n: number } | null;
 }
@@ -515,7 +557,7 @@ const SORT_OPTIONS: Array<{ key: SortKey; label: string }> = [
   { key: 'alpha',  label: 'a–z' },
 ];
 
-export default function FTContactsPanel({ contacts, mode, onClearContacts, focus }: Props) {
+export default function FTContactsPanel({ contacts, mode, myCall = '', onClearContacts, focus }: Props) {
   const [expanded,      setExpanded]      = useState<string | null>(null);
   const [sortKey,       setSortKey]       = useState<SortKey>('date');
   const [sortRev,       setSortRev]       = useState(false);
@@ -877,6 +919,7 @@ export default function FTContactsPanel({ contacts, mode, onClearContacts, focus
                 contactMap={contacts}
                 geoMap={geoMap}
                 op={opMap.get(c.callsign)}
+                myCall={myCall}
               />
             </div>
           ))
