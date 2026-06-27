@@ -276,7 +276,9 @@ export function nextTxMsgType(lastSent: MsgType | null, lastRx: MsgType | null):
   return 'cq';
 }
 
-// ── ADIF export ───────────────────────────────────────────────────────────────
+// ── ADIF export / import ──────────────────────────────────────────────────────
+
+const APP_URL = 'https://acesso.github.io/Signal-Decoder/';
 
 function adifDate(d: Date): string {
   return d.getUTCFullYear().toString() +
@@ -290,34 +292,53 @@ function adifTime(d: Date): string {
 }
 const af = (name: string, value: string) => `<${name}:${value.length}>${value}`;
 
+// FT8/FT4 use MODE=MFSK with SUBMODE for strict ADIF compliance, but most
+// logging software recognizes FT8/FT4 as MODE values directly — we write both.
+function adifMode(ftMode: FTMode): [string, string][] {
+  if (ftMode === 'FT8') return [['MODE', 'FT8']];
+  if (ftMode === 'FT4') return [['MODE', 'FT4']];
+  return [['MODE', ftMode]];
+}
+
 export function generateADIF(contacts: Map<string, Contact>, ftMode: FTMode): string {
   const now       = new Date();
-  const timestamp = `${adifDate(now)} ${adifTime(now)}`; // 15 chars
+  const timestamp = `${adifDate(now)} ${adifTime(now)}`;
 
   const lines: string[] = [
-    af('ADIF_VER', '3.0'),
-    af('PROGRAMID', 'rtty-decoder'),
+    af('ADIF_VER', '3.1.4'),
+    af('PROGRAMID', `Signal Decoder — ${APP_URL}`),
+    af('PROGRAMVERSION', '1.0'),
     af('CREATED_TIMESTAMP', timestamp),
     '<EOH>',
     '',
   ];
 
+  // Deduplicate: one record per callsign, using the first QSO window
+  const seen = new Set<string>();
+
   for (const c of contacts.values()) {
+    if (seen.has(c.callsign)) continue;
+    seen.add(c.callsign);
+
     const txMsgs = c.msgs.filter(m => m.role === 'tx');
     const rxMsgs = c.msgs.filter(m => m.role === 'rx');
-    const bestSnr = txMsgs.length > 0
-      ? Math.max(...txMsgs.map(m => m.snr))
+    const bestSnrTx = txMsgs.length > 0
+      ? txMsgs.reduce((best, m) => m.snr > best ? m.snr : best, -99)
+      : undefined;
+    const bestSnrRx = rxMsgs.length > 0
+      ? rxMsgs.reduce((best, m) => m.snr > best ? m.snr : best, -99)
       : undefined;
 
     const fields: [string, string][] = [
-      ['CALL',      c.callsign],
-      ['MODE',      ftMode],
-      ['QSO_DATE',  adifDate(c.firstSeen)],
-      ['TIME_ON',   adifTime(c.firstSeen)],
+      ['CALL',     c.callsign],
+      ...adifMode(ftMode),
+      ['QSO_DATE', adifDate(c.firstSeen)],
+      ['TIME_ON',  adifTime(c.firstSeen)],
     ];
 
-    if (c.grid)            fields.push(['GRIDSQUARE', c.grid]);
-    if (bestSnr !== undefined) fields.push(['RST_RCVD', String(bestSnr)]);
+    if (c.grid)                  fields.push(['GRIDSQUARE', c.grid]);
+    if (bestSnrTx !== undefined) fields.push(['RST_RCVD',   `${bestSnrTx > 0 ? '+' : ''}${bestSnrTx}`]);
+    if (bestSnrRx !== undefined) fields.push(['RST_SENT',   `${bestSnrRx > 0 ? '+' : ''}${bestSnrRx}`]);
 
     const comment = txMsgs.length > 0
       ? `heard direct: ${txMsgs.length} tx; addressed: ${rxMsgs.length} rx`
@@ -328,4 +349,51 @@ export function generateADIF(contacts: Map<string, Contact>, ftMode: FTMode): st
   }
 
   return lines.join('\n') + '\n';
+}
+
+// ── ADIF import ───────────────────────────────────────────────────────────────
+
+export interface ADIFRecord {
+  call: string;
+  qsoDate?: string;   // YYYYMMDD
+  timeOn?: string;    // HHMMSS
+  mode?: string;
+  gridsquare?: string;
+  rstRcvd?: string;
+  comment?: string;
+}
+
+function parseADIFValue(text: string, fieldName: string): string | undefined {
+  const re = new RegExp(`<${fieldName}:(\\d+)(?::[^>]*)?>`, 'i');
+  const m  = re.exec(text);
+  if (!m) return undefined;
+  const len   = parseInt(m[1], 10);
+  const start = m.index + m[0].length;
+  return text.slice(start, start + len);
+}
+
+export function parseADIF(content: string): ADIFRecord[] {
+  // Split on <EOR> (end of record), case-insensitive
+  const rawRecords = content.split(/<EOR>/i).map(s => s.trim()).filter(Boolean);
+  const records: ADIFRecord[] = [];
+
+  for (const raw of rawRecords) {
+    // Skip header block (before <EOH>)
+    if (/<EOH>/i.test(raw)) continue;
+    const call = parseADIFValue(raw, 'CALL');
+    if (!call || !isValidCallsign(call.trim().toUpperCase())) continue;
+    records.push({
+      call:        call.trim().toUpperCase(),
+      qsoDate:     parseADIFValue(raw, 'QSO_DATE'),
+      timeOn:      parseADIFValue(raw, 'TIME_ON'),
+      mode:        parseADIFValue(raw, 'MODE'),
+      gridsquare:  parseADIFValue(raw, 'GRIDSQUARE'),
+      rstRcvd:     parseADIFValue(raw, 'RST_RCVD'),
+      comment:     parseADIFValue(raw, 'COMMENT'),
+    });
+  }
+
+  // Deduplicate by callsign — keep first occurrence
+  const seen = new Set<string>();
+  return records.filter(r => { if (seen.has(r.call)) return false; seen.add(r.call); return true; });
 }

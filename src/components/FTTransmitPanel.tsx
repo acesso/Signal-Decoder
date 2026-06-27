@@ -3,9 +3,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   useFTTransmit, TxQueueEntry, loadMyCall, saveMyCall, loadMyGrid, saveMyGrid,
-  loadAutoReply, saveAutoReply,
+  loadAutoReply, saveAutoReply, loadBaseFreq, saveBaseFreq,
 } from '@/hooks/useFTTransmit';
-import { buildFTMessage, nextTxMsgType, parseFTMsg, isValidCallsign, Contact, MsgType, gridToLatLon, haversineKm } from '@/lib/ft/parser';
+import { buildFTMessage, nextTxMsgType, parseFTMsg, isValidCallsign, Contact, MsgType, MSG_TYPE_COLOR, MSG_TYPE_LABEL, gridToLatLon, haversineKm } from '@/lib/ft/parser';
 import { callsignCountry } from '@/lib/ft/prefixes';
 import { FT_WINDOW_SECONDS, type FTMode } from '@/lib/ft/decoder';
 import { fmtAbsHz } from '@/lib/formatFreq';
@@ -195,8 +195,8 @@ interface Suggestion {
 
 // Priority: stations actively in QSO with us rank above stations we merely heard.
 function contactPriority(c: Contact, myCall: string): number {
-  const repliedToUs = c.msgs.some(m => m.role === 'tx' &&
-    parseFTMsg(m.raw).callee?.toUpperCase() === myCall.toUpperCase());
+  const myCallUp = myCall.toUpperCase();
+  const repliedToUs = c.msgs.some(m => m.role === 'tx' && m.parsed.callee?.toUpperCase() === myCallUp);
   return repliedToUs ? 1 : 0;
 }
 
@@ -224,18 +224,14 @@ function buildSuggestions(myCall: string, myGrid: string, contacts: Map<string, 
 
   for (const c of candidates) {
     const theirMsgs  = c.msgs.filter(m => m.role === 'tx');
-    const replieToUs = theirMsgs.filter(m =>
-      parseFTMsg(m.raw).callee?.toUpperCase() === myCallUp
-    );
-    const ourMsgs    = c.msgs.filter(m => m.role === 'rx' &&
-      parseFTMsg(m.raw).caller?.toUpperCase() === myCallUp
-    );
+    const replieToUs = theirMsgs.filter(m => m.parsed.callee?.toUpperCase() === myCallUp);
+    const ourMsgs    = c.msgs.filter(m => m.role === 'rx' && m.parsed.caller?.toUpperCase() === myCallUp);
 
     const repliedToMe   = replieToUs.length > 0;
     const lastTheirMsg  = replieToUs[replieToUs.length - 1] ?? theirMsgs[theirMsgs.length - 1];
     const lastOurMsg    = ourMsgs[ourMsgs.length - 1];
-    const lastRx        = lastTheirMsg ? parseFTMsg(lastTheirMsg.raw).type : null;
-    const lastSent      = lastOurMsg   ? parseFTMsg(lastOurMsg.raw).type   : null;
+    const lastRx        = lastTheirMsg?.parsed.type ?? null;
+    const lastSent      = lastOurMsg?.parsed.type ?? null;
 
     let nextTxType: ReturnType<typeof nextTxMsgType>;
     if (!lastSent) {
@@ -245,7 +241,11 @@ function buildSuggestions(myCall: string, myGrid: string, contacts: Map<string, 
       if (nextTxType === 'cq') continue;
     }
 
-    const reportDb = lastTheirMsg ? Math.round(lastTheirMsg.snr) : 0;
+    // Use best SNR across all their messages to us (not just the latest)
+    const bestSnr  = replieToUs.length
+      ? replieToUs.reduce((best, m) => m.snr > best ? m.snr : best, -99)
+      : (lastTheirMsg ? lastTheirMsg.snr : 0);
+    const reportDb = Math.round(bestSnr);
     const message  = buildFTMessage(nextTxType, myCall, c.callsign, reportDb, myGrid);
 
     // Build exchange thread: interleave their direct messages and our replies,
@@ -277,7 +277,7 @@ function buildSuggestions(myCall: string, myGrid: string, contacts: Map<string, 
       countryCode: pfx?.countryCode,
       repliedToMe,
       thread,
-      maxSnr: c.msgs.length ? Math.max(...c.msgs.map(m => m.snr)) : -99,
+      maxSnr: c.msgs.reduce((best, m) => m.snr > best ? m.snr : best, -99),
       latLon: c.latLon,
     });
   }
@@ -323,7 +323,8 @@ interface FTTransmitPanelProps {
 export default function FTTransmitPanel({ mode, contacts, vfoFrequency = 0, onMyCallChange, onMyGridChange, onSetPTT }: FTTransmitPanelProps) {
   const [myCall, setMyCallState]   = useState(() => { const v = loadMyCall(); return v; });
   const [myGrid, setMyGridState]   = useState(() => loadMyGrid());
-  const [baseFreq, setBaseFreq]    = useState(850);
+  const [baseFreq, setBaseFreqState] = useState(() => loadBaseFreq());
+  const setBaseFreq = useCallback((v: number) => { setBaseFreqState(v); saveBaseFreq(v); }, []);
   const [editMsg, setEditMsg]      = useState('');
   const [editLabel, setEditLabel]  = useState('');
   const [callErr, setCallErr]      = useState(false);
@@ -383,8 +384,9 @@ export default function FTTransmitPanel({ mode, contacts, vfoFrequency = 0, onMy
 
   // ── Auto-reply ───────────────────────────────────────────────────────────────
   const [autoReply, setAutoReplyState] = useState(() => loadAutoReply());
-  // Track callsigns we've already auto-enqueued this session to avoid duplicates
-  const autoRepliedRef = useRef(new Set<string>());
+  // Track the last-processed message fingerprint per callsign:
+  // callsign → "lastTheirMsgCount|lastOurMsgCount" so we re-fire when new messages arrive
+  const autoRepliedRef = useRef(new Map<string, string>());
 
   const setAutoReply = useCallback((v: boolean) => {
     setAutoReplyState(v);
@@ -392,52 +394,75 @@ export default function FTTransmitPanel({ mode, contacts, vfoFrequency = 0, onMy
     if (!v) autoRepliedRef.current.clear();
   }, []);
 
-  // Reset seen-set when TX engine stops so replies fire again next session
+  // Reset seen-map when TX engine stops so replies fire again next session
   useEffect(() => {
     if (!isRunning) autoRepliedRef.current.clear();
   }, [isRunning]);
 
+  // Use a ref so the effect always reads the live value without being a dep
+  const autoReplyRef  = useRef(autoReply);
+  const isRunningRef2 = useRef(isRunning);
+  const canOperateRef = useRef(canOperate);
+  useEffect(() => { autoReplyRef.current  = autoReply;  }, [autoReply]);
+  useEffect(() => { isRunningRef2.current = isRunning;  }, [isRunning]);
+  useEffect(() => { canOperateRef.current = canOperate; }, [canOperate]);
+
   useEffect(() => {
-    if (!autoReply || !isRunning || !canOperate) return;
+    if (!autoReplyRef.current || !isRunningRef2.current || !canOperateRef.current) return;
     const myCallUp = myCall.toUpperCase();
     const myGridUp = myGrid.toUpperCase();
 
     for (const contact of contacts.values()) {
       const callsign = contact.callsign.toUpperCase();
       if (callsign === myCallUp) continue;
-      if (autoRepliedRef.current.has(callsign)) continue;
 
-      // Check if this contact has transmitted to us
+      // Messages they sent addressed to us
       const theirMsgsToUs = contact.msgs.filter(m =>
-        m.role === 'tx' && parseFTMsg(m.raw).callee?.toUpperCase() === myCallUp
+        m.role === 'tx' && m.parsed.callee?.toUpperCase() === myCallUp
       );
       if (theirMsgsToUs.length === 0) continue;
 
-      // Don't auto-reply if we already have this callsign queued
-      if (state.queue.some(e => e.message.includes(callsign))) continue;
+      // What we've already sent them — read from the TX sent log, not from decoded
+      // contacts (our own transmissions are never decoded back by the receiver)
+      const sentToThem = state.sent.filter(e => {
+        const parsed = parseFTMsg(e.message);
+        return parsed.callee?.toUpperCase() === callsign || parsed.caller?.toUpperCase() === myCallUp;
+      }).filter(e => parseFTMsg(e.message).callee?.toUpperCase() === callsign);
 
-      // Determine what we've already sent them
-      const ourMsgs = contact.msgs.filter(m =>
-        m.role === 'rx' && parseFTMsg(m.raw).caller?.toUpperCase() === myCallUp
-      );
-      const lastOurType  = ourMsgs.length ? parseFTMsg(ourMsgs[ourMsgs.length - 1].raw).type : null;
-      const lastTheirMsg = theirMsgsToUs[theirMsgsToUs.length - 1];
-      const lastTheirType = parseFTMsg(lastTheirMsg.raw).type;
+      // Fingerprint: re-fire whenever either side has a new message
+      const fingerprint = `${theirMsgsToUs.length}|${sentToThem.length}`;
+      if (autoRepliedRef.current.get(callsign) === fingerprint) continue;
 
-      const nextType = nextTxMsgType(lastOurType ?? 'cq', lastTheirType);
-      // 'cq' means the exchange is complete — nothing to send
-      if (nextType === 'cq') continue;
+      const lastTheirMsg  = theirMsgsToUs[theirMsgsToUs.length - 1];
+      const lastTheirType = lastTheirMsg.parsed.type;
 
-      const reportDb = Math.round(lastTheirMsg.snr);
-      const message  = buildFTMessage(nextType, myCallUp, callsign, reportDb, myGridUp);
+      // Derive last sent type from the sent log
+      const lastSentMsg  = sentToThem.length ? sentToThem[sentToThem.length - 1] : null;
+      const lastSentType = lastSentMsg ? parseFTMsg(lastSentMsg.message).type : null;
+
+      // For the very first reply to a station, treat as if we just sent CQ
+      const effectiveLastSent: MsgType = lastSentType ?? 'cq';
+      const nextType = nextTxMsgType(effectiveLastSent, lastTheirType);
+
+      // 'cq' means complete or unrecognised — nothing to send
+      if (nextType === 'cq') { autoRepliedRef.current.set(callsign, fingerprint); continue; }
+
+      // Use best SNR from all their messages to us
+      const bestSnr = theirMsgsToUs.reduce((best, m) => m.snr > best ? m.snr : best, -99);
+      const message = buildFTMessage(nextType, myCallUp, callsign, Math.round(bestSnr), myGridUp);
+
+      // Don't enqueue if this exact message is already queued or already sent
+      if (state.queue.some(e => e.message === message)) { autoRepliedRef.current.set(callsign, fingerprint); continue; }
+      if (state.sent.some(e => e.message === message))  { autoRepliedRef.current.set(callsign, fingerprint); continue; }
+
       const labelMap: Record<string, string> = {
         answer: 'Answer', report: 'Report', r_report: 'R+Report', rr73: 'RR73', tx73: '73',
       };
 
-      autoRepliedRef.current.add(callsign);
+      autoRepliedRef.current.set(callsign, fingerprint);
       enqueueFirst({ id: uid(), message, label: `Auto → ${contact.callsign} (${labelMap[nextType] ?? nextType})` });
     }
-  }, [contacts, autoReply, isRunning, canOperate, myCall, myGrid, state.queue, enqueueFirst]);
+  }, [contacts, myCall, myGrid, state.queue, state.sent, enqueueFirst]);
 
   // ── Suggestion sort / filter state ──────────────────────────────────────────
   type SugSort = 'default' | 'snr-hi' | 'snr-lo' | 'near' | 'far';
@@ -500,12 +525,14 @@ export default function FTTransmitPanel({ mode, contacts, vfoFrequency = 0, onMy
 
   const addSuggestion = (sug: Suggestion) => {
     if (!canOperate) return;
+    if (state.queue.some(e => e.message === sug.message)) return;
     enqueue({ id: uid(), message: sug.message, label: sug.label });
   };
 
   const addCustom = () => {
     const msg = editMsg.trim().toUpperCase();
     if (!msg) return;
+    if (state.queue.some(e => e.message === msg)) return;
     enqueue({ id: uid(), message: msg, label: editLabel.trim() || msg });
     setEditMsg(''); setEditLabel('');
   };
@@ -948,29 +975,45 @@ export default function FTTransmitPanel({ mode, contacts, vfoFrequency = 0, onMy
             </div>
           ) : null}
 
-          {/* Sent log */}
+          {/* Sent log — newest first, no enclosing box */}
           {state.sent.length > 0 && (
-            <>
-              <div className="text-[#8b949e] text-[10px] font-semibold uppercase tracking-wide mt-2 pt-2 border-t border-[#21262d]">
-                Sent Log
+            <div className="mt-2 pt-2 border-t border-[#21262d]">
+              <div className="text-[#8b949e] text-[10px] font-semibold uppercase tracking-wide mb-1 flex items-center justify-between">
+                <span>Sent Log</span>
+                <span className="text-[#484f58] normal-case">{state.sent.length}</span>
               </div>
-              <div className="space-y-0.5 max-h-40 overflow-y-auto">
+              <div className="space-y-px">
                 {state.sent.map(entry => {
                   const absFreq = entry.vfoHz > 0 ? entry.vfoHz + entry.audioHz : 0;
+                  const parsed  = parseFTMsg(entry.message);
+                  const typeColor = MSG_TYPE_COLOR[parsed.type];
+                  const typeLabel = MSG_TYPE_LABEL[parsed.type];
                   return (
                     <div key={entry.id}
-                      className={`flex items-center gap-2 text-xs font-mono px-2 py-1 rounded ${entry.error ? 'text-[#f85149]' : 'text-[#484f58]'}`}>
-                      <span className="shrink-0 text-[10px]">{entry.windowStart.toLocaleTimeString(undefined, { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' })}</span>
-                      <span className="truncate flex-1 text-[#c9d1d9]">{entry.message}</span>
+                      className="flex items-center gap-1.5 text-[11px] font-mono py-0.5">
+                      <span className="shrink-0 text-[10px] text-[#484f58] tabular-nums w-[56px]">
+                        {entry.windowStart.toLocaleTimeString(undefined, { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' })}
+                      </span>
+                      <span
+                        className="shrink-0 px-1 py-px rounded text-[8px] font-bold w-[36px] text-center"
+                        style={{ background: `${typeColor}1a`, color: typeColor }}
+                      >
+                        {typeLabel}
+                      </span>
+                      <span className={`truncate flex-1 ${entry.error ? 'text-[#f85149]' : 'text-[#c9d1d9]'}`}>
+                        {entry.message}
+                      </span>
                       <span className="shrink-0 text-[10px] text-[#484f58]">
                         {absFreq > 0 ? fmtAbsHz(absFreq) : `${entry.audioHz} Hz`}
                       </span>
-                      {entry.error && <span className="shrink-0 text-[10px]" title={entry.error}>⚠</span>}
+                      {entry.error && (
+                        <span className="shrink-0 text-[10px] text-[#f85149]" title={entry.error}>⚠</span>
+                      )}
                     </div>
                   );
                 })}
               </div>
-            </>
+            </div>
           )}
         </div>
       </div>
