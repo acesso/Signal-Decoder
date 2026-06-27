@@ -127,7 +127,9 @@ function dtColor(dt: number): string {
   return a <= 0.2 ? '#2ea043' : a <= 0.5 ? '#e3b341' : '#f85149';
 }
 
-function utcTime(d: Date): string { return d.toISOString().slice(11, 19); }
+function localHMS(d: Date): string {
+  return d.toLocaleTimeString(undefined, { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
+}
 function formatFreq(hz: number, vfoHz = 0): string {
   if (vfoHz > 0) return fmtAbsHz(vfoHz + hz);
   return hz.toFixed(0).padStart(4, ' ');
@@ -189,7 +191,7 @@ function MsgText({ msg, contacts, myCall, onSelect }: {
 
 // ── Main component ────────────────────────────────────────────────────────────
 
-const FTDecoder = forwardRef<DecoderControls, { ftMode: FTMode; myCall?: string; onContactsChange?: (c: Map<string, Contact>) => void } & DecoderProps>(function FTDecoder({ ftMode, myCall = '', onStateChange, onContactsChange, analyser, vfoFrequency }, ref) {
+const FTDecoder = forwardRef<DecoderControls, { ftMode: FTMode; myCall?: string; myGrid?: string; onContactsChange?: (c: Map<string, Contact>) => void } & DecoderProps>(function FTDecoder({ ftMode, myCall = '', myGrid = '', onStateChange, onContactsChange, analyser, vfoFrequency }, ref) {
   const {
     state, startRecording, stopRecording, clearResults, ftSupported,
   } = useFTProcessor(ftMode);
@@ -405,7 +407,7 @@ const FTDecoder = forwardRef<DecoderControls, { ftMode: FTMode; myCall?: string;
                     row.kind === 'sep' ? (
                       <tr key={row.key}>
                         <td colSpan={5} className="px-2 py-0.5 text-[10px] text-[#484f58] border-t border-[#21262d] bg-[#0d1117]/60">
-                          {utcTime(row.time)} UTC — {row.mode}
+                          {localHMS(row.time)} — {row.mode}
                           {row.empty && <span className="ml-2 text-[#30363d]">no signals</span>}
                         </td>
                       </tr>
@@ -417,7 +419,7 @@ const FTDecoder = forwardRef<DecoderControls, { ftMode: FTMode; myCall?: string;
                       }`}>
                         <td className="py-1 px-2 whitespace-nowrap" style={{ color: row.addressedToMe ? '#f0e68c' : '#484f58' }}>
                           {row.addressedToMe && <span className="mr-1 text-[10px]">▶</span>}
-                          {utcTime(row.time)}
+                          {localHMS(row.time)}
                         </td>
                         <td className="py-1 px-2 text-right text-[#8b949e] whitespace-nowrap">{row.absFreq}</td>
                         <td className="py-1 px-2 text-right whitespace-nowrap" style={{ color: snrColor(row.snr) }}>
@@ -472,6 +474,7 @@ const FTDecoder = forwardRef<DecoderControls, { ftMode: FTMode; myCall?: string;
             contacts={contacts}
             mode={ftMode}
             myCall={myCall}
+            myGrid={myGrid}
             onClearContacts={() => setContacts(new Map())}
             focus={contactFocus}
           />
