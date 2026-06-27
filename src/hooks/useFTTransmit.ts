@@ -92,6 +92,15 @@ export function saveAllowConsecutiveTx(v: boolean) {
   if (typeof window !== 'undefined') localStorage.setItem(LS_CONSECUTIVE_TX, String(v));
 }
 
+const LS_AUTOREPLY = 'ft_auto_reply';
+export function loadAutoReply(): boolean {
+  if (typeof window === 'undefined') return false;
+  return localStorage.getItem(LS_AUTOREPLY) === 'true';
+}
+export function saveAutoReply(v: boolean) {
+  if (typeof window !== 'undefined') localStorage.setItem(LS_AUTOREPLY, String(v));
+}
+
 // ── Timing helpers ────────────────────────────────────────────────────────────
 
 function msUntilNextWindow(windowSec: number): number {
@@ -481,6 +490,17 @@ export function useFTTransmit(
     });
   }, [startEncode, syncQueueRef]);
 
+  // Prepend to queue — for auto-reply so it plays before other queued entries
+  const enqueueFirst = useCallback((entry: Omit<TxQueueEntry, 'samples' | 'encodeStatus'>) => {
+    const full: TxQueueEntry = { ...entry, samples: null, encodeStatus: 'pending' };
+    startEncode(full);
+    setState(prev => {
+      const q = [full, ...prev.queue];
+      syncQueueRef(q);
+      return { ...prev, queue: q };
+    });
+  }, [startEncode, syncQueueRef]);
+
   const dequeue = useCallback((id: string) => {
     setState(prev => {
       const q = prev.queue.filter(e => e.id !== id);
@@ -544,6 +564,7 @@ export function useFTTransmit(
     start,
     stop,
     enqueue,
+    enqueueFirst,
     dequeue,
     moveUp,
     setAutoCQ,
