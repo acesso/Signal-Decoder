@@ -29,7 +29,9 @@ const FTLeafletMap = dynamic(() => import('./FTLeafletMap'), {
   ),
 });
 
-function utcHMS(d: Date): string { return d.toISOString().slice(11, 19); }
+function localHMS(d: Date): string {
+  return d.toLocaleTimeString(undefined, { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
+}
 
 function gridWithFlag(grid: string, geoMap: Map<string, GeoInfo>): string {
   const flag = geoMap.get(grid)?.flag;
@@ -155,7 +157,7 @@ function ConversationBalloon({
           const isTx = m.role === 'tx';
           return (
             <div key={i} className="flex items-start gap-1.5 font-mono text-[9px]">
-              <span className="text-[#30363d] shrink-0 w-[44px]">{utcHMS(m.windowStart)}z</span>
+              <span className="text-[#30363d] shrink-0 w-[44px]">{localHMS(m.windowStart)}</span>
               <span className="text-[#484f58] shrink-0 w-[60px]" title="Frequency">
                 {formatMsgFreq(m.freq)}
               </span>
@@ -430,7 +432,7 @@ function ContactCard({
                 const isTx   = m.role === 'tx';
                 const peerCs = isTx ? m.parsed.callee : m.parsed.caller;
                 const peerColor    = peerCs ? contactMap.get(peerCs)?.color : undefined;
-                const repeatsTitle = group.map(g => `${utcHMS(g.windowStart)}z  ${g.raw}`).join('\n');
+                const repeatsTitle = group.map(g => `${localHMS(g.windowStart)}  ${g.raw}`).join('\n');
                 const gridLoc  = m.parsed.grid ? gridToLatLon(m.parsed.grid) : null;
                 const otherLoc = isTx
                   ? (peerCs ? contactMap.get(peerCs)?.latLon : undefined)
@@ -438,7 +440,7 @@ function ContactCard({
                 const km = gridLoc && otherLoc ? haversineKm(gridLoc, otherLoc) : null;
                 return (
                   <div key={i} className="font-mono text-[10px] flex items-center gap-1.5 min-w-0">
-                    <span className="text-[#30363d] shrink-0 w-[56px]">{utcHMS(m.windowStart)}z</span>
+                    <span className="text-[#30363d] shrink-0 w-[56px]">{localHMS(m.windowStart)}</span>
                     <span className="text-[#484f58] shrink-0 w-[60px]" title="Frequency">
                       {formatMsgFreq(m.freq)}
                     </span>
@@ -542,27 +544,33 @@ interface Props {
   contacts: Map<string, Contact>;
   mode: FTMode;
   myCall?: string;
+  myGrid?: string;
   onClearContacts: () => void;
   focus?: { cs: string; n: number } | null;
 }
 
-type SortKey = 'date' | 'tx' | 'rx' | 'worked' | 'alpha';
-type QuickFilter = 'full-qso' | 'handshake' | 'tx-only' | 'rx-only' | string; // string = country code
+type SortKey = 'date' | 'tx' | 'rx' | 'worked' | 'alpha' | 'snr-hi' | 'snr-lo' | 'near' | 'far';
+type QuickFilter = 'full-qso' | 'handshake' | 'tx-only' | 'rx-only'; // country handled by separate select
 
-const SORT_OPTIONS: Array<{ key: SortKey; label: string }> = [
-  { key: 'date',   label: 'time' },
-  { key: 'tx',     label: 'tx' },
-  { key: 'rx',     label: 'rx' },
-  { key: 'worked', label: 'worked' },
-  { key: 'alpha',  label: 'a–z' },
+const SORT_OPTIONS: Array<{ key: SortKey; label: string; title: string }> = [
+  { key: 'date',   label: 'Time',     title: 'Most recently heard first' },
+  { key: 'tx',     label: 'TX',       title: 'Most transmissions first' },
+  { key: 'rx',     label: 'RX',       title: 'Most receptions first' },
+  { key: 'worked', label: 'Worked',   title: 'Most unique stations worked first' },
+  { key: 'snr-hi', label: 'Strongest', title: 'Strongest signal (highest SNR) first' },
+  { key: 'snr-lo', label: 'Weakest',  title: 'Weakest signal (lowest SNR) first' },
+  { key: 'near',   label: 'Nearest',  title: 'Geographically closest first (requires your grid)' },
+  { key: 'far',    label: 'Farthest', title: 'Geographically farthest first (requires your grid)' },
+  { key: 'alpha',  label: 'A–Z',      title: 'Alphabetical by callsign' },
 ];
 
-export default function FTContactsPanel({ contacts, mode, myCall = '', onClearContacts, focus }: Props) {
-  const [expanded,      setExpanded]      = useState<string | null>(null);
-  const [sortKey,       setSortKey]       = useState<SortKey>('date');
-  const [sortRev,       setSortRev]       = useState(false);
-  const [query,         setQuery]         = useState('');
-  const [quickFilter,   setQuickFilter]   = useState<QuickFilter | null>(null);
+export default function FTContactsPanel({ contacts, mode, myCall = '', myGrid = '', onClearContacts, focus }: Props) {
+  const [expanded,       setExpanded]      = useState<string | null>(null);
+  const [sortKey,        setSortKey]       = useState<SortKey>('date');
+  const [sortRev,        setSortRev]       = useState(false);
+  const [query,          setQuery]         = useState('');
+  const [quickFilter,    setQuickFilter]   = useState<QuickFilter | null>(null);
+  const [countryFilter,  setCountryFilter] = useState<string>(''); // country code or ''
   const [mapHeight,     setMapHeight]     = useState(160);
   const panelRef    = useRef<HTMLDivElement>(null);
   const mapDragRef  = useRef<{ startY: number; startH: number } | null>(null);
@@ -627,8 +635,13 @@ export default function FTContactsPanel({ contacts, mode, myCall = '', onClearCo
 
   const txCount = (c: Contact) => c.msgs.filter(m => m.role === 'tx').length;
   const rxCount = (c: Contact) => c.msgs.filter(m => m.role === 'rx').length;
+  const maxSnr  = (c: Contact) => c.msgs.length ? Math.max(...c.msgs.map(m => m.snr)) : -99;
 
-  // Build the list of unique countries for the quick-filter chips, with counts
+  const myLatLon: [number, number] | null = myGrid ? (gridToLatLon(myGrid) ?? null) : null;
+  const distKm = (c: Contact): number =>
+    (myLatLon && c.latLon) ? haversineKm(myLatLon, c.latLon) : Infinity;
+
+  // Build the list of unique countries for the country select dropdown
   const countryOptions = Array.from(
     Array.from(contacts.values()).reduce((acc, c) => {
       const geo = c.grid ? geoMap.get(c.grid) : undefined;
@@ -648,36 +661,32 @@ export default function FTContactsPanel({ contacts, mode, myCall = '', onClearCo
 
   const sorted = Array.from(contacts.values()).sort((a, b) => {
     let cmp: number;
-    if (sortKey === 'date')        cmp = b.lastSeen.getTime() - a.lastSeen.getTime();
+    if      (sortKey === 'date')   cmp = b.lastSeen.getTime() - a.lastSeen.getTime();
     else if (sortKey === 'tx')     cmp = txCount(b) - txCount(a);
     else if (sortKey === 'rx')     cmp = rxCount(b) - rxCount(a);
     else if (sortKey === 'worked') cmp = b.peers.size - a.peers.size;
+    else if (sortKey === 'snr-hi') cmp = maxSnr(b) - maxSnr(a);
+    else if (sortKey === 'snr-lo') cmp = maxSnr(a) - maxSnr(b);
+    else if (sortKey === 'near')   cmp = distKm(a) - distKm(b);
+    else if (sortKey === 'far')    cmp = distKm(b) - distKm(a);
     else                           cmp = a.callsign.localeCompare(b.callsign);
     return sortRev ? -cmp : cmp;
   });
 
-  // Apply quick filter
-  const quickFiltered = quickFilter
-    ? sorted.filter(c => {
-        if (quickFilter === 'full-qso') {
-          return Array.from(c.peers).some(p => isFullQSO(c, p));
-        }
-        if (quickFilter === 'handshake') {
-          return Array.from(c.peers).some(p => isHandshake(c, p) && !isFullQSO(c, p));
-        }
-        if (quickFilter === 'tx-only') {
-          return txCount(c) > 0 && rxCount(c) === 0;
-        }
-        if (quickFilter === 'rx-only') {
-          return rxCount(c) > 0 && txCount(c) === 0;
-        }
-        // country code filter
-        const geo = c.grid ? geoMap.get(c.grid) : undefined;
-        const pfx = callsignCountry(c.callsign);
-        const code = geo?.countryCode ?? pfx?.countryCode;
-        return code === quickFilter;
-      })
-    : sorted;
+  // Apply quick filter + country filter
+  const quickFiltered = sorted.filter(c => {
+    if (quickFilter === 'full-qso'  && !Array.from(c.peers).some(p => isFullQSO(c, p))) return false;
+    if (quickFilter === 'handshake' && !Array.from(c.peers).some(p => isHandshake(c, p) && !isFullQSO(c, p))) return false;
+    if (quickFilter === 'tx-only'   && !(txCount(c) > 0 && rxCount(c) === 0)) return false;
+    if (quickFilter === 'rx-only'   && !(rxCount(c) > 0 && txCount(c) === 0)) return false;
+    if (countryFilter) {
+      const geo  = c.grid ? geoMap.get(c.grid) : undefined;
+      const pfx  = callsignCountry(c.callsign);
+      const code = geo?.countryCode ?? pfx?.countryCode;
+      if (code !== countryFilter) return false;
+    }
+    return true;
+  });
 
   // Free-text search on top
   const q        = query.trim().toLowerCase();
@@ -695,10 +704,12 @@ export default function FTContactsPanel({ contacts, mode, myCall = '', onClearCo
     : quickFiltered;
 
   const withLocation   = sorted.filter(c => c.latLon).length;
+  // counts always over full sorted list (not affected by active filter) so chips show real totals
   const fullQSOCount   = sorted.filter(c => Array.from(c.peers).some(p => isFullQSO(c, p))).length;
   const handshakeCount = sorted.filter(c => Array.from(c.peers).some(p => isHandshake(c, p) && !isFullQSO(c, p))).length;
   const txOnlyCount    = sorted.filter(c => txCount(c) > 0 && rxCount(c) === 0).length;
   const rxOnlyCount    = sorted.filter(c => rxCount(c) > 0 && txCount(c) === 0).length;
+  const hasAnyFilter   = !!quickFilter || !!countryFilter;
 
   function downloadADIF() {
     const content = generateADIF(contacts, mode);
@@ -720,7 +731,7 @@ export default function FTContactsPanel({ contacts, mode, myCall = '', onClearCo
         <h2 className="text-lg sm:text-xl font-semibold">Contacts</h2>
         <div className="flex items-center gap-1.5 flex-wrap justify-end">
           <span className="text-xs font-mono text-[#8b949e]">
-            {q || quickFilter ? `${filtered.length}/${contacts.size} shown` : `${contacts.size} found`}
+            {q || hasAnyFilter ? `${filtered.length}/${contacts.size} shown` : `${contacts.size} found`}
             {withLocation > 0 && <span className="text-[#484f58]"> · {withLocation} located</span>}
           </span>
           {contacts.size > 0 && (
@@ -788,9 +799,9 @@ export default function FTContactsPanel({ contacts, mode, myCall = '', onClearCo
         </div>
       )}
 
-      {/* Quick filter chips */}
+      {/* Quick filter chips + country select */}
       {contacts.size > 0 && (
-        <div className="mb-1.5 shrink-0 flex flex-wrap gap-1">
+        <div className="mb-1.5 shrink-0 flex flex-wrap gap-1 items-center">
           {fullQSOCount > 0 && (
             <button
               onClick={() => setQuickFilter(f => f === 'full-qso' ? null : 'full-qso')}
@@ -843,25 +854,28 @@ export default function FTContactsPanel({ contacts, mode, myCall = '', onClearCo
               rx only <span className="opacity-60">{rxOnlyCount}</span>
             </button>
           )}
-          {countryOptions.map(({ code, country, flag, count }) => (
-            <button
-              key={code}
-              onClick={() => setQuickFilter(f => f === code ? null : code)}
-              title={country}
-              className={`text-[9px] font-mono px-1.5 py-0.5 rounded border transition-colors ${
-                quickFilter === code
-                  ? 'border-[#e3b341]/50 text-[#e3b341] bg-[#e3b341]/10'
-                  : 'border-[#30363d] text-[#8b949e] hover:text-[#e3b341] hover:border-[#e3b341]/30'
+          {countryOptions.length > 0 && (
+            <select
+              value={countryFilter}
+              onChange={e => setCountryFilter(e.target.value)}
+              title="Filter by country"
+              className={`text-[9px] font-mono px-1 py-0.5 rounded border bg-[#0d1117] transition-colors cursor-pointer ${
+                countryFilter
+                  ? 'border-[#e3b341]/50 text-[#e3b341]'
+                  : 'border-[#30363d] text-[#8b949e]'
               }`}
             >
-              {flag} {code} <span className="opacity-60">{count}</span>
-            </button>
-          ))}
-          {quickFilter && (
+              <option value="">🌍 All countries</option>
+              {countryOptions.map(({ code, country, flag, count }) => (
+                <option key={code} value={code}>{flag} {country} ({count})</option>
+              ))}
+            </select>
+          )}
+          {hasAnyFilter && (
             <button
-              onClick={() => setQuickFilter(null)}
+              onClick={() => { setQuickFilter(null); setCountryFilter(''); }}
               className="text-[9px] font-mono px-1.5 py-0.5 rounded border border-[#30363d] text-[#484f58] hover:text-[#c9d1d9]"
-              title="Clear filter"
+              title="Clear all filters"
             >
               ✕ clear
             </button>
@@ -873,14 +887,14 @@ export default function FTContactsPanel({ contacts, mode, myCall = '', onClearCo
       {contacts.size > 1 && (
         <div className="flex items-center gap-1 mb-1.5 shrink-0 flex-wrap">
           <span className="text-[9px] text-[#484f58] font-mono">sort:</span>
-          {SORT_OPTIONS.map(({ key, label }) => (
+          {SORT_OPTIONS.map(({ key, label, title }) => (
             <button
               key={key}
               onClick={() => {
                 if (sortKey === key) setSortRev(r => !r);
                 else { setSortKey(key); setSortRev(false); }
               }}
-              title={sortKey === key ? 'Click again to reverse' : `Sort by ${label}`}
+              title={sortKey === key ? `${title} — click to reverse` : title}
               className={`text-[9px] font-mono px-1.5 py-0.5 rounded border transition-colors ${
                 sortKey === key
                   ? 'border-[#2ea043]/50 text-[#2ea043] bg-[#2ea043]/10'
@@ -897,9 +911,9 @@ export default function FTContactsPanel({ contacts, mode, myCall = '', onClearCo
       <div className="flex-1 overflow-y-auto min-h-0 max-h-[50vh] lg:max-h-none">
         {filtered.length === 0 ? (
           <div className="flex flex-col items-center justify-center h-28 gap-2">
-            <div className="text-3xl select-none">{q || quickFilter ? '🔍' : '🌍'}</div>
+            <div className="text-3xl select-none">{q || hasAnyFilter ? '🔍' : '🌍'}</div>
             <div className="text-xs text-[#484f58] font-mono">
-              {q ? `No contacts match "${query.trim()}"` : quickFilter ? 'No contacts match this filter' : 'No contacts yet'}
+              {q ? `No contacts match "${query.trim()}"` : hasAnyFilter ? 'No contacts match this filter' : 'No contacts yet'}
             </div>
           </div>
         ) : (
