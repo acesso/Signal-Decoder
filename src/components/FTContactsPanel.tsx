@@ -1,7 +1,7 @@
 'use client';
 
 import dynamic from 'next/dynamic';
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import {
   Contact, ContactMsg, MSG_TYPE_LABEL, MSG_TYPE_COLOR, generateADIF, gridToLatLon, haversineKm,
@@ -633,16 +633,35 @@ export default function FTContactsPanel({ contacts, mode, myCall = '', myGrid = 
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [focus]);
 
-  const txCount = (c: Contact) => c.msgs.filter(m => m.role === 'tx').length;
-  const rxCount = (c: Contact) => c.msgs.filter(m => m.role === 'rx').length;
-  const maxSnr  = (c: Contact) => c.msgs.length ? Math.max(...c.msgs.map(m => m.snr)) : -99;
+  const myGridUp = myGrid.toUpperCase();
 
-  const myLatLon: [number, number] | null = myGrid ? (gridToLatLon(myGrid) ?? null) : null;
-  const distKm = (c: Contact): number =>
-    (myLatLon && c.latLon) ? haversineKm(myLatLon, c.latLon) : Infinity;
+  const myLatLon: [number, number] | null = useMemo(
+    () => myGridUp ? (gridToLatLon(myGridUp) ?? null) : null,
+    [myGridUp],
+  );
+
+  // Per-contact derived values — computed once per contacts Map reference, not per render
+  const contactStats = useMemo(() => {
+    const map = new Map<string, {
+      txCount: number; rxCount: number; maxSnr: number; distKm: number;
+      countryCode: string | undefined;
+    }>();
+    for (const c of contacts.values()) {
+      let txCount = 0, rxCount = 0, snrMax = -99;
+      for (const m of c.msgs) {
+        if (m.role === 'tx') txCount++;
+        else rxCount++;
+        if (m.snr > snrMax) snrMax = m.snr;
+      }
+      const dkm = (myLatLon && c.latLon) ? haversineKm(myLatLon, c.latLon) : Infinity;
+      const pfx  = callsignCountry(c.callsign);
+      map.set(c.callsign, { txCount, rxCount, maxSnr: snrMax, distKm: dkm, countryCode: pfx?.countryCode });
+    }
+    return map;
+  }, [contacts, myLatLon]);
 
   // Build the list of unique countries for the country select dropdown
-  const countryOptions = Array.from(
+  const countryOptions = useMemo(() => Array.from(
     Array.from(contacts.values()).reduce((acc, c) => {
       const geo = c.grid ? geoMap.get(c.grid) : undefined;
       const pfx = callsignCountry(c.callsign);
@@ -657,28 +676,52 @@ export default function FTContactsPanel({ contacts, mode, myCall = '', myGrid = 
       }
       return acc;
     }, new Map<string, { code: string; country: string; flag: string; count: number }>())
-  .values()).sort((a, b) => b.count - a.count || a.country.localeCompare(b.country));
+  .values()).sort((a, b) => b.count - a.count || a.country.localeCompare(b.country)),
+  [contacts, geoMap]);
 
-  const sorted = Array.from(contacts.values()).sort((a, b) => {
+  // Sort contacts — only when contacts, sortKey, sortRev, or stats change
+  const sorted = useMemo(() => Array.from(contacts.values()).sort((a, b) => {
+    const sa = contactStats.get(a.callsign)!;
+    const sb = contactStats.get(b.callsign)!;
     let cmp: number;
     if      (sortKey === 'date')   cmp = b.lastSeen.getTime() - a.lastSeen.getTime();
-    else if (sortKey === 'tx')     cmp = txCount(b) - txCount(a);
-    else if (sortKey === 'rx')     cmp = rxCount(b) - rxCount(a);
+    else if (sortKey === 'tx')     cmp = sb.txCount - sa.txCount;
+    else if (sortKey === 'rx')     cmp = sb.rxCount - sa.rxCount;
     else if (sortKey === 'worked') cmp = b.peers.size - a.peers.size;
-    else if (sortKey === 'snr-hi') cmp = maxSnr(b) - maxSnr(a);
-    else if (sortKey === 'snr-lo') cmp = maxSnr(a) - maxSnr(b);
-    else if (sortKey === 'near')   cmp = distKm(a) - distKm(b);
-    else if (sortKey === 'far')    cmp = distKm(b) - distKm(a);
+    else if (sortKey === 'snr-hi') cmp = sb.maxSnr - sa.maxSnr;
+    else if (sortKey === 'snr-lo') cmp = sa.maxSnr - sb.maxSnr;
+    else if (sortKey === 'near')   cmp = sa.distKm - sb.distKm;
+    else if (sortKey === 'far')    cmp = sb.distKm - sa.distKm;
     else                           cmp = a.callsign.localeCompare(b.callsign);
     return sortRev ? -cmp : cmp;
-  });
+  }), [contacts, contactStats, sortKey, sortRev]);
+
+  // Stats for filter chip counts — computed once over sorted, not re-run per filter change
+  const filterStats = useMemo(() => {
+    let withLocation = 0, fullQSOCount = 0, handshakeCount = 0, txOnlyCount = 0, rxOnlyCount = 0;
+    for (const c of sorted) {
+      const s = contactStats.get(c.callsign)!;
+      if (c.latLon) withLocation++;
+      if (s.txCount > 0 && s.rxCount === 0) txOnlyCount++;
+      if (s.rxCount > 0 && s.txCount === 0) rxOnlyCount++;
+      const peers = Array.from(c.peers);
+      const hasFull = peers.some(p => isFullQSO(c, p));
+      const hasHand = peers.some(p => isHandshake(c, p) && !isFullQSO(c, p));
+      if (hasFull) fullQSOCount++;
+      if (hasHand) handshakeCount++;
+    }
+    return { withLocation, fullQSOCount, handshakeCount, txOnlyCount, rxOnlyCount };
+  }, [sorted, contactStats]);
+
+  const { withLocation, fullQSOCount, handshakeCount, txOnlyCount, rxOnlyCount } = filterStats;
 
   // Apply quick filter + country filter
-  const quickFiltered = sorted.filter(c => {
+  const quickFiltered = useMemo(() => sorted.filter(c => {
+    const s = contactStats.get(c.callsign)!;
     if (quickFilter === 'full-qso'  && !Array.from(c.peers).some(p => isFullQSO(c, p))) return false;
     if (quickFilter === 'handshake' && !Array.from(c.peers).some(p => isHandshake(c, p) && !isFullQSO(c, p))) return false;
-    if (quickFilter === 'tx-only'   && !(txCount(c) > 0 && rxCount(c) === 0)) return false;
-    if (quickFilter === 'rx-only'   && !(rxCount(c) > 0 && txCount(c) === 0)) return false;
+    if (quickFilter === 'tx-only'   && !(s.txCount > 0 && s.rxCount === 0)) return false;
+    if (quickFilter === 'rx-only'   && !(s.rxCount > 0 && s.txCount === 0)) return false;
     if (countryFilter) {
       const geo  = c.grid ? geoMap.get(c.grid) : undefined;
       const pfx  = callsignCountry(c.callsign);
@@ -686,11 +729,11 @@ export default function FTContactsPanel({ contacts, mode, myCall = '', myGrid = 
       if (code !== countryFilter) return false;
     }
     return true;
-  });
+  }), [sorted, contactStats, quickFilter, countryFilter, geoMap]);
 
   // Free-text search on top
   const q        = query.trim().toLowerCase();
-  const filtered = q
+  const filtered = useMemo(() => q
     ? quickFiltered.filter(c => {
         const op  = opMap.get(c.callsign);
         const pfx = callsignCountry(c.callsign);
@@ -701,14 +744,9 @@ export default function FTContactsPanel({ contacts, mode, myCall = '', myGrid = 
         return [c.callsign, ...c.grids, ...geoFields, pfx?.country, pfx?.countryCode, op?.name]
           .some(s => s?.toLowerCase().includes(q));
       })
-    : quickFiltered;
+    : quickFiltered,
+  [q, quickFiltered, opMap, geoMap]);
 
-  const withLocation   = sorted.filter(c => c.latLon).length;
-  // counts always over full sorted list (not affected by active filter) so chips show real totals
-  const fullQSOCount   = sorted.filter(c => Array.from(c.peers).some(p => isFullQSO(c, p))).length;
-  const handshakeCount = sorted.filter(c => Array.from(c.peers).some(p => isHandshake(c, p) && !isFullQSO(c, p))).length;
-  const txOnlyCount    = sorted.filter(c => txCount(c) > 0 && rxCount(c) === 0).length;
-  const rxOnlyCount    = sorted.filter(c => rxCount(c) > 0 && txCount(c) === 0).length;
   const hasAnyFilter   = !!quickFilter || !!countryFilter;
 
   function downloadADIF() {

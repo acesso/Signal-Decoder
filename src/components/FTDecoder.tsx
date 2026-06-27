@@ -1,6 +1,6 @@
 'use client';
 
-import { Fragment, forwardRef, useCallback, useEffect, useImperativeHandle, useRef, useState } from 'react';
+import { Fragment, forwardRef, useCallback, useEffect, useImperativeHandle, useMemo, useRef, useState } from 'react';
 import type { DecoderControls, DecoderProps } from './DecoderControls';
 import { fmtAbsHz } from '@/lib/formatFreq';
 import AudioAnalysisPanel from './AudioAnalysisPanel';
@@ -228,6 +228,13 @@ const FTDecoder = forwardRef<DecoderControls, { ftMode: FTMode; myCall?: string;
     for (const r of fresh) {
       frozenVfoRef.current.set(r.windowStart.getTime(), currentVfo);
     }
+    // Evict stale entries — keep only what's still referenced by the results array
+    if (frozenVfoRef.current.size > results.length + 10) {
+      const live = new Set(results.map(r => r.windowStart.getTime()));
+      for (const k of frozenVfoRef.current.keys()) {
+        if (!live.has(k)) frozenVfoRef.current.delete(k);
+      }
+    }
 
     // Bake absolute freq into ContactMsg so contacts panel never needs VFO.
     // Compute next outside setContacts so we can pass the same value to
@@ -295,7 +302,7 @@ const FTDecoder = forwardRef<DecoderControls, { ftMode: FTMode; myCall?: string;
   const myCallUpper = myCall.toUpperCase();
 
   // Use the VFO that was active at the moment each window was decoded (frozen).
-  const tableRows: TableRow[] = results.flatMap((r, ri) => {
+  const tableRows: TableRow[] = useMemo(() => results.flatMap((r, ri) => {
     const frozenVfo = frozenVfoRef.current.get(r.windowStart.getTime()) ?? 0;
     return [
       { kind: 'sep' as const, time: r.windowStart, mode: r.mode, empty: r.messages.length === 0, key: `sep-${ri}` },
@@ -311,7 +318,9 @@ const FTDecoder = forwardRef<DecoderControls, { ftMode: FTMode; myCall?: string;
         };
       }),
     ];
-  });
+  // frozenVfoRef is a ref — not a dep, but results changing is the only trigger needed
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }), [results, myCallUpper]);
 
   const controls: DecoderControls = {
     isRecording: state.isRecording,
