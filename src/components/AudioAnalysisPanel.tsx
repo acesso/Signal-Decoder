@@ -5,7 +5,7 @@ import type React from 'react';
 import GLSpectrogram, { GLSpectrogramHandle, GLView } from './GLSpectrogram';
 import type { MFSKChannel } from '@/lib/mfsk/decoder';
 
-type SpectrogramView = 'legacy' | GLView;
+type SpectrogramView = 'legacy' | 'terrain';
 
 // ── Canvas helpers (copied from MFSKDecoder) ──────────────────────────────────
 
@@ -20,20 +20,46 @@ function hexToRgb(hex: string): [number, number, number] {
   return [isNaN(r) ? 100 : r, isNaN(g) ? 100 : g, isNaN(b) ? 100 : b];
 }
 
-function drawAxisLabels(ctx: CanvasRenderingContext2D, w: number, pH: number, minF: number, maxF: number, vfoHz = 0) {
+// niceTicks: returns {major, minor} step sizes for a given span so the axis
+// has 4–8 major labels and minor ticks at 1/5 of major.
+function niceTicks(span: number): { maj: number; min: number } {
+  const targets = [25,50,100,200,250,500,1000,2000,2500,5000];
+  const majStep = targets.find(s => span / s <= 8) ?? 5000;
+  return { maj: majStep, min: majStep / 5 };
+}
+
+function drawAxisLabels(
+  ctx: CanvasRenderingContext2D, w: number, pH: number,
+  minF: number, maxF: number, vfoHz = 0,
+  // when true, also draw vertical grid lines up into the plot area
+  drawGridLines = false,
+) {
   const span = maxF - minF;
+  const { maj, min } = niceTicks(span);
+
+  // baseline separator
   ctx.strokeStyle = '#30363d'; ctx.lineWidth = 1;
   ctx.beginPath(); ctx.moveTo(0, pH); ctx.lineTo(w, pH); ctx.stroke();
-  const step = span <= 500 ? 50 : span <= 1000 ? 100 : span <= 2000 ? 200 : 500;
-  const majMult = step * 5;
-  const medMult = step * 2;
-  const firstTick = Math.ceil(minF / step) * step;
-  for (let f = firstTick; f <= maxF; f += step) {
+
+  const firstMin = Math.ceil(minF / min) * min;
+  for (let f = firstMin; f <= maxF + min * 0.5; f += min) {
     const x = ((f - minF) / span) * w;
-    const maj = f % majMult === 0, med = !maj && f % medMult === 0;
-    ctx.strokeStyle = maj ? '#8b949e' : '#30363d';
-    ctx.beginPath(); ctx.moveTo(x, pH); ctx.lineTo(x, pH + (maj ? 6 : med ? 4 : 2)); ctx.stroke();
-    if (maj) {
+    if (x < 0 || x > w) continue;
+    const isMaj = Math.round(f / maj) * maj === Math.round(f);
+
+    // grid line into plot
+    if (drawGridLines && isMaj) {
+      ctx.strokeStyle = 'rgba(48,54,61,0.6)'; ctx.lineWidth = 0.5;
+      ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, pH); ctx.stroke();
+    }
+
+    // tick mark
+    const tickH = isMaj ? 7 : 3;
+    ctx.strokeStyle = isMaj ? '#8b949e' : '#3d444d';
+    ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(x, pH); ctx.lineTo(x, pH + tickH); ctx.stroke();
+
+    if (isMaj) {
       ctx.fillStyle = '#8b949e'; ctx.font = '10px monospace'; ctx.textAlign = 'center';
       if (vfoHz > 0) {
         const absHz = vfoHz + f;
@@ -41,10 +67,31 @@ function drawAxisLabels(ctx: CanvasRenderingContext2D, w: number, pH: number, mi
         const khzFrac = Math.round((absHz % 1_000_000) / 1000);
         ctx.fillText(`${mhzInt}.${String(khzFrac).padStart(3, '0')}`, x, pH + 17);
       } else {
-        ctx.fillText(f >= 1000 ? `${f/1000}k` : `${f}`, x, pH + 17);
+        ctx.fillText(f >= 1000 ? `${(f/1000).toFixed(f % 1000 === 0 ? 0 : 1)}k` : `${f}`, x, pH + 17);
       }
     }
   }
+}
+
+// Draw a TX frequency marker as a full-height vertical overlay on a canvas.
+function drawTxMarker(
+  ctx: CanvasRenderingContext2D, w: number, h: number,
+  txHz: number, minHz: number, maxHz: number,
+) {
+  const span = maxHz - minHz;
+  if (txHz < minHz || txHz > maxHz) return;
+  const x = ((txHz - minHz) / span) * w;
+  ctx.save();
+  ctx.strokeStyle = 'rgba(88,166,255,0.7)';
+  ctx.lineWidth = 1.5;
+  ctx.setLineDash([4, 3]);
+  ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, h); ctx.stroke();
+  ctx.setLineDash([]);
+  // small label at top
+  ctx.font = '9px monospace'; ctx.textAlign = x > w * 0.85 ? 'right' : 'left';
+  ctx.fillStyle = 'rgba(88,166,255,0.9)';
+  ctx.fillText(`TX ${txHz}Hz`, x + (x > w * 0.85 ? -4 : 4), 10);
+  ctx.restore();
 }
 
 function drawSqGrid(
@@ -165,6 +212,8 @@ export interface AudioAnalysisPanelProps {
   glBands?: MFSKChannel[];
   /** VFO frequency from radio CAT in Hz — when set, axis labels show absolute frequency */
   vfoFrequency?: number;
+  /** TX audio frequency in Hz — draws a vertical marker line on the spectrogram (FT mode) */
+  txMarkerHz?: number;
   /** Extra CSS classes applied to the root card div (e.g. flex sizing) */
   className?: string;
   style?: React.CSSProperties;
@@ -185,6 +234,7 @@ export default function AudioAnalysisPanel({
   defaultMaxHz = 3000,
   glBands,
   vfoFrequency,
+  txMarkerHz,
   className,
   style,
 }: AudioAnalysisPanelProps) {
@@ -201,6 +251,7 @@ export default function AudioAnalysisPanel({
 
   const specRef        = useRef<HTMLCanvasElement>(null);
   const sgCanvRef      = useRef<HTMLCanvasElement>(null);
+  const sgOverlayRef   = useRef<HTMLCanvasElement>(null);
   const glSgRef        = useRef<GLSpectrogramHandle>(null);
   const rafRef         = useRef<number | null>(null);
   const sgContainerRef = useRef<HTMLDivElement>(null);
@@ -215,6 +266,7 @@ export default function AudioAnalysisPanel({
   const showGridRef = useRef(showGrid);
   const gridSzRef   = useRef(gridSize);
   const vfoHzRef    = useRef(vfoFrequency ?? 0);
+  const txMarkerRef = useRef(txMarkerHz ?? 0);
   const sgGRef        = useRef(sgGamma);
   const sg3dSpRef     = useRef(80);   // GL rows
   const sg2dSpRef     = useRef(50);   // 2D canvas rows
@@ -237,6 +289,7 @@ export default function AudioAnalysisPanel({
   useEffect(() => { showGridRef.current = showGrid; }, [showGrid]);
   useEffect(() => { gridSzRef.current  = gridSize; }, [gridSize]);
   useEffect(() => { vfoHzRef.current   = vfoFrequency ?? 0; }, [vfoFrequency]);
+  useEffect(() => { txMarkerRef.current = txMarkerHz ?? 0; }, [txMarkerHz]);
   useEffect(() => { sgGRef.current         = sgGamma;    }, [sgGamma]);
   useEffect(() => { sg3dSpRef.current = sg3dSpeed; glSgRef.current?.setRowInterval(sg3dSpeed); }, [sg3dSpeed]);
   useEffect(() => { sg2dSpRef.current      = sg2dSpeed;  }, [sg2dSpeed]);
@@ -373,6 +426,9 @@ export default function AudioAnalysisPanel({
       const halfBw = m.bandwidthHz != null ? m.bandwidthHz / 2 : 40;
       drawChannelMarker(ctx, canvas.width, PLOT_H, m.freq, m.color, m.label, halfBw, minHz, maxHz);
     }
+    if (txMarkerRef.current > 0) {
+      drawTxMarker(ctx, canvas.width, PLOT_H, txMarkerRef.current, minHz, maxHz);
+    }
     drawAxisLabels(ctx, canvas.width, PLOT_H, minHz, maxHz, vfoHzRef.current);
     return vis;
   }, [analyser]);
@@ -394,10 +450,28 @@ export default function AudioAnalysisPanel({
     ctx.putImageData(row, 0, 0);
   }, []);
 
+  // Overlay drawn on top of the 2D spectrogram every frame: ruler ticks + TX marker.
+  const drawSgOverlay = useCallback((canvas: HTMLCanvasElement) => {
+    const ctx = canvas.getContext('2d'); if (!ctx) return;
+    const w = canvas.width, h = canvas.height;
+    ctx.clearRect(0, 0, w, h);
+    const minHz = minHzRef.current, maxHz = maxHzRef.current;
+    // Ruler at the bottom edge of the overlay
+    const rulerH = 18;
+    const rulerY = h - rulerH;
+    ctx.fillStyle = 'rgba(10,10,10,0.65)';
+    ctx.fillRect(0, rulerY, w, rulerH);
+    drawAxisLabels(ctx, w, rulerY, minHz, maxHz, vfoHzRef.current, true);
+    // TX marker line
+    if (txMarkerRef.current > 0) {
+      drawTxMarker(ctx, w, h - rulerH, txMarkerRef.current, minHz, maxHz);
+    }
+  }, []);
+
   // Animation loop — spectrum ~30fps; 2D and 3D spectrograms throttled independently
   useEffect(() => {
     const tick = (now: number) => {
-      const sp = specRef.current, sg = sgCanvRef.current;
+      const sp = specRef.current, sg = sgCanvRef.current, ov = sgOverlayRef.current;
       if (sp && now - spLastTs.current >= 33) {
         spLastTs.current = now;
         const fd = drawSpectrum(sp);
@@ -414,13 +488,15 @@ export default function AudioAnalysisPanel({
           }
         }
       }
+      // 2D overlay (ruler + TX marker) — always redraw every frame so it stays sharp
+      if (ov) drawSgOverlay(ov);
       // Redraw the 3D terrain every rAF frame so the view is always smooth
       glSgRef.current?.render();
       rafRef.current = requestAnimationFrame(tick);
     };
     rafRef.current = requestAnimationFrame(tick);
     return () => { if (rafRef.current) cancelAnimationFrame(rafRef.current); };
-  }, [drawSpectrum, drawSpectrogram]);
+  }, [drawSpectrum, drawSpectrogram, drawSgOverlay]);
 
   // GL bands from markers
   const glBandsComputed = glBands
@@ -568,14 +644,16 @@ export default function AudioAnalysisPanel({
       <div className="flex flex-col gap-2 mt-3 flex-1 min-h-0">
         <h3 className="text-xs font-medium text-[#8b949e] shrink-0">Spectrogram</h3>
         <div ref={sgContainerRef} className="relative flex-1 min-h-[100px]">
-          <div className={sgView === 'legacy' ? 'block' : 'hidden'}>
+          <div className={`${sgView === 'legacy' ? 'block' : 'hidden'} relative`}>
             <canvas ref={sgCanvRef} width={640} height={sgH} style={{ height: sgH }}
               className="w-full border border-[#30363d] rounded bg-[#0d1117] block"/>
+            <canvas ref={sgOverlayRef} width={640} height={sgH} style={{ height: sgH }}
+              className="absolute inset-0 w-full pointer-events-none"/>
           </div>
           <div className={sgView !== 'legacy' ? 'block' : 'hidden'}>
             <GLSpectrogram
               ref={glSgRef}
-              view={sgView === 'legacy' ? 'terrain' : sgView}
+              view="terrain"
               gamma={sgGamma}
               height={sgH}
               maxHz={displayMaxHz}
@@ -587,6 +665,7 @@ export default function AudioAnalysisPanel({
               sqlAlpha={0.6}
               sqlGridSize={showGrid ? gridSize : undefined}
               vfoFrequency={vfoFrequency}
+              txMarkerHz={txMarkerHz}
             />
           </div>
         </div>
@@ -595,7 +674,6 @@ export default function AudioAnalysisPanel({
             <select value={sgView} onChange={e => setSgView(e.target.value as SpectrogramView)}
               className="bg-[#0d1117] border border-[#30363d] rounded px-1.5 py-0.5 text-[#c9d1d9] focus:outline-none focus:border-[#2ea043] cursor-pointer">
               <option value="terrain">3D Terrain</option>
-              <option value="ridge">Ridgeline</option>
               <option value="legacy">Classic 2D</option>
             </select>
           </label>

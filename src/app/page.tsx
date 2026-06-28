@@ -275,6 +275,7 @@ export default function Home() {
   const [ftMyCall, setFtMyCall] = useState('');
   const [ftMyGrid, setFtMyGrid] = useState('');
   const [txStatus, setTxStatus] = useState<TxStatus | null>(null);
+  const txAudioHz = txStatus?.txAudioHz ?? 0;
 
   // ── Radio CAT — lifted here so VFO frequency flows to all decoders ────────
   const cat = useRadioCAT();
@@ -327,7 +328,11 @@ export default function Home() {
     audioStop();
   }, [audioStop, activeRef]);
 
-  const handleReset = useCallback(() => { activeRef.current?.reset(); }, [activeRef]);
+  const clearSentRef = useRef<(() => void) | null>(null);
+  const handleReset = useCallback(() => {
+    activeRef.current?.reset();
+    clearSentRef.current?.();
+  }, [activeRef]);
 
   // Switching mode: stop previous decoder (but keep global audio), connect new decoder
   const handleModeChange = useCallback(async (newMode: DecoderMode) => {
@@ -426,6 +431,7 @@ export default function Home() {
                   onMyGridChange={setFtMyGrid}
                   onSetPTT={cat.state.connected ? cat.setPTT : undefined}
                   onStatusChange={setTxStatus}
+                  onReset={(fn) => { clearSentRef.current = fn; }}
                 />
               </div>
             </details>
@@ -446,7 +452,7 @@ export default function Home() {
           <MFSKDecoder ref={mfskRef} onStateChange={onStateChangeCbs.mfsk} analyser={analyser} vfoFrequency={vfoFrequency} />
         </div>
         <div className={mode === 'ft' ? '' : 'hidden'}>
-          <FTDecoder ref={ftRef} ftMode={ftMode} myCall={ftMyCall} myGrid={ftMyGrid} onStateChange={onStateChangeCbs.ft} onContactsChange={setFtContacts} analyser={analyser} vfoFrequency={vfoFrequency} />
+          <FTDecoder ref={ftRef} ftMode={ftMode} myCall={ftMyCall} myGrid={ftMyGrid} onStateChange={onStateChangeCbs.ft} onContactsChange={setFtContacts} analyser={analyser} vfoFrequency={vfoFrequency} txAudioHz={txAudioHz} />
         </div>
 
       </div>
