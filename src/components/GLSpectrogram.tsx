@@ -2,7 +2,7 @@
 
 import { forwardRef, useEffect, useImperativeHandle, useMemo, useRef, useState } from 'react';
 
-export type GLView = 'terrain' | 'ridge';
+export type GLView = 'terrain';
 
 export interface GLSpectrogramHandle {
   pushRow(data: Uint8Array): void;
@@ -34,6 +34,7 @@ interface Props {
   sqlAlpha?: number;       // 0..1 opacity of the squelch plane
   sqlGridSize?: number;    // grid resolution (cols = size*2, rows = size); enables grid mode
   vfoFrequency?: number;   // radio VFO in Hz — offsets frequency labels to show absolute freq
+  txMarkerHz?: number;     // TX audio frequency in Hz — vertical line overlay
 }
 
 // History texture: TEX_W frequency bins × TEX_H rows, written as a ring buffer
@@ -47,11 +48,6 @@ const HEIGHT_SCALE = 0.55;
 
 const TERRAIN_X = 192;  // mesh columns (frequency)
 const TERRAIN_Z = 56;   // mesh rows (time) — TERRAIN_X*TERRAIN_Z*6 must stay under Uint16 limit (65535)
-const RIDGE_COUNT = 56; // ridgeline rows
-const RIDGE_SEGS  = 180;
-const RIDGE_BASE_NEW = -0.85;
-const RIDGE_BASE_OLD = 0.80;
-const RIDGE_LABEL_Y  = -0.92;
 
 // Google's polynomial approximation of the Turbo colormap
 const TURBO_GLSL = `
@@ -233,67 +229,6 @@ void main() {
 }
 `;
 
-const RIDGE_VS = `
-precision mediump float;
-attribute vec2 aPos; // x = freq [0,1], y = 1 on the curve / 0 on the baseline
-uniform sampler2D uTex;
-uniform float uHead, uDepth, uGamma, uRow; // uRow = depth [0,1] (0 = newest, drawn at the bottom)
-uniform vec2 uPan;
-uniform float uScale;
-varying float vV;
-varying float vX;
-void main() {
-  float texV = fract(uHead - uRow * uDepth);
-  float v = pow(texture2D(uTex, vec2(aPos.x, texV)).r, uGamma);
-  vV = v;
-  vX = aPos.x;
-  float base = mix(${RIDGE_BASE_NEW}, ${RIDGE_BASE_OLD}, uRow);
-  float y = base + aPos.y * v * ${HEIGHT_SCALE};
-  float x = (aPos.x * 2.0 - 1.0) * mix(0.98, 0.86, uRow); // slight narrowing for depth
-  gl_Position = vec4((vec2(x, y) + uPan) * uScale, 0.0, 1.0);
-}
-`;
-
-const RIDGE_FS = `
-precision mediump float;
-uniform float uStroke, uRow;
-varying float vV;
-varying float vX;
-${TURBO_GLSL}
-${BANDS_GLSL}
-void main() {
-  if (uStroke < 0.5) {
-    gl_FragColor = vec4(${BG[0]}, ${BG[1]}, ${BG[2]}, 1.0); // fill occludes ridges behind
-  } else {
-    vec3 c = turbo(clamp(vV * 1.15, 0.0, 1.0));
-    c = applyBands(c, vX);
-    gl_FragColor = vec4(c * mix(1.0, 0.3, uRow), 1.0);
-  }
-}
-`;
-
-// Ridge background plate carrying the frequency grid (pans/zooms with content)
-const RIDGE_GRID_VS = `
-precision mediump float;
-attribute vec2 aPos; // x = freq [0,1], y = content-space y
-uniform vec2 uPan;
-uniform float uScale;
-varying float vX;
-void main() {
-  vX = aPos.x;
-  float x = (aPos.x * 2.0 - 1.0) * 0.98;
-  gl_Position = vec4((vec2(x, aPos.y) + uPan) * uScale, 0.0, 1.0);
-}
-`;
-
-const RIDGE_GRID_FS = `
-precision mediump float;
-varying float vX;
-${GRID_GLSL}
-void main() {
-  gl_FragColor = vec4(applyGrid(vec3(${BG[0]}, ${BG[1]}, ${BG[2]}), vX), 1.0);
-}
-`;
 
 // Squelch threshold: a translucent "sheet of paper" cutting through the terrain
 // at the threshold height (uMode 0), or a thin line on the front ridge (uMode 1)
@@ -411,7 +346,6 @@ function formatHz(hz: number): string {
 
 // Camera defaults — terrain opens at a 45° elevation for a perspective look
 const TERRAIN_CAM = { az: 0, el: Math.PI / 4, dist: 2.6, tx: 0, tz: 0 };
-const RIDGE_CAM   = { scale: 1, panX: 0, panY: 0 };
 
 interface BandUniforms {
   count: WebGLUniformLocation | null;
@@ -424,7 +358,7 @@ interface BandUniforms {
 // ── Component ─────────────────────────────────────────────────────────────────
 
 const GLSpectrogram = forwardRef<GLSpectrogramHandle, Props>(function GLSpectrogram(
-  { view, gamma, height, minHz = 0, maxHz, bands, bandAlpha = 0.3, markers, sqlLevel, sqlAlpha = 0.3, sqlGridSize, vfoFrequency = 0 }, ref,
+  { view, gamma, height, minHz = 0, maxHz, bands, bandAlpha = 0.3, markers, sqlLevel, sqlAlpha = 0.3, sqlGridSize, vfoFrequency = 0, txMarkerHz }, ref,
 ) {
   const canvasRef      = useRef<HTMLCanvasElement>(null);
   const glRef          = useRef<WebGLRenderingContext | null>(null);
@@ -452,14 +386,17 @@ const GLSpectrogram = forwardRef<GLSpectrogramHandle, Props>(function GLSpectrog
   const minHzRef   = useRef(minHz);
   const maxHzRef   = useRef(maxHz);
   const terrainCam = useRef({ ...TERRAIN_CAM });
-  const ridgeCam   = useRef({ ...RIDGE_CAM });
   const rowScratch  = useRef(new Uint8Array(TEX_W));
   const rowSmoothed = useRef(new Float32Array(TEX_W));
   const smoothAlpha = useRef(0.35);
   const labelElsRef = useRef<(HTMLSpanElement | null)[]>([]);
   const markerElsRef = useRef<(HTMLDivElement | null)[]>([]);
   const markersRef = useRef<SpectroBand[]>([]);
+  const txMarkerElRef = useRef<HTMLDivElement | null>(null);
+  const txMarkerHzRef = useRef(txMarkerHz ?? 0);
   const [failed, setFailed] = useState(false);
+
+  useEffect(() => { txMarkerHzRef.current = txMarkerHz ?? 0; renderRef.current?.(); }, [txMarkerHz]);
 
   // Frequency reference grid: minor lines + labelled major lines
   const span = maxHz - minHz;
@@ -607,8 +544,8 @@ const GLSpectrogram = forwardRef<GLSpectrogramHandle, Props>(function GLSpectrog
       if (mvp) gl.uniformMatrix4fv(sqlLoc.mvp, false, mvp);
       gl.uniform1f(sqlLoc.y, y);
       gl.uniform1f(sqlLoc.mode, mode);
-      gl.uniform2f(sqlLoc.pan, ridgeCam.current.panX, ridgeCam.current.panY);
-      gl.uniform1f(sqlLoc.scale, ridgeCam.current.scale);
+      gl.uniform2f(sqlLoc.pan, 0, 0);
+      gl.uniform1f(sqlLoc.scale, 1);
       gl.uniform1f(sqlLoc.alpha, sql.alpha);
       gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
       gl.disable(gl.BLEND);
@@ -645,6 +582,25 @@ const GLSpectrogram = forwardRef<GLSpectrogramHandle, Props>(function GLSpectrog
         el.style.top = '0';
         el.style.bottom = '0';
       });
+      // TX frequency marker line
+      const txEl = txMarkerElRef.current;
+      const txHz = txMarkerHzRef.current;
+      if (txEl) {
+        if (txHz > 0 && txHz >= minHzRef.current && txHz <= maxHzRef.current) {
+          const xNorm = (txHz - minHzRef.current) / spanLocal;
+          const pos = project(xNorm);
+          if (pos && pos[0] >= 0 && pos[0] <= W) {
+            txEl.style.display = 'block';
+            txEl.style.left = `${pos[0]}px`;
+            txEl.style.top = '0';
+            txEl.style.bottom = '0';
+          } else {
+            txEl.style.display = 'none';
+          }
+        } else {
+          txEl.style.display = 'none';
+        }
+      }
     };
 
     if (view === 'terrain') {
@@ -840,83 +796,6 @@ const GLSpectrogram = forwardRef<GLSpectrogramHandle, Props>(function GLSpectrog
           return [sx, sy + 2];
         });
       };
-    } else {
-      const prog = mkProgram(RIDGE_VS, RIDGE_FS);
-      const gridProg = mkProgram(RIDGE_GRID_VS, RIDGE_GRID_FS);
-      if (!prog || !gridProg) { setFailed(true); return; }
-      // Interleaved strip: (x,1)=on curve, (x,0)=baseline. The fill pass reads
-      // both as a TRIANGLE_STRIP; the stroke pass strides over only the (x,1)s.
-      const strip = new Float32Array((RIDGE_SEGS + 1) * 4);
-      for (let i = 0; i <= RIDGE_SEGS; i++) {
-        const x = i / RIDGE_SEGS;
-        strip[i * 4]     = x; strip[i * 4 + 1] = 1;
-        strip[i * 4 + 2] = x; strip[i * 4 + 3] = 0;
-      }
-      const sbuf = mkBuffer(strip);
-      const gquad = mkBuffer(new Float32Array([0, -0.97, 1, -0.97, 0, 0.97, 1, 0.97]));
-      const aPos = gl.getAttribLocation(prog, 'aPos');
-      const gPos = gl.getAttribLocation(gridProg, 'aPos');
-      const loc = {
-        head: gl.getUniformLocation(prog, 'uHead'),
-        depth: gl.getUniformLocation(prog, 'uDepth'),
-        gamma: gl.getUniformLocation(prog, 'uGamma'),
-        row: gl.getUniformLocation(prog, 'uRow'),
-        stroke: gl.getUniformLocation(prog, 'uStroke'),
-        pan: gl.getUniformLocation(prog, 'uPan'),
-        scale: gl.getUniformLocation(prog, 'uScale'),
-        bands: bandLocs(prog),
-      };
-      const gloc = {
-        pan: gl.getUniformLocation(gridProg, 'uPan'),
-        scale: gl.getUniformLocation(gridProg, 'uScale'),
-        grid: gl.getUniformLocation(gridProg, 'uGrid'),
-      };
-      renderRef.current = () => {
-        const cam = ridgeCam.current;
-        gl.viewport(0, 0, canvas.width, canvas.height);
-        gl.disable(gl.DEPTH_TEST);
-        gl.clearColor(BG[0], BG[1], BG[2], 1);
-        gl.clear(gl.COLOR_BUFFER_BIT);
-        // Background grid plate
-        gl.useProgram(gridProg);
-        gl.bindBuffer(gl.ARRAY_BUFFER, gquad);
-        gl.enableVertexAttribArray(gPos);
-        gl.vertexAttribPointer(gPos, 2, gl.FLOAT, false, 0, 0);
-        gl.uniform2f(gloc.pan, cam.panX, cam.panY);
-        gl.uniform1f(gloc.scale, cam.scale);
-        gl.uniform2f(gloc.grid, gridRef.current[0], gridRef.current[1]);
-        gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
-        // Ridges — painter's algorithm: oldest (back/top) first
-        gl.useProgram(prog);
-        gl.bindBuffer(gl.ARRAY_BUFFER, sbuf);
-        gl.enableVertexAttribArray(aPos);
-        gl.bindTexture(gl.TEXTURE_2D, texRef.current);
-        gl.uniform1f(loc.head, headNorm());
-        gl.uniform1f(loc.depth, DEPTH);
-        gl.uniform1f(loc.gamma, gammaRef.current);
-        gl.uniform2f(loc.pan, cam.panX, cam.panY);
-        gl.uniform1f(loc.scale, cam.scale);
-        setBandUniforms(loc.bands);
-        for (let r = RIDGE_COUNT - 1; r >= 0; r--) {
-          gl.uniform1f(loc.row, r / (RIDGE_COUNT - 1));
-          gl.uniform1f(loc.stroke, 0);
-          gl.vertexAttribPointer(aPos, 2, gl.FLOAT, false, 8, 0);
-          gl.drawArrays(gl.TRIANGLE_STRIP, 0, (RIDGE_SEGS + 1) * 2);
-          gl.uniform1f(loc.stroke, 1);
-          gl.vertexAttribPointer(aPos, 2, gl.FLOAT, false, 16, 0);
-          gl.drawArrays(gl.LINE_STRIP, 0, RIDGE_SEGS + 1);
-        }
-        // Squelch threshold on the front (newest) ridge
-        drawSql(1, RIDGE_BASE_NEW + sqlHeight());
-        placeLabels(xNorm => {
-          const cx = ((xNorm * 2 - 1) * 0.98 + cam.panX) * cam.scale;
-          const cy = (RIDGE_LABEL_Y + cam.panY) * cam.scale;
-          return [
-            (cx * 0.5 + 0.5) * canvas.clientWidth,
-            (1 - (cy * 0.5 + 0.5)) * canvas.clientHeight,
-          ];
-        });
-      };
     }
 
     renderRef.current?.();
@@ -936,7 +815,7 @@ const GLSpectrogram = forwardRef<GLSpectrogramHandle, Props>(function GLSpectrog
     let drag: { mode: 'rotate' | 'pan'; x: number; y: number } | null = null;
 
     const onMouseDown = (e: MouseEvent) => {
-      const pan = e.button === 2 || e.button === 1 || e.shiftKey || view === 'ridge';
+      const pan = e.button === 2 || e.button === 1 || e.shiftKey;
       drag = { mode: pan ? 'pan' : 'rotate', x: e.clientX, y: e.clientY };
       canvas.style.cursor = 'grabbing';
       e.preventDefault();
@@ -947,42 +826,28 @@ const GLSpectrogram = forwardRef<GLSpectrogramHandle, Props>(function GLSpectrog
       const dy = e.clientY - drag.y;
       drag.x = e.clientX;
       drag.y = e.clientY;
-      if (view === 'terrain') {
-        const cam = terrainCam.current;
-        if (drag.mode === 'rotate') {
-          cam.az = Math.max(-1.3, Math.min(1.3, cam.az - dx * 0.008));
-          cam.el = Math.max(0.12, Math.min(1.5, cam.el + dy * 0.008));
-        } else {
-          // Pan the look-at target in the ground plane, following the camera heading
-          const s = 0.0022 * cam.dist;
-          cam.tx -= (dx * Math.cos(cam.az) + dy * Math.sin(cam.az)) * s;
-          cam.tz -= (dy * Math.cos(cam.az) - dx * Math.sin(cam.az)) * s;
-          cam.tx = Math.max(-1.5, Math.min(1.5, cam.tx));
-          cam.tz = Math.max(-2.0, Math.min(1.5, cam.tz));
-        }
+      const cam = terrainCam.current;
+      if (drag.mode === 'rotate') {
+        cam.az = Math.max(-1.3, Math.min(1.3, cam.az - dx * 0.008));
+        cam.el = Math.max(0.12, Math.min(1.5, cam.el + dy * 0.008));
       } else {
-        const cam = ridgeCam.current;
-        const rect = canvas.getBoundingClientRect();
-        cam.panX += (dx / rect.width)  *  2 / cam.scale;
-        cam.panY += (dy / rect.height) * -2 / cam.scale;
+        const s = 0.0022 * cam.dist;
+        cam.tx -= (dx * Math.cos(cam.az) + dy * Math.sin(cam.az)) * s;
+        cam.tz -= (dy * Math.cos(cam.az) - dx * Math.sin(cam.az)) * s;
+        cam.tx = Math.max(-1.5, Math.min(1.5, cam.tx));
+        cam.tz = Math.max(-2.0, Math.min(1.5, cam.tz));
       }
       renderRef.current?.();
     };
     const onMouseUp = () => { drag = null; canvas.style.cursor = 'grab'; };
     const onWheel = (e: WheelEvent) => {
       e.preventDefault();
-      if (view === 'terrain') {
-        const cam = terrainCam.current;
-        cam.dist = Math.max(0.8, Math.min(7, cam.dist * Math.exp(e.deltaY * 0.0012)));
-      } else {
-        const cam = ridgeCam.current;
-        cam.scale = Math.max(0.5, Math.min(8, cam.scale * Math.exp(-e.deltaY * 0.0012)));
-      }
+      const cam = terrainCam.current;
+      cam.dist = Math.max(0.8, Math.min(7, cam.dist * Math.exp(e.deltaY * 0.0012)));
       renderRef.current?.();
     };
     const onDblClick = () => {
       terrainCam.current = { ...TERRAIN_CAM };
-      ridgeCam.current   = { ...RIDGE_CAM };
       renderRef.current?.();
     };
     const onContextMenu = (e: MouseEvent) => e.preventDefault();
@@ -1095,8 +960,20 @@ const GLSpectrogram = forwardRef<GLSpectrogramHandle, Props>(function GLSpectrog
           }}
         />
       ))}
+      {/* TX frequency marker line */}
+      <div
+        ref={txMarkerElRef}
+        className="absolute pointer-events-none"
+        style={{
+          display: 'none',
+          width: '2px',
+          transform: 'translateX(-50%)',
+          background: 'rgba(88,166,255,0.75)',
+          boxShadow: '0 0 4px rgba(88,166,255,0.5)',
+        }}
+      />
       <div className="absolute bottom-1.5 right-2 text-[9px] font-mono text-[#484f58] pointer-events-none select-none">
-        {view === 'terrain' ? 'drag rotate · shift+drag pan · scroll zoom · dblclick reset' : 'drag pan · scroll zoom · dblclick reset'}
+        drag rotate · shift+drag pan · scroll zoom · dblclick reset
       </div>
       {failed && (
         <div className="absolute inset-0 flex items-center justify-center text-xs text-[#f85149] font-mono">

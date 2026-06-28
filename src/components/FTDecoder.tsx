@@ -191,7 +191,7 @@ function MsgText({ msg, contacts, myCall, onSelect }: {
 
 // ── Main component ────────────────────────────────────────────────────────────
 
-const FTDecoder = forwardRef<DecoderControls, { ftMode: FTMode; myCall?: string; myGrid?: string; onContactsChange?: (c: Map<string, Contact>) => void } & DecoderProps>(function FTDecoder({ ftMode, myCall = '', myGrid = '', onStateChange, onContactsChange, analyser, vfoFrequency }, ref) {
+const FTDecoder = forwardRef<DecoderControls, { ftMode: FTMode; myCall?: string; myGrid?: string; onContactsChange?: (c: Map<string, Contact>) => void; txAudioHz?: number } & DecoderProps>(function FTDecoder({ ftMode, myCall = '', myGrid = '', onStateChange, onContactsChange, analyser, vfoFrequency, txAudioHz = 0 }, ref) {
   const {
     state, startRecording, stopRecording, clearResults, ftSupported,
   } = useFTProcessor(ftMode);
@@ -207,6 +207,24 @@ const FTDecoder = forwardRef<DecoderControls, { ftMode: FTMode; myCall?: string;
   // Always-current VFO ref — readable synchronously inside effects without stale closure
   const vfoRef = useRef<number>(0);
   useEffect(() => { vfoRef.current = vfoFrequency ?? 0; }, [vfoFrequency]);
+
+  // ── UTC clock skew check ──────────────────────────────────────────────────
+  // Fetch once against a public time API; warn if local clock is off by >1 s.
+  const [clockSkewS, setClockSkewS] = useState<number | null>(null);
+  useEffect(() => {
+    const controller = new AbortController();
+    const t0 = Date.now();
+    fetch('https://worldtimeapi.org/api/ip', { signal: controller.signal })
+      .then(r => r.json())
+      .then((data: { unixtime: number }) => {
+        const rtt      = Date.now() - t0;
+        const serverMs = data.unixtime * 1000 + rtt / 2;
+        const skewS    = (Date.now() - serverMs) / 1000;
+        setClockSkewS(skewS);
+      })
+      .catch(() => {}); // network error or offline — silently ignore
+    return () => controller.abort();
+  }, []);
 
   // Frozen VFO per decoded window: windowStart.getTime() → vfoHz at that moment.
   // Keyed by timestamp so entries survive result-array prepends without index shifting.
@@ -259,7 +277,14 @@ const FTDecoder = forwardRef<DecoderControls, { ftMode: FTMode; myCall?: string;
     onContactsChange?.(new Map());
     prevResultLenRef.current = 0;
     frozenVfoRef.current.clear();
-  }, [clearResults]);
+    // Restart audio capture to flush the ScriptProcessorNode and AudioContext —
+    // same effect as mode-switch; relieves main-thread audio callback buildup.
+    if (state.isRecording) {
+      stopRecording();
+      // Let the audio graph fully close before re-opening (~50ms is enough)
+      setTimeout(() => { startRecording(); }, 100);
+    }
+  }, [clearResults, state.isRecording, stopRecording, startRecording]);
 
   const handleImportADIF = useCallback((content: string) => {
     const records = parseADIF(content);
@@ -340,7 +365,8 @@ const FTDecoder = forwardRef<DecoderControls, { ftMode: FTMode; myCall?: string;
 
   // Use the VFO that was active at the moment each window was decoded (frozen).
   const tableRows: TableRow[] = useMemo(() => results.flatMap((r, ri) => {
-    const frozenVfo = frozenVfoRef.current.get(r.windowStart.getTime()) ?? 0;
+    // Fall back to the live VFO for the newest window whose entry isn't frozen yet
+    const frozenVfo = frozenVfoRef.current.get(r.windowStart.getTime()) ?? vfoRef.current;
     return [
       { kind: 'sep' as const, time: r.windowStart, mode: r.mode, empty: r.messages.length === 0, key: `sep-${ri}` },
       ...r.messages.map((m, mi) => {
@@ -422,6 +448,21 @@ const FTDecoder = forwardRef<DecoderControls, { ftMode: FTMode; myCall?: string;
             </div>
           )}
 
+          {clockSkewS !== null && Math.abs(clockSkewS) > 1 && (
+            <div className="mb-2 bg-[#e3b341]/10 border border-[#e3b341]/30 rounded-md p-2 text-[#e3b341] text-xs flex items-start gap-2 shrink-0">
+              <svg xmlns="http://www.w3.org/2000/svg" className="h-3.5 w-3.5 mt-0.5 shrink-0" viewBox="0 0 20 20" fill="currentColor">
+                <path fillRule="evenodd" d="M8.257 3.099c.765-1.36 2.722-1.36 3.486 0l5.58 9.92c.75 1.334-.213 2.98-1.742 2.98H4.42c-1.53 0-2.493-1.646-1.743-2.98l5.58-9.92zM11 13a1 1 0 11-2 0 1 1 0 012 0zm-1-8a1 1 0 00-1 1v3a1 1 0 002 0V6a1 1 0 00-1-1z" clipRule="evenodd" />
+              </svg>
+              <span>
+                <strong>Clock skew detected:</strong> your system clock is{' '}
+                {clockSkewS > 0
+                  ? `${clockSkewS.toFixed(1)} s ahead`
+                  : `${Math.abs(clockSkewS).toFixed(1)} s behind`}{' '}
+                UTC. FT8/FT4 requires sync within ±1 s — enable NTP to fix this.
+              </span>
+            </div>
+          )}
+
 
           <div className="flex-1 overflow-y-auto min-h-0 max-h-[60vh] lg:max-h-none font-mono text-xs">
             {results.length === 0 ? (
@@ -499,6 +540,7 @@ const FTDecoder = forwardRef<DecoderControls, { ftMode: FTMode; myCall?: string;
           analyser={analyser ?? null}
           isRecording={state.isRecording}
           vfoFrequency={vfoFrequency}
+          txMarkerHz={txAudioHz > 0 ? txAudioHz : undefined}
           className="min-w-0"
           style={{ flex: panelWeights[1] }}
         />

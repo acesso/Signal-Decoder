@@ -79,7 +79,7 @@ export function loadOutputDevice(): string {
 export function saveOutputDevice(v: string) {
   if (typeof window !== 'undefined') localStorage.setItem(LS_OUTPUT, v);
 }
-const DEFAULT_GAIN = Math.pow(10, -20 / 20); // -20 dB
+const DEFAULT_GAIN = Math.pow(10, -50 / 20); // -50 dB
 export function loadTxGain(): number {
   if (typeof window === 'undefined') return DEFAULT_GAIN;
   const stored = localStorage.getItem(LS_GAIN);
@@ -291,6 +291,18 @@ export function useFTTransmit(
     return ctx;
   }
 
+  // ── Sent log helpers ──────────────────────────────────────────────────────
+  // Drop the new entry if it is identical to the most-recent one (same message
+  // and no error) — prevents the log from filling with repeated auto-CQ rows.
+  // Cap at 50 entries total.
+
+  function dedupeAndCapSent(entry: SentEntry, prev: SentEntry[]): SentEntry[] {
+    if (!entry.error && prev.length > 0 && prev[0].message === entry.message) {
+      return prev; // suppress consecutive duplicate
+    }
+    return [entry, ...prev].slice(0, 50);
+  }
+
   // ── Transmit loop ─────────────────────────────────────────────────────────
 
   const runLoop = useCallback(async () => {
@@ -365,7 +377,7 @@ export function useFTTransmit(
           setState(prev => ({
             ...prev,
             queue: prev.queue.filter(q => q.id !== live.id),
-            sent: [sent, ...prev.sent].slice(0, 100),
+            sent: dedupeAndCapSent(sent, prev.sent),
             error: live.encodeError ?? 'Encode error',
           }));
           queueRef.current = queueRef.current.filter(q => q.id !== live.id);
@@ -393,8 +405,8 @@ export function useFTTransmit(
       const windowStartMs  = windowStart.getTime();
       const txWindowBucket = windowStartMs - (windowStartMs % windowMs);
       lastTxWindowRef.current = txWindowBucket;
-      // For auto-CQ, generate a unique sent-log id from the window timestamp
-      if (useAutoCQ) txId = `autocq-${txWindowBucket}`;
+      // For auto-CQ, generate a unique sent-log id from exact playback time
+      if (useAutoCQ) txId = `autocq-${windowStartMs}`;
       setState(prev => ({ ...prev, status: 'playing', error: null }));
 
       // Auto-PTT on — race with a 500ms timeout so a non-responsive CAT never blocks TX
@@ -446,7 +458,7 @@ export function useFTTransmit(
         ...prev, status: 'waiting',
         // Auto-CQ entries never enter the queue, so only filter for real entries
         queue: useAutoCQ ? prev.queue : prev.queue.filter(q => q.id !== txId),
-        sent: [sent, ...prev.sent].slice(0, 100),
+        sent: dedupeAndCapSent(sent, prev.sent),
       }));
       if (!useAutoCQ) {
         queueRef.current = queueRef.current.filter(q => q.id !== txId);
@@ -568,6 +580,10 @@ export function useFTTransmit(
     setState(prev => ({ ...prev, allowConsecutiveTx: v }));
   }, []);
 
+  const clearSent = useCallback(() => {
+    setState(prev => ({ ...prev, sent: [] }));
+  }, []);
+
   useEffect(() => () => { stop(); }, [stop]);
 
   return {
@@ -584,6 +600,7 @@ export function useFTTransmit(
     setTxGain,
     setAutoPTT,
     setAllowConsecutiveTx,
+    clearSent,
     isRunning: isRunningRef,
   };
 }

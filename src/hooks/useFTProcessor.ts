@@ -79,7 +79,7 @@ export function useFTProcessor(mode: FTMode) {
           const result: FTDecodeResult = { windowStart, mode: modeRef.current, messages, decodeMs };
           setState(prev => ({
             ...prev,
-            results: [result, ...prev.results].slice(0, 300),
+            results: [result, ...prev.results].slice(0, 100),
           }));
         });
     };

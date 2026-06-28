@@ -53,7 +53,6 @@ export interface RadioCATControls {
   setFrequency: (hz: number) => Promise<void>;
   setMode: (mode: CATMode) => Promise<void>;
   setPTT: (tx: boolean) => Promise<void>;
-  poll: () => Promise<void>;
 }
 
 // ── Kenwood TS-series CAT protocol ───────────────────────────────────────────
@@ -107,7 +106,8 @@ export function useRadioCAT(): RadioCATControls {
   const writerRef    = useRef<WritableStreamDefaultWriter<Uint8Array> | null>(null);
   const readerRef    = useRef<ReadableStreamDefaultReader<Uint8Array> | null>(null);
   const rxBufRef     = useRef<string>('');
-  const pollTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const pollTimerRef    = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const pollRunningRef  = useRef(false);
   const timeoutMsRef     = useRef<number>(50);
   const pollIntervalMsRef = useRef<number>(100);
   const debugRef     = useRef<boolean>(false);
@@ -139,9 +139,10 @@ export function useRadioCAT(): RadioCATControls {
     inflightRef.current = entry;
 
     const cmdStr = new TextDecoder().decode(entry.bytes).trim();
+    const qLen = queueRef.current.length; // already shifted, so this is remaining
 
     if (entry.prefix === null) {
-      log('debug', 'write ←', cmdStr);
+      log('debug', 'write ←', cmdStr, `[q:${qLen}]`);
       writerRef.current.write(entry.bytes).then(() => {
         entry.resolve('');
         inflightRef.current = null;
@@ -155,9 +156,15 @@ export function useRadioCAT(): RadioCATControls {
       return;
     }
 
-    log('debug', 'query ←', cmdStr, `(timeout ${timeoutMsRef.current}ms)`);
+    log('debug', 'query ←', cmdStr, `(timeout ${timeoutMsRef.current}ms) [q:${qLen}]`);
 
     entry.timer = setTimeout(() => {
+      // Flush any partial rx data — a timeout means the radio's response was
+      // lost or garbled; stale bytes in the buffer would corrupt the next reply.
+      if (rxBufRef.current.length > 0) {
+        log('debug', 'timeout: flushing rx buffer:', JSON.stringify(rxBufRef.current));
+        rxBufRef.current = '';
+      }
       log('debug', 'timeout for', cmdStr);
       inflightRef.current = null;
       entry.resolve('__timeout__');
@@ -183,7 +190,7 @@ export function useRadioCAT(): RadioCATControls {
       log('debug', 'unexpected →', msg.trim(), '(waiting for', inf.prefix + ')');
       return;
     }
-    log('debug', 'response →', msg.trim());
+    log('debug', 'response →', msg.trim(), `[q:${queueRef.current.length}]`);
     if (inf.timer) clearTimeout(inf.timer);
     inflightRef.current = null;
     inf.resolve(msg);
@@ -198,6 +205,10 @@ export function useRadioCAT(): RadioCATControls {
   }, [log]);
 
   const query = useCallback((cmd: string, isPoll = false): Promise<string> => {
+    // Deduplicate: if an identical command is already queued, skip it
+    if (queueRef.current.some(e => e.isPoll === isPoll && new TextDecoder().decode(e.bytes) === cmd)) {
+      return Promise.resolve('__dedup__');
+    }
     return new Promise<string>((resolve, reject) => {
       queueRef.current.push({
         bytes:  encoder.encode(cmd),
@@ -231,6 +242,12 @@ export function useRadioCAT(): RadioCATControls {
           const { value, done } = await reader.read();
           if (done) { log('debug', 'read loop: stream done'); break; }
           rxBufRef.current += dec.decode(value, { stream: true });
+          // Guard against unbounded growth from a radio sending malformed data
+          // with no ';' terminator — a Kenwood response is at most ~20 bytes.
+          if (rxBufRef.current.length > 256) {
+            log('warn', 'rx buffer overflow, flushing:', JSON.stringify(rxBufRef.current));
+            rxBufRef.current = '';
+          }
           let i: number;
           while ((i = rxBufRef.current.indexOf(';')) !== -1) {
             const msg = rxBufRef.current.slice(0, i + 1);
@@ -258,42 +275,58 @@ export function useRadioCAT(): RadioCATControls {
     return m ? (KENWOOD_MODE_MAP[m[1].toUpperCase()] ?? null) : null;
   };
 
-  // ── Poll ─────────────────────────────────────────────────────────────────
+  // ── Poll loop — self-scheduling setTimeout so the next poll only fires
+  // after the current one fully completes. This prevents poll buildup when
+  // the radio is slow or the USB-serial stack stalls. ─────────────────────
 
-  const poll = useCallback(async () => {
-    if (!writerRef.current) return;
-    if (queueRef.current.some(e => !e.isPoll)) return;
-
-    const safeQuery = async (cmd: string): Promise<string> => {
-      try { return await query(cmd, true); } catch { return ''; }
-    };
-
-    const now = Date.now();
-    const fr = await safeQuery('FA;');
-    const mr = await safeQuery('MD;');
-
-    const freq = parseFrequency(fr);
-    const mode = parseMode(mr);
-
-    log('debug', 'poll — freq:', freq, 'mode:', mode);
-
-    if (freq !== null || mode !== null) {
-      setState(prev => {
-        const ls = lastSetRef.current;
-        return {
-          ...prev,
-          frequency: freq !== null && (now - ls.frequency > SET_GRACE_MS) ? freq : prev.frequency,
-          mode:      mode !== null && (now - ls.mode      > SET_GRACE_MS) ? mode : prev.mode,
+  const schedulePoll = useCallback(() => {
+    if (pollTimerRef.current !== null) return; // already scheduled
+    pollTimerRef.current = setTimeout(async () => {
+      pollTimerRef.current = null;
+      if (!writerRef.current || pollRunningRef.current) {
+        // Port gone or previous poll still running — reschedule and skip
+        schedulePoll();
+        return;
+      }
+      pollRunningRef.current = true;
+      try {
+        if (queueRef.current.some(e => !e.isPoll)) {
+          // A user command (PTT/freq/mode) is pending — skip this poll cycle
+          return;
+        }
+        const safeQuery = async (cmd: string): Promise<string> => {
+          try { return await query(cmd, true); } catch { return ''; }
         };
-      });
-    }
-  }, [log, query]);
+        const now = Date.now();
+        const fr  = await safeQuery('FA;');
+        const mr  = await safeQuery('MD;');
+        const freq = parseFrequency(fr);
+        const mode = parseMode(mr);
+        log('debug', 'poll — freq:', freq, 'mode:', mode, `[q:${queueRef.current.length}]`);
+        if (freq !== null || mode !== null) {
+          setState(prev => {
+            const ls = lastSetRef.current;
+            return {
+              ...prev,
+              frequency: freq !== null && (now - ls.frequency > SET_GRACE_MS) ? freq : prev.frequency,
+              mode:      mode !== null && (now - ls.mode      > SET_GRACE_MS) ? mode : prev.mode,
+            };
+          });
+        }
+      } finally {
+        pollRunningRef.current = false;
+        // Only reschedule if still connected
+        if (writerRef.current) schedulePoll();
+      }
+    }, pollIntervalMsRef.current);
+  }, [log, query]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // ── Public API ───────────────────────────────────────────────────────────
 
   const disconnect = useCallback(() => {
     log('info', 'disconnecting');
-    if (pollTimerRef.current) { clearInterval(pollTimerRef.current); pollTimerRef.current = null; }
+    if (pollTimerRef.current) { clearTimeout(pollTimerRef.current); pollTimerRef.current = null; }
+    pollRunningRef.current = false;
     if (inflightRef.current) {
       if (inflightRef.current.timer) clearTimeout(inflightRef.current.timer);
       inflightRef.current.resolve('__disconnected__');
@@ -334,9 +367,8 @@ export function useRadioCAT(): RadioCATControls {
       readerRef.current = reader;
       startReadLoop(reader);
       setState(prev => ({ ...prev, connected: true, error: null }));
-      await poll();
       log('info', 'polling every', config.pollIntervalMs + 'ms');
-      pollTimerRef.current = setInterval(() => { poll(); }, config.pollIntervalMs);
+      schedulePoll();
     } catch (err) {
       log('info', 'connection failed:', err);
       setState(prev => ({
@@ -344,7 +376,7 @@ export function useRadioCAT(): RadioCATControls {
         error: err instanceof Error ? err.message : 'Connection failed',
       }));
     }
-  }, [log, startReadLoop, poll]);
+  }, [log, startReadLoop, schedulePoll]);
 
   const setFrequency = useCallback(async (hz: number) => {
     lastSetRef.current.frequency = Date.now();
@@ -368,5 +400,5 @@ export function useRadioCAT(): RadioCATControls {
 
   useEffect(() => () => { disconnect(); }, [disconnect]);
 
-  return { state, connect, disconnect, setFrequency, setMode, setPTT, poll };
+  return { state, connect, disconnect, setFrequency, setMode, setPTT };
 }

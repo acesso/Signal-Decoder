@@ -28,21 +28,51 @@ export const FT_SUPPORTED: Record<FTMode, boolean> = {
 };
 
 // ── Worker-backed decoder ─────────────────────────────────────────────────────
-// Lazily created; one worker persists for the page lifetime.
+// Lazily created. If the worker crashes or a request times out the worker is
+// replaced automatically so subsequent decode windows recover without a reload.
+
+const DECODE_TIMEOUT_MS = 30_000; // FT8 window is 15s; give WASM 2x that
+
 let worker: Worker | null = null;
 let nextId = 0;
-const pending = new Map<number, (msgs: FTMessage[]) => void>();
+const pending = new Map<number, { resolve: (msgs: FTMessage[]) => void; timer: ReturnType<typeof setTimeout> }>();
+
+function rejectAll(reason: string) {
+  for (const { resolve, timer } of pending.values()) {
+    clearTimeout(timer);
+    resolve([]); // resolve with empty rather than reject — callers just get no messages
+  }
+  pending.clear();
+  console.warn('[ft8 decoder] worker reset:', reason);
+}
+
+function spawnWorker(): Worker {
+  if (worker) {
+    worker.onmessage = null;
+    worker.onerror   = null;
+    try { worker.terminate(); } catch { /* ignore */ }
+  }
+  worker = new Worker(new URL('./decoder.worker.ts', import.meta.url));
+
+  worker.onmessage = (e: MessageEvent) => {
+    const { id, messages } = e.data as { id: number; messages: FTMessage[]; error?: string };
+    const entry = pending.get(id);
+    if (!entry) return;
+    clearTimeout(entry.timer);
+    entry.resolve(messages ?? []);
+    pending.delete(id);
+  };
+
+  worker.onerror = (err) => {
+    rejectAll(`worker error: ${err.message}`);
+    worker = null; // next call will spawn a fresh one
+  };
+
+  return worker;
+}
 
 function getWorker(): Worker {
-  if (!worker) {
-    worker = new Worker(new URL('./decoder.worker.ts', import.meta.url));
-    worker.onmessage = (e: MessageEvent) => {
-      const { id, messages } = e.data;
-      pending.get(id)?.(messages);
-      pending.delete(id);
-    };
-  }
-  return worker;
+  return worker ?? spawnWorker();
 }
 
 export async function decodeFTAudio(
@@ -54,7 +84,16 @@ export async function decodeFTAudio(
 
   const id = nextId++;
   return new Promise(resolve => {
-    pending.set(id, resolve);
+    const timer = setTimeout(() => {
+      if (!pending.has(id)) return;
+      pending.delete(id);
+      resolve([]);
+      console.warn(`[ft8 decoder] request ${id} timed out — respawning worker`);
+      rejectAll('timeout');
+      worker = null; // force respawn on next request
+    }, DECODE_TIMEOUT_MS);
+
+    pending.set(id, { resolve, timer });
     // Transfer the buffer — zero-copy, avoids serialisation overhead
     getWorker().postMessage({ id, samples, sampleRate, mode }, [samples.buffer]);
   });
