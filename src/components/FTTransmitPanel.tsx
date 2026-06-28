@@ -311,6 +311,15 @@ function SugMsgText({ message, myCall, contactColor }: { message: string; myCall
 
 // ── Main component ────────────────────────────────────────────────────────────
 
+export interface TxStatus {
+  status: string;       // 'idle' | 'waiting' | 'encoding' | 'playing'
+  isRunning: boolean;
+  queueLen: number;
+  pendingReplies: number; // contacts that have messaged us but we haven't replied yet
+  autoReply: boolean;
+  windowSec: number;
+}
+
 interface FTTransmitPanelProps {
   mode: FTMode;
   contacts: Map<string, Contact>;
@@ -318,9 +327,10 @@ interface FTTransmitPanelProps {
   onMyCallChange?: (call: string) => void;
   onMyGridChange?: (grid: string) => void;
   onSetPTT?: (tx: boolean) => Promise<void>;
+  onStatusChange?: (s: TxStatus) => void;
 }
 
-export default function FTTransmitPanel({ mode, contacts, vfoFrequency = 0, onMyCallChange, onMyGridChange, onSetPTT }: FTTransmitPanelProps) {
+export default function FTTransmitPanel({ mode, contacts, vfoFrequency = 0, onMyCallChange, onMyGridChange, onSetPTT, onStatusChange }: FTTransmitPanelProps) {
   const [myCall, setMyCallState]   = useState(() => { const v = loadMyCall(); return v; });
   const [myGrid, setMyGridState]   = useState(() => loadMyGrid());
   const [baseFreq, setBaseFreqState] = useState(() => loadBaseFreq());
@@ -399,16 +409,20 @@ export default function FTTransmitPanel({ mode, contacts, vfoFrequency = 0, onMy
     if (!isRunning) autoRepliedRef.current.clear();
   }, [isRunning]);
 
-  // Use a ref so the effect always reads the live value without being a dep
-  const autoReplyRef  = useRef(autoReply);
-  const isRunningRef2 = useRef(isRunning);
-  const canOperateRef = useRef(canOperate);
-  useEffect(() => { autoReplyRef.current  = autoReply;  }, [autoReply]);
-  useEffect(() => { isRunningRef2.current = isRunning;  }, [isRunning]);
-  useEffect(() => { canOperateRef.current = canOperate; }, [canOperate]);
+  // Report status to parent (for collapsed summary display)
+  useEffect(() => {
+    if (!onStatusChange) return;
+    const myCallUp = myCall.toUpperCase();
+    let pendingReplies = 0;
+    for (const c of contacts.values()) {
+      const addressedUs = c.msgs.some(m => m.role === 'tx' && m.parsed.callee?.toUpperCase() === myCallUp);
+      if (addressedUs) pendingReplies++;
+    }
+    onStatusChange({ status: state.status, isRunning, queueLen: state.queue.length, pendingReplies, autoReply, windowSec: FT_WINDOW_SECONDS[mode] ?? 15 });
+  }, [state.status, isRunning, state.queue.length, contacts, myCall, autoReply, mode, onStatusChange]);
 
   useEffect(() => {
-    if (!autoReplyRef.current || !isRunningRef2.current || !canOperateRef.current) return;
+    if (!autoReply || !isRunning || !canOperate) return;
     const myCallUp = myCall.toUpperCase();
     const myGridUp = myGrid.toUpperCase();
 
@@ -423,11 +437,11 @@ export default function FTTransmitPanel({ mode, contacts, vfoFrequency = 0, onMy
       if (theirMsgsToUs.length === 0) continue;
 
       // What we've already sent them — read from the TX sent log, not from decoded
-      // contacts (our own transmissions are never decoded back by the receiver)
-      const sentToThem = state.sent.filter(e => {
-        const parsed = parseFTMsg(e.message);
-        return parsed.callee?.toUpperCase() === callsign || parsed.caller?.toUpperCase() === myCallUp;
-      }).filter(e => parseFTMsg(e.message).callee?.toUpperCase() === callsign);
+      // contacts (our own transmissions are never decoded back by the receiver).
+      // state.sent is newest-first, so filter then take index 0 for the most recent.
+      const sentToThem = state.sent.filter(e =>
+        parseFTMsg(e.message).callee?.toUpperCase() === callsign
+      );
 
       // Fingerprint: re-fire whenever either side has a new message
       const fingerprint = `${theirMsgsToUs.length}|${sentToThem.length}`;
@@ -436,8 +450,8 @@ export default function FTTransmitPanel({ mode, contacts, vfoFrequency = 0, onMy
       const lastTheirMsg  = theirMsgsToUs[theirMsgsToUs.length - 1];
       const lastTheirType = lastTheirMsg.parsed.type;
 
-      // Derive last sent type from the sent log
-      const lastSentMsg  = sentToThem.length ? sentToThem[sentToThem.length - 1] : null;
+      // state.sent is newest-first — index 0 is the most recently sent message
+      const lastSentMsg  = sentToThem.length ? sentToThem[0] : null;
       const lastSentType = lastSentMsg ? parseFTMsg(lastSentMsg.message).type : null;
 
       // For the very first reply to a station, treat as if we just sent CQ
@@ -462,7 +476,7 @@ export default function FTTransmitPanel({ mode, contacts, vfoFrequency = 0, onMy
       autoRepliedRef.current.set(callsign, fingerprint);
       enqueueFirst({ id: uid(), message, label: `Auto → ${contact.callsign} (${labelMap[nextType] ?? nextType})` });
     }
-  }, [contacts, myCall, myGrid, state.queue, state.sent, enqueueFirst]);
+  }, [contacts, myCall, myGrid, state.queue, state.sent, enqueueFirst, autoReply, isRunning, canOperate]);
 
   // ── Suggestion sort / filter state ──────────────────────────────────────────
   type SugSort = 'default' | 'snr-hi' | 'snr-lo' | 'near' | 'far';

@@ -90,6 +90,7 @@ export function resolveGridLocation(grid: string, latLon: [number, number]): Pro
 // support, so the data lookup goes through hamdb.org instead; the visible
 // callsign link in the UI still points at qrz.com.
 
+const OP_CACHE_MAX = 1000;
 const opCache   = new Map<string, OperatorInfo | null>();
 const opPending = new Map<string, Promise<OperatorInfo | null>>();
 
@@ -116,6 +117,10 @@ export function lookupOperator(callsign: string): Promise<OperatorInfo | null> {
   const task = fetchOperator(base)
     .catch(() => null)
     .then(info => {
+      if (opCache.size >= OP_CACHE_MAX) {
+        const first = opCache.keys().next().value;
+        if (first !== undefined) opCache.delete(first);
+      }
       opCache.set(base, info);
       opPending.delete(base);
       return info;
@@ -123,3 +128,7 @@ export function lookupOperator(callsign: string): Promise<OperatorInfo | null> {
   opPending.set(base, task);
   return task;
 }
+
+// ── Cache size accessors (for debug instrumentation) ──────────────────────────
+export function getGeoCacheSize(): number { return geoCache.size; }
+export function getOpCacheSize(): number  { return opCache.size; }
