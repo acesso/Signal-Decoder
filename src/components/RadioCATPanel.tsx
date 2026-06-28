@@ -57,7 +57,7 @@ function FrequencyInput({ frequency, onCommit }: {
 }) {
   const [editing, setEditing]   = useState(false);
   const [draft,   setDraft]     = useState('');
-  const [unit,    setUnit]      = useState<FreqUnit>('MHz');
+  const [unit,    setUnit]      = useState<FreqUnit>('KHz');
   const inputRef = useRef<HTMLInputElement>(null);
 
   const startEdit = () => {
@@ -282,9 +282,9 @@ function SettingsPanel({ config, onConfigChange, onConnect }: {
         <div className="flex flex-col gap-1.5">
           <label className="text-[10px] font-semibold uppercase tracking-widest text-[#8b949e]">Query Interval (ms)</label>
           <input
-            type="number" min={50} max={10000} step={50}
+            type="number" min={200} max={10000} step={100}
             value={config.pollIntervalMs}
-            onChange={e => onConfigChange({ ...config, pollIntervalMs: Math.max(50, Math.min(10000, Number(e.target.value))) })}
+            onChange={e => onConfigChange({ ...config, pollIntervalMs: Math.max(200, Math.min(10000, Number(e.target.value))) })}
             className="bg-[#0d1117] border border-[#30363d] text-[#c9d1d9] text-xs rounded px-2 py-1.5 focus:outline-none focus:border-[#388bfd] font-mono"
           />
         </div>
@@ -329,7 +329,7 @@ function SettingsPanel({ config, onConfigChange, onConnect }: {
 const DEFAULT_CONFIG: CATConnectionConfig & { presetIdx: number } = {
   presetIdx: 0,
   baudRate: 38400, dataBits: 8, stopBits: 1, parity: 'none',
-  timeoutMs: 50, pollIntervalMs: 100, debug: false,
+  timeoutMs: 200, pollIntervalMs: 500, debug: false,
 };
 
 export default function RadioCATPanel({ cat }: { cat: ReturnType<typeof useRadioCAT> }) {

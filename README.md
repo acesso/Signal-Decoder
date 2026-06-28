@@ -332,6 +332,42 @@ npm run build
 npm start
 ```
 
+### FT8/FT4 WASM Decoder
+
+The FT8/FT4 decoder is powered by a native C library ([kgoba/ft8_lib](https://github.com/kgoba/ft8_lib)) compiled to WebAssembly. The compiled output (`public/wasm/ft8.js` and `public/wasm/ft8.wasm`) is committed to the repository, so **no rebuild is needed for normal development or deployment**.
+
+The C source is included as a git submodule at `lib/ft8_lib`. When cloning for the first time, initialize it with:
+
+```bash
+git clone --recurse-submodules https://github.com/acesso/Signal-Decoder.git
+# or, if you already cloned without --recurse-submodules:
+git submodule update --init
+```
+
+#### Rebuilding the WASM (only needed if ft8_lib changes)
+
+Requires [Docker](https://docs.docker.com/get-docker/). Run from the **project root**:
+
+```bash
+docker run --rm \
+  -v "$(pwd):/src" \
+  -w /src/lib/wasm_build \
+  emscripten/emsdk \
+  make
+```
+
+Output is written to `public/wasm/ft8.{js,wasm}`. Commit both files after rebuilding.
+
+To clean and rebuild from scratch:
+
+```bash
+docker run --rm \
+  -v "$(pwd):/src" \
+  -w /src/lib/wasm_build \
+  emscripten/emsdk \
+  make clean all
+```
+
 ## How to Use
 
 Select a mode from the top tab bar (RTTY / CW / SSTV / FT / MFSK), then click **Start** and allow microphone access when prompted.

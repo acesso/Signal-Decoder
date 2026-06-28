@@ -183,6 +183,7 @@ interface Suggestion {
   label: string;
   callsign?: string;
   color?: string;
+  isCQ?: boolean; // contact's last heard message was a CQ
   countryCode?: string;
   // true when the contact has directly addressed our callsign — warrants highlight
   repliedToMe: boolean;
@@ -268,6 +269,7 @@ function buildSuggestions(myCall: string, myGrid: string, contacts: Map<string, 
     };
 
     const pfx = callsignCountry(c.callsign);
+    const lastTxParsedType = theirMsgs[theirMsgs.length - 1]?.parsed.type;
     sugs.push({
       type: nextTxType as MsgType,
       message,
@@ -275,6 +277,7 @@ function buildSuggestions(myCall: string, myGrid: string, contacts: Map<string, 
       callsign: c.callsign,
       color: c.color,
       countryCode: pfx?.countryCode,
+      isCQ: lastTxParsedType === 'cq',
       repliedToMe,
       thread,
       maxSnr: c.msgs.reduce((best, m) => m.snr > best ? m.snr : best, -99),
@@ -318,6 +321,7 @@ export interface TxStatus {
   pendingReplies: number; // contacts that have messaged us but we haven't replied yet
   autoReply: boolean;
   windowSec: number;
+  txAudioHz: number;    // current TX audio frequency in Hz (baseFreq)
 }
 
 interface FTTransmitPanelProps {
@@ -328,9 +332,10 @@ interface FTTransmitPanelProps {
   onMyGridChange?: (grid: string) => void;
   onSetPTT?: (tx: boolean) => Promise<void>;
   onStatusChange?: (s: TxStatus) => void;
+  onReset?: (clearSentFn: () => void) => void;
 }
 
-export default function FTTransmitPanel({ mode, contacts, vfoFrequency = 0, onMyCallChange, onMyGridChange, onSetPTT, onStatusChange }: FTTransmitPanelProps) {
+export default function FTTransmitPanel({ mode, contacts, vfoFrequency = 0, onMyCallChange, onMyGridChange, onSetPTT, onStatusChange, onReset }: FTTransmitPanelProps) {
   const [myCall, setMyCallState]   = useState(() => { const v = loadMyCall(); return v; });
   const [myGrid, setMyGridState]   = useState(() => loadMyGrid());
   const [baseFreq, setBaseFreqState] = useState(() => loadBaseFreq());
@@ -342,12 +347,15 @@ export default function FTTransmitPanel({ mode, contacts, vfoFrequency = 0, onMy
   const [isRunning, setIsRunning]  = useState(false);
   const [geoStatus, setGeoStatus]  = useState<'idle' | 'loading' | 'done' | 'denied'>('idle');
 
-  const { state, start, stop, enqueue, enqueueFirst, dequeue, moveUp, setAutoCQ, setAutoCQMessage, setOutputDevice, setTxGain, setAutoPTT, setAllowConsecutiveTx } =
+  const { state, start, stop, enqueue, enqueueFirst, dequeue, moveUp, setAutoCQ, setAutoCQMessage, setOutputDevice, setTxGain, setAutoPTT, setAllowConsecutiveTx, clearSent } =
     useFTTransmit(mode, baseFreq, vfoFrequency, onSetPTT);
 
+  // Register clearSent with parent so the global Reset button can clear TX history
+  useEffect(() => { onReset?.(clearSent); }, [onReset, clearSent]);
+
   // dB ↔ linear helpers (slider operates in dB, GainNode needs linear)
-  const gainToDb  = (g: number) => g <= 0 ? -40 : 20 * Math.log10(g);
-  const dbToGain  = (db: number) => db <= -40 ? 0 : Math.pow(10, db / 20);
+  const gainToDb  = (g: number) => g <= 0 ? -60 : 20 * Math.log10(g);
+  const dbToGain  = (db: number) => db <= -60 ? 0 : Math.pow(10, db / 20);
   const txDb      = Math.round(gainToDb(state.txGain));
 
   // Push persisted callsign/grid to parent on first render
@@ -418,8 +426,8 @@ export default function FTTransmitPanel({ mode, contacts, vfoFrequency = 0, onMy
       const addressedUs = c.msgs.some(m => m.role === 'tx' && m.parsed.callee?.toUpperCase() === myCallUp);
       if (addressedUs) pendingReplies++;
     }
-    onStatusChange({ status: state.status, isRunning, queueLen: state.queue.length, pendingReplies, autoReply, windowSec: FT_WINDOW_SECONDS[mode] ?? 15 });
-  }, [state.status, isRunning, state.queue.length, contacts, myCall, autoReply, mode, onStatusChange]);
+    onStatusChange({ status: state.status, isRunning, queueLen: state.queue.length, pendingReplies, autoReply, windowSec: FT_WINDOW_SECONDS[mode] ?? 15, txAudioHz: baseFreq });
+  }, [state.status, isRunning, state.queue.length, contacts, myCall, autoReply, mode, onStatusChange, baseFreq]);
 
   useEffect(() => {
     if (!autoReply || !isRunning || !canOperate) return;
@@ -483,6 +491,7 @@ export default function FTTransmitPanel({ mode, contacts, vfoFrequency = 0, onMy
   const [sugSort,          setSugSort]          = useState<SugSort>('default');
   const [sugCountryFilter, setSugCountryFilter] = useState('');
   const [sugMyOnly,        setSugMyOnly]        = useState(false);
+  const [sugCQOnly,        setSugCQOnly]        = useState(false);
 
   const DISPLAY_LIMIT = 8;
 
@@ -524,6 +533,7 @@ export default function FTTransmitPanel({ mode, contacts, vfoFrequency = 0, onMy
     const filteredSugs = contactSugs.filter(s => {
       if (sugMyOnly && s.thread.length === 0) return false;
       if (sugCountryFilter && s.countryCode !== sugCountryFilter) return false;
+      if (sugCQOnly && !s.isCQ) return false;
       return true;
     });
     const sortedSugs = [...filteredSugs].sort((a, b) => {
@@ -535,7 +545,7 @@ export default function FTTransmitPanel({ mode, contacts, vfoFrequency = 0, onMy
     });
     return [cqSug, ...sortedSugs.slice(0, DISPLAY_LIMIT - 1)];
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [allSuggestions, sugSort, sugCountryFilter, sugMyOnly, distKm]);
+  }, [allSuggestions, sugSort, sugCountryFilter, sugMyOnly, sugCQOnly, distKm]);
 
   const addSuggestion = (sug: Suggestion) => {
     if (!canOperate) return;
@@ -605,7 +615,7 @@ export default function FTTransmitPanel({ mode, contacts, vfoFrequency = 0, onMy
           </label>
           <div className="flex items-center gap-2">
             <input type="range"
-              min={-40} max={0} step={1}
+              min={-60} max={0} step={1}
               value={txDb}
               onChange={e => setTxGain(dbToGain(Number(e.target.value)))}
               className="w-28 accent-[#388bfd] cursor-pointer"
@@ -776,6 +786,20 @@ export default function FTTransmitPanel({ mode, contacts, vfoFrequency = 0, onMy
                     My QSOs
                   </button>
                 )}
+                {/* CQ-only filter */}
+                {contactSugs.some(s => s.isCQ) && (
+                  <button
+                    onClick={() => setSugCQOnly(v => !v)}
+                    title="Show only stations that are calling CQ"
+                    className={`text-[9px] font-mono px-1.5 py-0.5 rounded border transition-colors ${
+                      sugCQOnly
+                        ? 'border-[#2ea043]/50 text-[#2ea043] bg-[#2ea043]/10'
+                        : 'border-[#30363d] text-[#484f58] hover:text-[#8b949e]'
+                    }`}
+                  >
+                    CQ only
+                  </button>
+                )}
                 {/* Country select */}
                 {sugCountryOptions.length > 1 && (
                   <select
@@ -794,9 +818,9 @@ export default function FTTransmitPanel({ mode, contacts, vfoFrequency = 0, onMy
                     ))}
                   </select>
                 )}
-                {(sugSort !== 'default' || sugCountryFilter || sugMyOnly) && (
+                {(sugSort !== 'default' || sugCountryFilter || sugMyOnly || sugCQOnly) && (
                   <button
-                    onClick={() => { setSugSort('default'); setSugCountryFilter(''); setSugMyOnly(false); }}
+                    onClick={() => { setSugSort('default'); setSugCountryFilter(''); setSugMyOnly(false); setSugCQOnly(false); }}
                     className="text-[9px] font-mono px-1 py-0.5 rounded border border-[#30363d] text-[#484f58] hover:text-[#8b949e]"
                     title="Reset sort and filters"
                   >

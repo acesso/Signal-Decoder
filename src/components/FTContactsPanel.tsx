@@ -4,7 +4,7 @@ import dynamic from 'next/dynamic';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import {
-  Contact, ContactMsg, MSG_TYPE_LABEL, MSG_TYPE_COLOR, generateADIF, parseADIF, gridToLatLon, haversineKm,
+  Contact, ContactMsg, MSG_TYPE_LABEL, MSG_TYPE_COLOR, generateADIF, parseADIF, gridToLatLon, haversineKm, isConfirmedQSO,
 } from '@/lib/ft/parser';
 import { callsignCountry } from '@/lib/ft/prefixes';
 
@@ -699,6 +699,10 @@ export default function FTContactsPanel({ contacts, mode, myCall = '', myGrid = 
   const importFileRef = useRef<HTMLInputElement>(null);
   const [importStatus, setImportStatus] = useState<{ count: number; err?: string } | null>(null);
 
+  const confirmedQSOCount = myCall
+    ? [...contacts.values()].filter(c => isConfirmedQSO(c, myCall)).length
+    : 0;
+
   function downloadADIF() {
     const content = generateADIF(contacts, mode, { myCall, myGrid, vfoHz });
     const blob = new Blob([content], { type: 'text/plain;charset=utf-8' });
@@ -766,10 +770,13 @@ export default function FTContactsPanel({ contacts, mode, myCall = '', myGrid = 
             <>
               <button
                 onClick={downloadADIF}
-                className="text-xs px-2 py-0.5 rounded border border-[#30363d] text-[#8b949e] hover:text-[#79c0ff] hover:border-[#79c0ff]/40 transition-colors font-mono"
-                title="Download ADIF log (.adi)"
+                disabled={confirmedQSOCount === 0}
+                className="text-xs px-2 py-0.5 rounded border border-[#30363d] text-[#8b949e] hover:text-[#79c0ff] hover:border-[#79c0ff]/40 transition-colors font-mono disabled:opacity-40 disabled:cursor-not-allowed"
+                title={confirmedQSOCount > 0
+                  ? `Download ADIF log — ${confirmedQSOCount} confirmed QSO${confirmedQSOCount !== 1 ? 's' : ''} (SWL entries excluded)`
+                  : 'No confirmed two-way QSOs to export yet'}
               >
-                export
+                export{confirmedQSOCount > 0 ? ` (${confirmedQSOCount})` : ''}
               </button>
               <button
                 onClick={onClearContacts}

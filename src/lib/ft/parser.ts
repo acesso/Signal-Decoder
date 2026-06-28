@@ -375,6 +375,63 @@ export interface ADIFOptions {
   vfoHz?: number;
 }
 
+const REPORT_TYPES: ReadonlySet<MsgType> = new Set(['report', 'r_report']);
+const CLOSING_TYPES: ReadonlySet<MsgType> = new Set(['rr73', 'rrr', 'tx73']);
+const REOPEN_TYPES:  ReadonlySet<MsgType> = new Set(['cq', 'answer']);
+
+// Segment a contact's messages into discrete QSO exchanges.
+// A new segment starts at the first message and restarts whenever a closing
+// message (RR73/RRR/73) is followed by a CQ or answer from either side.
+function segmentQSOs(msgs: ContactMsg[]): ContactMsg[][] {
+  if (msgs.length === 0) return [];
+  const sorted = [...msgs].sort((a, b) => a.windowStart.getTime() - b.windowStart.getTime());
+  const segments: ContactMsg[][] = [];
+  let current: ContactMsg[] = [];
+  let pendingClose = false;
+
+  for (const m of sorted) {
+    if (pendingClose && REOPEN_TYPES.has(m.parsed.type)) {
+      if (current.length > 0) segments.push(current);
+      current = [];
+      pendingClose = false;
+    }
+    current.push(m);
+    if (CLOSING_TYPES.has(m.parsed.type)) pendingClose = true;
+  }
+  if (current.length > 0) segments.push(current);
+  return segments;
+}
+
+// Returns true if the segment/contact's messages constitute a confirmed two-way QSO.
+// Rules:
+//   1. Both sides must have transmitted to each other (basic handshake).
+//   2. At least one signal report must have been exchanged in either direction:
+//      - They sent me a report (they reported my signal), OR
+//      - I sent them a report (I reported their signal).
+//   This covers all standard FT8 QSO flows regardless of who called CQ.
+// Without myCall we cannot determine participation, so all contacts pass through.
+function segmentIsConfirmed(msgs: ContactMsg[], me: string): boolean {
+  // Messages I transmitted (I am the caller, role='tx' on my contact entry)
+  const iSent    = msgs.filter(m => m.role === 'tx' && m.parsed.caller?.toUpperCase() === me);
+  // Messages they transmitted to me (they are the caller, callee=me, role='tx' on their entry
+  // but stored as role='rx' on my contact because I was addressed)
+  const theySent = msgs.filter(m => m.role === 'rx' && m.parsed.callee?.toUpperCase() === me);
+  if (iSent.length === 0 || theySent.length === 0) return false;
+  const iSentReport    = iSent.some(m => REPORT_TYPES.has(m.parsed.type));
+  const theySentReport = theySent.some(m => REPORT_TYPES.has(m.parsed.type));
+  return iSentReport || theySentReport;
+}
+
+export function isConfirmedQSO(c: Contact, myCall: string): boolean {
+  if (!myCall) return true;
+  return segmentIsConfirmed(c.msgs, myCall.toUpperCase());
+}
+
+function confirmedSegments(c: Contact, me: string): ContactMsg[][] {
+  if (!me) return [c.msgs];
+  return segmentQSOs(c.msgs).filter(seg => segmentIsConfirmed(seg, me));
+}
+
 export function generateADIF(
   contacts: Map<string, Contact>,
   ftMode: FTMode,
@@ -393,52 +450,59 @@ export function generateADIF(
     '',
   ];
 
-  // Deduplicate: one record per callsign, using the first QSO window
-  const seen = new Set<string>();
+  const me = (myCall ?? '').toUpperCase();
 
   for (const c of contacts.values()) {
-    if (seen.has(c.callsign)) continue;
-    seen.add(c.callsign);
+    // Each confirmed QSO segment with this callsign becomes a separate ADIF record.
+    for (const seg of confirmedSegments(c, me)) {
+      // Messages I transmitted: role='tx' on my contact, I am the caller
+      const iSentMsgs    = seg.filter(m => m.role === 'tx' && m.parsed.caller?.toUpperCase() === me);
+      // Messages they transmitted to me: role='rx' on my contact (I was addressed), they are caller
+      const theySentMsgs = seg.filter(m => m.role === 'rx' && m.parsed.callee?.toUpperCase() === me);
 
-    const txMsgs = c.msgs.filter(m => m.role === 'tx');
-    const rxMsgs = c.msgs.filter(m => m.role === 'rx');
-    const bestSnrTx = txMsgs.length > 0
-      ? txMsgs.reduce((best, m) => m.snr > best ? m.snr : best, -99)
-      : undefined;
-    const bestSnrRx = rxMsgs.length > 0
-      ? rxMsgs.reduce((best, m) => m.snr > best ? m.snr : best, -99)
-      : undefined;
+      // RST_RCVD = best SNR on signals I received from them (their tx, stored as my rx)
+      const bestSnrRcvd = theySentMsgs.reduce((best, m) => m.snr > best ? m.snr : best, -99);
+      // RST_SENT = the report value I sent them (in my tx messages of type report/r_report)
+      const reportedSnr = iSentMsgs
+        .filter(m => REPORT_TYPES.has(m.parsed.type))
+        .map(m => m.parsed.report)
+        .filter((v): v is number => v !== undefined);
+      const bestSnrSent = reportedSnr.length > 0
+        ? reportedSnr.reduce((a, b) => a > b ? a : b)
+        : undefined;
 
-    // Derive absolute frequency: prefer the stored freq on the first tx message
-    // (already absolute when VFO was set at decode time), fall back to vfoHz arg.
-    const firstMsg  = (txMsgs[0] ?? rxMsgs[0]);
-    const absHz     = firstMsg
-      ? (firstMsg.freq > 1_000_000 ? firstMsg.freq : (vfoHz > 0 ? vfoHz + firstMsg.freq : 0))
-      : (vfoHz > 0 ? vfoHz : 0);
-    const freqMhz   = absHz > 0 ? absHz / 1_000_000 : 0;
-    const band      = freqMhz > 0 ? freqMhzToBand(freqMhz) : undefined;
+      // QSO start = first exchange message in this segment
+      const allExchange = [...iSentMsgs, ...theySentMsgs].sort(
+        (a, b) => a.windowStart.getTime() - b.windowStart.getTime(),
+      );
+      const qsoStart = allExchange[0]?.windowStart ?? c.firstSeen;
 
-    const fields: [string, string][] = [
-      ['CALL',     c.callsign],
-      ...adifMode(ftMode),
-      ['QSO_DATE', adifDate(c.firstSeen)],
-      ['TIME_ON',  adifTime(c.firstSeen)],
-    ];
+      const firstMsg = allExchange[0];
+      const absHz = firstMsg
+        ? (firstMsg.freq > 1_000_000 ? firstMsg.freq : (vfoHz > 0 ? vfoHz + firstMsg.freq : 0))
+        : (vfoHz > 0 ? vfoHz : 0);
+      const freqMhz = absHz > 0 ? absHz / 1_000_000 : 0;
+      const band    = freqMhz > 0 ? freqMhzToBand(freqMhz) : undefined;
 
-    if (band)                    fields.push(['BAND',      band]);
-    if (freqMhz > 0)             fields.push(['FREQ',      freqMhz.toFixed(6)]);
-    if (c.grid)                  fields.push(['GRIDSQUARE', c.grid]);
-    if (bestSnrTx !== undefined) fields.push(['RST_RCVD',  `${bestSnrTx >= 0 ? '+' : ''}${bestSnrTx}`]);
-    if (bestSnrRx !== undefined) fields.push(['RST_SENT',  `${bestSnrRx >= 0 ? '+' : ''}${bestSnrRx}`]);
-    if (myCall)                  fields.push(['STATION_CALLSIGN', myCall.toUpperCase()]);
-    if (myGrid)                  fields.push(['MY_GRIDSQUARE',    myGrid.toUpperCase()]);
+      const fields: [string, string][] = [
+        ['CALL',     c.callsign],
+        ...adifMode(ftMode),
+        ['QSO_DATE', adifDate(qsoStart)],
+        ['TIME_ON',  adifTime(qsoStart)],
+      ];
 
-    const comment = txMsgs.length > 0
-      ? `heard direct: ${txMsgs.length} tx; addressed: ${rxMsgs.length} rx`
-      : `callsign seen as addressee only; ${rxMsgs.length} msgs`;
-    fields.push(['COMMENT', comment]);
+      if (band)       fields.push(['BAND',           band]);
+      if (freqMhz > 0) fields.push(['FREQ',          freqMhz.toFixed(6)]);
+      if (c.grid)     fields.push(['GRIDSQUARE',      c.grid]);
+      fields.push(['RST_RCVD', `${bestSnrRcvd >= 0 ? '+' : ''}${bestSnrRcvd}`]);
+      if (bestSnrSent !== undefined)
+        fields.push(['RST_SENT', `${bestSnrSent >= 0 ? '+' : ''}${bestSnrSent}`]);
+      if (myCall)     fields.push(['STATION_CALLSIGN', me]);
+      if (myGrid)     fields.push(['MY_GRIDSQUARE',    myGrid.toUpperCase()]);
+      fields.push(['COMMENT', `FT8 QSO: ${iSentMsgs.length} sent, ${theySentMsgs.length} rcvd`]);
 
-    lines.push(fields.map(([k, v]) => af(k, v)).join(' ') + ' <EOR>');
+      lines.push(fields.map(([k, v]) => af(k, v)).join(' ') + ' <EOR>');
+    }
   }
 
   return lines.join('\n') + '\n';
