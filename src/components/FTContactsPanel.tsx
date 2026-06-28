@@ -6,8 +6,8 @@ import { createPortal } from 'react-dom';
 import {
   Contact, ContactMsg, MSG_TYPE_LABEL, MSG_TYPE_COLOR, generateADIF, parseADIF, gridToLatLon, haversineKm,
 } from '@/lib/ft/parser';
-import { GeoInfo, OperatorInfo, resolveGridLocation, lookupOperator } from '@/lib/ft/lookup';
 import { callsignCountry } from '@/lib/ft/prefixes';
+
 import type { FTMode } from '@/lib/ft/decoder';
 import { fmtAbsHz } from '@/lib/formatFreq';
 
@@ -33,35 +33,21 @@ function localHMS(d: Date): string {
   return d.toLocaleTimeString(undefined, { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
 }
 
-function gridWithFlag(grid: string, geoMap: Map<string, GeoInfo>): string {
-  const flag = geoMap.get(grid)?.flag;
-  return flag ? `${flag} ${grid}` : grid;
-}
-
 interface LocationParts {
   flag: string;
   country: string;
   grids: string;
 }
 
-function locationParts(contact: Contact, geoMap: Map<string, GeoInfo>): LocationParts | null {
-  const geo     = contact.grid ? geoMap.get(contact.grid) : undefined;
+function locationParts(contact: Contact): LocationParts | null {
   const pfx     = callsignCountry(contact.callsign);
-  const flag    = geo?.flag ?? pfx?.flag ?? '';
-  const country = geo?.country ?? pfx?.country ?? '';
+  const flag    = pfx?.flag ?? '';
+  const country = pfx?.country ?? '';
   const grids   = contact.grid
     ? contact.grid + (contact.grids.length > 1 ? ` +${contact.grids.length - 1}` : '')
     : '';
   if (!flag && !country && !grids) return null;
   return { flag, country, grids };
-}
-
-// Keep the string version for places that already use it as text
-function locationLabel(contact: Contact, geoMap: Map<string, GeoInfo>): string | null {
-  const p = locationParts(contact, geoMap);
-  if (!p) return null;
-  const parts = [p.flag, p.country, p.grids].filter(Boolean);
-  return parts.length ? parts.join(' ') : null;
 }
 
 function qrzUrl(callsign: string): string {
@@ -188,15 +174,13 @@ function ConversationBalloon({
 // ── Contact card ──────────────────────────────────────────────────────────────
 
 function ContactCard({
-  contact, expanded, onToggle, onSelect, contactMap, geoMap, op, myCall = '',
+  contact, expanded, onToggle, onSelect, contactMap, myCall = '',
 }: {
   contact: Contact;
   expanded: boolean;
   onToggle: () => void;
   onSelect: (callsign: string) => void;
   contactMap: Map<string, Contact>;
-  geoMap: Map<string, GeoInfo>;
-  op?: OperatorInfo;
   myCall?: string;
 }) {
   const [hoveredPeer, setHoveredPeer] = useState<string | null>(null);
@@ -241,8 +225,7 @@ function ContactCard({
   }
   const history = groups.slice(-12);
 
-  const loc     = locationLabel(contact, geoMap);
-  const locParts = locationParts(contact, geoMap);
+  const locParts = locationParts(contact);
   const longest = expanded ? longestDistances(contact, contactMap) : { tx: null, rx: null };
 
   // Split peers into groups
@@ -277,7 +260,7 @@ function ContactCard({
           className="text-[9px] font-mono font-bold hover:underline"
           style={{ color: pc?.color ?? '#8b949e' }}
         >
-          {peer}{pc?.grid ? ` ${gridWithFlag(pc.grid, geoMap)}` : ''}
+          {peer}{pc?.grid ? ` ${pc.grid}` : ''}
         </button>
         {hoveredPeer === peer && balloonPos && (
           <ConversationBalloon
@@ -336,7 +319,7 @@ function ContactCard({
         )}
         {locParts && (
           <span className="font-mono text-[10px] text-[#484f58] flex items-center gap-1 truncate min-w-0"
-            title={contact.grids.map(g => gridWithFlag(g, geoMap)).join(' · ')}>
+            title={contact.grids.join(' · ')}>
             {locParts.flag && (
               <span title={locParts.country} className="not-italic">{locParts.flag}</span>
             )}
@@ -374,23 +357,13 @@ function ContactCard({
       {/* Expanded history */}
       {expanded && (
         <div className="border-t border-[#21262d] bg-[#0d1117]/70 px-2.5 py-2">
-          {op && (op.name || op.email) && (
-            <div className="mb-1.5 pb-1.5 border-b border-[#21262d] text-[10px] font-mono flex items-center gap-1.5 flex-wrap">
-              <span className="text-[#484f58]">op:</span>
-              {op.name && <span className="text-[#c9d1d9]">{op.name}</span>}
-              {op.email && (
-                <a href={`mailto:${op.email}`} className="text-[#79c0ff] hover:underline">{op.email}</a>
-              )}
-            </div>
-          )}
-
           {contact.grids.length > 1 && (
             <div className="mb-1.5 pb-1.5 border-b border-[#21262d] text-[10px] font-mono flex items-center gap-1.5 flex-wrap">
               <span className="text-[#484f58]">grids:</span>
               {contact.grids.map(g => (
                 <span key={g} className={g === contact.grid ? 'text-[#c9d1d9] font-bold' : 'text-[#8b949e]'}
                   title={g === contact.grid ? 'Most recent locator' : undefined}>
-                  {gridWithFlag(g, geoMap)}
+                  {g}
                 </span>
               ))}
             </div>
@@ -545,6 +518,7 @@ interface Props {
   mode: FTMode;
   myCall?: string;
   myGrid?: string;
+  vfoHz?: number;
   onClearContacts: () => void;
   onImportADIF?: (content: string) => void;
   focus?: { cs: string; n: number } | null;
@@ -565,7 +539,7 @@ const SORT_OPTIONS: Array<{ key: SortKey; label: string; title: string }> = [
   { key: 'alpha',  label: 'A–Z',      title: 'Alphabetical by callsign' },
 ];
 
-export default function FTContactsPanel({ contacts, mode, myCall = '', myGrid = '', onClearContacts, onImportADIF, focus }: Props) {
+export default function FTContactsPanel({ contacts, mode, myCall = '', myGrid = '', vfoHz = 0, onClearContacts, onImportADIF, focus }: Props) {
   const [expanded,       setExpanded]      = useState<string | null>(null);
   const [sortKey,        setSortKey]       = useState<SortKey>('date');
   const [sortRev,        setSortRev]       = useState(false);
@@ -591,31 +565,11 @@ export default function FTContactsPanel({ contacts, mode, myCall = '', myGrid = 
     return () => { window.removeEventListener('mousemove', onMove); window.removeEventListener('mouseup', onUp); };
   }, []);
 
-  const [geoMap, setGeoMap] = useState<Map<string, GeoInfo>>(new Map());
-  const [opMap,  setOpMap]  = useState<Map<string, OperatorInfo>>(new Map());
-  const geoRequested = useRef(new Set<string>());
-  const opRequested  = useRef(new Set<string>());
-
   const cardRefs = useRef(new Map<string, HTMLDivElement>());
 
   useEffect(() => {
-    for (const c of contacts.values()) {
-      for (const grid of c.grids) {
-        if (geoRequested.current.has(grid)) continue;
-        const latLon = gridToLatLon(grid);
-        if (!latLon) continue;
-        geoRequested.current.add(grid);
-        resolveGridLocation(grid, latLon).then(info => {
-          if (info) setGeoMap(prev => new Map(prev).set(grid, info));
-        });
-      }
-      if (!opRequested.current.has(c.callsign)) {
-        opRequested.current.add(c.callsign);
-        const callsign = c.callsign;
-        lookupOperator(callsign).then(info => {
-          if (info) setOpMap(prev => new Map(prev).set(callsign, info));
-        });
-      }
+    for (const cs of cardRefs.current.keys()) {
+      if (!contacts.has(cs)) cardRefs.current.delete(cs);
     }
   }, [contacts]);
 
@@ -664,11 +618,10 @@ export default function FTContactsPanel({ contacts, mode, myCall = '', myGrid = 
   // Build the list of unique countries for the country select dropdown
   const countryOptions = useMemo(() => Array.from(
     Array.from(contacts.values()).reduce((acc, c) => {
-      const geo = c.grid ? geoMap.get(c.grid) : undefined;
       const pfx = callsignCountry(c.callsign);
-      const flag    = geo?.flag ?? pfx?.flag;
-      const country = geo?.country ?? pfx?.country;
-      const code    = geo?.countryCode ?? pfx?.countryCode;
+      const flag    = pfx?.flag;
+      const country = pfx?.country;
+      const code    = pfx?.countryCode;
       if (code && country && flag) {
         const existing = acc.get(code);
         acc.set(code, existing
@@ -678,7 +631,7 @@ export default function FTContactsPanel({ contacts, mode, myCall = '', myGrid = 
       return acc;
     }, new Map<string, { code: string; country: string; flag: string; count: number }>())
   .values()).sort((a, b) => b.count - a.count || a.country.localeCompare(b.country)),
-  [contacts, geoMap]);
+  [contacts]);
 
   // Sort contacts — only when contacts, sortKey, sortRev, or stats change
   const sorted = useMemo(() => Array.from(contacts.values()).sort((a, b) => {
@@ -724,29 +677,22 @@ export default function FTContactsPanel({ contacts, mode, myCall = '', myGrid = 
     if (quickFilter === 'tx-only'   && !(s.txCount > 0 && s.rxCount === 0)) return false;
     if (quickFilter === 'rx-only'   && !(s.rxCount > 0 && s.txCount === 0)) return false;
     if (countryFilter) {
-      const geo  = c.grid ? geoMap.get(c.grid) : undefined;
-      const pfx  = callsignCountry(c.callsign);
-      const code = geo?.countryCode ?? pfx?.countryCode;
+      const code = callsignCountry(c.callsign)?.countryCode;
       if (code !== countryFilter) return false;
     }
     return true;
-  }), [sorted, contactStats, quickFilter, countryFilter, geoMap]);
+  }), [sorted, contactStats, quickFilter, countryFilter]);
 
   // Free-text search on top
   const q        = query.trim().toLowerCase();
   const filtered = useMemo(() => q
     ? quickFiltered.filter(c => {
-        const op  = opMap.get(c.callsign);
         const pfx = callsignCountry(c.callsign);
-        const geoFields = c.grids.flatMap(g => {
-          const geo = geoMap.get(g);
-          return [geo?.country, geo?.countryCode];
-        });
-        return [c.callsign, ...c.grids, ...geoFields, pfx?.country, pfx?.countryCode, op?.name]
+        return [c.callsign, ...c.grids, pfx?.country, pfx?.countryCode]
           .some(s => s?.toLowerCase().includes(q));
       })
     : quickFiltered,
-  [q, quickFiltered, opMap, geoMap]);
+  [q, quickFiltered]);
 
   const hasAnyFilter   = !!quickFilter || !!countryFilter;
 
@@ -754,7 +700,7 @@ export default function FTContactsPanel({ contacts, mode, myCall = '', myGrid = 
   const [importStatus, setImportStatus] = useState<{ count: number; err?: string } | null>(null);
 
   function downloadADIF() {
-    const content = generateADIF(contacts, mode);
+    const content = generateADIF(contacts, mode, { myCall, myGrid, vfoHz });
     const blob = new Blob([content], { type: 'text/plain;charset=utf-8' });
     const url  = URL.createObjectURL(blob);
     const a    = document.createElement('a');
@@ -845,7 +791,7 @@ export default function FTContactsPanel({ contacts, mode, myCall = '', myGrid = 
           </span>
         </div>
         <div className="rounded overflow-hidden border border-[#21262d]" style={{ height: mapHeight }}>
-          <FTLeafletMap contacts={contacts} onSelect={select} geoMap={geoMap} selected={expanded} />
+          <FTLeafletMap contacts={contacts} onSelect={select} selected={expanded} />
         </div>
         {/* Drag handle to resize map */}
         <div
@@ -1013,8 +959,6 @@ export default function FTContactsPanel({ contacts, mode, myCall = '', myGrid = 
                 onToggle={() => setExpanded(p => p === c.callsign ? null : c.callsign)}
                 onSelect={select}
                 contactMap={contacts}
-                geoMap={geoMap}
-                op={opMap.get(c.callsign)}
                 myCall={myCall}
               />
             </div>

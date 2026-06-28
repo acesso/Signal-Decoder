@@ -128,6 +128,11 @@ export interface Contact {
   lastSeen: Date;
 }
 
+// Maximum unique callsigns to keep in memory at once.
+// On a busy band (20m FT8) you can hear 200+ unique calls/hour — cap prevents
+// unbounded growth. Oldest-seen contacts are evicted first when the limit is hit.
+const MAX_CONTACTS = 500;
+
 export function mergeContacts(
   existing: Map<string, Contact>,
   windowStart: Date,
@@ -164,8 +169,9 @@ export function mergeContacts(
 
     if (callerValid) {
       const caller = getOrCreate(parsed.caller);
-      // Record this transmission for the sender
       caller.msgs.push({ windowStart, raw, parsed, freq, snr, role: 'tx' });
+      // Keep only the last 60 messages per contact — enough for full QSO history
+      if (caller.msgs.length > 60) caller.msgs.splice(0, caller.msgs.length - 60);
       caller.lastSeen = windowStart;
 
       // The grid always belongs to the transmitting station. A station can
@@ -173,20 +179,47 @@ export function mergeContacts(
       // with `grid`/`latLon` tracking the most recent one
       if (parsed.grid) {
         if (!caller.grids.includes(parsed.grid)) caller.grids.push(parsed.grid);
+        if (caller.grids.length > 10) caller.grids.splice(0, caller.grids.length - 10);
         if (caller.grid !== parsed.grid) {
           caller.grid   = parsed.grid;
           caller.latLon = gridToLatLon(parsed.grid) ?? undefined;
         }
       }
-      if (calleeValid) caller.peers.add(parsed.callee!);
+      if (calleeValid) {
+        caller.peers.add(parsed.callee!);
+        if (caller.peers.size > 50) {
+          const first = caller.peers.values().next().value;
+          if (first !== undefined) caller.peers.delete(first);
+        }
+      }
     }
 
     if (calleeValid) {
       const callee = getOrCreate(parsed.callee!);
-      if (callerValid) callee.peers.add(parsed.caller);
-      // Record this message in the callee's history too — they participated as the addressee
+      if (callerValid) {
+        callee.peers.add(parsed.caller);
+        if (callee.peers.size > 50) {
+          const first = callee.peers.values().next().value;
+          if (first !== undefined) callee.peers.delete(first);
+        }
+      }
       callee.msgs.push({ windowStart, raw, parsed, freq, snr, role: 'rx' });
+      if (callee.msgs.length > 60) callee.msgs.splice(0, callee.msgs.length - 60);
       callee.lastSeen = windowStart;
+    }
+  }
+
+  // Evict oldest contacts when over the limit — sort by lastSeen ascending,
+  // drop the stalest ones. Never evict a contact that has messages in this window
+  // (they're active right now).
+  if (contacts.size > MAX_CONTACTS) {
+    const sorted = [...contacts.values()].sort(
+      (a, b) => a.lastSeen.getTime() - b.lastSeen.getTime()
+    );
+    for (const c of sorted) {
+      if (contacts.size <= MAX_CONTACTS) break;
+      if (c.lastSeen.getTime() === windowStart.getTime()) continue; // active this window
+      contacts.delete(c.callsign);
     }
   }
 
@@ -246,33 +279,28 @@ export function buildFTMessage(
 // Rules follow the standard FT8 QSO flow:
 //   CQ → (they answer) → report → (they r_report) → rr73 → tx73
 //   (we answer their CQ) → answer → (they report) → r_report → (they rr73) → tx73
+// RR73 / r_report / tx73 are all treated as equivalent closing messages.
+// We always close with RR73 — it confirms receipt AND signs off in one transmission.
+const CLOSING: ReadonlySet<MsgType> = new Set(['r_report', 'rrr', 'rr73', 'tx73']);
+
 export function nextTxMsgType(lastSent: MsgType | null, lastRx: MsgType | null): TxMsgType {
-  if (!lastSent)                                                  return 'cq';
+  if (!lastSent) return 'cq';
 
-  // We sent CQ — they answered, send them our report
-  if (lastSent === 'cq' && lastRx === 'answer')                   return 'report';
-  // We sent CQ — no reply yet, keep waiting (resend report if they already replied)
-  if (lastSent === 'cq')                                          return 'report';
+  // We sent CQ — reply with report once they answer (or retry report)
+  if (lastSent === 'cq') return lastRx === 'answer' ? 'report' : 'report';
 
-  // We answered their CQ with our grid — they sent us a report
-  if (lastSent === 'answer' && lastRx === 'report')               return 'r_report';
-  if (lastSent === 'answer' && lastRx === 'r_report')             return 'r_report';
-  // We answered but no response yet — resend answer
-  if (lastSent === 'answer')                                      return 'answer';
+  // We answered their CQ — reply with r_report once they report to us (or retry answer)
+  if (lastSent === 'answer') return (lastRx === 'report' || lastRx === 'r_report') ? 'r_report' : 'answer';
 
-  // We sent a report — they r_report'd or RRR'd back → send RR73
-  if (lastSent === 'report' && (lastRx === 'r_report' || lastRx === 'rrr')) return 'rr73';
-  // We sent a report — no reply yet, or they sent another answer — keep waiting
-  if (lastSent === 'report')                                      return 'rr73';
+  // We sent a report — close with RR73 (they confirmed with r_report/rrr or we retry)
+  if (lastSent === 'report') return 'rr73';
 
-  // We sent r_report — they haven't confirmed yet or sent something — send RR73
-  if (lastSent === 'r_report' && lastRx === 'rr73')               return 'tx73';
-  if (lastSent === 'r_report')                                    return 'rr73';
+  // We sent r_report — close with RR73 unless already done
+  if (lastSent === 'r_report') return CLOSING.has(lastRx!) ? 'cq' : 'rr73';
 
-  // We sent RR73 — wrap up
-  if (lastSent === 'rr73')                                        return 'tx73';
+  // We sent RR73 or any other closing — QSO complete
+  if (CLOSING.has(lastSent)) return 'cq';
 
-  // QSO complete or unrecognised state — default to CQ
   return 'cq';
 }
 
@@ -292,20 +320,72 @@ function adifTime(d: Date): string {
 }
 const af = (name: string, value: string) => `<${name}:${value.length}>${value}`;
 
-// FT8/FT4 use MODE=MFSK with SUBMODE for strict ADIF compliance, but most
-// logging software recognizes FT8/FT4 as MODE values directly — we write both.
+// ADIF 3.1.7: FT8 is its own primary MODE; FT4 is a SUBMODE of MFSK.
 function adifMode(ftMode: FTMode): [string, string][] {
   if (ftMode === 'FT8') return [['MODE', 'FT8']];
-  if (ftMode === 'FT4') return [['MODE', 'FT4']];
+  if (ftMode === 'FT4') return [['MODE', 'MFSK'], ['SUBMODE', 'FT4']];
   return [['MODE', ftMode]];
 }
 
-export function generateADIF(contacts: Map<string, Contact>, ftMode: FTMode): string {
+// ADIF 3.1.7 BAND enumeration — maps frequency in MHz to band name.
+// Ranges are inclusive lower bound, exclusive upper bound.
+const BAND_RANGES: [number, number, string][] = [
+  [0.1357,  0.1378,  '2190m'],
+  [0.472,   0.479,   '630m'],
+  [0.501,   0.504,   '560m'],
+  [1.8,     2.0,     '160m'],
+  [3.5,     4.0,     '80m'],
+  [5.06,    5.45,    '60m'],
+  [7.0,     7.3,     '40m'],
+  [10.1,    10.15,   '30m'],
+  [14.0,    14.35,   '20m'],
+  [18.068,  18.168,  '17m'],
+  [21.0,    21.45,   '15m'],
+  [24.890,  24.99,   '12m'],
+  [28.0,    29.7,    '10m'],
+  [50.0,    54.0,    '6m'],
+  [70.0,    71.0,    '4m'],
+  [144.0,   148.0,   '2m'],
+  [222.0,   225.0,   '1.25m'],
+  [420.0,   450.0,   '70cm'],
+  [902.0,   928.0,   '33cm'],
+  [1240.0,  1300.0,  '23cm'],
+  [2300.0,  2450.0,  '13cm'],
+  [3300.0,  3500.0,  '9cm'],
+  [5650.0,  5925.0,  '6cm'],
+  [10000.0, 10500.0, '3cm'],
+  [24000.0, 24050.0, '1.25cm'],
+  [47000.0, 47200.0, '6mm'],
+  [75500.0, 81000.0, '4mm'],
+];
+
+export function freqMhzToBand(mhz: number): string | undefined {
+  for (const [lo, hi, band] of BAND_RANGES) {
+    if (mhz >= lo && mhz < hi) return band;
+  }
+  return undefined;
+}
+
+export interface ADIFOptions {
+  myCall?: string;
+  myGrid?: string;
+  // VFO frequency in Hz — used to derive FREQ and BAND for each contact.
+  // Contacts store their audio offset; the absolute freq = vfoHz + audioOffsetHz.
+  // If 0 / absent, FREQ and BAND are omitted.
+  vfoHz?: number;
+}
+
+export function generateADIF(
+  contacts: Map<string, Contact>,
+  ftMode: FTMode,
+  opts: ADIFOptions = {},
+): string {
+  const { myCall, myGrid, vfoHz = 0 } = opts;
   const now       = new Date();
   const timestamp = `${adifDate(now)} ${adifTime(now)}`;
 
   const lines: string[] = [
-    af('ADIF_VER', '3.1.4'),
+    af('ADIF_VER', '3.1.7'),
     af('PROGRAMID', `Signal Decoder — ${APP_URL}`),
     af('PROGRAMVERSION', '1.0'),
     af('CREATED_TIMESTAMP', timestamp),
@@ -329,6 +409,15 @@ export function generateADIF(contacts: Map<string, Contact>, ftMode: FTMode): st
       ? rxMsgs.reduce((best, m) => m.snr > best ? m.snr : best, -99)
       : undefined;
 
+    // Derive absolute frequency: prefer the stored freq on the first tx message
+    // (already absolute when VFO was set at decode time), fall back to vfoHz arg.
+    const firstMsg  = (txMsgs[0] ?? rxMsgs[0]);
+    const absHz     = firstMsg
+      ? (firstMsg.freq > 1_000_000 ? firstMsg.freq : (vfoHz > 0 ? vfoHz + firstMsg.freq : 0))
+      : (vfoHz > 0 ? vfoHz : 0);
+    const freqMhz   = absHz > 0 ? absHz / 1_000_000 : 0;
+    const band      = freqMhz > 0 ? freqMhzToBand(freqMhz) : undefined;
+
     const fields: [string, string][] = [
       ['CALL',     c.callsign],
       ...adifMode(ftMode),
@@ -336,9 +425,13 @@ export function generateADIF(contacts: Map<string, Contact>, ftMode: FTMode): st
       ['TIME_ON',  adifTime(c.firstSeen)],
     ];
 
+    if (band)                    fields.push(['BAND',      band]);
+    if (freqMhz > 0)             fields.push(['FREQ',      freqMhz.toFixed(6)]);
     if (c.grid)                  fields.push(['GRIDSQUARE', c.grid]);
-    if (bestSnrTx !== undefined) fields.push(['RST_RCVD',   `${bestSnrTx > 0 ? '+' : ''}${bestSnrTx}`]);
-    if (bestSnrRx !== undefined) fields.push(['RST_SENT',   `${bestSnrRx > 0 ? '+' : ''}${bestSnrRx}`]);
+    if (bestSnrTx !== undefined) fields.push(['RST_RCVD',  `${bestSnrTx >= 0 ? '+' : ''}${bestSnrTx}`]);
+    if (bestSnrRx !== undefined) fields.push(['RST_SENT',  `${bestSnrRx >= 0 ? '+' : ''}${bestSnrRx}`]);
+    if (myCall)                  fields.push(['STATION_CALLSIGN', myCall.toUpperCase()]);
+    if (myGrid)                  fields.push(['MY_GRIDSQUARE',    myGrid.toUpperCase()]);
 
     const comment = txMsgs.length > 0
       ? `heard direct: ${txMsgs.length} tx; addressed: ${rxMsgs.length} rx`

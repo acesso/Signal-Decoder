@@ -6,7 +6,6 @@ import { MapContainer, TileLayer, Marker, Popup, Polyline, CircleMarker, Tooltip
 import L from 'leaflet';
 import 'leaflet/dist/leaflet.css';
 import { Contact, haversineKm } from '@/lib/ft/parser';
-import type { GeoInfo } from '@/lib/ft/lookup';
 
 // QSO line colors by direction relative to the hovered station
 const TX_COLOR = '#2ea043'; // hovered station transmitting (solid)
@@ -63,8 +62,7 @@ function FlyTo({ pos }: { pos: [number, number] | null }) {
 interface Props {
   contacts: Map<string, Contact>;
   onSelect?: (callsign: string) => void;
-  geoMap?: Map<string, GeoInfo>;
-  selected?: string | null; // expanded contact — map flies to it when located
+  selected?: string | null;
 }
 
 interface QsoLine {
@@ -75,7 +73,7 @@ interface QsoLine {
   peer: string;
 }
 
-export default function FTLeafletMap({ contacts, onSelect, geoMap, selected }: Props) {
+export default function FTLeafletMap({ contacts, onSelect, selected }: Props) {
   const [hoverCs, setHoverCs] = useState<string | null>(null);
   const markers = Array.from(contacts.values()).filter(c => c.latLon);
   const selContact = selected ? contacts.get(selected) : undefined;
@@ -188,10 +186,7 @@ export default function FTLeafletMap({ contacts, onSelect, geoMap, selected }: P
                 </div>
                 {c.grids.length > 0 && (
                   <div style={{ color: '#8b949e', fontSize: 11 }}>
-                    {c.grids.map(g => {
-                      const flag = geoMap?.get(g)?.flag;
-                      return flag ? `${flag} ${g}` : g;
-                    }).join(' · ')}
+                    {c.grids.join(' · ')}
                   </div>
                 )}
                 <div style={{ color: '#484f58', fontSize: 10, marginTop: 3 }}>

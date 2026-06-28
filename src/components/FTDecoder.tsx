@@ -521,6 +521,7 @@ const FTDecoder = forwardRef<DecoderControls, { ftMode: FTMode; myCall?: string;
             mode={ftMode}
             myCall={myCall}
             myGrid={myGrid}
+            vfoHz={vfoFrequency ?? 0}
             onClearContacts={() => setContacts(new Map())}
             onImportADIF={handleImportADIF}
             focus={contactFocus}

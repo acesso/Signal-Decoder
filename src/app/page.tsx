@@ -6,7 +6,7 @@ import SSTVDecoder from "@/components/SSTVDecoder";
 import CWDecoder from "@/components/CWDecoder";
 import FTDecoder, { FTModeSelector } from "@/components/FTDecoder";
 import MFSKDecoder from "@/components/MFSKDecoder";
-import FTTransmitPanel from "@/components/FTTransmitPanel";
+import FTTransmitPanel, { type TxStatus } from "@/components/FTTransmitPanel";
 import type { DecoderControls } from '@/components/DecoderControls';
 import { useGlobalAudio } from '@/hooks/useGlobalAudio';
 import { FTMode } from '@/lib/ft/decoder';
@@ -37,6 +37,61 @@ const MODE_META: Record<DecoderMode, { label: string; description: string }> = {
     description: 'Multiple Frequency Shift Keying decoder — configurable tones, live bit-stream grid',
   },
 };
+
+// ── Memory / resource debug bar ────────────────────────────────────────────
+
+function MemDebugBar({ contacts }: { contacts: Map<string, Contact> }) {
+  const [snap, setSnap] = useState<{
+    heapMB: number | null;
+    heapLimitMB: number | null;
+    contacts: number;
+    totalMsgs: number;
+    domNodes: number;
+  } | null>(null);
+
+  useEffect(() => {
+    const update = () => {
+      const mem = (performance as unknown as { memory?: { usedJSHeapSize: number; jsHeapSizeLimit: number } }).memory;
+      let totalMsgs = 0;
+      for (const c of contacts.values()) totalMsgs += c.msgs.length;
+      setSnap({
+        heapMB:      mem ? Math.round(mem.usedJSHeapSize / 1024 / 1024) : null,
+        heapLimitMB: mem ? Math.round(mem.jsHeapSizeLimit / 1024 / 1024) : null,
+        contacts:    contacts.size,
+        totalMsgs,
+        domNodes:    document.querySelectorAll('*').length,
+      });
+    };
+    update();
+    const id = setInterval(update, 2000);
+    return () => clearInterval(id);
+  }, [contacts]);
+
+  if (!snap) return null;
+
+  const heapPct = snap.heapMB !== null && snap.heapLimitMB
+    ? Math.round((snap.heapMB / snap.heapLimitMB) * 100)
+    : null;
+  const heapColor = heapPct === null ? '#484f58' : heapPct > 75 ? '#f85149' : heapPct > 50 ? '#e3b341' : '#2ea043';
+
+  return (
+    <div className="px-4 sm:px-6 lg:px-8 py-1 border-t border-[#21262d] bg-[#0d1117]/80 shrink-0">
+      <div className="flex flex-wrap gap-x-4 gap-y-0.5 items-center font-mono text-[10px] text-[#484f58]">
+        <span className="text-[#30363d] select-none">⬡ mem</span>
+        {snap.heapMB !== null ? (
+          <span style={{ color: heapColor }}>
+            heap {snap.heapMB} MB{heapPct !== null ? ` (${heapPct}%)` : ''}
+          </span>
+        ) : (
+          <span title="Chrome only — enable chrome://flags/#enable-precise-memory-info for accuracy">heap n/a</span>
+        )}
+        <span>contacts <span className="text-[#8b949e]">{snap.contacts}</span></span>
+        <span>msgs <span className="text-[#8b949e]">{snap.totalMsgs}</span></span>
+        <span>DOM <span className="text-[#8b949e]">{snap.domNodes}</span></span>
+      </div>
+    </div>
+  );
+}
 
 // ── Shared top bar ──────────────────────────────────────────────────────────
 
@@ -107,6 +162,110 @@ function TopBar({
   );
 }
 
+// ── TX collapsed summary chips ───────────────────────────────────────────────
+
+const TX_STATUS_COLOR: Record<string, string> = {
+  idle:     '#484f58',
+  waiting:  '#e3b341',
+  encoding: '#58a6ff',
+  playing:  '#2ea043',
+};
+const TX_STATUS_LABEL: Record<string, string> = {
+  idle:     'IDLE',
+  waiting:  'WAIT',
+  encoding: 'ENC',
+  playing:  'TX',
+};
+
+// Miniature rAF-driven progress ring — pure SVG DOM mutations, no React re-renders
+function TxRingMini({ status, windowSec, playing }: { status: string; windowSec: number; playing: boolean }) {
+  const svgRef = useRef<SVGSVGElement>(null);
+  const rafRef = useRef<number | null>(null);
+  const prevRef = useRef('');
+  // viewBox 0 0 72 72, rendered at 28×28
+  const r = 28, cx = 36, cy = 36;
+  const circ = 2 * Math.PI * r;
+
+  useEffect(() => {
+    const tick = () => {
+      const svg = svgRef.current;
+      if (!svg) { rafRef.current = requestAnimationFrame(tick); return; }
+      const totalMs = windowSec * 1000;
+      const now = new Date();
+      const elapsed = (now.getSeconds() * 1000 + now.getMilliseconds()) % totalMs;
+      const progress = elapsed / totalMs;
+      const secVal = ((totalMs - elapsed) / 1000).toFixed(1);
+      if (secVal === prevRef.current) { rafRef.current = requestAnimationFrame(tick); return; }
+      prevRef.current = secVal;
+      const color = TX_STATUS_COLOR[status] ?? '#484f58';
+      const filled = circ * progress;
+      svg.querySelector<SVGCircleElement>('.mring-arc')?.setAttribute('stroke', color);
+      svg.querySelector<SVGCircleElement>('.mring-arc')?.setAttribute('stroke-dasharray', `${filled} ${circ - filled}`);
+      rafRef.current = requestAnimationFrame(tick);
+    };
+    rafRef.current = requestAnimationFrame(tick);
+    return () => { if (rafRef.current) cancelAnimationFrame(rafRef.current); };
+  }, [status, windowSec, circ]);
+
+  const initColor = TX_STATUS_COLOR[status] ?? '#484f58';
+  return (
+    <svg ref={svgRef} width={28} height={28} viewBox="0 0 72 72" className="shrink-0">
+      {playing && (
+        <circle cx={cx} cy={cy} r={r + 6} fill="none" stroke="#2ea043" strokeWidth={3}
+          opacity={0.35} className="animate-ping" style={{ animationDuration: '1s' }} />
+      )}
+      <circle cx={cx} cy={cy} r={r} fill="none" stroke="#21262d" strokeWidth={7} />
+      <circle className="mring-arc" cx={cx} cy={cy} r={r} fill="none"
+        stroke={initColor} strokeWidth={7}
+        strokeDasharray={`0 ${circ}`} strokeDashoffset={circ * 0.25} />
+    </svg>
+  );
+}
+
+function TxSummaryChips({ s }: { s: TxStatus | null }) {
+  if (!s) return null;
+  const stColor = TX_STATUS_COLOR[s.status] ?? '#484f58';
+  const stLabel = TX_STATUS_LABEL[s.status] ?? s.status.toUpperCase();
+  const dimColor = '#30363d';
+  return (
+    <span className="tx-summary-chips inline-flex items-center gap-2 ml-3 align-middle" style={{ lineHeight: 1 }}>
+      {/* Mini animated ring */}
+      <TxRingMini status={s.isRunning ? s.status : 'idle'} windowSec={s.windowSec} playing={s.status === 'playing'} />
+      {/* Status label */}
+      <span className="font-mono text-[10px] font-bold" style={{ color: s.isRunning ? stColor : '#484f58' }}>
+        {stLabel}
+      </span>
+      {/* Queue tag — always shown */}
+      <span className="inline-flex items-center gap-1 font-mono text-[10px] px-1.5 py-0.5 rounded border"
+        style={{
+          borderColor: s.queueLen > 0 ? 'rgba(88,166,255,0.4)' : dimColor,
+          color:        s.queueLen > 0 ? '#58a6ff' : '#484f58',
+          background:   s.queueLen > 0 ? 'rgba(88,166,255,0.08)' : 'transparent',
+        }}>
+        <span style={{ color: s.queueLen > 0 ? '#8b949e' : '#30363d' }}>Queue</span>
+        <span className="font-bold">{s.queueLen}</span>
+      </span>
+      {/* Replies tag — always shown */}
+      <span className="inline-flex items-center gap-1 font-mono text-[10px] px-1.5 py-0.5 rounded border"
+        style={{
+          borderColor: s.pendingReplies > 0 ? 'rgba(227,179,65,0.4)' : dimColor,
+          color:        s.pendingReplies > 0 ? '#e3b341' : '#484f58',
+          background:   s.pendingReplies > 0 ? 'rgba(227,179,65,0.08)' : 'transparent',
+        }}>
+        <span style={{ color: s.pendingReplies > 0 ? '#8b949e' : '#30363d' }}>Replies</span>
+        <span className="font-bold">{s.pendingReplies}</span>
+      </span>
+      {/* Auto-reply badge */}
+      {s.autoReply && (
+        <span className="font-mono text-[10px] px-1.5 py-0.5 rounded border"
+          style={{ color: '#58a6ff', borderColor: 'rgba(88,166,255,0.3)', background: 'rgba(88,166,255,0.08)' }}>
+          auto
+        </span>
+      )}
+    </span>
+  );
+}
+
 // ── Page ────────────────────────────────────────────────────────────────────
 
 export default function Home() {
@@ -115,6 +274,7 @@ export default function Home() {
   const [ftContacts, setFtContacts] = useState<Map<string, Contact>>(new Map());
   const [ftMyCall, setFtMyCall] = useState('');
   const [ftMyGrid, setFtMyGrid] = useState('');
+  const [txStatus, setTxStatus] = useState<TxStatus | null>(null);
 
   // ── Radio CAT — lifted here so VFO frequency flows to all decoders ────────
   const cat = useRadioCAT();
@@ -248,19 +408,25 @@ export default function Home() {
         {/* FT Transmit panel — only shown when FT mode is active */}
         {mode === 'ft' && (
           <div className="pb-3">
+            {/* chips hidden via CSS when panel is open */}
+            <style>{`
+              details[open] .tx-summary-chips { display: none !important; }
+            `}</style>
             <details className="bg-[#161b22] border border-[#30363d] rounded-lg" open>
-              <summary className="cursor-pointer px-4 py-3 sm:px-5 font-semibold text-sm hover:bg-[#21262d] rounded-lg transition-colors select-none">
+              <summary className="cursor-pointer px-4 py-3 sm:px-5 font-semibold text-sm hover:bg-[#21262d] rounded-lg transition-colors select-none flex items-center">
                 Transmit
+                <TxSummaryChips s={txStatus} />
               </summary>
               <div className="px-4 pb-4 sm:px-5 sm:pb-5">
                 <FTTransmitPanel
-                mode={ftMode}
-                contacts={ftContacts}
-                vfoFrequency={vfoFrequency}
-                onMyCallChange={setFtMyCall}
-                onMyGridChange={setFtMyGrid}
-                onSetPTT={cat.state.connected ? cat.setPTT : undefined}
-              />
+                  mode={ftMode}
+                  contacts={ftContacts}
+                  vfoFrequency={vfoFrequency}
+                  onMyCallChange={setFtMyCall}
+                  onMyGridChange={setFtMyGrid}
+                  onSetPTT={cat.state.connected ? cat.setPTT : undefined}
+                  onStatusChange={setTxStatus}
+                />
               </div>
             </details>
           </div>
@@ -284,6 +450,9 @@ export default function Home() {
         </div>
 
       </div>
+
+      {/* Memory / resource debug bar — always visible at the bottom */}
+      <MemDebugBar contacts={ftContacts} />
     </main>
   );
 }
