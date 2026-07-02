@@ -225,7 +225,9 @@ Real-time decoding of MFSK (Multiple Frequency Shift Keying) modes using Goertze
 
 ## FT8 / FT4 Decoder
 
-Real-time decoding of the WSJT-X FT digital modes, with automatic QSO tracking. Decoding is powered by [ft8ts](https://github.com/e04/ft8ts) (GPL-3.0) and runs entirely in the browser.
+Real-time decoding of the WSJT-X FT digital modes, with automatic QSO tracking. Decoding runs entirely in the browser via two WebAssembly engines: FT8 uses [ft8mon](https://github.com/rtmrtmrtmrtm/ft8mon) (MIT — full WSJT-X-style LDPC + OSD + multi-pass interference subtraction), FT4 uses [ft8_lib](https://github.com/kgoba/ft8_lib) (see the *FT8/FT4 WASM Decoders* section below for the architecture, benchmark, and rebuild instructions).
+
+Decoded messages **stream into the UI live** as the decoder finds them — a window's results appear one by one during the decode pass instead of all at once when it finishes, and the contacts/auto-reply pipeline consumes them just as incrementally. The FT panel includes a WASM status strip with a live decode progress bar (elapsed vs CPU budget; turns green when the window reaches the rolling average message count), runtime decoder tuning (**Tune**: OSD depth, CPU budget with a data-driven suggested value, subtraction passes, LDPC iterations, band limits — applied live, persisted locally), and a **⟳ WASM** button that reloads the decode engines without a page refresh.
 
 ### FT Modes
 
@@ -752,72 +754,6 @@ Select a mode from the top tab bar (RTTY / CW / SSTV / FT / MFSK), then click **
 - Resolution: Matches selected SSTV mode
 - Filename: Includes mode and timestamp for easy identification
 - Method: Canvas.toBlob() API for efficient conversion
-
-## Project Structure
-
-```
-src/
-├── app/
-│   ├── layout.tsx              # Root layout with metadata
-│   ├── page.tsx                # Home page with mode state management
-│   └── globals.css             # Global Tailwind styles
-├── components/
-│   ├── RTTYDecoder.tsx         # RTTY (Baudot) decoder UI
-│   ├── CWDecoder.tsx           # CW (Morse) decoder UI
-│   ├── SSTVDecoder.tsx         # SSTV image decoder UI
-│   ├── FTDecoder.tsx           # FT8/FT4 decoder UI (clock ring, waterfall, messages)
-│   ├── FTContactsPanel.tsx     # FT contact list, QSO history, sorting, ADIF export
-│   ├── FTLeafletMap.tsx        # World map of located FT contacts (Leaflet)
-│   ├── MFSKDecoder.tsx         # MFSK decoder UI (bit grid, spectrum, channel manager)
-│   ├── GLSpectrogram.tsx       # WebGL 3D spectrogram (terrain + ridge views)
-│   ├── SessionCard.tsx         # Decoded session display card
-│   ├── SettingsPanel.tsx       # Mode selection settings panel
-│   └── PWAInstallPrompt.tsx    # PWA install prompt
-├── hooks/
-│   ├── useAudioProcessor.ts    # Web Audio API integration (mode-aware)
-│   ├── useCWProcessor.ts       # CW audio capture + decoder loop
-│   ├── useRTTYProcessor.ts     # RTTY audio capture + decoder loop
-│   ├── useFTProcessor.ts       # UTC-windowed FT8/FT4 capture + decode
-│   └── useMFSKProcessor.ts     # MFSK audio capture + Goertzel decoder loop
-└── lib/
-    ├── rtty/
-    │   ├── decoder.ts          # RTTY Baudot/ITA2 decoder
-    │   ├── baudot.ts           # Baudot character tables
-    │   └── sessions.ts         # Session management
-    ├── cw/
-    │   ├── decoder.ts          # CW Morse code decoder
-    │   └── morse-table.ts      # Morse code lookup table
-    ├── ft/
-    │   ├── decoder.ts          # FT8/FT4 window decoding (ft8ts)
-    │   ├── parser.ts           # Message classification, callsign/grid extraction, ADIF
-    │   └── lookup.ts           # Async reverse geocoding + operator lookups
-    ├── mfsk/
-    │   ├── decoder.ts          # MFSKDecoder: Goertzel-based tone detection
-    │   ├── fec.ts              # FEC pipeline: de-interleaver + Viterbi + varicode
-    │   └── varicode.ts         # IZ8BLY varicode lookup table and bit-stream decoder
-    └── sstv/
-        ├── constants.ts             # SSTV mode specifications
-        ├── decoder.ts               # Main decoder orchestration (multi-mode)
-        ├── sync-detector.ts         # Sync pulse detection (9ms/20ms)
-        ├── robot36-line-decoder.ts  # Robot36 interlaced YUV decoder
-        ├── robot72-line-decoder.ts  # Robot72 sequential YUV decoder
-        ├── scottie-s1-line-decoder.ts # Scottie S1 RGB sequential decoder
-        ├── scottie-s2-line-decoder.ts # Scottie S2 RGB sequential decoder
-        ├── pd120-line-decoder.ts    # PD120 dual-luminance decoder
-        ├── pd160-line-decoder.ts    # PD160 dual-luminance decoder
-        ├── pd180-line-decoder.ts    # PD180 dual-luminance decoder
-        └── fm-demodulator.ts        # DSP primitives (FM demod, filters, EMA)
-
-doc/
-├── ROBOT36.md                  # Robot36 technical specification
-├── ROBOT72.md                  # Robot72 technical specification
-├── SCOTTIE_S1.md               # Scottie S1 technical specification
-├── SCOTTIE_S2.md               # Scottie S2 technical specification
-├── PD120.md                    # PD120 technical specification
-├── PD160.md                    # PD160 technical specification
-├── PD180.md                    # PD180 technical specification
-└── ARCHITECTURE.md             # Overall system architecture
-```
 
 ### Known Issues
 
