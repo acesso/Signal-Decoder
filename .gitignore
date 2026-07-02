@@ -18,6 +18,9 @@
 # production
 /build
 
+# firmware compiled artifacts (arduino-cli --output-dir)
+firmware/**/build/
+
 # misc
 .DS_Store
 *.pem
