@@ -53,7 +53,6 @@ robot36/
 # IDE files
 .vscode/
 .idea/
-.github/
 
 # Claude Code
 .claude/

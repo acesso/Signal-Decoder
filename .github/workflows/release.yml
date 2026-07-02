@@ -1,0 +1,85 @@
+# Creates a GitHub release when commits land on main (e.g. a branch merge),
+# using CHANGELOG.md as the source of truth for the version:
+#   - version  = topmost "## [x.y.z]" section heading
+#   - body     = that section's content
+# If the tag vX.Y.Z already exists the workflow is a no-op, so merges that
+# don't move the changelog version don't produce duplicate releases.
+name: Release from changelog
+
+on:
+  push:
+    branches: ["main"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: "release"
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Extract latest version and notes from CHANGELOG.md
+        id: changelog
+        run: |
+          set -euo pipefail
+          version=$(grep -oPm1 '^## \[\K[0-9]+\.[0-9]+\.[0-9]+(?=\])' CHANGELOG.md || true)
+          if [ -z "$version" ]; then
+            echo "No released version section found in CHANGELOG.md — nothing to do."
+            echo "version=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+          # Body = lines between this version's heading and the next "## " heading
+          awk -v ver="$version" '
+            $0 ~ "^## \\[" ver "\\]" { grab = 1; next }
+            grab && /^## /           { exit }
+            grab                     { print }
+          ' CHANGELOG.md > release_notes.md
+          echo "--- release notes for v$version ---"
+          cat release_notes.md
+
+      - name: Skip if tag already exists
+        id: tagcheck
+        if: steps.changelog.outputs.version != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          v="v${{ steps.changelog.outputs.version }}"
+          if gh api "repos/${{ github.repository }}/git/ref/tags/$v" >/dev/null 2>&1; then
+            echo "Tag $v already exists — skipping release."
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Sanity — package.json version matches changelog
+        if: steps.changelog.outputs.version != '' && steps.tagcheck.outputs.exists == 'false'
+        run: |
+          set -euo pipefail
+          pkg=$(node -p "require('./package.json').version")
+          cl="${{ steps.changelog.outputs.version }}"
+          if [ "$pkg" != "$cl" ]; then
+            echo "::warning::package.json version ($pkg) != CHANGELOG.md version ($cl) — releasing changelog version anyway."
+          fi
+
+      - name: Create release
+        if: steps.changelog.outputs.version != '' && steps.tagcheck.outputs.exists == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          v="v${{ steps.changelog.outputs.version }}"
+          gh release create "$v" \
+            --target "${{ github.sha }}" \
+            --title "$v" \
+            --notes-file release_notes.md
+          echo "Created release $v"
