@@ -1,7 +1,7 @@
 'use client';
 
 import { useState, useCallback, useRef } from 'react';
-import { useRadioCAT, type CATMode, type CATConnectionConfig } from '@/hooks/useRadioCAT';
+import { useRadioCAT, type CATMode, type CATConnectionConfig, type RigProfile, type RadioCATControls } from '@/hooks/useRadioCAT';
 export { useRadioCAT };
 
 // ── Constants ─────────────────────────────────────────────────────────────────
@@ -17,17 +17,19 @@ interface RadioPreset {
   stopBits: number;
   parity: 'none' | 'even' | 'odd';
   notes: string;
+  rigProfile: RigProfile;
 }
 
 const RADIO_PRESETS: RadioPreset[] = [
-  { label: 'Kenwood TS-480 / TS-590 / TS-2000', baudRate: 9600,   dataBits: 8, stopBits: 1, parity: 'none', notes: 'Default 9600 8N1' },
-  { label: 'Kenwood TS-480 (high speed)',        baudRate: 57600,  dataBits: 8, stopBits: 1, parity: 'none', notes: 'Configure in menu 60' },
-  { label: 'Icom IC-7300 / IC-7610',             baudRate: 9600,   dataBits: 8, stopBits: 1, parity: 'none', notes: 'Set CI-V USB Baud Rate to 9600' },
-  { label: 'Icom IC-7300 (high speed)',          baudRate: 115200, dataBits: 8, stopBits: 1, parity: 'none', notes: 'Set CI-V USB Baud Rate to Auto' },
-  { label: 'Yaesu FT-817 / FT-818',             baudRate: 4800,   dataBits: 8, stopBits: 2, parity: 'none', notes: 'Default 4800 8N2' },
-  { label: 'Yaesu FT-991A',                     baudRate: 38400,  dataBits: 8, stopBits: 1, parity: 'none', notes: 'Menu 031 = 38400' },
-  { label: 'Elecraft K3 / KX3',                 baudRate: 38400,  dataBits: 8, stopBits: 1, parity: 'none', notes: 'CONFIG > BAUD = 38400' },
-  { label: 'Custom / Other',                     baudRate: 9600,   dataBits: 8, stopBits: 1, parity: 'none', notes: 'Manually set baud rate below' },
+  { label: 'uSDX BLACK_BRICK 4.00e',            baudRate: 38400,  dataBits: 8, stopBits: 1, parity: 'none', notes: 'PU7FTW custom firmware — adds volume, attenuator, noise reduction, AGC, filter, TX drive and S-meter controls, batched CAT polling', rigProfile: 'usdx-blackbrick' },
+  { label: 'Kenwood TS-480 / TS-590 / TS-2000', baudRate: 9600,   dataBits: 8, stopBits: 1, parity: 'none', notes: 'Default 9600 8N1', rigProfile: 'generic' },
+  { label: 'Kenwood TS-480 (high speed)',        baudRate: 57600,  dataBits: 8, stopBits: 1, parity: 'none', notes: 'Configure in menu 60', rigProfile: 'generic' },
+  { label: 'Icom IC-7300 / IC-7610',             baudRate: 9600,   dataBits: 8, stopBits: 1, parity: 'none', notes: 'Set CI-V USB Baud Rate to 9600', rigProfile: 'generic' },
+  { label: 'Icom IC-7300 (high speed)',          baudRate: 115200, dataBits: 8, stopBits: 1, parity: 'none', notes: 'Set CI-V USB Baud Rate to Auto', rigProfile: 'generic' },
+  { label: 'Yaesu FT-817 / FT-818',             baudRate: 4800,   dataBits: 8, stopBits: 2, parity: 'none', notes: 'Default 4800 8N2', rigProfile: 'generic' },
+  { label: 'Yaesu FT-991A',                     baudRate: 38400,  dataBits: 8, stopBits: 1, parity: 'none', notes: 'Menu 031 = 38400', rigProfile: 'generic' },
+  { label: 'Elecraft K3 / KX3',                 baudRate: 38400,  dataBits: 8, stopBits: 1, parity: 'none', notes: 'CONFIG > BAUD = 38400', rigProfile: 'generic' },
+  { label: 'Custom / Other',                     baudRate: 9600,   dataBits: 8, stopBits: 1, parity: 'none', notes: 'Manually set baud rate below', rigProfile: 'generic' },
 ];
 
 // ── Frequency helpers ─────────────────────────────────────────────────────────
@@ -89,6 +91,19 @@ function FrequencyInput({ frequency, onCommit }: {
     if (frequency !== null) setDraft(freqToDisplay(frequency, next));
   };
 
+  // The unit toggle is always visible (both display and edit mode), at the
+  // right side of the frequency — click to switch MHz/kHz for both the
+  // display formatting and the next edit's input format.
+  const unitToggle = (
+    <button
+      onMouseDown={e => { e.preventDefault(); toggleUnit(); }}
+      className="text-[10px] font-bold px-1.5 py-1 rounded bg-[#21262d] border border-[#30363d] text-[#8b949e] hover:text-[#c9d1d9] hover:border-[#8b949e] transition-colors select-none shrink-0"
+      title="Switch between MHz and kHz"
+    >
+      {unit}
+    </button>
+  );
+
   // ── Display (non-editing) ──
   if (!editing) {
     let mhzPart = '——', khzPart = '———', hzPart = '———';
@@ -99,17 +114,20 @@ function FrequencyInput({ frequency, onCommit }: {
       hzPart  = s.slice(-3);
     }
     return (
-      <button
-        onClick={startEdit}
-        title="Click to edit frequency"
-        className="flex items-center gap-0 font-mono text-sm tabular-nums tracking-wider hover:opacity-80 transition-opacity"
-      >
-        <span className="text-[#c9d1d9]">{mhzPart}</span>
-        <span className="text-[#484f58]">.</span>
-        <span className="text-[#79c0ff]">{khzPart}</span>
-        <span className="text-[#484f58]">.</span>
-        <span className="text-[#6e7681]">{hzPart}</span>
-      </button>
+      <div className="flex items-center gap-1.5">
+        <button
+          onClick={startEdit}
+          title="Click to edit frequency"
+          className="flex items-center gap-0 font-mono text-sm tabular-nums tracking-wider hover:opacity-80 transition-opacity"
+        >
+          <span className="text-[#c9d1d9]">{mhzPart}</span>
+          <span className="text-[#484f58]">.</span>
+          <span className="text-[#79c0ff]">{khzPart}</span>
+          <span className="text-[#484f58]">.</span>
+          <span className="text-[#6e7681]">{hzPart}</span>
+        </button>
+        {unitToggle}
+      </div>
     );
   }
 
@@ -129,13 +147,7 @@ function FrequencyInput({ frequency, onCommit }: {
         placeholder={unit === 'MHz' ? '14.225000' : '14225.000'}
         className="w-32 bg-[#0d1117] border border-[#388bfd] text-[#79c0ff] font-mono text-sm px-2 py-1 rounded focus:outline-none"
       />
-      <button
-        onMouseDown={e => { e.preventDefault(); toggleUnit(); }}
-        className="text-[10px] font-bold px-1.5 py-1 rounded bg-[#21262d] border border-[#30363d] text-[#8b949e] hover:text-[#c9d1d9] hover:border-[#8b949e] transition-colors select-none"
-        title="Switch between MHz and kHz input"
-      >
-        {unit}
-      </button>
+      {unitToggle}
     </div>
   );
 }
@@ -203,7 +215,7 @@ function SettingsPanel({ config, onConfigChange, onConnect }: {
 
   const applyPreset = (idx: number) => {
     const p = RADIO_PRESETS[idx];
-    onConfigChange({ presetIdx: idx, baudRate: p.baudRate, dataBits: p.dataBits, stopBits: p.stopBits, parity: p.parity, timeoutMs: config.timeoutMs, pollIntervalMs: config.pollIntervalMs, debug: config.debug });
+    onConfigChange({ presetIdx: idx, baudRate: p.baudRate, dataBits: p.dataBits, stopBits: p.stopBits, parity: p.parity, timeoutMs: config.timeoutMs, pollIntervalMs: config.pollIntervalMs, debug: config.debug, rigProfile: p.rigProfile });
   };
 
   return (
@@ -324,17 +336,144 @@ function SettingsPanel({ config, onConfigChange, onConnect }: {
   );
 }
 
+// ── NumberStepper ─────────────────────────────────────────────────────────────
+// Labeled -/+ stepper for small bounded ranges (volume, attenuators, noise reduction).
+// `valueLabels[n - min]`, when provided, is shown instead of the raw index —
+// used for the analog attenuator, whose firmware steps map to fixed dB presets,
+// not a linear scale.
+
+function NumberStepper({ label, value, min, max, valueLabels, onChange }: {
+  label: string;
+  value: number | null;
+  min: number;
+  max: number;
+  valueLabels?: string[];
+  onChange: (n: number) => void;
+}) {
+  const v = value ?? min;
+  const step = (delta: number) => onChange(Math.max(min, Math.min(max, v + delta)));
+  const display = value === null ? '—' : (valueLabels?.[value - min] ?? String(value));
+  return (
+    <div className="flex items-center gap-1.5" title={label}>
+      <span className="text-[10px] font-semibold text-[#8b949e] whitespace-nowrap">{label}</span>
+      <button
+        onClick={() => step(-1)}
+        disabled={value === null || v <= min}
+        className="w-5 h-5 flex items-center justify-center text-xs rounded bg-[#21262d] border border-[#30363d] text-[#8b949e] hover:text-[#c9d1d9] hover:border-[#8b949e] disabled:opacity-30 disabled:hover:border-[#30363d]"
+      >
+        −
+      </button>
+      <span className="text-xs font-mono tabular-nums w-12 text-center text-[#c9d1d9]">{display}</span>
+      <button
+        onClick={() => step(1)}
+        disabled={value === null || v >= max}
+        className="w-5 h-5 flex items-center justify-center text-xs rounded bg-[#21262d] border border-[#30363d] text-[#8b949e] hover:text-[#c9d1d9] hover:border-[#8b949e] disabled:opacity-30 disabled:hover:border-[#30363d]"
+      >
+        +
+      </button>
+    </div>
+  );
+}
+
+// Analog attenuator firmware preset steps — from `att_label[]` in usdxBLACKBRICK.ino
+// (param enum ATT, EEPROM 0x1A). Not linear — each index is a fixed dB pad.
+const ANALOG_ATTENUATOR_DB_LABELS = ['0dB', '-13dB', '-20dB', '-33dB', '-40dB', '-53dB', '-60dB', '-73dB'];
+
+// Digital attenuator (A2, EEPROM 0x1B) is a raw bit-shift on the audio sample
+// (`ac2 >>= att2` in usdxBLACKBRICK.ino) — each step halves the amplitude,
+// i.e. exactly -6.02dB/step, linear across the full 0..16 range.
+const DIGITAL_ATTENUATOR_DB_LABELS = [
+  '0dB', '-6dB', '-12dB', '-18dB', '-24dB', '-30dB', '-36dB', '-42dB',
+  '-48dB', '-54dB', '-60dB', '-66dB', '-72dB', '-78dB', '-84dB', '-90dB', '-96dB',
+];
+
+// Filter bandwidth labels — mirrors filt_label[] in firmware for F_MCU > 16MHz builds
+// (this rig runs at 20MHz), param enum FILTER, EEPROM 0x13.
+const FILTER_LABELS = ['Full', '3kHz', '2.4kHz', '1.8kHz', '500Hz', '200Hz', '100Hz', '50Hz'];
+
+// AGC firmware behavior note: FAST_AGC is undefined in this build (usdxBLACKBRICK.ino),
+// so the runtime only branches on agc==1 vs agc==0 (process_agc_fast vs no AGC) — agc==2
+// ("Slow") has no distinct code path and is indistinguishable from off. The menu itself
+// (case AGC, offon_label) exposes only OFF/ON. So the UI mirrors that as a toggle.
+const AGC_ON = 1;
+const AGC_OFF = 0;
+
+// ── SMeterDisplay ─────────────────────────────────────────────────────────────
+// Read-only dBm readout — no +/- controls, since there is no SM SET command.
+
+function SMeterDisplay({ dbm }: { dbm: number | null }) {
+  return (
+    <div className="flex items-center gap-1.5" title="S-Meter (signal strength)">
+      <span className="text-[10px] font-semibold text-[#8b949e] whitespace-nowrap">S-Meter</span>
+      <span className="text-xs font-mono tabular-nums w-16 text-center text-[#79c0ff] bg-[#0d1117] border border-[#30363d] rounded px-1.5 py-0.5">
+        {dbm === null ? '—' : `${dbm} dBm`}
+      </span>
+    </div>
+  );
+}
+
+// ── BlackBrickControls ────────────────────────────────────────────────────────
+// uSDX BLACK_BRICK 4.00e custom extension controls: volume, attenuators, noise
+// reduction, AGC, filter, TX drive. Wraps onto its own row below the main
+// toolbar. S-Meter is shown separately in the main toolbar since it's a
+// read-only reading, not a control.
+
+function BlackBrickControls({ volume, att1, att2, nr, agc, filter, drive, onVolume, onAtt1, onAtt2, onNR, onAGC, onFilter, onDrive }: {
+  volume: number | null;
+  att1: number | null;
+  att2: number | null;
+  nr: number | null;
+  agc: number | null;
+  filter: number | null;
+  drive: number | null;
+  onVolume: (n: number) => void;
+  onAtt1: (n: number) => void;
+  onAtt2: (n: number) => void;
+  onNR: (n: number) => void;
+  onAGC: (n: number) => void;
+  onFilter: (n: number) => void;
+  onDrive: (n: number) => void;
+}) {
+  const agcOn = agc === AGC_ON;
+  return (
+    <div className="basis-full flex items-center gap-3 flex-wrap pt-2 mt-1 border-t border-[#21262d]">
+      <NumberStepper label="Volume" value={volume} min={-1} max={16} onChange={onVolume} />
+      <NumberStepper label="Analog Attenuator" value={att1} min={0} max={7} valueLabels={ANALOG_ATTENUATOR_DB_LABELS} onChange={onAtt1} />
+      <NumberStepper label="Digital Attenuator" value={att2} min={0} max={16} valueLabels={DIGITAL_ATTENUATOR_DB_LABELS} onChange={onAtt2} />
+      <NumberStepper label="Noise Reduction" value={nr} min={0} max={8} onChange={onNR} />
+      <NumberStepper label="Filter Bandwidth" value={filter} min={0} max={7} valueLabels={FILTER_LABELS} onChange={onFilter} />
+      <NumberStepper label="TX Driver" value={drive} min={0} max={8} onChange={onDrive} />
+
+      <div className="flex items-center gap-1.5" title="Auto Gain Control">
+        <span className="text-[10px] font-semibold text-[#8b949e] whitespace-nowrap">Auto Gain Control</span>
+        <button
+          onClick={() => onAGC(agcOn ? AGC_OFF : AGC_ON)}
+          disabled={agc === null}
+          className={`text-[10px] font-semibold px-2 py-1 rounded transition-colors border disabled:opacity-30
+            ${agcOn
+              ? 'bg-[#238636] border-[#238636] text-white'
+              : 'bg-[#21262d] border-[#30363d] text-[#8b949e] hover:text-[#c9d1d9] hover:border-[#8b949e]'
+            }`}
+        >
+          {agc === null ? '—' : agcOn ? 'ON' : 'OFF'}
+        </button>
+      </div>
+    </div>
+  );
+}
+
 // ── Main panel ────────────────────────────────────────────────────────────────
 
 const DEFAULT_CONFIG: CATConnectionConfig & { presetIdx: number } = {
   presetIdx: 0,
   baudRate: 38400, dataBits: 8, stopBits: 1, parity: 'none',
   timeoutMs: 200, pollIntervalMs: 500, debug: false,
+  rigProfile: RADIO_PRESETS[0].rigProfile,
 };
 
 export default function RadioCATPanel({ cat }: { cat: ReturnType<typeof useRadioCAT> }) {
-  const { state, connect, disconnect, setFrequency, setMode, setPTT } = cat;
-  const { connected, frequency, mode, ptt, error, isSupported } = state;
+  const { state, connect, disconnect, setFrequency, setMode, setPTT, setVolume, setAtt1, setAtt2, setNR, setAGC, setFilter, setDrive } = cat;
+  const { connected, frequency, mode, ptt, error, isSupported, volume, att1, att2, nr, agc, filter, sMeter, drive } = state;
 
   const [showSettings, setShowSettings] = useState(false);
   const [config, setConfig] = useState(DEFAULT_CONFIG);
@@ -343,6 +482,13 @@ export default function RadioCATPanel({ cat }: { cat: ReturnType<typeof useRadio
   const handleFreqCommit = useCallback((hz: number) => { setFrequency(hz).catch(() => {}); }, [setFrequency]);
   const handleModeChange = useCallback((m: CATMode) => { setMode(m).catch(() => {}); }, [setMode]);
   const handlePTTToggle  = useCallback(() => { setPTT(!ptt).catch(() => {}); }, [setPTT, ptt]);
+  const handleVolume     = useCallback((n: number) => { setVolume(n).catch(() => {}); }, [setVolume]);
+  const handleAtt1       = useCallback((n: number) => { setAtt1(n).catch(() => {}); }, [setAtt1]);
+  const handleAtt2       = useCallback((n: number) => { setAtt2(n).catch(() => {}); }, [setAtt2]);
+  const handleNR         = useCallback((n: number) => { setNR(n).catch(() => {}); }, [setNR]);
+  const handleAGC        = useCallback((n: number) => { setAGC(n).catch(() => {}); }, [setAGC]);
+  const handleFilter     = useCallback((n: number) => { setFilter(n).catch(() => {}); }, [setFilter]);
+  const handleDrive      = useCallback((n: number) => { setDrive(n).catch(() => {}); }, [setDrive]);
 
   return (
     <div>
@@ -391,6 +537,14 @@ export default function RadioCATPanel({ cat }: { cat: ReturnType<typeof useRadio
 
         {connected && (
           <>
+            {config.rigProfile === 'usdx-blackbrick' && (
+              <>
+                <div className="w-px h-6 bg-[#30363d] shrink-0" />
+                {/* S-Meter — read-only, shown right after Connect/Disconnect */}
+                <SMeterDisplay dbm={sMeter} />
+              </>
+            )}
+
             <div className="w-px h-6 bg-[#30363d] shrink-0" />
 
             {/* Frequency */}
@@ -405,6 +559,17 @@ export default function RadioCATPanel({ cat }: { cat: ReturnType<typeof useRadio
 
             {/* PTT */}
             <PTTButton ptt={ptt} onToggle={handlePTTToggle} />
+
+            {/* uSDX BLACK_BRICK 4.00e extensions */}
+            {config.rigProfile === 'usdx-blackbrick' && (
+              <BlackBrickControls
+                volume={volume} att1={att1} att2={att2} nr={nr}
+                agc={agc} filter={filter} drive={drive}
+                onVolume={handleVolume} onAtt1={handleAtt1} onAtt2={handleAtt2}
+                onNR={handleNR}
+                onAGC={handleAGC} onFilter={handleFilter} onDrive={handleDrive}
+              />
+            )}
           </>
         )}
 

@@ -23,6 +23,10 @@ declare global {
 
 export type CATMode = 'USB' | 'LSB' | 'AM' | 'FM' | 'CW' | 'RTTY';
 
+/** Rig dialect. 'generic' speaks plain TS-480; 'usdx-blackbrick' adds the
+ *  PU7FTW custom extension commands (VO/AT/A2/NR/AG0/FW/SM/DR) and batches its poll. */
+export type RigProfile = 'generic' | 'usdx-blackbrick';
+
 export interface CATConnectionConfig {
   baudRate: number;
   dataBits: number;
@@ -34,6 +38,8 @@ export interface CATConnectionConfig {
   pollIntervalMs: number;
   /** Enable CAT debug logging to the browser console */
   debug: boolean;
+  /** Rig dialect — controls which CAT commands are available/polled */
+  rigProfile: RigProfile;
 }
 
 export interface RadioState {
@@ -44,6 +50,21 @@ export interface RadioState {
   error: string | null;
   /** false on SSR, true once mounted in a supporting browser */
   isSupported: boolean;
+  /** uSDX BLACK_BRICK 4.00e extension state — null unless rigProfile is 'usdx-blackbrick' */
+  volume: number | null;
+  att1: number | null;
+  att2: number | null;
+  nr: number | null;
+  /** AGC state: 0=OFF, 1=ON. The firmware CAT command allows values up to 2
+   *  ("Slow"), but this build has FAST_AGC undefined, so only agc==1 has a
+   *  distinct code path — 2 behaves identically to 0. Treated as a toggle. */
+  agc: number | null;
+  /** Filter bandwidth index: 0=Full, 1=3000Hz, 2=2400Hz, 3=1800Hz, 4=500Hz, 5=200Hz, 6=100Hz, 7=50Hz */
+  filter: number | null;
+  /** S-meter reading in dBm. Read-only — there is no corresponding setter. */
+  sMeter: number | null;
+  /** TX drive/power level, 0..8 (linear). */
+  drive: number | null;
 }
 
 export interface RadioCATControls {
@@ -53,6 +74,13 @@ export interface RadioCATControls {
   setFrequency: (hz: number) => Promise<void>;
   setMode: (mode: CATMode) => Promise<void>;
   setPTT: (tx: boolean) => Promise<void>;
+  setVolume: (n: number) => Promise<void>;
+  setAtt1: (n: number) => Promise<void>;
+  setAtt2: (n: number) => Promise<void>;
+  setNR: (n: number) => Promise<void>;
+  setAGC: (n: number) => Promise<void>;
+  setFilter: (n: number) => Promise<void>;
+  setDrive: (n: number) => Promise<void>;
 }
 
 // ── Kenwood TS-series CAT protocol ───────────────────────────────────────────
@@ -62,6 +90,33 @@ export interface RadioCATControls {
 // Set mode:    MD2;                     (no echo)
 // PTT on:      TX;                      (no echo)
 // PTT off:     RX;                      (no echo)
+
+// ── uSDX BLACK_BRICK 4.00e — PU7FTW custom extensions ────────────────────────
+// Not part of the TS-480 spec. All SET commands echo the new value as a GET
+// reply, and are safe to include in a multi-command string (e.g. "VO;AT;A2;").
+// Query volume: VO;    → VOn;      (-1..16, -1 = mute)
+// Set volume:   VOn;   → VOn;
+// Query ATT1:   AT;    → ATn;      (0..7)
+// Set ATT1:     ATn;   → ATn;
+// Query ATT2:   A2;    → A2n;      (0..16)
+// Set ATT2:     A2n;   → A2n;
+// Query NR:     NR;    → NRn;      (0..8, 0 = off)
+// Set NR:       NRn;   → NRn;
+// Query AGC:    AG0;   → AG0n;     (0=OFF, 1=ON — firmware accepts up to 2,
+//                                   but this build has FAST_AGC undefined so
+//                                   2 ["Slow"] is not a distinct state from 0)
+// Set AGC:      AG0n;  → AG0n;     (n in 0..1)
+// Query filter: FW;    → FWn;      (0=Full 1=3000 2=2400 3=1800 4=500 5=200 6=100 7=50 Hz)
+// Set filter:   FWn;   → FWn;      (n in 0..7)
+// Query S-meter: SM;   → SMn;      (signed dBm, read-only — there is no SM SET)
+// Query TX drive: DR;  → DRn;      (0..8, linear)
+// Set TX drive:   DRn; → DRn;
+// The firmware supports serialized/batched queries in one write, e.g.
+// "FA;MD;AG0;FW;VO;AT;A2;NR;SM;DR;" — replies come back concatenated in the same order.
+// Note: BL (backlight) exists in firmware but is intentionally not surfaced
+// here — its CAT-driven hardware effect could not be confirmed reliable.
+
+const BLACKBRICK_POLL_CMDS = ['FA;', 'MD;', 'AG0;', 'FW;', 'VO;', 'AT;', 'A2;', 'NR;', 'SM;', 'DR;'];
 
 const KENWOOD_MODE_MAP: Record<string, CATMode> = {
   '1': 'LSB', '2': 'USB', '3': 'CW', '4': 'FM', '5': 'AM', '6': 'RTTY',
@@ -76,8 +131,12 @@ const CAT_MODE_TO_KENWOOD: Record<CATMode, string> = {
 
 interface QueueEntry {
   bytes: Uint8Array;
-  /** 2-char response prefix expected; null = fire-and-forget */
-  prefix: string | null;
+  /** 2-char response prefixes expected, in order; null = fire-and-forget.
+   *  Multiple prefixes = a serialized/batched command string (e.g. "FA;MD;VO;")
+   *  whose replies are collected and joined before resolving. */
+  prefixes: string[] | null;
+  /** Replies collected so far, for entries with prefixes.length > 1 */
+  collected: string[];
   isPoll: boolean;
   resolve: (resp: string) => void;
   reject:  (err: Error)   => void;
@@ -93,6 +152,8 @@ export function useRadioCAT(): RadioCATControls {
   const [state, setState] = useState<RadioState>({
     connected: false, frequency: null, mode: null,
     ptt: false, error: null, isSupported: false,
+    volume: null, att1: null, att2: null, nr: null,
+    agc: null, filter: null, sMeter: null, drive: null,
   });
 
   useEffect(() => {
@@ -111,13 +172,14 @@ export function useRadioCAT(): RadioCATControls {
   const timeoutMsRef     = useRef<number>(50);
   const pollIntervalMsRef = useRef<number>(100);
   const debugRef     = useRef<boolean>(false);
+  const rigProfileRef = useRef<RigProfile>('generic');
   const encoder      = useRef(new TextEncoder()).current;
 
   const queueRef    = useRef<QueueEntry[]>([]);
   const inflightRef = useRef<QueueEntry | null>(null);
 
-  const lastSetRef = useRef<{ frequency: number; mode: number }>({
-    frequency: 0, mode: 0,
+  const lastSetRef = useRef<{ frequency: number; mode: number; volume: number; att1: number; att2: number; nr: number; agc: number; filter: number; drive: number }>({
+    frequency: 0, mode: 0, volume: 0, att1: 0, att2: 0, nr: 0, agc: 0, filter: 0, drive: 0,
   });
 
   const log = useCallback((level: 'debug' | 'info' | 'warn' | 'error', ...args: unknown[]) => {
@@ -141,7 +203,7 @@ export function useRadioCAT(): RadioCATControls {
     const cmdStr = new TextDecoder().decode(entry.bytes).trim();
     const qLen = queueRef.current.length; // already shifted, so this is remaining
 
-    if (entry.prefix === null) {
+    if (entry.prefixes === null) {
       log('debug', 'write ←', cmdStr, `[q:${qLen}]`);
       writerRef.current.write(entry.bytes).then(() => {
         entry.resolve('');
@@ -156,7 +218,11 @@ export function useRadioCAT(): RadioCATControls {
       return;
     }
 
-    log('debug', 'query ←', cmdStr, `(timeout ${timeoutMsRef.current}ms) [q:${qLen}]`);
+    // Batched multi-command strings return one reply per sub-command from the
+    // same read window, but need proportionally more time for the radio to
+    // process and emit all of them.
+    const timeoutMs = timeoutMsRef.current * entry.prefixes.length;
+    log('debug', 'query ←', cmdStr, `(timeout ${timeoutMs}ms) [q:${qLen}]`);
 
     entry.timer = setTimeout(() => {
       // Flush any partial rx data — a timeout means the radio's response was
@@ -169,7 +235,7 @@ export function useRadioCAT(): RadioCATControls {
       inflightRef.current = null;
       entry.resolve('__timeout__');
       drainQueue();
-    }, timeoutMsRef.current);
+    }, timeoutMs);
 
     writerRef.current.write(entry.bytes).catch(err => {
       if (entry.timer) clearTimeout(entry.timer);
@@ -182,18 +248,24 @@ export function useRadioCAT(): RadioCATControls {
 
   const handleResponse = useCallback((msg: string) => {
     const inf = inflightRef.current;
-    if (!inf || inf.prefix === null) {
+    if (!inf || inf.prefixes === null) {
       log('debug', 'unsolicited →', msg.trim());
       return;
     }
-    if (msg.substring(0, 2) !== inf.prefix) {
-      log('debug', 'unexpected →', msg.trim(), '(waiting for', inf.prefix + ')');
+    const expected = inf.prefixes[inf.collected.length];
+    if (msg.substring(0, 2) !== expected) {
+      log('debug', 'unexpected →', msg.trim(), '(waiting for', expected + ')');
       return;
     }
-    log('debug', 'response →', msg.trim(), `[q:${queueRef.current.length}]`);
+    inf.collected.push(msg);
+    if (inf.collected.length < inf.prefixes.length) {
+      log('debug', 'partial →', msg.trim(), `[${inf.collected.length}/${inf.prefixes.length}]`);
+      return;
+    }
+    log('debug', 'response →', inf.collected.join(''), `[q:${queueRef.current.length}]`);
     if (inf.timer) clearTimeout(inf.timer);
     inflightRef.current = null;
-    inf.resolve(msg);
+    inf.resolve(inf.collected.join(''));
     drainQueue();
   }, [log, drainQueue]);
 
@@ -212,7 +284,27 @@ export function useRadioCAT(): RadioCATControls {
     return new Promise<string>((resolve, reject) => {
       queueRef.current.push({
         bytes:  encoder.encode(cmd),
-        prefix: cmd.substring(0, 2),
+        prefixes: [cmd.substring(0, 2)],
+        collected: [],
+        isPoll, resolve, reject, timer: null,
+      });
+      drainQueue();
+    });
+  }, [encoder, drainQueue]);
+
+  // Sends a serialized multi-command string (e.g. "FA;MD;VO;") in a single
+  // write and collects each reply in order, joined back into one string.
+  // Used to batch the poll into one round-trip instead of one per field.
+  const queryBatch = useCallback((cmds: string[], isPoll = false): Promise<string> => {
+    const cmdStr = cmds.join('');
+    if (queueRef.current.some(e => e.isPoll === isPoll && new TextDecoder().decode(e.bytes) === cmdStr)) {
+      return Promise.resolve('__dedup__');
+    }
+    return new Promise<string>((resolve, reject) => {
+      queueRef.current.push({
+        bytes:  encoder.encode(cmdStr),
+        prefixes: cmds.map(c => c.substring(0, 2)),
+        collected: [],
         isPoll, resolve, reject, timer: null,
       });
       drainQueue();
@@ -224,7 +316,8 @@ export function useRadioCAT(): RadioCATControls {
     return new Promise<void>((resolve, reject) => {
       queueRef.current.push({
         bytes:  encoder.encode(cmd),
-        prefix: null, isPoll: false,
+        prefixes: null, collected: [],
+        isPoll: false,
         resolve: () => resolve(), reject, timer: null,
       });
       drainQueue();
@@ -275,6 +368,11 @@ export function useRadioCAT(): RadioCATControls {
     return m ? (KENWOOD_MODE_MAP[m[1].toUpperCase()] ?? null) : null;
   };
 
+  const parseIntField = (resp: string, prefix: string): number | null => {
+    const m = resp.match(new RegExp(`^${prefix}(-?\\d+);$`));
+    return m ? parseInt(m[1], 10) : null;
+  };
+
   // ── Poll loop — self-scheduling setTimeout so the next poll only fires
   // after the current one fully completes. This prevents poll buildup when
   // the radio is slow or the USB-serial stack stalls. ─────────────────────
@@ -294,24 +392,64 @@ export function useRadioCAT(): RadioCATControls {
           // A user command (PTT/freq/mode) is pending — skip this poll cycle
           return;
         }
-        const safeQuery = async (cmd: string): Promise<string> => {
-          try { return await query(cmd, true); } catch { return ''; }
-        };
         const now = Date.now();
-        const fr  = await safeQuery('FA;');
-        const mr  = await safeQuery('MD;');
-        const freq = parseFrequency(fr);
-        const mode = parseMode(mr);
-        log('debug', 'poll — freq:', freq, 'mode:', mode, `[q:${queueRef.current.length}]`);
-        if (freq !== null || mode !== null) {
-          setState(prev => {
-            const ls = lastSetRef.current;
-            return {
+        const ls  = lastSetRef.current;
+
+        if (rigProfileRef.current === 'usdx-blackbrick') {
+          // Serialized batch — one round-trip for every polled field instead
+          // of one per command, per the firmware's new multi-command support.
+          let resp = '';
+          try { resp = await queryBatch(BLACKBRICK_POLL_CMDS, true); } catch { resp = ''; }
+          const frames = resp.split(';').filter(Boolean).map(f => f + ';');
+          const byPrefix = new Map<string, string>();
+          for (const f of frames) byPrefix.set(f.substring(0, 2), f);
+
+          // AG0 replies as "AG0n;" — prefix is "AG", not "AG0"
+          const agcRaw = [...byPrefix.entries()].find(([k]) => k === 'AG')?.[1] ?? null;
+          const freq      = byPrefix.has('FA') ? parseFrequency(byPrefix.get('FA')!) : null;
+          const mode      = byPrefix.has('MD') ? parseMode(byPrefix.get('MD')!) : null;
+          const agc       = agcRaw ? parseIntField(agcRaw, 'AG0') : null;
+          const filter    = byPrefix.has('FW') ? parseIntField(byPrefix.get('FW')!, 'FW') : null;
+          const volume    = byPrefix.has('VO') ? parseIntField(byPrefix.get('VO')!, 'VO') : null;
+          const att1      = byPrefix.has('AT') ? parseIntField(byPrefix.get('AT')!, 'AT') : null;
+          const att2      = byPrefix.has('A2') ? parseIntField(byPrefix.get('A2')!, 'A2') : null;
+          const nr        = byPrefix.has('NR') ? parseIntField(byPrefix.get('NR')!, 'NR') : null;
+          const sMeter    = byPrefix.has('SM') ? parseIntField(byPrefix.get('SM')!, 'SM') : null;
+          const drive     = byPrefix.has('DR') ? parseIntField(byPrefix.get('DR')!, 'DR') : null;
+
+          log('debug', 'poll(batch) — freq:', freq, 'mode:', mode, 'agc:', agc, 'filt:', filter,
+            'vol:', volume, 'att1:', att1, 'att2:', att2, 'nr:', nr, 'sm:', sMeter, 'drive:', drive, `[q:${queueRef.current.length}]`);
+
+          setState(prev => ({
+            ...prev,
+            frequency: freq   !== null && (now - ls.frequency > SET_GRACE_MS) ? freq   : prev.frequency,
+            mode:      mode   !== null && (now - ls.mode      > SET_GRACE_MS) ? mode   : prev.mode,
+            agc:       agc    !== null && (now - ls.agc       > SET_GRACE_MS) ? agc    : prev.agc,
+            filter:    filter !== null && (now - ls.filter    > SET_GRACE_MS) ? filter : prev.filter,
+            volume:    volume !== null && (now - ls.volume    > SET_GRACE_MS) ? volume : prev.volume,
+            att1:      att1   !== null && (now - ls.att1      > SET_GRACE_MS) ? att1   : prev.att1,
+            att2:      att2   !== null && (now - ls.att2      > SET_GRACE_MS) ? att2   : prev.att2,
+            nr:        nr     !== null && (now - ls.nr        > SET_GRACE_MS) ? nr     : prev.nr,
+            drive:     drive  !== null && (now - ls.drive     > SET_GRACE_MS) ? drive  : prev.drive,
+            // sMeter is read-only telemetry — no grace period needed, always take the latest poll value.
+            sMeter:    sMeter !== null ? sMeter : prev.sMeter,
+          }));
+        } else {
+          const safeQuery = async (cmd: string): Promise<string> => {
+            try { return await query(cmd, true); } catch { return ''; }
+          };
+          const fr  = await safeQuery('FA;');
+          const mr  = await safeQuery('MD;');
+          const freq = parseFrequency(fr);
+          const mode = parseMode(mr);
+          log('debug', 'poll — freq:', freq, 'mode:', mode, `[q:${queueRef.current.length}]`);
+          if (freq !== null || mode !== null) {
+            setState(prev => ({
               ...prev,
               frequency: freq !== null && (now - ls.frequency > SET_GRACE_MS) ? freq : prev.frequency,
               mode:      mode !== null && (now - ls.mode      > SET_GRACE_MS) ? mode : prev.mode,
-            };
-          });
+            }));
+          }
         }
       } finally {
         pollRunningRef.current = false;
@@ -319,7 +457,7 @@ export function useRadioCAT(): RadioCATControls {
         if (writerRef.current) schedulePoll();
       }
     }, pollIntervalMsRef.current);
-  }, [log, query]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [log, query, queryBatch]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // ── Public API ───────────────────────────────────────────────────────────
 
@@ -341,7 +479,10 @@ export function useRadioCAT(): RadioCATControls {
     writerRef.current = null;
     portRef.current   = null;
     rxBufRef.current  = '';
-    setState(prev => ({ ...prev, connected: false, frequency: null, mode: null, ptt: false, error: null }));
+    setState(prev => ({
+      ...prev, connected: false, frequency: null, mode: null, ptt: false, error: null,
+      volume: null, att1: null, att2: null, nr: null, agc: null, filter: null, sMeter: null, drive: null,
+    }));
   }, [log]);
 
   const connect = useCallback(async (config: CATConnectionConfig) => {
@@ -350,7 +491,7 @@ export function useRadioCAT(): RadioCATControls {
       setState(prev => ({ ...prev, error: 'Web Serial API not supported in this browser' }));
       return;
     }
-    log('info', `connecting — ${config.baudRate} ${config.dataBits}${config.parity === 'none' ? 'N' : config.parity[0].toUpperCase()}${config.stopBits} timeout:${config.timeoutMs}ms debug:${config.debug}`);
+    log('info', `connecting — ${config.baudRate} ${config.dataBits}${config.parity === 'none' ? 'N' : config.parity[0].toUpperCase()}${config.stopBits} timeout:${config.timeoutMs}ms debug:${config.debug} profile:${config.rigProfile}`);
     try {
       const serial = (navigator as Navigator & { serial: { requestPort(): Promise<SerialPort> } }).serial;
       const port = await serial.requestPort();
@@ -361,6 +502,7 @@ export function useRadioCAT(): RadioCATControls {
       if (!port.writable || !port.readable) throw new Error('Port streams unavailable');
       timeoutMsRef.current     = config.timeoutMs;
       pollIntervalMsRef.current = config.pollIntervalMs;
+      rigProfileRef.current    = config.rigProfile;
       portRef.current   = port;
       writerRef.current = port.writable.getWriter();
       const reader      = port.readable.getReader();
@@ -398,7 +540,59 @@ export function useRadioCAT(): RadioCATControls {
     await write(tx ? 'TX;' : 'RX;');
   }, [log, write]);
 
+  const setVolume = useCallback(async (n: number) => {
+    lastSetRef.current.volume = Date.now();
+    log('info', 'setVolume →', n);
+    setState(prev => ({ ...prev, volume: n }));
+    await write(`VO${n};`);
+  }, [log, write]);
+
+  const setAtt1 = useCallback(async (n: number) => {
+    lastSetRef.current.att1 = Date.now();
+    log('info', 'setAtt1 →', n);
+    setState(prev => ({ ...prev, att1: n }));
+    await write(`AT${n};`);
+  }, [log, write]);
+
+  const setAtt2 = useCallback(async (n: number) => {
+    lastSetRef.current.att2 = Date.now();
+    log('info', 'setAtt2 →', n);
+    setState(prev => ({ ...prev, att2: n }));
+    await write(`A2${n};`);
+  }, [log, write]);
+
+  const setNR = useCallback(async (n: number) => {
+    lastSetRef.current.nr = Date.now();
+    log('info', 'setNR →', n);
+    setState(prev => ({ ...prev, nr: n }));
+    await write(`NR${n};`);
+  }, [log, write]);
+
+  const setAGC = useCallback(async (n: number) => {
+    lastSetRef.current.agc = Date.now();
+    log('info', 'setAGC →', n);
+    setState(prev => ({ ...prev, agc: n }));
+    await write(`AG0${n};`);
+  }, [log, write]);
+
+  const setFilter = useCallback(async (n: number) => {
+    lastSetRef.current.filter = Date.now();
+    log('info', 'setFilter →', n);
+    setState(prev => ({ ...prev, filter: n }));
+    await write(`FW${n};`);
+  }, [log, write]);
+
+  const setDrive = useCallback(async (n: number) => {
+    lastSetRef.current.drive = Date.now();
+    log('info', 'setDrive →', n);
+    setState(prev => ({ ...prev, drive: n }));
+    await write(`DR${n};`);
+  }, [log, write]);
+
   useEffect(() => () => { disconnect(); }, [disconnect]);
 
-  return { state, connect, disconnect, setFrequency, setMode, setPTT };
+  return {
+    state, connect, disconnect, setFrequency, setMode, setPTT,
+    setVolume, setAtt1, setAtt2, setNR, setAGC, setFilter, setDrive,
+  };
 }

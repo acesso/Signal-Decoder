@@ -275,32 +275,264 @@ Callsigns are extracted from decoded messages and tracked as contacts with full 
 - **Canvas API**: Progressive image rendering
 - **Tailwind CSS**: Utility-first styling
 
-## Testing
+## uSDX BLACK_BRICK Firmware
 
-The project includes comprehensive unit tests for the core SSTV decoding algorithms.
+The `firmware/usdxBLACKBRICK/` directory contains `usdxBLACKBRICK.ino` — a customized uSDX firmware for the Chinese black-brick clone (ATmega328P at 20 MHz) with TS-480 Kenwood CAT protocol and PU7FTW custom extensions. The web app's Radio CAT panel speaks directly to this firmware.
 
-### Running Tests
+### Hardware
+
+| Item | Detail |
+|------|--------|
+| MCU | ATmega328P at 20 MHz |
+| Display | HD44780 2-line LCD (regular green backlit, NOT OLED) |
+| Flash programmer | USBasp (USB ID `16c0:05dc`) |
+| CAT serial | CH340 USB-serial chip (USB ID `1a86:55d3`) |
+
+**USBasp ISP wiring to uSDX BLACK_BRICK programming header:**
+
+```text
+USBasp 10-pin IDC    uSDX ISP header (6-pin)
+─────────────────    ───────────────────────
+Pin 1  MOSI     →    MOSI
+Pin 5  RST      →    RST
+Pin 7  SCK      →    SCK
+Pin 9  MISO     →    MISO
+Pin 2  VCC      →    VCC  (3.3 V or 5 V — match radio supply)
+Pin 6  GND      →    GND
+```
+
+The ISP header is typically a 6-pin 2×3 2.54 mm connector on the radio PCB. The USBasp can power the target from its VCC pin — leave the radio's own power switch off while flashing.
+
+### Prerequisites
+
+Install `arduino-cli` and `avrdude`:
 
 ```bash
-# Run all tests
+# Arch / Manjaro
+sudo pacman -S arduino-cli avrdude
+
+# Debian / Ubuntu
+sudo apt install avrdude
+curl -fsSL https://raw.githubusercontent.com/arduino/arduino-cli/master/install.sh | sh
+```
+
+Add the Arduino AVR core (one time):
+
+```bash
+arduino-cli core update-index
+arduino-cli core install arduino:avr
+```
+
+**Linux — USBasp udev rule** (allows flashing without `sudo`):
+
+```bash
+sudo tee /etc/udev/rules.d/51-usbasp.rules <<'EOF'
+SUBSYSTEM=="usb", ATTR{idVendor}=="16c0", ATTR{idProduct}=="05dc", MODE="0666", GROUP="dialout"
+EOF
+sudo udevadm control --reload-rules && sudo udevadm trigger
+```
+
+Add your user to the `dialout` group (needed for both USBasp and the CH340 serial port):
+
+```bash
+sudo usermod -aG dialout $USER   # log out and back in for the group to apply
+```
+
+### Compile
+
+All commands are run from the **repository root** (`Signal-Decoder/`).
+
+```bash
+arduino-cli compile \
+  --fqbn arduino:avr:uno \
+  --output-dir firmware/build \
+  firmware/usdxBLACKBRICK
+```
+
+> The FQBN targets Arduino Uno (16 MHz). The firmware corrects the baud rate for the actual 20 MHz crystal via `Serial.begin(16000000ULL * BAUD / F_MCU)`.
+
+Expected output:
+
+```text
+Sketch uses 30048 bytes (93%) of program storage space. Maximum is 32256 bytes.
+Global variables use 1472 bytes (71%) of dynamic memory, leaving 576 bytes for local variables.
+```
+
+Build artifacts are written to `firmware/build/`:
+
+- `usdxBLACKBRICK.ino.hex` — flash image
+- `usdxBLACKBRICK.ino.eep` — EEPROM image (empty by default; settings are written at runtime)
+
+### Flash
+
+Connect the USBasp to the uSDX ISP header. The radio's own power switch should be **off** — the USBasp supplies VCC.
+
+```bash
+avrdude -c usbasp -p m328p -B 4 -v \
+  -U flash:w:firmware/build/usdxBLACKBRICK.ino.hex:i
+```
+
+The `-B 4` flag sets a 4 µs ISP bit-clock period (≈187 kHz SCK). This is necessary because the USBasp's default clock can be too fast for the target to follow reliably.
+
+Expected final lines from avrdude:
+
+```text
+30048 bytes of flash verified
+Avrdude done.  Thank you.
+```
+
+**Troubleshooting:**
+
+- **`target does not answer`** — USBasp not making contact. Reseat the ISP connector and check pin 1 orientation.
+- **`cannot open USB device`** — missing udev rule or user not in `dialout` group. Add the rule above and re-login.
+- **`Error: cannot set sck period`** — old USBasp bootloader. This is a harmless warning; the flash proceeds normally.
+- **Sketch won't start after flash** — EEPROM holds stale settings from a previous firmware. Power-cycle the radio; hold the encoder button at boot to reset to defaults.
+
+### Verify the flash without a programmer
+
+After flashing, disconnect the USBasp and power the radio normally. Open a terminal and send the batch poll command:
+
+```bash
+# Replace /dev/ttyACM1 with your actual port (ttyACM0, ttyUSB0, etc.)
+stty -F /dev/ttyACM1 38400 raw -echo
+printf 'FA;MD;AG0;FW;VO;AT;A2;NR;BL;' > /dev/ttyACM1 && cat /dev/ttyACM1 &
+sleep 0.5 && kill %1
+```
+
+A working radio replies with all 9 frames in one line, e.g.:
+
+```text
+FA00007074000;MD1;AG01;FW0;VO12;AT0;A22;NR2;BL1;
+```
+
+If the port is busy or silent, make sure no other CAT application (hamlib, rigctld, WSJT-X) has the port open.
+
+### CAT connection parameters
+
+| Parameter | Value |
+|-----------|-------|
+| Baud rate | 38400 (default; configurable in menu → *CAT baud*: 9600 / 19200 / 38400 / 57600) |
+| Data bits | 8 |
+| Stop bits | 1 |
+| Parity | None |
+| Flow control | None |
+| Port (Linux) | `/dev/ttyACM0` or `/dev/ttyACM1` (CH340 USB-serial) |
+| Port (Windows) | `COMx` — check Device Manager under *Ports (COM & LPT)* |
+
+### Custom CAT commands (PU7FTW extensions)
+
+All commands terminate with `;`. All SET commands echo the new value as a GET reply. Commands are safe to batch in a single write — the firmware processes them in order and concatenates replies, e.g. `FA;MD;AG0;FW;VO;AT;A2;NR;BL;` returns all 9 replies in one read window.
+
+| Command | Query | Set | Range | Notes |
+|---------|-------|-----|-------|-------|
+| **VO** — volume | `VO;` → `VOn;` | `VOn;` | −1…16 | −1 = mute |
+| **AT** — ATT1 | `AT;` → `ATn;` | `ATn;` | 0…7 | dB steps: 0/−13/−20/−33/−40/−53/−60/−73 dB |
+| **A2** — ATT2 | `A2;` → `A2n;` | `A2n;` | 0…16 | linear index |
+| **NR** — noise reduction | `NR;` → `NRn;` | `NRn;` | 0…8 | 0 = off |
+| **BL** — backlight | `BL;` → `BL0;`/`BL1;` | `BL0;`/`BL1;` | 0…1 | |
+| **AG0** — AGC | `AG0;` → `AG0n;` | `AG0n;` | 0…2 | 0=OFF 1=Fast 2=Slow |
+| **FW** — filter BW | `FW;` → `FWn;` | `FWn;` | 0…7 | 0=Full 1=3k 2=2.4k 3=1.8k 4=500 5=200 6=100 7=50 Hz |
+| **TQ** — PTT state | `TQ;` → `TQ0;`/`TQ1;` | `TQ0;`/`TQ1;` | 0…1 | firmware also broadcasts `TQ0;`/`TQ1;` unsolicited on PTT transitions |
+
+Standard TS-480 commands also supported: `FA` (VFO A freq get/set), `MD` (mode), `IF` (37-byte info frame), `TX`/`RX` (PTT), `ID`, `PS`, `AI`, `VX`.
+
+## Testing
+
+The project includes unit tests for core decoding algorithms and CAT protocol logic.
+
+### Running all tests
+
+```bash
+# Run all tests (no hardware needed)
 npm test
 
-# Run tests in watch mode (for development)
+# Watch mode during development
 npm run test:watch
 
-# Run tests with coverage report
+# With coverage report
 npm run test:coverage
 ```
 
-### Test Framework
+### CAT protocol tests (no hardware required)
 
-- **Jest** - Test runner with TypeScript support
-- **@testing-library/react** - React component testing utilities
-- **jsdom** - DOM environment for tests
+`src/lib/cat/__tests__/protocol.test.ts` runs entirely in Node.js — no radio, no serial port. It covers:
+
+- TS-480 command construction (`FA`, `MD`)
+- Response parsing helpers (`parseFrequency`, `parseMode`, `parseIntField`, `parseBoolField`)
+- All 8 custom BLACK_BRICK commands (`VO`, `AT`, `A2`, `NR`, `BL`, `AG0`, `FW`, `TQ`)
+- Multi-command batch response splitting and 2-char prefix lookup map
+- IF frame parsing against the exact frame layout emitted by the firmware
+- Range validation for every writable parameter
+
+```bash
+npm test -- src/lib/cat/__tests__/protocol.test.ts
+```
+
+Expected result: **35 tests, 35 passed**.
+
+### Testbed setup (live radio required)
+
+The CAT unit tests above need no hardware. If you want to run manual smoke tests or extend the suite with hardware-in-the-loop tests:
+
+**1. Flash the firmware** (see [Flash](#flash) above).
+
+**2. Confirm the port appears:**
+
+```bash
+ls /dev/ttyACM*    # Linux
+# Expected: /dev/ttyACM0 or /dev/ttyACM1
+```
+
+**3. Confirm your user can access it:**
+
+```bash
+stat /dev/ttyACM1       # check group — should be 'dialout'
+groups                  # your user should include 'dialout'
+```
+
+If not, add yourself to `dialout` (see [Prerequisites](#prerequisites)) and re-login.
+
+**4. Make sure no other software has the port open:**
+
+```bash
+lsof /dev/ttyACM1       # should return nothing
+# If hamlib/rigctld is running:
+pkill rigctld
+```
+
+**5. Send a smoke-test batch query:**
+
+```bash
+PORT=/dev/ttyACM1
+BAUD=38400
+stty -F $PORT $BAUD raw -echo cs8 -cstopb -parenb
+printf 'FA;MD;AG0;FW;VO;AT;A2;NR;BL;' > $PORT
+timeout 1 cat $PORT
+```
+
+Expected output (values will differ by radio state):
+
+```
+FA00007074000;MD1;AG01;FW0;VO12;AT0;A22;NR2;BL1;
+```
+
+**6. Run the Jest test suite** (no hardware needed, but safe to run with the radio connected):
+
+```bash
+npm test -- --no-coverage
+```
+
+The CAT protocol tests pass regardless of whether the radio is connected — they test parsing and command construction in pure JavaScript. The 2 pre-existing failures in `sstv/constants.test.ts` are unrelated to the firmware or CAT stack.
+
+### Test framework
+
+- **Jest** — test runner with TypeScript support via `ts-jest`
+- **@testing-library/react** — React component testing utilities
+- **jsdom** — DOM environment for browser API simulation
 
 ## Getting Started
 
-### Prerequisites
+### Requirements
 
 - Node.js 18+ installed
 - A modern web browser with microphone access
