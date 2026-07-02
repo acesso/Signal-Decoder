@@ -9,7 +9,13 @@ import MFSKDecoder from "@/components/MFSKDecoder";
 import FTTransmitPanel, { type TxStatus } from "@/components/FTTransmitPanel";
 import type { DecoderControls } from '@/components/DecoderControls';
 import { useGlobalAudio } from '@/hooks/useGlobalAudio';
-import { FTMode } from '@/lib/ft/decoder';
+import {
+  FTMode,
+  type FTDecoderStats,
+  type FTDecoderStatus,
+  subscribeDecoderStats,
+  subscribeDecoderStatus,
+} from '@/lib/ft/decoder';
 import RadioCATPanel, { useRadioCAT } from '@/components/RadioCATPanel';
 import type { Contact } from '@/lib/ft/parser';
 
@@ -48,6 +54,14 @@ function MemDebugBar({ contacts }: { contacts: Map<string, Contact> }) {
     totalMsgs: number;
     domNodes: number;
   } | null>(null);
+  const [wasmStats,  setWasmStats]  = useState<FTDecoderStats | null>(null);
+  const [wasmStatus, setWasmStatus] = useState<FTDecoderStatus | null>(null);
+
+  useEffect(() => {
+    const unsubStats  = subscribeDecoderStats(setWasmStats);
+    const unsubStatus = subscribeDecoderStatus(setWasmStatus);
+    return () => { unsubStats(); unsubStatus(); };
+  }, []);
 
   useEffect(() => {
     const update = () => {
@@ -88,6 +102,29 @@ function MemDebugBar({ contacts }: { contacts: Map<string, Contact> }) {
         <span>contacts <span className="text-[#8b949e]">{snap.contacts}</span></span>
         <span>msgs <span className="text-[#8b949e]">{snap.totalMsgs}</span></span>
         <span>DOM <span className="text-[#8b949e]">{snap.domNodes}</span></span>
+        {wasmStatus && wasmStatus.generation > 0 && (
+          <>
+            <span className="text-[#30363d] select-none">· ⬡ wasm</span>
+            <span title="active decode engine">
+              {wasmStats?.engine ?? (wasmStatus.engines.length ? wasmStatus.engines.join('+') : 'loading…')}
+            </span>
+            {wasmStats && (
+              <>
+                <span title="WASM memory: live allocations / reserved linear memory">
+                  heap <span className="text-[#8b949e]">
+                    {(wasmStats.heapUsedBytes / 1024 / 1024).toFixed(1)}/{Math.round(wasmStats.heapBytes / 1024 / 1024)} MB
+                  </span>
+                </span>
+                <span title="last decode time inside the worker">
+                  dec <span className="text-[#8b949e]">{(wasmStats.decodeMs / 1000).toFixed(1)}s</span>
+                </span>
+              </>
+            )}
+            {wasmStatus.generation > 1 && (
+              <span title="worker respawn count">gen <span className="text-[#8b949e]">{wasmStatus.generation}</span></span>
+            )}
+          </>
+        )}
       </div>
     </div>
   );

@@ -564,11 +564,20 @@ npm run build
 npm start
 ```
 
-### FT8/FT4 WASM Decoder
+### FT8/FT4 WASM Decoders
 
-The FT8/FT4 decoder is powered by a native C library ([kgoba/ft8_lib](https://github.com/kgoba/ft8_lib)) compiled to WebAssembly. The compiled output (`public/wasm/ft8.js` and `public/wasm/ft8.wasm`) is committed to the repository, so **no rebuild is needed for normal development or deployment**.
+Two native decoders are compiled to WebAssembly; the compiled output under `public/wasm/` is committed, so **no rebuild is needed for normal development or deployment**.
 
-The C source is included as a git submodule at `lib/ft8_lib`. When cloning for the first time, initialize it with:
+| Engine | Used for | Source | Pipeline |
+| --- | --- | --- | --- |
+| `ft8mon.{js,wasm}` | FT8 | [rtmrtmrtmrtm/ft8mon](https://github.com/rtmrtmrtmrtm/ft8mon) (Robert Morris, AB1HL — MIT license), vendored at `lib/ft8mon` | LDPC belief propagation + OSD fallback + multi-pass interference subtraction (WSJT-X-style), statically linked against FFTW 3.3.10 compiled to WASM |
+| `ft8.{js,wasm}` | FT4, and FT8 fallback | [kgoba/ft8_lib](https://github.com/kgoba/ft8_lib), git submodule at `lib/ft8_lib` | lightweight single-pass BP-only decoder |
+
+ft8mon decodes substantially more signals than ft8_lib (on ft8_lib's reference WAVs, matched against WSJT-X decodes: **310/353 vs 257/353**) at the cost of CPU time, bounded by a runtime-tunable budget. Decoder tuning (OSD depth, CPU budget, subtraction passes, LDPC iterations, band limits) lives behind the **Tune** button in the FT8/4 panel and applies live, without restart. The **⟳ WASM** button respawns the decode worker and reloads both modules without a page reload. ft8mon is FT8-only, which is why ft8_lib remains for FT4.
+
+`lib/ft8mon` is vendored (not a submodule) because it carries small Emscripten compatibility patches, all under `#ifdef __EMSCRIPTEN__`: synchronous decode instead of `std::thread`, `set()` returns NaN instead of `exit(1)` on unknown params, no FFTW plan lock file, no libsndfile dependency.
+
+The ft8_lib source is a git submodule. When cloning for the first time, initialize it with:
 
 ```bash
 git clone --recurse-submodules https://github.com/acesso/Signal-Decoder.git
@@ -576,7 +585,7 @@ git clone --recurse-submodules https://github.com/acesso/Signal-Decoder.git
 git submodule update --init
 ```
 
-#### Rebuilding the WASM (only needed if ft8_lib changes)
+#### Rebuilding the WASM (only needed if lib/ft8_lib, lib/ft8mon, or the wrappers change)
 
 Requires [Docker](https://docs.docker.com/get-docker/). Run from the **project root**:
 
@@ -584,11 +593,12 @@ Requires [Docker](https://docs.docker.com/get-docker/). Run from the **project r
 docker run --rm \
   -v "$(pwd):/src" \
   -w /src/lib/wasm_build \
+  -u "$(id -u):$(id -g)" \
   emscripten/emsdk \
   make
 ```
 
-Output is written to `public/wasm/ft8.{js,wasm}`. Commit both files after rebuilding.
+The first build downloads and cross-compiles FFTW (cached under `lib/wasm_build/fftw-build/`, gitignored). Output is written to `public/wasm/ft8.{js,wasm}` and `public/wasm/ft8mon.{js,wasm}`. Commit these files after rebuilding.
 
 To clean and rebuild from scratch:
 
@@ -596,8 +606,17 @@ To clean and rebuild from scratch:
 docker run --rm \
   -v "$(pwd):/src" \
   -w /src/lib/wasm_build \
+  -u "$(id -u):$(id -g)" \
   emscripten/emsdk \
   make clean all
+```
+
+#### Decoder regression benchmark
+
+`lib/wasm_build/testbuild/test_decode.mjs` decodes ft8_lib's reference WAVs (`lib/ft8_lib/test/wav/`) with both engines and reports match counts against the expected decodes. Build the node-target modules it needs with `make test-modules` (same Docker invocation as above), then run:
+
+```bash
+node lib/wasm_build/testbuild/test_decode.mjs [osd_depth]
 ```
 
 ## How to Use

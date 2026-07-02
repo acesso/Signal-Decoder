@@ -8,6 +8,7 @@ import { useFTProcessor } from '@/hooks/useFTProcessor';
 import { FTMode, FT_WINDOW_SECONDS } from '@/lib/ft/decoder';
 import { Contact, mergeContacts, parseFTMsg, parseADIF, isValidCallsign, gridToLatLon, CONTACT_PALETTE } from '@/lib/ft/parser';
 import FTContactsPanel from './FTContactsPanel';
+import FTWasmPanel from './FTWasmPanel';
 
 // ── Clock ring (rAF-driven, no setState) ──────────────────────────────────────
 
@@ -230,27 +231,31 @@ const FTDecoder = forwardRef<DecoderControls, { ftMode: FTMode; myCall?: string;
   // Keyed by timestamp so entries survive result-array prepends without index shifting.
   const frozenVfoRef = useRef<Map<number, number>>(new Map());
 
+  // Messages already merged into contacts, per window (windowStart ms → count).
+  // Messages now STREAM into a window's result while its decode runs, so merging
+  // tracks a per-window high-water mark instead of the results-array length —
+  // each effect run merges only the slice it hasn't seen yet.
+  const mergedCountRef = useRef<Map<number, number>>(new Map());
+
   useEffect(() => {
     const { results } = state;
-    if (results.length < prevResultLenRef.current) {
+    if (results.length === 0) {
       prevResultLenRef.current = 0;
       frozenVfoRef.current.clear();
+      mergedCountRef.current.clear();
       return;
     }
-    const newCount = results.length - prevResultLenRef.current;
-    if (newCount <= 0) return;
 
-    // Snapshot VFO for each new window (results is newest-first)
     const currentVfo = vfoRef.current;
-    const fresh = results.slice(0, newCount);
-    for (const r of fresh) {
-      frozenVfoRef.current.set(r.windowStart.getTime(), currentVfo);
-    }
+
     // Evict stale entries — keep only what's still referenced by the results array
     if (frozenVfoRef.current.size > results.length + 10) {
       const live = new Set(results.map(r => r.windowStart.getTime()));
       for (const k of frozenVfoRef.current.keys()) {
         if (!live.has(k)) frozenVfoRef.current.delete(k);
+      }
+      for (const k of mergedCountRef.current.keys()) {
+        if (!live.has(k)) mergedCountRef.current.delete(k);
       }
     }
 
@@ -259,15 +264,27 @@ const FTDecoder = forwardRef<DecoderControls, { ftMode: FTMode; myCall?: string;
     // onContactsChange without running the merge twice or calling a side-effect
     // inside the updater (which React may call during render).
     let next = contacts;
-    for (const r of fresh.slice().reverse()) {
-      const msgsWithAbsFreq = r.messages.map(msg => ({
+    let changed = false;
+    for (const r of results.slice().reverse()) { // oldest first
+      const key = r.windowStart.getTime();
+      // Snapshot VFO the first time we see this window
+      if (!frozenVfoRef.current.has(key)) frozenVfoRef.current.set(key, currentVfo);
+      const vfo    = frozenVfoRef.current.get(key)!;
+      const merged = mergedCountRef.current.get(key) ?? 0;
+      if (r.messages.length <= merged) continue;
+
+      const freshMsgs = r.messages.slice(merged).map(msg => ({
         ...msg,
-        freq: currentVfo > 0 ? currentVfo + msg.freq : msg.freq,
+        freq: vfo > 0 ? vfo + msg.freq : msg.freq,
       }));
-      next = mergeContacts(next, r.windowStart, msgsWithAbsFreq, 0);
+      next = mergeContacts(next, r.windowStart, freshMsgs, 0);
+      mergedCountRef.current.set(key, r.messages.length);
+      changed = true;
     }
-    setContacts(next);
-    onContactsChange?.(next);
+    if (changed) {
+      setContacts(next);
+      onContactsChange?.(next);
+    }
     prevResultLenRef.current = results.length;
   }, [state.results]); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -357,7 +374,7 @@ const FTDecoder = forwardRef<DecoderControls, { ftMode: FTMode; myCall?: string;
   const totalMsgs = results.reduce((s, r) => s + r.messages.length, 0);
   const hasData   = results.length > 0 || contacts.size > 0;
 
-  type SepRow = { kind: 'sep'; time: Date; mode: FTMode; empty: boolean; key: string };
+  type SepRow = { kind: 'sep'; time: Date; mode: FTMode; empty: boolean; decoding: boolean; decodeMs: number; key: string };
   type MsgRow = { kind: 'msg'; absFreq: string; dt: number; snr: number; msg: string; time: Date; addressedToMe: boolean; key: string };
   type TableRow = SepRow | MsgRow;
 
@@ -368,7 +385,7 @@ const FTDecoder = forwardRef<DecoderControls, { ftMode: FTMode; myCall?: string;
     // Fall back to the live VFO for the newest window whose entry isn't frozen yet
     const frozenVfo = frozenVfoRef.current.get(r.windowStart.getTime()) ?? vfoRef.current;
     return [
-      { kind: 'sep' as const, time: r.windowStart, mode: r.mode, empty: r.messages.length === 0, key: `sep-${ri}` },
+      { kind: 'sep' as const, time: r.windowStart, mode: r.mode, empty: r.messages.length === 0, decoding: !!r.decoding, decodeMs: r.decodeMs, key: `sep-${ri}` },
       ...r.messages.map((m, mi) => {
         const parsed = parseFTMsg(m.msg);
         const addressedToMe = !!myCallUpper && parsed.callee?.toUpperCase() === myCallUpper;
@@ -495,7 +512,15 @@ const FTDecoder = forwardRef<DecoderControls, { ftMode: FTMode; myCall?: string;
                       <tr key={row.key}>
                         <td colSpan={5} className="px-2 py-0.5 text-[10px] text-[#484f58] border-t border-[#21262d] bg-[#0d1117]/60">
                           {localHMS(row.time)} — {row.mode}
-                          {row.empty && <span className="ml-2 text-[#30363d]">no signals</span>}
+                          {row.decoding && (
+                            <span className="ml-2 text-[#e3b341] animate-pulse">decoding…</span>
+                          )}
+                          {!row.decoding && row.empty && <span className="ml-2 text-[#30363d]">no signals</span>}
+                          {!row.decoding && row.decodeMs > 0 && (
+                            <span className="ml-2 text-[#30363d]" title="decode time">
+                              dec {(row.decodeMs / 1000).toFixed(1)}s
+                            </span>
+                          )}
                         </td>
                       </tr>
                     ) : (
@@ -524,6 +549,11 @@ const FTDecoder = forwardRef<DecoderControls, { ftMode: FTMode; myCall?: string;
                 </tbody>
               </table>
             )}
+          </div>
+
+          {/* WASM engine monitor + runtime tuning */}
+          <div className="mt-2 shrink-0">
+            <FTWasmPanel ftMode={ftMode} />
           </div>
         </div>
 

@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   FTDecodeResult,
+  FTMessage,
   FTMode,
   FT_WINDOW_SECONDS,
   FT_SUPPORTED,
@@ -69,18 +70,36 @@ export function useFTProcessor(mode: FTMode) {
 
   const runLoop = useCallback(async () => {
     // Kick off decode of a captured buffer in the background; does not block the record loop.
+    // A placeholder result is inserted immediately and messages stream into it as the
+    // decoder finds them, so the UI (and contacts/auto-reply pipeline) doesn't wait
+    // for the full CPU budget to elapse.
     const dispatchDecode = (captured: Float32Array, sampleRate: number, windowStart: Date) => {
-      const t0 = performance.now();
-      decodeFTAudio(captured, sampleRate, modeRef.current)
+      const t0  = performance.now();
+      const key = windowStart.getTime();
+      const patchWindow = (patch: (r: FTDecodeResult) => FTDecodeResult) =>
+        setState(prev => ({
+          ...prev,
+          results: prev.results.map(r => (r.windowStart.getTime() === key ? patch(r) : r)),
+        }));
+
+      const placeholder: FTDecodeResult = {
+        windowStart, mode: modeRef.current, messages: [], decodeMs: 0, decoding: true,
+      };
+      setState(prev => ({ ...prev, results: [placeholder, ...prev.results].slice(0, 100) }));
+
+      const onPartial = (msg: FTMessage) => {
+        if (!isRunningRef.current) return;
+        patchWindow(r => ({ ...r, messages: [...r.messages, msg] }));
+      };
+
+      decodeFTAudio(captured, sampleRate, modeRef.current, onPartial)
         .then(messages => ({ messages, decodeMs: performance.now() - t0 }))
-        .catch(() => ({ messages: [], decodeMs: performance.now() - t0 }))
+        .catch(() => ({ messages: [] as FTMessage[], decodeMs: performance.now() - t0 }))
         .then(({ messages, decodeMs }) => {
           if (!isRunningRef.current) return;
-          const result: FTDecodeResult = { windowStart, mode: modeRef.current, messages, decodeMs };
-          setState(prev => ({
-            ...prev,
-            results: [result, ...prev.results].slice(0, 100),
-          }));
+          // Final list is authoritative (same content the partials streamed);
+          // replace rather than append so nothing is duplicated or lost.
+          patchWindow(r => ({ ...r, messages, decodeMs, decoding: false }));
         });
     };
 

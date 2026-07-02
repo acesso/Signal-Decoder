@@ -18,6 +18,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <math.h>
+#include <malloc.h>
 #include <emscripten/emscripten.h>
 
 #include "ft8/decode.h"
@@ -28,7 +29,7 @@
 /* ── tunables ──────────────────────────────────────────────────────────────── */
 #define DECODE_RATE     12000   /* ft8_lib works best at 12 kHz */
 #define MIN_SCORE       10
-#define MAX_CANDIDATES  140
+#define MAX_CANDIDATES  300
 #define LDPC_ITERATIONS 25
 #define MAX_DECODED     50
 #define HASH_SIZE       256
@@ -263,4 +264,9 @@ void ft8_free_result(char* ptr) {
 EMSCRIPTEN_KEEPALIVE
 void ft8_init(void) {
     ht_init();
+}
+
+EMSCRIPTEN_KEEPALIVE
+int ft8_heap_used(void) {
+    return (int)mallinfo().uordblks;
 }
