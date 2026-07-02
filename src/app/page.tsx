@@ -125,6 +125,18 @@ function MemDebugBar({ contacts }: { contacts: Map<string, Contact> }) {
             )}
           </>
         )}
+        <span className="ml-auto flex items-center gap-2">
+          <span title="app version">v{process.env.NEXT_PUBLIC_APP_VERSION}</span>
+          <a
+            href="https://github.com/acesso/Signal-Decoder"
+            target="_blank"
+            rel="noopener noreferrer"
+            className="text-[#8b949e] hover:text-[#58a6ff] transition-colors"
+            title="source code on GitHub"
+          >
+            GitHub ↗
+          </a>
+        </span>
       </div>
     </div>
   );

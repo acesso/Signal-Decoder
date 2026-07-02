@@ -129,6 +129,9 @@ const nextConfig = {
   },
   basePath: process.env.BASE_PATH || '',
   assetPrefix: process.env.BASE_PATH ? process.env.BASE_PATH + '/' : undefined,
+  env: {
+    NEXT_PUBLIC_APP_VERSION: require('./package.json').version,
+  },
 }
 
 module.exports = withPWA(nextConfig)

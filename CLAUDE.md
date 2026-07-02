@@ -1,5 +1,32 @@
 # Signal-Decoder — standing instructions
 
+## Dev servers — ports and discipline
+
+The user keeps their own `next dev` running **all the time on port 3000**. **Port 3002 is Claude's** — use it for any test/verification instance.
+
+- To stop a server, find the exact listener PID (`ss -tlnp | grep 3002`) and kill only that PID. Never `pkill -f "next dev"` (kills the user's server too) and never `lsof -ti :PORT | xargs kill` (lsof also lists client-connection PIDs — this has killed the user's browser).
+- Never run `npm run build` while any dev server is running — build and dev share `.next/` and the dev server's cache gets corrupted (MODULE_NOT_FOUND webpack errors until restart). Use `npx tsc --noEmit` + the dev server's own HMR compile as the gate instead, or stop servers first.
+- The app registers a PWA service worker; browsers can serve stale chunks after changes. If the UI looks partially updated, unregister the service worker + clear Cache Storage + hard reload before debugging.
+
+## FT8/FT4 WASM decoders — rebuild after native changes
+
+FT8 decodes via ft8mon (vendored, patched, at `lib/ft8mon`), FT4 via ft8_lib (submodule at `lib/ft8_lib`); wrappers live in `lib/wasm_build/`. **Any change to `lib/ft8mon/`, `lib/ft8_lib`, or `lib/wasm_build/*.c*` is not complete until the WASM is rebuilt and the artifacts under `public/wasm/` are committed** — the TS side loads those binaries, not the sources.
+
+Rebuild (from project root; Docker required, FFTW build is cached after the first run):
+
+```bash
+docker run --rm -v "$(pwd):/src" -w /src/lib/wasm_build -u "$(id -u):$(id -g)" emscripten/emsdk make
+```
+
+Regression benchmark against ft8_lib's reference WAVs (expected ballpark: ft8mon ≈310/353 matched, ft8_lib ≈257/353):
+
+```bash
+docker run --rm -v "$(pwd):/src" -w /src/lib/wasm_build -u "$(id -u):$(id -g)" emscripten/emsdk make test-modules
+node lib/wasm_build/testbuild/test_decode.mjs 2
+```
+
+Gotchas already learned the hard way (don't re-litigate): ft8mon needs `STACK_SIZE=8388608` (ldpc_decode overflows the 64KB default); no pthreads/SharedArrayBuffer (GitHub Pages can't serve COOP/COEP) — ft8mon's `entry()` runs `go()` synchronously under `#ifdef __EMSCRIPTEN__`; keep all ft8mon patches inside `#ifdef __EMSCRIPTEN__` guards. A running decode worker holds the old WASM — use the ⟳ WASM button or reload the page after rebuilding.
+
 ## Node version — always match `.nvmrc`
 
 This repo pins its Node version in `.nvmrc` (currently `v26.3.0`). Before running any `node`/`npm`/`npx` command in this repo, run `nvm use` (or `source ~/.nvm/nvm.sh && nvm use` if `nvm` isn't already loaded in the shell) so the command runs under the pinned version, not whatever Node happens to be active. Don't assume the ambient shell's Node matches — check with `node --version` if unsure. If the pinned version isn't installed via nvm, install it (`nvm install`) rather than falling back to a different version.
