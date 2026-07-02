@@ -65,3 +65,6 @@ robot36/
 *.tar.bz2
 fldigi-*/
 fldigi_src/
+# WASM build intermediates (FFTW cross-compile cache, node test builds)
+lib/wasm_build/fftw-build/
+lib/wasm_build/testbuild/*.js

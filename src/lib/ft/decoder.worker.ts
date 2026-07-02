@@ -1,27 +1,37 @@
 /**
- * FT8/FT4 decoder worker — backed by the native C ft8_lib compiled to WASM.
+ * FT8/FT4 decoder worker.
  *
- * The WASM module (public/wasm/ft8.wasm + ft8.js glue) is loaded at worker
- * startup via importScripts so the first decode request is not blocked.
+ * Two WASM engines:
+ *   ft8mon.wasm — ft8mon (AB1HL): LDPC + OSD + multi-pass subtraction. FT8 only.
+ *   ft8.wasm    — ft8_lib (kgoba): lightweight BP-only decoder. Used for FT4,
+ *                 and as FT8 fallback if ft8mon fails to load.
  *
- * The callsign hash table lives inside the WASM module (ft8_init called once),
- * mirroring the old @e04/ft8ts HashCallBook lifetime across decode windows.
+ * Both modules are loaded at worker startup so the first decode window is not
+ * blocked. Callsign hash tables live inside each WASM instance and persist
+ * across decode windows (matching the old @e04/ft8ts HashCallBook lifetime).
+ *
+ * Decoder params (osd_depth, budget, ...) arrive via 'params' messages and are
+ * applied to ft8mon immediately — they take effect on the next decode call.
  */
 
-import type { FTMode } from './decoder';
+import type { FTMode, FTDecoderParams } from './decoder';
 
-export interface WorkerRequest {
-  id: number;
-  samples: Float32Array;
-  sampleRate: number;
-  mode: FTMode;
+export type WorkerRequest =
+  | { type: 'decode'; id: number; samples: Float32Array; sampleRate: number; mode: FTMode }
+  | { type: 'params'; params: FTDecoderParams };
+
+export interface WorkerStats {
+  engine: 'ft8mon' | 'ft8_lib';
+  decodeMs: number;       // time spent inside the WASM decode call
+  heapBytes: number;      // reserved WASM linear memory of the engine used
+  heapUsedBytes: number;  // live malloc'd bytes inside that heap (mallinfo)
+  windowSamples: number;
 }
 
-export interface WorkerResponse {
-  id: number;
-  messages: Array<{ freq: number; dt: number; snr: number; msg: string; sync: number }>;
-  error?: string;
-}
+export type WorkerResponse =
+  | { type: 'result'; id: number; messages: Array<{ freq: number; dt: number; snr: number; msg: string; sync: number; pass?: number }>; stats: WorkerStats; error?: string }
+  | { type: 'progress'; id: number; decoded: number; message: { freq: number; dt: number; snr: number; msg: string; sync: number; pass: number } }
+  | { type: 'ready'; engines: string[] };
 
 // ── WASM public-asset URL helper ────────────────────────────────────────────
 // Worker chunks are served from /_next/static/chunks/… (or /<basePath>/_next/…
@@ -34,84 +44,199 @@ function getPublicBase(): string {
 }
 
 // ── Module types ─────────────────────────────────────────────────────────────
-interface FT8Module {
+interface FT8LibModule {
   _ft8_init: () => void;
+  _ft8_heap_used: () => number;
   _ft8_decode: (ptr: number, len: number, sr: number, isFT4: number) => number;
   _malloc: (size: number) => number;
   _free: (ptr: number) => void;
   HEAPF32: Float32Array;
+  HEAPU8: Uint8Array;
+  UTF8ToString: (ptr: number) => string;
+}
+
+interface FT8MonModule {
+  _ftm_init: () => void;
+  _ftm_heap_used: () => number;
+  _ftm_decode: (ptr: number, len: number, sr: number, minHz: number, maxHz: number, budgetSec: number) => number;
+  _malloc: (size: number) => number;
+  _free: (ptr: number) => void;
+  ccall: (name: string, ret: string, argTypes: string[], args: unknown[]) => number;
+  HEAPF32: Float32Array;
+  HEAPU8: Uint8Array;
   UTF8ToString: (ptr: number) => string;
 }
 
 // ── Module bootstrap ─────────────────────────────────────────────────────────
-let moduleReady: Promise<FT8Module> | null = null;
+async function instantiate<T>(jsFile: string, wasmFile: string, factoryName: string): Promise<T> {
+  const base = getPublicBase();
+  const wasmBinary: ArrayBuffer = await fetch(`${base}/wasm/${wasmFile}`).then(r => {
+    if (!r.ok) throw new Error(`WASM fetch ${r.status}: ${wasmFile}`);
+    return r.arrayBuffer();
+  });
 
-function loadModule(): Promise<FT8Module> {
-  if (moduleReady) return moduleReady;
-  moduleReady = (async (): Promise<FT8Module> => {
-    const base = getPublicBase();
-    const wasmUrl = `${base}/wasm/ft8.wasm`;
-    const jsUrl   = `${base}/wasm/ft8.js`;
+  (self as unknown as Record<string, (...a: string[]) => void>).importScripts(`${base}/wasm/${jsFile}`);
 
-    const wasmBinary: ArrayBuffer = await fetch(wasmUrl).then(r => {
-      if (!r.ok) throw new Error(`WASM fetch ${r.status}: ${wasmUrl}`);
-      return r.arrayBuffer();
-    });
+  const factory = (self as unknown as Record<string, unknown>)[factoryName] as
+    (opts: object) => Promise<T>;
+  if (typeof factory !== 'function') {
+    throw new Error(`${factoryName} not found after importScripts`);
+  }
 
-    (self as unknown as Record<string, (...a: string[]) => void>).importScripts(jsUrl);
+  return factory({ wasmBinary, print: () => {}, printErr: () => {} });
+}
 
-    const createFT8Module = (self as unknown as Record<string, unknown>).createFT8Module as
-      (opts: object) => Promise<FT8Module>;
+let ft8monReady: Promise<FT8MonModule> | null = null;
+let ft8libReady: Promise<FT8LibModule> | null = null;
 
-    if (typeof createFT8Module !== 'function') {
-      throw new Error('createFT8Module not found after importScripts');
-    }
+// Latest params — applied to ft8mon on load and on every 'params' message.
+let params: FTDecoderParams = {
+  osdDepth: 2, ldpcIters: 25, npasses: 3, osdLdpcThresh: 70,
+  minHz: 150, maxHz: 3100, budgetSec: 5,
+};
 
-    const mod: FT8Module = await createFT8Module({
-      wasmBinary,
-      print:    () => {},
-      printErr: () => {},
-    });
+function applyParams(mod: FT8MonModule) {
+  const map: Array<[string, number]> = [
+    ['osd_depth',       params.osdDepth],
+    ['ldpc_iters',      params.ldpcIters],
+    ['npasses_one',     params.npasses],
+    ['npasses_two',     params.npasses],
+    ['osd_ldpc_thresh', params.osdLdpcThresh],
+  ];
+  for (const [key, val] of map) {
+    mod.ccall('ftm_set', 'number', ['string', 'string'], [key, String(val)]);
+  }
+}
 
+function loadFt8Mon(): Promise<FT8MonModule> {
+  if (ft8monReady) return ft8monReady;
+  ft8monReady = (async () => {
+    const mod = await instantiate<FT8MonModule>('ft8mon.js', 'ft8mon.wasm', 'createFT8MonModule');
+    mod._ftm_init();
+    applyParams(mod);
+    return mod;
+  })();
+  ft8monReady.catch(() => { ft8monReady = null; }); // retry on next request
+  return ft8monReady;
+}
+
+function loadFt8Lib(): Promise<FT8LibModule> {
+  if (ft8libReady) return ft8libReady;
+  ft8libReady = (async () => {
+    const mod = await instantiate<FT8LibModule>('ft8.js', 'ft8.wasm', 'createFT8Module');
     mod._ft8_init();
     return mod;
   })();
-
-  // If load fails, clear the cached promise so the next request retries
-  moduleReady.catch(() => { moduleReady = null; });
-
-  return moduleReady;
+  ft8libReady.catch(() => { ft8libReady = null; });
+  return ft8libReady;
 }
 
-// Pre-load the module so it is warm before the first 15-second window closes.
-loadModule().catch(err => {
-  console.error('[ft8 worker] WASM load failed:', err);
+// Pre-load both engines, then tell the main thread which ones are available.
+Promise.allSettled([loadFt8Mon(), loadFt8Lib()]).then(settled => {
+  const engines = ['ft8mon', 'ft8_lib'].filter((_, i) => settled[i].status === 'fulfilled');
+  settled.forEach((s, i) => {
+    if (s.status === 'rejected') {
+      console.error(`[ft8 worker] ${i === 0 ? 'ft8mon' : 'ft8_lib'} load failed:`, s.reason);
+    }
+  });
+  self.postMessage({ type: 'ready', engines } satisfies WorkerResponse);
 });
 
-// ── Decode request handler ───────────────────────────────────────────────────
-self.onmessage = async (e: MessageEvent<WorkerRequest>) => {
-  const { id, samples, sampleRate, mode } = e.data;
+// ── Decode helpers ───────────────────────────────────────────────────────────
+type Messages = Extract<WorkerResponse, { type: 'result' }>['messages'];
+
+function decodeWithFt8Mon(mod: FT8MonModule, samples: Float32Array, sampleRate: number, id: number): Messages {
+  const ptr = mod._malloc(samples.length * 4);
+  if (!ptr) throw new Error('WASM malloc returned null');
+  // The WASM calls self.__ftmProgress synchronously per decoded message;
+  // postMessage still delivers while the decode call is blocking this thread.
+  (self as unknown as Record<string, unknown>).__ftmProgress =
+    (decoded: number, freq: number, dt: number, snr: number, sync: number, pass: number, msg: string) => {
+      self.postMessage({
+        type: 'progress', id, decoded,
+        message: { freq, dt, snr, msg, sync, pass },
+      } satisfies WorkerResponse);
+    };
   try {
-    const mod = await loadModule();
+    mod.HEAPF32.set(samples, ptr >> 2);
+    const jsonPtr = mod._ftm_decode(ptr, samples.length, sampleRate,
+                                    params.minHz, params.maxHz, params.budgetSec);
+    return JSON.parse(mod.UTF8ToString(jsonPtr));
+  } finally {
+    delete (self as unknown as Record<string, unknown>).__ftmProgress;
+    mod._free(ptr);
+  }
+}
 
-    const byteLen = samples.length * 4;
-    const ptr = mod._malloc(byteLen);
-    if (!ptr) throw new Error('WASM malloc returned null');
+function decodeWithFt8Lib(mod: FT8LibModule, samples: Float32Array, sampleRate: number, isFT4: boolean): Messages {
+  const ptr = mod._malloc(samples.length * 4);
+  if (!ptr) throw new Error('WASM malloc returned null');
+  try {
+    mod.HEAPF32.set(samples, ptr >> 2);
+    const jsonPtr = mod._ft8_decode(ptr, samples.length, sampleRate, isFT4 ? 1 : 0);
+    return JSON.parse(mod.UTF8ToString(jsonPtr));
+  } finally {
+    mod._free(ptr);
+  }
+}
 
-    try {
-      mod.HEAPF32.set(samples, ptr >> 2);
-      const isFT4   = mode === 'FT4' ? 1 : 0;
-      const jsonPtr = mod._ft8_decode(ptr, samples.length, sampleRate, isFT4);
-      const json    = mod.UTF8ToString(jsonPtr);
-      const messages: WorkerResponse['messages'] = JSON.parse(json);
-      self.postMessage({ id, messages } satisfies WorkerResponse);
-    } finally {
-      mod._free(ptr);
+// ── Message handler ──────────────────────────────────────────────────────────
+self.onmessage = async (e: MessageEvent<WorkerRequest>) => {
+  const req = e.data;
+
+  if (req.type === 'params') {
+    params = req.params;
+    // Apply to the live ft8mon instance if it is (or becomes) loaded.
+    ft8monReady?.then(applyParams).catch(() => {});
+    return;
+  }
+
+  const { id, samples, sampleRate, mode } = req;
+  try {
+    let engine: WorkerStats['engine'];
+    let messages: Messages;
+    let heapBytes: number;
+    let heapUsedBytes: number;
+    const t0 = performance.now();
+
+    if (mode === 'FT8') {
+      try {
+        const mod = await loadFt8Mon();
+        messages      = decodeWithFt8Mon(mod, samples, sampleRate, id);
+        heapBytes     = mod.HEAPU8.length;
+        heapUsedBytes = mod._ftm_heap_used();
+        engine        = 'ft8mon';
+      } catch (monErr) {
+        // ft8mon unavailable (load or decode failure) — fall back to ft8_lib
+        console.warn('[ft8 worker] ft8mon failed, falling back to ft8_lib:', monErr);
+        const mod = await loadFt8Lib();
+        messages      = decodeWithFt8Lib(mod, samples, sampleRate, false);
+        heapBytes     = mod.HEAPU8.length;
+        heapUsedBytes = mod._ft8_heap_used();
+        engine        = 'ft8_lib';
+      }
+    } else {
+      const mod = await loadFt8Lib();
+      messages      = decodeWithFt8Lib(mod, samples, sampleRate, mode === 'FT4');
+      heapBytes     = mod.HEAPU8.length;
+      heapUsedBytes = mod._ft8_heap_used();
+      engine        = 'ft8_lib';
     }
+
+    const stats: WorkerStats = {
+      engine,
+      decodeMs: performance.now() - t0,
+      heapBytes,
+      heapUsedBytes,
+      windowSamples: samples.length,
+    };
+    self.postMessage({ type: 'result', id, messages, stats } satisfies WorkerResponse);
   } catch (err) {
     self.postMessage({
+      type: 'result',
       id,
       messages: [],
+      stats: { engine: 'ft8_lib', decodeMs: 0, heapBytes: 0, heapUsedBytes: 0, windowSamples: samples.length },
       error: err instanceof Error ? err.message : String(err),
     } satisfies WorkerResponse);
   }
