@@ -143,9 +143,35 @@ export class AudioRingRecorder {
     return encodeWavPcm16(ch.ring.snapshot(), ch.sampleRate);
   }
 
-  save(channel: RecChannel): boolean {
-    const blob = this.toWav(channel);
-    if (!blob) return false;
+  // Encoding runs in a worker: the ~90 MB snapshot+WAV allocation burst (and
+  // the GC it forces) would otherwise land on the loaded main thread, where
+  // it measured as a 500-700 ms freeze at the 5-minute ring maximum. The
+  // snapshot moves out and the WAV bytes move back as zero-copy transferables.
+  private wavWorker: Worker | null = null;
+  private encodeInWorker(samples: Float32Array, sampleRate: number): Promise<ArrayBuffer> {
+    if (!this.wavWorker) {
+      this.wavWorker = new Worker(new URL('./wav.worker.ts', import.meta.url));
+    }
+    const worker = this.wavWorker;
+    return new Promise((resolve, reject) => {
+      worker.onmessage = (e: MessageEvent<ArrayBuffer>) => resolve(e.data);
+      worker.onerror = (err) => { this.wavWorker = null; reject(err); };
+      worker.postMessage({ samples, sampleRate }, [samples.buffer]);
+    });
+  }
+
+  async save(channel: RecChannel): Promise<boolean> {
+    const ch = this.channels[channel];
+    if (!ch.ring || ch.ring.length === 0) return false;
+    let blob: Blob;
+    if (typeof Worker !== 'undefined') {
+      blob = new Blob(
+        [await this.encodeInWorker(ch.ring.snapshot(), ch.sampleRate)],
+        { type: 'audio/wav' },
+      );
+    } else {
+      blob = this.toWav(channel)!;
+    }
     const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-');
     const url   = URL.createObjectURL(blob);
     const a     = document.createElement('a');
@@ -159,8 +185,12 @@ export class AudioRingRecorder {
   }
 
   // Saves every channel that holds audio; returns the channels saved.
-  saveAll(): RecChannel[] {
-    return (['input', 'output'] as RecChannel[]).filter(c => this.save(c));
+  async saveAll(): Promise<RecChannel[]> {
+    const out: RecChannel[] = [];
+    for (const c of ['input', 'output'] as RecChannel[]) {
+      if (await this.save(c)) out.push(c);
+    }
+    return out;
   }
 }
 
