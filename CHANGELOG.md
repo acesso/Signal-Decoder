@@ -12,51 +12,34 @@ them into a version section when cutting a release.
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-07-03
+
 ### Added
 
-- **Retroactive audio capture** (Rec button in the top bar): ring buffers hold
-  the most recent N seconds of input audio and of TX output audio while
-  decoding runs (N configurable 30 s–5 min via the new global-settings gear,
-  persisted). Rec downloads each stream that holds audio as its own mono
-  16-bit PCM WAV, so a signal can be saved *after* it was heard. The input tap
-  lives on the shared analyser context; the TX tap records the real playback
-  timeline (pre-gain, including silence between transmissions).
+- **Retroactive audio capture**: Rec button downloads the last 30 s–5 min
+  (gear-configurable) of input and TX audio as separate mono 16-bit WAVs —
+  see the README's "Audio Ring Buffer (Rec)" section for details.
+- Global-settings gear in the top bar (ring duration, fill state, clear).
+- Perf testbed `--rec` flag: fake media audio, sparse random Rec clicks, and
+  per-window browser memory tracking.
 
 ### Fixed
 
-- Cumulative decode-Δ drift under CPU load: capture windows free-ran on
-  `sleep(15 s)` after the first UTC alignment, so every ounce of main-thread
-  delay at a window boundary accumulated permanently into capture-start
-  lateness (all decodes shifting toward +1 s and beyond over a long session).
-  Windows now re-align to the wall clock every cycle (self-correcting), the
-  next capture buffer is re-armed before decode dispatch instead of after,
-  and arming lateness >300 ms is logged to the console for diagnosis.
-
-- UI freeze on every decoded message once contacts accumulated (noticeable
-  from ~100-200 contacts on busy bands). Four cumulative fixes: streamed
-  partials batch into one state update per 250 ms; message parsing is cached
-  and table rows are memoized (was O(history) per new message); the decoded
-  messages table and contacts list are windowed via a new dependency-free
-  `VirtualList` (constant DOM size regardless of history — was 38k+ nodes);
-  contacts merge continuously into an authoritative ref but publish to the
-  heavy consumers (panel sort/stats, map markers, auto-reply) at most every
-  800 ms. Validated to 1200 contacts at 100 msgs/window synthetic load.
+- Cumulative decode-Δ drift under CPU load: capture windows now re-align to
+  the wall clock every cycle.
+- UI freezes on new decoded messages at high contact counts: batched
+  partials, cached parsing, virtualized lists, throttled contacts publish.
+- Stale PD120 SSTV constants test (PD is a 4-component dual-luminance format).
 
 ### Changed
 
-- `MAX_CONTACTS` raised from 500 to 1200 (virtualized lists keep render cost
-  independent of contact count; LRU eviction unchanged).
-- Dev-only `window.__ftInjectWindow` hook (tree-shaken from production) lets
-  performance tests inject synthetic decode windows through the real
-  streaming pipeline.
+- `MAX_CONTACTS` raised from 500 to 1200.
+- Dev-only `window.__ftInjectWindow` hook for performance tests.
 
 ### Known issues
 
-- The FT8 decode CPU budget is a soft limit: ft8mon only checks its deadline
-  between candidates, so fixed per-pass costs (FFTs, coarse search,
-  subtraction) can overrun the configured budget by roughly a second per
-  pass, more on slow machines. Inherent to the strongest-first multi-pass
-  design; documented in the README.
+- The FT8 decode CPU budget is a soft limit and can overrun by ~1 s per
+  pass on slow machines (see README).
 
 ## [0.2.0] - 2026-07-02
 
@@ -109,6 +92,7 @@ contact tracking / world map / ADIF export / auto-CQ + auto-reply transmit,
 MFSK4–128 with FEC, WebGL spectrograms, radio CAT control (Kenwood TS-480
 protocol, uSDX), PWA offline support.
 
-[Unreleased]: https://github.com/acesso/Signal-Decoder/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/acesso/Signal-Decoder/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/acesso/Signal-Decoder/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/acesso/Signal-Decoder/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/acesso/Signal-Decoder/releases/tag/v0.1.0

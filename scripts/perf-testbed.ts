@@ -16,10 +16,18 @@
  *  - a playwright Firefox build: `~/.cache/ms-playwright/firefox-*` or
  *    PLAYWRIGHT_FIREFOX_PATH pointing at the executable
  *
+ * Optionally (--rec) exercises the audio ring-buffer Rec feature: Firefox is
+ * launched with fake media streams (getUserMedia yields a synthetic tone),
+ * decoding is started so the input tap fills the ring (forced to the 5-min
+ * maximum), and the Rec button is clicked sparsely at random (~20% of
+ * windows) — each click snapshots the ring and encodes it to WAV on the main
+ * thread, the worst-case cost of the feature. Browser memory (RSS of the
+ * playwright Firefox process tree, from /proc) is sampled every window.
+ *
  * Usage:
  *   npm run test:perf -- [--msgs 50] [--cadence 12000] [--windows 40]
- *                        [--new-ratio 0.8] [--cat] [--url http://localhost:3002]
- *                        [--out perf-results.jsonl]
+ *                        [--new-ratio 0.8] [--cat] [--rec]
+ *                        [--url http://localhost:3002] [--out perf-results.jsonl]
  *
  * Load profile references:
  *   target:  --msgs 50  --cadence 12000 --windows 40   (validated perf goal)
@@ -28,7 +36,7 @@
  */
 
 import { firefox } from 'playwright-core';
-import { writeFileSync, appendFileSync, readdirSync, existsSync } from 'node:fs';
+import { writeFileSync, appendFileSync, readdirSync, existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 
@@ -44,6 +52,8 @@ const NEW_RATIO = Number(arg('new-ratio', '0.8'));
 const URL       = arg('url', 'http://localhost:3002');
 const OUT       = arg('out', 'perf-results.jsonl');
 const WITH_CAT  = process.argv.includes('--cat');
+const WITH_REC  = process.argv.includes('--rec');
+const REC_CLICK_P = 0.2; // sparse random Rec clicks: ~1 in 5 windows
 
 // ── firefox executable ───────────────────────────────────────────────────────
 function findFirefox(): string {
@@ -57,6 +67,26 @@ function findFirefox(): string {
     }
   }
   throw new Error('No playwright Firefox found — set PLAYWRIGHT_FIREFOX_PATH');
+}
+
+// ── browser memory (RSS) ─────────────────────────────────────────────────────
+// Firefox exposes no in-page memory API, so sample the OS instead: sum VmRSS
+// of every process whose cmdline points at the ms-playwright Firefox build.
+// Read-only /proc walk — matches only OUR browser (the user's own Firefox
+// runs from /usr/lib64/firefox, a different path).
+function playwrightFirefoxRssMB(): number | null {
+  try {
+    let kb = 0;
+    for (const pid of readdirSync('/proc').filter(d => /^\d+$/.test(d))) {
+      try {
+        const cmd = readFileSync(`/proc/${pid}/cmdline`, 'utf8');
+        if (!cmd.includes('ms-playwright') || !cmd.includes('firefox')) continue;
+        const m = readFileSync(`/proc/${pid}/status`, 'utf8').match(/^VmRSS:\s+(\d+) kB/m);
+        if (m) kb += Number(m[1]);
+      } catch { /* process exited mid-walk */ }
+    }
+    return kb > 0 ? Math.round(kb / 1024) : null;
+  } catch { return null; }
 }
 
 // ── synthetic traffic ────────────────────────────────────────────────────────
@@ -100,16 +130,34 @@ const log = (obj: object) => appendFileSync(OUT, JSON.stringify(obj) + '\n');
 
 async function main() {
   writeFileSync(OUT, '');
-  const browser = await firefox.launch({ executablePath: findFirefox(), headless: true });
+  const browser = await firefox.launch({
+    executablePath: findFirefox(),
+    headless: true,
+    // Fake media streams give getUserMedia a synthetic tone without a mic —
+    // needed so the --rec input tap has real samples flowing through it.
+    firefoxUserPrefs: WITH_REC ? {
+      'media.navigator.streams.fake': true,
+      'media.navigator.permission.disabled': true,
+    } : {},
+  });
   try {
     const page = await browser.newPage({ viewport: { width: 1700, height: 950 } });
     page.on('pageerror', e => log({ ev: 'pageerror', err: e.message.slice(0, 200) }));
     page.on('crash', () => log({ ev: 'PAGE-CRASHED' }));
+    // Rec downloads land in playwright's temp dir; log and discard them
+    page.on('download', dl => {
+      log({ ev: 'download', name: dl.suggestedFilename() });
+      dl.delete().catch(() => {});
+    });
 
     if (WITH_CAT) {
       // string form: tsx/esbuild injects a __name helper into serialized
       // functions that does not exist in the page — strings bypass it
       await page.addInitScript("window.__catUseMock = true;");
+    }
+    if (WITH_REC) {
+      // Worst-case ring: 5 min at 48 kHz ≈ 57.6 MB Float32 per stream
+      await page.addInitScript("try { localStorage.setItem('audioRecDurationSec', '300'); } catch {}");
     }
 
     // Port convention: 3000 belongs to the developer's own dev server —
@@ -124,6 +172,15 @@ async function main() {
       await page.getByRole('button', { name: /Connect Radio/ }).click();
       await page.waitForSelector('text=Disconnect', { timeout: 10000 });
       log({ ev: 'cat-connected' });
+    }
+
+    if (WITH_REC) {
+      // Start real decoding: the global audio context opens on the fake tone
+      // and the ring-buffer input tap begins filling. The real 15 s decode
+      // loop also runs — extra realistic load on top of the injections.
+      await page.getByRole('button', { name: 'Start Decoding' }).click();
+      await page.waitForTimeout(1500);
+      log({ ev: 'rec-armed', durationSec: 300 });
     }
 
     await page.evaluate(`(() => {
@@ -148,7 +205,7 @@ async function main() {
     })()`);
 
     const hasHook = await page.evaluate("typeof window.__ftInjectWindow === 'function'");
-    log({ ev: 'start', hasHook, MSGS, CADENCE, WINDOWS, NEW_RATIO, WITH_CAT });
+    log({ ev: 'start', hasHook, MSGS, CADENCE, WINDOWS, NEW_RATIO, WITH_CAT, WITH_REC });
     if (!hasHook) throw new Error('__ftInjectWindow missing — dev server running production build?');
 
     for (let win = 1; win <= WINDOWS; win++) {
@@ -158,7 +215,22 @@ async function main() {
       // esbuild's __name helper injected — this avoids both failure modes
       await page.evaluate(`window.__ftInjectWindow(${JSON.stringify(msgs)}, 50)`)
         .catch(e => log({ ev: 'inject-fail', win, err: String(e).slice(0, 120) }));
-      await page.waitForTimeout(CADENCE);
+
+      // Sparse random Rec click mid-window: ring snapshot + WAV encode runs
+      // on the main thread, so its cost shows up in the heartbeat blocks.
+      let recClicked = false;
+      if (WITH_REC && Math.random() < REC_CLICK_P) {
+        await page.waitForTimeout(CADENCE / 2);
+        const rec = page.getByRole('button', { name: 'Rec' });
+        if (await rec.isEnabled().catch(() => false)) {
+          await rec.click().catch(() => {});
+          recClicked = true;
+          log({ ev: 'rec-click', win });
+        }
+        await page.waitForTimeout(CADENCE / 2);
+      } else {
+        await page.waitForTimeout(CADENCE);
+      }
 
       const footer = await page.locator('span:has-text("contacts")').first().locator('..').textContent().catch(() => '');
       const num = (re: RegExp) => { const r = footer?.match(re); return r ? Number(r[1]) : null; };
@@ -176,11 +248,14 @@ async function main() {
         blockMax: perf.blocks.reduce((s, d) => Math.max(s, d), 0),
         rafMax: perf.rafGaps.reduce((s, d) => Math.max(s, d), 0),
         cat: perf.cat,
+        rssMB: WITH_REC ? playwrightFirefoxRssMB() : null,
+        recClicked,
       };
       log(sample);
       console.log(`win ${String(win).padStart(3)}: contacts ${sample.contacts} msgs ${sample.msgs} dom ${sample.dom} | ` +
         `blocks ${sample.blockCount} tot ${sample.blockTotal}ms max ${sample.blockMax}ms` +
-        (sample.cat ? ` | CAT polls ${(sample.cat as { polls: number }).polls} maxGap ${(sample.cat as { maxPollGapMs: number }).maxPollGapMs}ms avgGap ${(sample.cat as { avgPollGapMs: number }).avgPollGapMs}ms` : ''));
+        (sample.cat ? ` | CAT polls ${(sample.cat as { polls: number }).polls} maxGap ${(sample.cat as { maxPollGapMs: number }).maxPollGapMs}ms avgGap ${(sample.cat as { avgPollGapMs: number }).avgPollGapMs}ms` : '') +
+        (sample.rssMB !== null ? ` | rss ${sample.rssMB}MB${recClicked ? ' [REC]' : ''}` : ''));
     }
     log({ ev: 'done' });
   } finally {
