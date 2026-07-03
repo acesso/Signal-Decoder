@@ -61,6 +61,10 @@ No installation, no downloads, no setup - just open and decode!
   - Bidirectional exponential moving average filtering
 - **Live Display**: Progressive rendering with real-time spectrum visualization
 - **Save Output**: Export decoded images as PNG or text sessions
+- **Retroactive Audio Capture**: A ring buffer keeps the last 30 s–5 min
+  (configurable via the ⚙ menu in the top bar) of input and TX output audio
+  while decoding runs; the **Rec** button downloads each stream as its own
+  mono 16-bit WAV — hear something interesting, then save it after the fact
 - **Signal Analysis**: Real-time spectrum analyzer and signal strength indicator
 - **Mobile-Responsive**: Optimized for both desktop and mobile devices
 

@@ -12,6 +12,16 @@ them into a version section when cutting a release.
 
 ## [Unreleased]
 
+### Added
+
+- **Retroactive audio capture** (Rec button in the top bar): ring buffers hold
+  the most recent N seconds of input audio and of TX output audio while
+  decoding runs (N configurable 30 s–5 min via the new global-settings gear,
+  persisted). Rec downloads each stream that holds audio as its own mono
+  16-bit PCM WAV, so a signal can be saved *after* it was heard. The input tap
+  lives on the shared analyser context; the TX tap records the real playback
+  timeline (pre-gain, including silence between transmissions).
+
 ### Fixed
 
 - Cumulative decode-Δ drift under CPU load: capture windows free-ran on

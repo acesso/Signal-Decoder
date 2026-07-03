@@ -18,6 +18,7 @@ import {
 } from '@/lib/ft/decoder';
 import RadioCATPanel, { useRadioCAT } from '@/components/RadioCATPanel';
 import type { Contact } from '@/lib/ft/parser';
+import { audioRecorder, REC_DURATION_CHOICES_SEC } from '@/lib/audio/ringRecorder';
 
 type DecoderMode = 'rtty' | 'sstv' | 'cw' | 'ft' | 'mfsk';
 
@@ -144,6 +145,10 @@ function MemDebugBar({ contacts }: { contacts: Map<string, Contact> }) {
 
 // ── Shared top bar ──────────────────────────────────────────────────────────
 
+function recDurationLabel(sec: number): string {
+  return sec < 60 ? `${sec} s` : `${sec / 60} min`;
+}
+
 function TopBar({
   controls,
   mode,
@@ -158,6 +163,22 @@ function TopBar({
   const isRecording = controls?.isRecording ?? false;
   const isSupported = controls?.isSupported ?? true;
   const error       = controls?.error ?? null;
+
+  // Audio ring buffer (global Rec) — poll fill state once per second; the
+  // interval only causes re-renders while the buffered amount is changing.
+  const [recStatus, setRecStatus]   = useState(() => ({ inputSec: 0, outputSec: 0, durationSec: 60 }));
+  const [showGlobals, setShowGlobals] = useState(false);
+  useEffect(() => {
+    const tick = () => setRecStatus(prev => {
+      const s = audioRecorder.status();
+      return prev.inputSec === s.inputSec && prev.outputSec === s.outputSec
+          && prev.durationSec === s.durationSec ? prev : s;
+    });
+    tick();
+    const t = setInterval(tick, 1000);
+    return () => clearInterval(t);
+  }, []);
+  const recHasAudio = recStatus.inputSec > 0 || recStatus.outputSec > 0;
 
   return (
     <div className="bg-[#161b22] border border-[#30363d] rounded-lg px-4 py-3 shrink-0">
@@ -196,6 +217,36 @@ function TopBar({
           Reset
         </button>
 
+        {/* Retroactive audio capture: the ring buffer always holds the last
+            N of input/TX audio while running; Rec downloads it as WAV. */}
+        <button
+          onClick={() => audioRecorder.saveAll()}
+          disabled={!recHasAudio}
+          title={
+            recHasAudio
+              ? `Download the last ${recDurationLabel(recStatus.durationSec)} of audio as WAV `
+                + `(input ${recStatus.inputSec}s buffered${recStatus.outputSec > 0 ? `, TX out ${recStatus.outputSec}s` : ''})`
+              : 'Nothing buffered yet — audio is captured while decoding runs'
+          }
+          className="bg-[#21262d] hover:bg-[#30363d] disabled:opacity-40 disabled:cursor-not-allowed text-[#c9d1d9] font-semibold px-4 py-2 rounded-md transition-colors text-sm border border-[#30363d] flex items-center gap-1.5"
+        >
+          <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" viewBox="0 0 20 20" fill="currentColor">
+            <circle cx="10" cy="10" r="6" fill={isRecording ? '#f85149' : 'currentColor'} />
+          </svg>
+          Rec
+        </button>
+
+        <button
+          onClick={() => setShowGlobals(v => !v)}
+          title="Global settings"
+          aria-expanded={showGlobals}
+          className={`bg-[#21262d] hover:bg-[#30363d] text-[#c9d1d9] font-semibold px-3 py-2 rounded-md transition-colors text-sm border ${showGlobals ? 'border-[#58a6ff]' : 'border-[#30363d]'} flex items-center`}
+        >
+          <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" viewBox="0 0 20 20" fill="currentColor">
+            <path fillRule="evenodd" d="M11.49 3.17c-.38-1.56-2.6-1.56-2.98 0a1.532 1.532 0 01-2.286.948c-1.372-.836-2.942.734-2.106 2.106.54.886.061 2.042-.947 2.287-1.561.379-1.561 2.6 0 2.978a1.532 1.532 0 01.947 2.287c-.836 1.372.734 2.942 2.106 2.106a1.532 1.532 0 012.287.947c.379 1.561 2.6 1.561 2.978 0a1.533 1.533 0 012.287-.947c1.372.836 2.942-.734 2.106-2.106a1.533 1.533 0 01.947-2.287c1.561-.379 1.561-2.6 0-2.978a1.532 1.532 0 01-.947-2.287c.836-1.372-.734-2.942-2.106-2.106a1.532 1.532 0 01-2.287-.947zM10 13a3 3 0 100-6 3 3 0 000 6z" clipRule="evenodd" />
+          </svg>
+        </button>
+
         {/* FT sub-mode selector — inline in the bar when FT is active */}
         {mode === 'ft' && (
           <div className="ml-2 pl-3 border-l border-[#30363d]">
@@ -207,6 +258,40 @@ function TopBar({
           <span className="text-[#f85149] text-xs font-mono ml-auto">{error}</span>
         )}
       </div>
+
+      {showGlobals && (
+        <div className="mt-3 pt-3 border-t border-[#30363d] flex items-center gap-x-4 gap-y-2 flex-wrap text-xs text-[#8b949e]">
+          <span className="font-semibold text-[#c9d1d9]">Audio ring buffer</span>
+          <label className="flex items-center gap-1.5">
+            keep last
+            <select
+              value={recStatus.durationSec}
+              onChange={e => {
+                audioRecorder.setDurationSec(Number(e.target.value));
+                setRecStatus(audioRecorder.status());
+              }}
+              className="bg-[#0d1117] border border-[#30363d] rounded px-2 py-1 text-[#c9d1d9]"
+            >
+              {REC_DURATION_CHOICES_SEC.map(sec => (
+                <option key={sec} value={sec}>{recDurationLabel(sec)}</option>
+              ))}
+            </select>
+          </label>
+          <span className="font-mono">
+            buffered: input {recStatus.inputSec}s · TX out {recStatus.outputSec}s
+          </span>
+          <button
+            onClick={() => { audioRecorder.clear(); setRecStatus(audioRecorder.status()); }}
+            disabled={!recHasAudio}
+            className="bg-[#21262d] hover:bg-[#30363d] disabled:opacity-40 disabled:cursor-not-allowed text-[#c9d1d9] px-2.5 py-1 rounded border border-[#30363d] transition-colors"
+          >
+            Clear
+          </button>
+          <span className="italic">
+            Rec saves each stream as its own mono 16-bit WAV — capture runs whenever decoding is on.
+          </span>
+        </div>
+      )}
     </div>
   );
 }
