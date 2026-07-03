@@ -32,14 +32,15 @@ describe('SSTV Mode Constants', () => {
     });
 
     test('has correct timing specifications', () => {
-      expect(SSTV_MODES.PD120.scanTime).toBeCloseTo(496.628, 2);
+      // sync(20) + porch(2.08) + 4 × 121.6 (Y-even, R-Y, B-Y, Y-odd)
+      expect(SSTV_MODES.PD120.scanTime).toBeCloseTo(508.48, 2);
       expect(SSTV_MODES.PD120.syncPulse).toBe(20);
       expect(SSTV_MODES.PD120.syncPorch).toBe(2.08);
     });
 
     test('has correct channel timing', () => {
       expect(SSTV_MODES.PD120.colorScanTime).toBe(121.6);
-      expect(SSTV_MODES.PD120.colorScanTimes).toEqual([121.6, 121.6, 121.6]);
+      expect(SSTV_MODES.PD120.colorScanTimes).toEqual([121.6, 121.6, 121.6, 121.6]);
     });
 
     test('pixel dwell time is approximately 190µs', () => {
