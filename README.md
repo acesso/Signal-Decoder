@@ -271,6 +271,50 @@ Callsigns are extracted from decoded messages and tracked as contacts with full 
 - **Sorting**: By last activity, TX count, or callsign — click the active sort again to reverse
 - **ADIF export**: Download the session log as a standard `.adi` file for import into any logger
 
+## Audio Ring Buffer (Rec)
+
+A global retroactive audio recorder: while decoding runs, ring buffers
+continuously hold the most recent N seconds of audio, and the **Rec** button in
+the top bar downloads them as WAV — so you can save a signal *after* hearing
+it, no need to have been recording in advance.
+
+- **Two independent streams, two separate files**: `audio-input-<utc>.wav`
+  (everything arriving at the sound card) and `audio-output-<utc>.wav` (FT8/FT4
+  transmit audio). Rec only saves streams that actually hold audio, so in an
+  RX-only session you get just the input file.
+- **Format**: mono 16-bit PCM WAV at the capturing audio context's native
+  sample rate (typically 48 kHz) — opens anywhere, including WSJT-X and
+  Audacity.
+- **Duration**: configurable via the ⚙ gear next to Rec (30 s / 1 / 2 / 5 min,
+  persisted in `localStorage`). Changing it live re-sizes the rings, keeping
+  the newest audio that still fits. The gear row also shows per-stream fill
+  state and a Clear button.
+
+### How the audio is tapped
+
+- **Input** taps the shared global-audio context (`useGlobalAudio`) — the one
+  the Start button opens and every decoder's spectrum feeds from — via a
+  `ScriptProcessorNode` (4096-sample blocks, ~85 ms cadence at 48 kHz) whose
+  output stays silent; it only copies each block into the ring. One tap covers
+  all decoder modes.
+- **Output** taps the TX playback context (`useFTTransmit`): every
+  `AudioBufferSourceNode` that plays a transmission also connects to a
+  recording tap **pre-gain**, so the recorded level is full-scale regardless
+  of the TX gain setting. The tap stays pulled by the graph between
+  transmissions, so the ring reflects the true output timeline — including
+  the silence between overs. (The TX context resamples the encoder's 12 kHz
+  waveform to its native rate, so both WAVs share one sample rate.)
+- **Memory & save cost**: each stream costs `duration × sampleRate × 4` bytes
+  of Float32 ring — ~11.5 MB per stream at 1 min/48 kHz, ~57.6 MB at the
+  5-min maximum. Saving snapshots the ring on the main thread and encodes the
+  WAV in a dedicated worker (`wav.worker.ts`), buffers crossing as zero-copy
+  transferables — encoding on the main thread instead measured as a
+  GC-amplified 700-800 ms freeze under full load. Steady-state capture cost
+  is unmeasurable; a save click blocks ~200 ms at the default 1-min ring and
+  ~0.5 s at the 5-min maximum under the golden worst-case load (1200 contacts
+  + CAT + live decode; mostly the browser's own blob/download machinery).
+  Validated with the testbed's `--rec` flag (see the performance appendix).
+
 ## Technology Stack
 
 - **Next.js 15**: React framework with App Router
@@ -638,6 +682,8 @@ node lib/wasm_build/testbuild/test_decode.mjs [osd_depth]
 | medium | `--msgs 18 --cadence 2500 --windows 120` | 725 contacts, near-zero blocking |
 
 Add `--cat` to also connect the simulated uSDX radio (`src/lib/cat/mockSerial.ts`) so the full serial CAT poll pipeline runs concurrently; per-sample output then includes poll-cadence stats (`maxPollGapMs` stretching = main-thread jam, the mechanism behind CAT-induced decode-delta drift).
+
+Add `--rec` to exercise the audio ring buffer under load: Firefox launches with fake media streams (`getUserMedia` yields a synthetic tone), decoding is started so the input tap fills a ring forced to the 5-minute maximum, and the Rec button is clicked at random in ~20% of windows (each click = ring snapshot + main-thread WAV encode, the feature's worst-case cost). Per-window output then includes `rssMB` — the RSS of the playwright Firefox process tree sampled from `/proc`, since Firefox has no in-page memory API — for catching leaks and confirming the ring saturates at its expected size.
 
 #### Manual live-signal test rig (WebSDR → app, Linux/PipeWire)
 
