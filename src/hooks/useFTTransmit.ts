@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { FTMode, FT_WINDOW_SECONDS, FT_SUPPORTED } from '@/lib/ft/decoder';
+import { audioRecorder } from '@/lib/audio/ringRecorder';
 
 export interface TxQueueEntry {
   id: string;
@@ -190,6 +191,7 @@ export function useFTTransmit(
   const onSetPTTRef           = useRef(onSetPTT);
   const gainRef               = useRef(loadTxGain());
   const gainNodeRef           = useRef<GainNode | null>(null);
+  const txTapRef              = useRef<ScriptProcessorNode | null>(null);
   const queueRef              = useRef<TxQueueEntry[]>([]);
   const timersRef             = useRef<Set<ReturnType<typeof setTimeout>>>(new Set());
   const audioCtxRef           = useRef<AudioContext | null>(null);
@@ -430,6 +432,7 @@ export function useFTTransmit(
           const src = ctx.createBufferSource();
           src.buffer = buf;
           src.connect(gainNodeRef.current ?? ctx.destination);
+          if (txTapRef.current) src.connect(txTapRef.current);
           src.onended = () => resolve();
           src.start(ctx.currentTime);
         });
@@ -484,6 +487,20 @@ export function useFTTransmit(
       gainNodeRef.current = audioCtxRef.current.createGain();
       gainNodeRef.current.gain.value = gainRef.current;
       gainNodeRef.current.connect(audioCtxRef.current.destination);
+
+      // Ring-buffer tap for the global "Rec" feature. Each playback source
+      // also connects to this node (pre-gain, so the recording level doesn't
+      // depend on the TX gain setting); its own output stays silent — the
+      // zeroed output buffer is never written, the destination link only
+      // keeps the node pulled so it records real-time silence between
+      // transmissions and the ring reflects the true output timeline.
+      const ctx = audioCtxRef.current;
+      const tap = ctx.createScriptProcessor(4096, 1, 1);
+      tap.onaudioprocess = (e) => {
+        audioRecorder.write('output', e.inputBuffer.getChannelData(0), ctx.sampleRate);
+      };
+      tap.connect(ctx.destination);
+      txTapRef.current = tap;
     }
     if (audioCtxRef.current.state === 'suspended') {
       await audioCtxRef.current.resume();
@@ -495,6 +512,11 @@ export function useFTTransmit(
   const stop = useCallback(() => {
     isRunningRef.current = false;
     clearTimers();
+    if (txTapRef.current) {
+      txTapRef.current.onaudioprocess = null;
+      txTapRef.current.disconnect();
+      txTapRef.current = null;
+    }
     audioCtxRef.current?.close().catch(() => null);
     audioCtxRef.current = null;
     if (autoPTTRef.current) {

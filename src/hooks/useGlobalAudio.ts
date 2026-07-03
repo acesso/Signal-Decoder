@@ -2,6 +2,7 @@
 
 import { useRef, useState, useCallback, useEffect } from 'react';
 import type React from 'react';
+import { audioRecorder } from '@/lib/audio/ringRecorder';
 
 export interface GlobalAudioState {
   isRecording: boolean;
@@ -29,6 +30,7 @@ export function useGlobalAudio(): {
 
   const streamRef      = useRef<MediaStream | null>(null);
   const audioCtxRef    = useRef<AudioContext | null>(null);
+  const recTapRef      = useRef<ScriptProcessorNode | null>(null);
 
   // Support check on mount
   useEffect(() => {
@@ -43,6 +45,12 @@ export function useGlobalAudio(): {
   const stop = useCallback(() => {
     streamRef.current?.getTracks().forEach(t => t.stop());
     streamRef.current = null;
+
+    if (recTapRef.current) {
+      recTapRef.current.onaudioprocess = null;
+      recTapRef.current.disconnect();
+      recTapRef.current = null;
+    }
 
     if (analyserRef.current) {
       analyserRef.current.disconnect();
@@ -81,6 +89,18 @@ export function useGlobalAudio(): {
       silencer.gain.value = 0.001;
       node.connect(silencer);
       silencer.connect(ctx.destination);
+
+      // Ring-buffer tap: feeds the global retroactive recorder ("Rec" button).
+      // Output stays silent — a ScriptProcessor's output buffer is zeroed each
+      // callback and we never write to it; the destination link just keeps the
+      // node pulled by the graph.
+      const tap = ctx.createScriptProcessor(4096, 1, 1);
+      tap.onaudioprocess = (e) => {
+        audioRecorder.write('input', e.inputBuffer.getChannelData(0), ctx.sampleRate);
+      };
+      source.connect(tap);
+      tap.connect(ctx.destination);
+      recTapRef.current = tap;
 
       analyserRef.current = node;
       setAnalyser(node);
