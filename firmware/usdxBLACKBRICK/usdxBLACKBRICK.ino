@@ -50,7 +50,7 @@ Global variables use 1499 bytes (73%) of dynamic memory, leaving 549 bytes for l
 */
 
 //  G8RDI Modifications log:
-#define VERSION   "4.00d"    // Fixed format "9.99z" : Additions and changes Copyright 2022-2023 GW8RDI - You can use and distribute if you maintain the copyright message, commercial use is prohibited.
+#define VERSION   "4.00h"    // Fixed format "9.99z" : Additions and changes Copyright 2022-2023 GW8RDI - You can use and distribute if you maintain the copyright message, commercial use is prohibited.
 
 //  2022/03/04 - Added delay to show serial number at start - G8RDI mod
 //               Added band change direction based on last freq step directions. See "case BE | DC:" - GW8RDI mod
@@ -125,7 +125,7 @@ Global variables use 1499 bytes (73%) of dynamic memory, leaving 549 bytes for l
 
 
 
-#define BACKLIGHT_PIN 0x20   // PD5, bit 5 for BLACK_BRICK
+#define BACKLIGHT_PIN 0x08   // PD3, bit 3 for BLACK_BRICK (shared with LCD_D7 data line; lcd post() re-asserts it after every LCD transfer)
 
 #define KEEP_BAND_DATA 1        // Maintain last freq and mode set on each band
 
@@ -1396,9 +1396,11 @@ void encoder_setup()
 {
 	pinMode(ROT_A, INPUT_PULLUP);
 	pinMode(ROT_B, INPUT_PULLUP);
+	delay(5);                                  // let the pull-ups charge the encoder lines (debounce caps) before sampling, else a late-rising line fakes a rotation step at boot
+	last_state = (_digitalRead(ROT_B) << 1) | _digitalRead(ROT_A);
+	PCIFR |= (1 << PCIF2);                     // clear any pin-change flag pended while lines were settling
 	PCMSK2 |= (1 << PCINT22) | (1 << PCINT23); // interrupt-enable for ROT_A, ROT_B pin changes; see https://github.com/EnviroDIY/Arduino-SDI-12/wiki/2b.-Overview-of-Interrupts
 	PCICR |= (1 << PCIE2);
-	last_state = (_digitalRead(ROT_B) << 1) | _digitalRead(ROT_A);
 	interrupts();
 }
 /*
@@ -2299,7 +2301,7 @@ inline int16_t ssb(int16_t in)
 
 #define MIC_ATTEN  0  // 0*6dB attenuation (note that the LSB bits are quite noisy)
 volatile int8_t mox = 0;
-volatile int8_t volume = 12;
+volatile int8_t volume = 11;
 
 // This is the ADC ISR, issued with sample-rate via timer1 compb interrupt.
 // It performs in real-time the ADC sampling, calculation of SSB phase-differences, calculation of SI5351 frequency registers and send the registers to SI5351 over I2C.
@@ -2688,9 +2690,9 @@ volatile uint8_t agc = 2;
 #else
 volatile uint8_t agc = 1;
 #endif
-volatile uint8_t nr = 2;    // G8RDI mod
+volatile uint8_t nr = 0;    // G8RDI mod
 volatile uint8_t att = 0;
-volatile uint8_t att2 = 2;  // Minimum att2 increased, to prevent numeric overflow on strong signals
+volatile uint8_t att2 = 0;  // note: values >=2 help prevent numeric overflow on strong signals
 volatile uint8_t _init = 0;
 
 // Old AGC algorithm which only increases gain, but does not decrease it for very strong signals.
@@ -4208,7 +4210,7 @@ volatile bool changedMode = 0;
 volatile bool changedModeCAT = 0;
 volatile int32_t freq = 14000000;
 static int32_t vfo[] = { 7074000, 14074000 };
-static uint8_t vfomode[] = { LSB, USB };  // G8RDI mod was USB, USB
+static uint8_t vfomode[] = { USB, USB };  // default both VFOs to USB
 enum vfo_t { VFOA = 0, VFOB = 1, SPLIT = 2 };
 volatile uint8_t vfosel = VFOA;
 volatile int32_t rit = 0;	// GW8RDI mod - changed to int32_t from int16_t
@@ -4635,10 +4637,7 @@ char* szStation = (char*)MY_CALLSIGN_PADDED;  // If callsign is different length
 void show_banner() {
 	lcd.setCursor(0, 0);
 	szStation[CALLSIGN_LENGTH] = ' ';
-	if (cat_enabled)
-		szStation[CALLSIGN_LENGTH + 1] = 'c';
-	else
-		szStation[CALLSIGN_LENGTH + 1] = ' ';
+	szStation[CALLSIGN_LENGTH + 1] = ' ';  // (was 'c' CAT-enabled indicator — always on in this build, so just visual noise)
 	if (error_code > 0)
 		sprintf(&szStation[CALLSIGN_LENGTH], "%02X", error_code);
 	lcd.print(szStation);
@@ -4693,6 +4692,13 @@ volatile int8_t menu = 0;  // current parameter id selected in menu
 
 //uint8_t eeprom_version; // G8RDI mod 2022/08/27 was set to unit8_t and should have been 16-bit!  Caused constant resetting when VERSION changed
 uint16_t eeprom_version;
+
+// Snapshot of the compile-time defaults, captured in setup() BEFORE the EEPROM
+// load overwrites the variables. Served by the FD; CAT command so the app can
+// show what a factory reset (SR2;) would restore, without hardcoding values
+// that could drift from the actual initializers.
+struct factory_defaults_t { int8_t volume; uint8_t att, att2, nr, agc, filt, drive, backlight, pwm_min, pwm_max, md; };
+factory_defaults_t factory_defaults;
 #define EEPROM_OFFSET 0x150  // avoid collision with QCX settings, overwrites text settings though
 int eeprom_addr;
 
@@ -4816,7 +4822,7 @@ static uint8_t vox_tx = 0;
 static uint8_t vox_sample = 0;
 static uint16_t vox_adc = 0;
 
-static uint8_t pwm_min = 0;
+static uint8_t pwm_min = 10;
 static uint8_t pwm_max = 160;  // PWM value for which PA reaches its maximum: 128 for BS170, 160 for IRFI510G
 
 const char* offon_label[2] = { "OFF", "ON" };
@@ -5057,7 +5063,7 @@ void initPins() {
 	pinMode(PD4, OUTPUT);
 	pinMode(PD5, OUTPUT);
 #else
-	pinMode(PD5, OUTPUT);    // PD5 = BACKLIGHT_PIN for BLACK_BRICK
+	pinMode(PD3, OUTPUT);    // PD3 = BACKLIGHT_PIN for BLACK_BRICK
 #endif
 }
 
@@ -5123,6 +5129,15 @@ void analyseCATcmd()    // Supported Kenwood TS-480 protocol CAT commands
 	else if (CMD('S','M',';'))                              Command_SM_GET();
 	else if (CMD('D','R',';'))                              Command_DR_GET();
 	else if (CMD2('D','R') && CATcmd[3]==';')               Command_DR_SET();
+	else if (CMD('P','M',';'))                              Command_PM_GET();
+	else if (CMD2('P','M') && CATcmd[2]!=';')              Command_PM_SET();
+	else if (CMD('P','X',';'))                              Command_PX_GET();
+	else if (CMD2('P','X') && CATcmd[2]!=';')              Command_PX_SET();
+	else if (CMD('S','R',';'))                              Command_SR();
+	else if (CMD('S','R','2') && CATcmd[3]==';')            Command_SR2();
+	else if (CMD('F','D',';'))                              Command_FD();
+	else if (CMD('X','F',';'))                              Command_XF_GET();
+	else if (CMD2('X','F') && CATcmd[2]!=';')              Command_XF_SET();
 #ifdef CAT_EXT
 	else if (CMD2('U','K') && CATcmd[4]==';')               Command_UK(CATcmd[2], CATcmd[3]);
 	else if (CMD('U','D',';'))                              Command_UD();
@@ -5518,6 +5533,101 @@ void Command_DR_SET()
 	Command_DR_GET();
 }
 
+// PM; → get PA bias min, PMn; → set (0..pwm_max-1). PX; → get PA max, PXn; → set (pwm_min..255).
+// Changing either must rebuild the PWM lookup table (build_lut) — the same post-apply the
+// rotary-menu handler does — otherwise the new bias only takes effect on the next reboot.
+void build_lut();  // defined after the CAT section
+void Command_PM_GET()
+{
+	char buf[7];
+	sprintf(buf, "PM%u;", (uint8_t)pwm_min);
+	Serial.print(buf);
+}
+void Command_PM_SET()
+{
+	uint16_t v = (uint16_t)atoi(CATcmd + 2);
+	if (v < pwm_max) { pwm_min = v; paramAction(SAVE, PWM_MIN); build_lut(); }
+	Command_PM_GET();
+}
+void Command_PX_GET()
+{
+	char buf[7];
+	sprintf(buf, "PX%u;", (uint8_t)pwm_max);
+	Serial.print(buf);
+}
+void Command_PX_SET()
+{
+	uint16_t v = (uint16_t)atoi(CATcmd + 2);
+	if (v >= pwm_min && v <= 255) { pwm_max = v; paramAction(SAVE, PWM_MAX); build_lut(); }
+	Command_PX_GET();
+}
+
+// SR; → soft-restart the radio, equivalent to a power cycle: acks "SR1;" first,
+// then lets the watchdog time out — the same reboot mechanism powerDown() uses.
+// setup() runs again from scratch (si5351, LCD, EEPROM settings reload) and the
+// radio re-announces itself with the boot IF; frame once CAT is back up.
+void Command_SR()
+{
+	Serial.print(F("SR1;"));
+	Serial.flush();          // make sure the ack leaves the UART before we die
+	wdt_enable(WDTO_15MS);
+	for (;;);                // wait for the watchdog to reset the MCU
+}
+
+// SR2; → factory reset (matches the Kenwood TS-480's SR2 "full reset"):
+// invalidates the stored settings version and reboots. On the next boot the
+// version mismatch triggers the firmware's own "Reset settings.." path, which
+// rewrites ALL params with the compile-time defaults — including band
+// memories and the ref-frequency calibration, i.e. a full wipe.
+void Command_SR2()
+{
+	eeprom_version = 0;
+	paramAction(SAVE, VERS);
+	Serial.print(F("SR2;"));
+	Serial.flush();
+	wdt_enable(WDTO_15MS);
+	for (;;);
+}
+
+// FD; → the factory-default values a reset (SR2;) would restore, as ONE frame:
+// FD<vol>,<att>,<att2>,<nr>,<agc>,<filt>,<drive>,<backlight>,<pwm_min>,<pwm_max>,<md>;
+// (md = Kenwood mode digit). Single frame so the app's reply-prefix queue can
+// await it like any other command. Values come from the setup() snapshot taken
+// before the EEPROM load, so they always match the real initializers.
+void Command_FD()
+{
+	char buf[48];
+	sprintf_P(buf, PSTR("FD%d,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u;"),
+		factory_defaults.volume, factory_defaults.att, factory_defaults.att2,
+		factory_defaults.nr, factory_defaults.agc, factory_defaults.filt,
+		factory_defaults.drive, factory_defaults.backlight,
+		factory_defaults.pwm_min, factory_defaults.pwm_max, factory_defaults.md);
+	Serial.print(buf);
+}
+
+// XF; → get reference frequency (si5351.fxtal, the menu's "Ref frq"), XFn; →
+// set it (14..28 MHz, same bounds as the menu). This is the frequency-
+// calibration value: the assumed TCXO frequency all VFO frequencies are
+// computed from. Setting it saves to EEPROM and marks `change` so the main
+// loop retunes with the new value immediately — same post-apply as the menu.
+// Driven by the web app's calibration wizard (receive-only, off-air reference).
+void Command_XF_GET()
+{
+	char buf[14];
+	sprintf_P(buf, PSTR("XF%lu;"), (unsigned long)si5351.fxtal);
+	Serial.print(buf);
+}
+void Command_XF_SET()
+{
+	uint32_t v = (uint32_t)atol(CATcmd + 2);
+	if (v >= 14000000UL && v <= 28000000UL) {
+		si5351.fxtal = v;
+		paramAction(SAVE, SIFXTAL);
+		change = true;  // retune so the correction takes effect now
+	}
+	Command_XF_GET();
+}
+
 #endif //CAT
 
 void fatal(const __FlashStringHelper * msg, int value = 0, char unit = '\0') {
@@ -5749,6 +5859,13 @@ void setup()
 	mode_last[4] = mode_last[5] = mode_last[6] = mode_last[7] = mode_last[8] = USB;   // Set for up to 9 bands only xyzzy
 #endif
 
+	// Capture the compile-time defaults before the EEPROM load overwrites them (served by FD;)
+	factory_defaults.volume = volume; factory_defaults.att = att; factory_defaults.att2 = att2;
+	factory_defaults.nr = nr; factory_defaults.agc = agc; factory_defaults.filt = filt;
+	factory_defaults.drive = drive; factory_defaults.backlight = backlight;
+	factory_defaults.pwm_min = pwm_min; factory_defaults.pwm_max = pwm_max;
+	factory_defaults.md = mode + 1;  // Kenwood MD digit (mode enum + 1)
+
 	// Load parameters from EEPROM, reset to factory defaults when stored values are from a different version
 	paramAction(LOAD, VERS);
 
@@ -5792,6 +5909,8 @@ void setup()
 	delay(800); // G8RDI mod added so visible
 
 	show_banner();  // remove release number
+
+	encoder_val = 0;  // discard any spurious encoder event picked up during boot, so the VFO starts exactly on the stored frequency
 
 	start_rx();   // Start radio receiver
 

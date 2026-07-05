@@ -284,16 +284,22 @@ const FTDecoder = forwardRef<DecoderControls, { ftMode: FTMode; myCall?: string;
   const getContactStable = useCallback((cs: string) => contactsRef.current.get(cs), []);
 
   // ── UTC clock skew check ──────────────────────────────────────────────────
-  // Fetch once against a public time API; warn if local clock is off by >1 s.
+  // Fetch once against Cloudflare's edge trace endpoint (plain text `ts=<unix
+  // seconds>`, CORS-open via `Access-Control-Allow-Origin: *`, and backed by
+  // Cloudflare's own network — far more reliable than dedicated "time API"
+  // services, which have a history of outages/CORS resets). Warn if local
+  // clock is off by >1 s, since FT8/4 timing is UTC-slot-synchronized.
   const [clockSkewS, setClockSkewS] = useState<number | null>(null);
   useEffect(() => {
     const controller = new AbortController();
     const t0 = Date.now();
-    fetch('https://worldtimeapi.org/api/ip', { signal: controller.signal })
-      .then(r => r.json())
-      .then((data: { unixtime: number }) => {
+    fetch('https://cloudflare.com/cdn-cgi/trace', { signal: controller.signal })
+      .then(r => r.text())
+      .then(text => {
+        const m = text.match(/^ts=([\d.]+)/m);
+        if (!m) return;
         const rtt      = Date.now() - t0;
-        const serverMs = data.unixtime * 1000 + rtt / 2;
+        const serverMs = parseFloat(m[1]) * 1000 + rtt / 2;
         const skewS    = (Date.now() - serverMs) / 1000;
         setClockSkewS(skewS);
       })

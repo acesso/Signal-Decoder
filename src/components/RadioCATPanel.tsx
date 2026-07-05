@@ -1,7 +1,8 @@
 'use client';
 
-import { useState, useCallback, useRef } from 'react';
-import { useRadioCAT, type CATMode, type CATConnectionConfig, type RigProfile, type RadioCATControls } from '@/hooks/useRadioCAT';
+import { useState, useCallback, useRef, useEffect } from 'react';
+import { useRadioCAT, type CATMode, type CATConnectionConfig, type RigProfile, type RadioCATControls, type PABias, type FactoryDefaults } from '@/hooks/useRadioCAT';
+import CalibrationWizard from '@/components/CalibrationWizard';
 export { useRadioCAT };
 
 // ── Constants ─────────────────────────────────────────────────────────────────
@@ -21,7 +22,7 @@ interface RadioPreset {
 }
 
 const RADIO_PRESETS: RadioPreset[] = [
-  { label: 'uSDX BLACK_BRICK 4.00e',            baudRate: 38400,  dataBits: 8, stopBits: 1, parity: 'none', notes: 'PU7FTW custom firmware — adds volume, attenuator, noise reduction, AGC, filter, TX drive and S-meter controls, batched CAT polling', rigProfile: 'usdx-blackbrick' },
+  { label: 'uSDX BLACK_BRICK 4.00h',            baudRate: 38400,  dataBits: 8, stopBits: 1, parity: 'none', notes: 'PU7FTW custom firmware — adds volume, attenuator, noise reduction, AGC, filter, TX drive, backlight, PA bias and S-meter controls, batched CAT polling', rigProfile: 'usdx-blackbrick' },
   { label: 'Kenwood TS-480 / TS-590 / TS-2000', baudRate: 9600,   dataBits: 8, stopBits: 1, parity: 'none', notes: 'Default 9600 8N1', rigProfile: 'generic' },
   { label: 'Kenwood TS-480 (high speed)',        baudRate: 57600,  dataBits: 8, stopBits: 1, parity: 'none', notes: 'Configure in menu 60', rigProfile: 'generic' },
   { label: 'Icom IC-7300 / IC-7610',             baudRate: 9600,   dataBits: 8, stopBits: 1, parity: 'none', notes: 'Set CI-V USB Baud Rate to 9600', rigProfile: 'generic' },
@@ -412,13 +413,92 @@ function SMeterDisplay({ dbm }: { dbm: number | null }) {
   );
 }
 
-// ── BlackBrickControls ────────────────────────────────────────────────────────
-// uSDX BLACK_BRICK 4.00e custom extension controls: volume, attenuators, noise
-// reduction, AGC, filter, TX drive. Wraps onto its own row below the main
-// toolbar. S-Meter is shown separately in the main toolbar since it's a
-// read-only reading, not a control.
+// ── BacklightToggle ───────────────────────────────────────────────────────────
+// Icon-only LCD backlight switch (BL command). Lit = amber bulb, off = gray.
 
-function BlackBrickControls({ volume, att1, att2, nr, agc, filter, drive, onVolume, onAtt1, onAtt2, onNR, onAGC, onFilter, onDrive }: {
+function BacklightToggle({ backlight, onToggle }: {
+  backlight: number | null;
+  onToggle: (n: number) => void;
+}) {
+  const on = backlight === 1;
+  return (
+    <button
+      onClick={() => onToggle(on ? 0 : 1)}
+      disabled={backlight === null}
+      title={backlight === null ? 'LCD backlight (state unknown)' : `LCD backlight ${on ? 'on — click to switch off' : 'off — click to switch on'}`}
+      className={`w-7 h-7 flex items-center justify-center rounded border transition-colors disabled:opacity-30
+        ${on
+          ? 'bg-[#3a2d12] border-[#d29922] text-[#e3b341]'
+          : 'bg-[#21262d] border-[#30363d] text-[#8b949e] hover:text-[#c9d1d9] hover:border-[#8b949e]'
+        }`}
+    >
+      {/* light-bulb icon (heroicons v1 solid) */}
+      <svg xmlns="http://www.w3.org/2000/svg" className="h-3.5 w-3.5" viewBox="0 0 20 20" fill="currentColor">
+        <path d="M11 3a1 1 0 10-2 0v1a1 1 0 102 0V3zM15.657 5.757a1 1 0 00-1.414-1.414l-.707.707a1 1 0 001.414 1.414l.707-.707zM18 10a1 1 0 01-1 1h-1a1 1 0 110-2h1a1 1 0 011 1zM5.05 6.464A1 1 0 106.464 5.05l-.707-.707a1 1 0 00-1.414 1.414l.707.707zM5 10a1 1 0 01-1 1H3a1 1 0 110-2h1a1 1 0 011 1zM8 16v-1h4v1a2 2 0 11-4 0zM12 14c.015-.34.208-.646.477-.859a4 4 0 10-4.954 0c.27.213.462.519.476.859h4.002z" />
+      </svg>
+    </button>
+  );
+}
+
+// ── RestartRadioButton ────────────────────────────────────────────────────────
+// Soft-restarts the radio over CAT (SR; → watchdog reset, like a power cycle).
+// Single click, no confirm — a restart is harmless (settings survive), the
+// radio is just off the wire for a few seconds.
+
+function RestartRadioButton({ onReset }: { onReset: () => void }) {
+  return (
+    <button
+      onClick={onReset}
+      title="Restart radio (soft power cycle) — drops off CAT for a few seconds"
+      className="w-7 h-7 flex items-center justify-center rounded border transition-colors bg-[#da3633] border-[#da3633] text-white hover:bg-[#f85149] hover:border-[#f85149]"
+    >
+      {/* refresh/restart icon (heroicons v1 solid) */}
+      <svg xmlns="http://www.w3.org/2000/svg" className="h-3.5 w-3.5 shrink-0" viewBox="0 0 20 20" fill="currentColor">
+        <path fillRule="evenodd" d="M4 2a1 1 0 011 1v2.101a7.002 7.002 0 0111.601 2.566 1 1 0 11-1.885.666A5.002 5.002 0 005.999 7H9a1 1 0 010 2H4a1 1 0 01-1-1V3a1 1 0 011-1zm.008 9.057a1 1 0 011.276.61A5.002 5.002 0 0014.001 13H11a1 1 0 110-2h5a1 1 0 011 1v5a1 1 0 11-2 0v-2.101a7.002 7.002 0 01-11.601-2.566 1 1 0 01.61-1.276z" clipRule="evenodd" />
+      </svg>
+    </button>
+  );
+}
+
+// ── FactoryResetButton ────────────────────────────────────────────────────────
+// SR2; — wipes ALL stored settings (band memories, ref-freq calibration) and
+// reboots. Destructive, so unlike the restart button this keeps a two-step
+// confirm: first click arms ("Wipe everything?"), auto-disarms after 4s.
+
+function FactoryResetButton({ onConfirm }: { onConfirm: () => void }) {
+  const [armed, setArmed] = useState(false);
+
+  useEffect(() => {
+    if (!armed) return;
+    const t = setTimeout(() => setArmed(false), 4000);
+    return () => clearTimeout(t);
+  }, [armed]);
+
+  return (
+    <button
+      onClick={() => { if (!armed) { setArmed(true); return; } setArmed(false); onConfirm(); }}
+      title={armed
+        ? 'Click again to confirm — wipes ALL stored settings and reboots'
+        : 'Factory reset — restores the defaults shown here, wiping band memories and calibration'}
+      className={`text-[10px] font-semibold px-2.5 py-1.5 rounded border transition-colors whitespace-nowrap
+        ${armed
+          ? 'bg-[#da3633] border-[#f85149] text-white'
+          : 'bg-[#21262d] border-[#f85149] text-[#f85149] hover:bg-[#da3633] hover:text-white'
+        }`}
+    >
+      {armed ? 'Wipe everything?' : 'Factory Reset'}
+    </button>
+  );
+}
+
+// ── BlackBrickControls ────────────────────────────────────────────────────────
+// uSDX BLACK_BRICK 4.00h custom extension controls: volume, attenuators, noise
+// reduction, AGC, filter, TX drive, backlight. Wraps onto its own row below the
+// main toolbar. S-Meter is shown separately in the main toolbar since it's a
+// read-only reading, not a control. PA bias lives in its own on-demand panel
+// (PABiasPanel) behind the wrench button — not polled, queried when opened.
+
+function BlackBrickControls({ volume, att1, att2, nr, agc, filter, drive, backlight, paOpen, onVolume, onAtt1, onAtt2, onNR, onAGC, onFilter, onDrive, onBacklight, onTogglePA, onReset }: {
   volume: number | null;
   att1: number | null;
   att2: number | null;
@@ -426,6 +506,8 @@ function BlackBrickControls({ volume, att1, att2, nr, agc, filter, drive, onVolu
   agc: number | null;
   filter: number | null;
   drive: number | null;
+  backlight: number | null;
+  paOpen: boolean;
   onVolume: (n: number) => void;
   onAtt1: (n: number) => void;
   onAtt2: (n: number) => void;
@@ -433,6 +515,9 @@ function BlackBrickControls({ volume, att1, att2, nr, agc, filter, drive, onVolu
   onAGC: (n: number) => void;
   onFilter: (n: number) => void;
   onDrive: (n: number) => void;
+  onBacklight: (n: number) => void;
+  onTogglePA: () => void;
+  onReset: () => void;
 }) {
   const agcOn = agc === AGC_ON;
   return (
@@ -458,6 +543,188 @@ function BlackBrickControls({ volume, att1, att2, nr, agc, filter, drive, onVolu
           {agc === null ? '—' : agcOn ? 'ON' : 'OFF'}
         </button>
       </div>
+
+      <BacklightToggle backlight={backlight} onToggle={onBacklight} />
+
+      <div className="ml-auto flex items-center gap-1.5">
+        <RestartRadioButton onReset={onReset} />
+
+        {/* PA bias settings — tucked away, opens the on-demand panel */}
+        <button
+          onClick={onTogglePA}
+          title="PA bias settings (advanced)"
+          className={`w-7 h-7 flex items-center justify-center rounded border transition-colors
+            ${paOpen
+              ? 'bg-[#21262d] border-[#388bfd] text-[#79c0ff]'
+              : 'bg-[#21262d] border-[#30363d] text-[#8b949e] hover:text-[#c9d1d9] hover:border-[#8b949e]'
+            }`}
+        >
+          {/* wrench icon (heroicons v1 solid, adjustments) */}
+          <svg xmlns="http://www.w3.org/2000/svg" className="h-3.5 w-3.5" viewBox="0 0 20 20" fill="currentColor">
+            <path d="M5 4a1 1 0 00-2 0v7.268a2 2 0 000 3.464V16a1 1 0 102 0v-1.268a2 2 0 000-3.464V4zM11 4a1 1 0 10-2 0v1.268a2 2 0 000 3.464V16a1 1 0 102 0V8.732a2 2 0 000-3.464V4zM16 3a1 1 0 011 1v7.268a2 2 0 010 3.464V16a1 1 0 11-2 0v-1.268a2 2 0 010-3.464V4a1 1 0 011-1z" />
+          </svg>
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// ── PABiasPanel ───────────────────────────────────────────────────────────────
+// On-demand advanced radio options: PA bias endpoints editor (PM = idle bias,
+// PX = full-drive PWM) plus the factory-reset control. Deliberately NOT part
+// of the poll loop: PA bias and the factory-default values are read once when
+// the panel opens (so the user sees the radio's current numbers before
+// touching anything) and written only on commit. Plain bounded number inputs,
+// no sliders.
+
+function PABiasPanel({ getPABias, setPABias, getFactoryDefaults, onFactoryReset, onOpenCalibration }: {
+  getPABias: () => Promise<PABias | null>;
+  setPABias: (which: 'min' | 'max', n: number) => Promise<number | null>;
+  getFactoryDefaults: () => Promise<FactoryDefaults | null>;
+  onFactoryReset: () => void;
+  onOpenCalibration: () => void;
+}) {
+  const [bias, setBias]         = useState<PABias | null>(null);
+  const [defaults, setDefaults] = useState<FactoryDefaults | null>(null);
+  const [failed, setFailed]     = useState(false);
+  const [minDraft, setMinDraft] = useState('');
+  const [maxDraft, setMaxDraft] = useState('');
+  const [busy, setBusy]         = useState(false);
+
+  const load = useCallback(async () => {
+    setBias(null); setDefaults(null); setFailed(false);
+    const [b, d] = await Promise.all([getPABias(), getFactoryDefaults()]);
+    if (b) {
+      setBias(b);
+      setMinDraft(String(b.min));
+      setMaxDraft(String(b.max));
+    } else {
+      setFailed(true);
+    }
+    setDefaults(d);
+  }, [getPABias, getFactoryDefaults]);
+
+  useEffect(() => { load(); }, [load]);  // query on open
+
+  const commit = async (which: 'min' | 'max') => {
+    if (!bias || busy) return;
+    const raw = which === 'min' ? minDraft : maxDraft;
+    const n = parseInt(raw, 10);
+    // Clamp to what the firmware will accept: min ∈ [0, max-1], max ∈ [min+1, 255]
+    const clamped = isNaN(n)
+      ? (which === 'min' ? bias.min : bias.max)
+      : which === 'min'
+        ? Math.max(0, Math.min(bias.max - 1, n))
+        : Math.max(bias.min + 1, Math.min(255, n));
+    if (clamped === (which === 'min' ? bias.min : bias.max)) {
+      // No effective change — just normalize the draft back
+      (which === 'min' ? setMinDraft : setMaxDraft)(String(which === 'min' ? bias.min : bias.max));
+      return;
+    }
+    setBusy(true);
+    const confirmed = await setPABias(which, clamped);
+    setBusy(false);
+    // Trust the radio's echo (it returns the old value if the SET was rejected)
+    const effective = confirmed ?? (which === 'min' ? bias.min : bias.max);
+    setBias(prev => prev ? { ...prev, [which]: effective } : prev);
+    (which === 'min' ? setMinDraft : setMaxDraft)(String(effective));
+  };
+
+  const inputCls = 'w-16 bg-[#0d1117] border border-[#30363d] text-[#c9d1d9] text-xs rounded px-2 py-1.5 focus:outline-none focus:border-[#388bfd] font-mono disabled:opacity-40';
+  const keyHandler = (which: 'min' | 'max') => (e: React.KeyboardEvent<HTMLInputElement>) => {
+    if (e.key === 'Enter')  { e.preventDefault(); commit(which); }
+    if (e.key === 'Escape') { setMinDraft(String(bias?.min ?? '')); setMaxDraft(String(bias?.max ?? '')); }
+  };
+
+  // Human-readable one-liner of what a factory reset would restore, built from
+  // the radio's own FD; reply (never hardcoded).
+  const defaultsSummary = defaults === null ? null : [
+    `Volume ${defaults.volume}`,
+    `Mode ${defaults.mode ?? '?'}`,
+    `AGC ${defaults.agc === 1 ? 'On' : 'Off'}`,
+    `Filter ${FILTER_LABELS[defaults.filter] ?? defaults.filter}`,
+    `ATT ${ANALOG_ATTENUATOR_DB_LABELS[defaults.att1] ?? defaults.att1}/${DIGITAL_ATTENUATOR_DB_LABELS[defaults.att2] ?? defaults.att2}`,
+    `NR ${defaults.nr}`,
+    `Drive ${defaults.drive}`,
+    `Backlight ${defaults.backlight === 1 ? 'On' : 'Off'}`,
+    `PA bias ${defaults.paMin}/${defaults.paMax}`,
+  ].join(' · ');
+
+  return (
+    <div className="mt-2 bg-[#161b22] border border-[#30363d] rounded-lg p-4 flex flex-col gap-3">
+      <span className="text-[10px] font-bold uppercase tracking-widest text-[#8b949e] select-none">
+        Advanced Radio Options
+      </span>
+
+      {failed ? (
+        <div className="flex items-center gap-3">
+          <span className="text-xs text-[#f85149]">Could not read PA bias from the radio.</span>
+          <button
+            onClick={load}
+            className="text-[10px] font-semibold px-2 py-1 rounded bg-[#21262d] border border-[#30363d] text-[#8b949e] hover:text-[#c9d1d9] hover:border-[#8b949e] transition-colors"
+          >
+            Retry
+          </button>
+        </div>
+      ) : bias === null ? (
+        <span className="text-xs text-[#8b949e]">Reading current values from the radio…</span>
+      ) : (
+        <div className="flex items-center gap-6 flex-wrap">
+          <div className="flex items-center gap-2" title={`PA bias min — PWM at zero drive (idle bias). Valid: 0 to ${bias.max - 1}.`}>
+            <span className="text-[10px] font-semibold text-[#8b949e] whitespace-nowrap">Bias Min</span>
+            <input
+              type="number" min={0} max={bias.max - 1} step={1}
+              value={minDraft} disabled={busy}
+              onChange={e => setMinDraft(e.target.value)}
+              onBlur={() => commit('min')}
+              onKeyDown={keyHandler('min')}
+              className={inputCls}
+            />
+          </div>
+          <div className="flex items-center gap-2" title={`PA max — PWM at full drive. Valid: ${bias.min + 1} to 255.`}>
+            <span className="text-[10px] font-semibold text-[#8b949e] whitespace-nowrap">PA Max</span>
+            <input
+              type="number" min={bias.min + 1} max={255} step={1}
+              value={maxDraft} disabled={busy}
+              onChange={e => setMaxDraft(e.target.value)}
+              onBlur={() => commit('max')}
+              onKeyDown={keyHandler('max')}
+              className={inputCls}
+            />
+          </div>
+          {busy && <span className="text-[10px] text-[#8b949e]">writing…</span>}
+        </div>
+      )}
+
+      <p className="text-[10px] text-[#f0883e]">
+        Sets the PA MOSFET bias PWM endpoints (0–255) and rebuilds the TX lookup table immediately.
+        Too-high values can overheat the finals — change with care.
+      </p>
+
+      {/* ── Frequency calibration ── */}
+      <div className="border-t border-[#21262d] pt-3 flex items-center gap-3 flex-wrap">
+        <button
+          onClick={onOpenCalibration}
+          className="text-[10px] font-semibold px-2.5 py-1.5 rounded border transition-colors whitespace-nowrap bg-[#21262d] border-[#30363d] text-[#8b949e] hover:text-[#c9d1d9] hover:border-[#8b949e]"
+          title="Calibrate the reference oscillator against an off-air standard station (receive-only)"
+        >
+          Calibrate Frequency…
+        </button>
+        <p className="text-[10px] text-[#8b949e] flex-1 min-w-[16rem]">
+          Guided, receive-only calibration of the dial frequency against WWV/CHU. No transmission — no dummy load needed.
+        </p>
+      </div>
+
+      {/* ── Factory reset ── */}
+      <div className="border-t border-[#21262d] pt-3 flex items-center gap-3 flex-wrap">
+        <FactoryResetButton onConfirm={onFactoryReset} />
+        <p className="text-[10px] text-[#8b949e] flex-1 min-w-[16rem]">
+          Restores all settings to firmware defaults and reboots — band memories and frequency calibration are wiped too.
+          {defaultsSummary
+            ? <> Defaults (reported by the radio): <span className="text-[#c9d1d9]">{defaultsSummary}</span>.</>
+            : <span className="text-[#f0883e]"> Could not read the default values from the radio.</span>}
+        </p>
+      </div>
     </div>
   );
 }
@@ -471,11 +738,13 @@ const DEFAULT_CONFIG: CATConnectionConfig & { presetIdx: number } = {
   rigProfile: RADIO_PRESETS[0].rigProfile,
 };
 
-export default function RadioCATPanel({ cat }: { cat: ReturnType<typeof useRadioCAT> }) {
-  const { state, connect, disconnect, setFrequency, setMode, setPTT, setVolume, setAtt1, setAtt2, setNR, setAGC, setFilter, setDrive } = cat;
-  const { connected, frequency, mode, ptt, error, isSupported, volume, att1, att2, nr, agc, filter, sMeter, drive } = state;
+export default function RadioCATPanel({ cat, collapsed = false }: { cat: ReturnType<typeof useRadioCAT>; collapsed?: boolean }) {
+  const { state, connect, disconnect, setFrequency, setMode, setPTT, setVolume, setAtt1, setAtt2, setNR, setAGC, setFilter, setDrive, setBacklight, getPABias, setPABias, resetRadio, getFactoryDefaults, factoryResetRadio } = cat;
+  const { connected, frequency, mode, ptt, error, isSupported, volume, att1, att2, nr, agc, filter, sMeter, drive, backlight } = state;
 
   const [showSettings, setShowSettings] = useState(false);
+  const [showPABias, setShowPABias] = useState(false);
+  const [showCalibration, setShowCalibration] = useState(false);
   const [config, setConfig] = useState(DEFAULT_CONFIG);
 
   const handleConnect    = useCallback(() => { setShowSettings(false); connect(config).catch(() => {}); }, [connect, config]);
@@ -489,6 +758,12 @@ export default function RadioCATPanel({ cat }: { cat: ReturnType<typeof useRadio
   const handleAGC        = useCallback((n: number) => { setAGC(n).catch(() => {}); }, [setAGC]);
   const handleFilter     = useCallback((n: number) => { setFilter(n).catch(() => {}); }, [setFilter]);
   const handleDrive      = useCallback((n: number) => { setDrive(n).catch(() => {}); }, [setDrive]);
+  const handleBacklight  = useCallback((n: number) => { setBacklight(n).catch(() => {}); }, [setBacklight]);
+  const handleTogglePA   = useCallback(() => { setShowPABias(s => !s); }, []);
+  const handleReset      = useCallback(() => { setShowPABias(false); resetRadio().catch(() => {}); }, [resetRadio]);
+  const handleFactoryReset = useCallback(() => { setShowPABias(false); factoryResetRadio().catch(() => {}); }, [factoryResetRadio]);
+  const handleOpenCalibration = useCallback(() => { setShowPABias(false); setShowCalibration(true); }, []);
+  const handleCloseCalibration = useCallback(() => { setShowCalibration(false); }, []);
 
   return (
     <div>
@@ -560,14 +835,17 @@ export default function RadioCATPanel({ cat }: { cat: ReturnType<typeof useRadio
             {/* PTT */}
             <PTTButton ptt={ptt} onToggle={handlePTTToggle} />
 
-            {/* uSDX BLACK_BRICK 4.00e extensions */}
-            {config.rigProfile === 'usdx-blackbrick' && (
+            {/* uSDX BLACK_BRICK 4.00h extensions */}
+            {config.rigProfile === 'usdx-blackbrick' && !collapsed && (
               <BlackBrickControls
                 volume={volume} att1={att1} att2={att2} nr={nr}
-                agc={agc} filter={filter} drive={drive}
+                agc={agc} filter={filter} drive={drive} backlight={backlight}
+                paOpen={showPABias}
                 onVolume={handleVolume} onAtt1={handleAtt1} onAtt2={handleAtt2}
                 onNR={handleNR}
                 onAGC={handleAGC} onFilter={handleFilter} onDrive={handleDrive}
+                onBacklight={handleBacklight} onTogglePA={handleTogglePA}
+                onReset={handleReset}
               />
             )}
           </>
@@ -587,8 +865,20 @@ export default function RadioCATPanel({ cat }: { cat: ReturnType<typeof useRadio
         )}
       </div>
 
-      {showSettings && !connected && (
+      {!collapsed && showSettings && !connected && (
         <SettingsPanel config={config} onConfigChange={setConfig} onConnect={handleConnect} />
+      )}
+
+      {!collapsed && showPABias && connected && config.rigProfile === 'usdx-blackbrick' && (
+        <PABiasPanel
+          getPABias={getPABias} setPABias={setPABias}
+          getFactoryDefaults={getFactoryDefaults} onFactoryReset={handleFactoryReset}
+          onOpenCalibration={handleOpenCalibration}
+        />
+      )}
+
+      {!collapsed && showCalibration && connected && config.rigProfile === 'usdx-blackbrick' && (
+        <CalibrationWizard cat={cat} onClose={handleCloseCalibration} />
       )}
     </div>
   );
