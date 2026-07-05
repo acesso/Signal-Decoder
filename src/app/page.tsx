@@ -396,6 +396,21 @@ function TxSummaryChips({ s }: { s: TxStatus | null }) {
           auto
         </span>
       )}
+      {/* Auto-CQ / Auto-PTT / Consecutive-TX — dim when off, colored to match their full-panel toggle */}
+      <span className="inline-flex items-center gap-1">
+        <span className="font-mono text-[9px] font-bold px-1 py-0.5 rounded" style={{
+          color:      s.autoCQ ? '#3fb950' : '#484f58',
+          background: s.autoCQ ? 'rgba(46,160,67,0.12)' : 'transparent',
+        }} title="Auto-CQ">CQ</span>
+        <span className="font-mono text-[9px] font-bold px-1 py-0.5 rounded" style={{
+          color:      s.autoPTT ? '#e3b341' : '#484f58',
+          background: s.autoPTT ? 'rgba(227,179,65,0.12)' : 'transparent',
+        }} title="Auto-PTT">PTT</span>
+        <span className="font-mono text-[9px] font-bold px-1 py-0.5 rounded" style={{
+          color:      s.allowConsecutiveTx ? '#f85149' : '#484f58',
+          background: s.allowConsecutiveTx ? 'rgba(248,81,73,0.12)' : 'transparent',
+        }} title="Consecutive TX">TX×N</span>
+      </span>
     </span>
   );
 }
@@ -410,6 +425,17 @@ export default function Home() {
   const [ftMyGrid, setFtMyGrid] = useState('');
   const [txStatus, setTxStatus] = useState<TxStatus | null>(null);
   const txAudioHz = txStatus?.txAudioHz ?? 0;
+
+  // ── Sticky CAT panel — collapses to its main bar once the body scrolls past
+  // it, so the frequency/mode/PTT controls stay reachable while the decoder
+  // content below scrolls. Re-expands once scrolled back near the top. ─────
+  const scrollBodyRef = useRef<HTMLDivElement>(null);
+  const [catCollapsed, setCatCollapsed] = useState(false);
+  const handleBodyScroll = useCallback(() => {
+    const el = scrollBodyRef.current;
+    if (!el) return;
+    setCatCollapsed(el.scrollTop > 24);
+  }, []);
 
   // ── Radio CAT — lifted here so VFO frequency flows to all decoders ────────
   const cat = useRadioCAT();
@@ -537,11 +563,12 @@ export default function Home() {
       </div>
 
       {/* Scrollable body — CAT + TX panel + decoder content */}
-      <div className="flex-1 min-h-0 overflow-y-auto px-4 sm:px-6 lg:px-8 pb-8">
+      <div ref={scrollBodyRef} onScroll={handleBodyScroll} className="flex-1 min-h-0 overflow-y-auto px-4 sm:px-6 lg:px-8 pb-8">
 
-        {/* CAT radio control panel */}
-        <div className="pb-3">
-          <RadioCATPanel cat={cat} />
+        {/* CAT radio control panel — sticky: stays visible while scrolling,
+            collapsing to just its main bar so it doesn't eat too much space. */}
+        <div className="sticky top-0 z-10 bg-[#0d1117] pb-3">
+          <RadioCATPanel cat={cat} collapsed={catCollapsed} />
         </div>
 
         {/* FT Transmit panel — only shown when FT mode is active */}
@@ -551,7 +578,7 @@ export default function Home() {
             <style>{`
               details[open] .tx-summary-chips { display: none !important; }
             `}</style>
-            <details className="bg-[#161b22] border border-[#30363d] rounded-lg" open>
+            <details className="bg-[#161b22] border border-[#30363d] rounded-lg">
               <summary className="cursor-pointer px-4 py-3 sm:px-5 font-semibold text-sm hover:bg-[#21262d] rounded-lg transition-colors select-none flex items-center">
                 Transmit
                 <TxSummaryChips s={txStatus} />
