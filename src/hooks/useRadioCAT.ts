@@ -50,7 +50,7 @@ export interface RadioState {
   error: string | null;
   /** false on SSR, true once mounted in a supporting browser */
   isSupported: boolean;
-  /** uSDX BLACK_BRICK 4.00e extension state — null unless rigProfile is 'usdx-blackbrick' */
+  /** uSDX BLACK_BRICK 4.00h extension state — null unless rigProfile is 'usdx-blackbrick' */
   volume: number | null;
   att1: number | null;
   att2: number | null;
@@ -65,6 +65,32 @@ export interface RadioState {
   sMeter: number | null;
   /** TX drive/power level, 0..8 (linear). */
   drive: number | null;
+  /** LCD backlight: 0=off, 1=on. */
+  backlight: number | null;
+}
+
+/** PA bias PWM endpoints (see PM/PX commands) — not polled; fetched on demand. */
+export interface PABias {
+  /** PWM at zero drive (idle bias), 0..max-1 */
+  min: number;
+  /** PWM at full drive, min..255 */
+  max: number;
+}
+
+/** The compile-time defaults a factory reset (SR2;) would restore — reported
+ *  by the radio itself via FD; so the UI never hardcodes (or lies about) them. */
+export interface FactoryDefaults {
+  volume: number;
+  att1: number;
+  att2: number;
+  nr: number;
+  agc: number;
+  filter: number;
+  drive: number;
+  backlight: number;
+  paMin: number;
+  paMax: number;
+  mode: CATMode | null;
 }
 
 export interface RadioCATControls {
@@ -81,6 +107,32 @@ export interface RadioCATControls {
   setAGC: (n: number) => Promise<void>;
   setFilter: (n: number) => Promise<void>;
   setDrive: (n: number) => Promise<void>;
+  setBacklight: (n: number) => Promise<void>;
+  /** One-shot query of both PA bias endpoints (PM;PX;). Not part of the poll
+   *  loop — call when opening the PA settings panel so the user sees the
+   *  radio's current values before changing them. */
+  getPABias: () => Promise<PABias | null>;
+  /** SET one PA bias endpoint and resolve with the value the radio confirmed
+   *  (its echo), or null on timeout/rejection. Firmware clamps: min < max, max ≤ 255. */
+  setPABias: (which: 'min' | 'max', n: number) => Promise<number | null>;
+  /** Soft-restart the radio (SR; — watchdog reset, equivalent to a power
+   *  cycle). Resolves true once the radio acks with SR1;. The rig drops off
+   *  the wire for a few seconds while it reboots; the poll loop rides through
+   *  the timeouts and picks the state back up automatically. */
+  resetRadio: () => Promise<boolean>;
+  /** One-shot FD; query: what a factory reset would restore. Not polled —
+   *  call once when the advanced settings panel opens. */
+  getFactoryDefaults: () => Promise<FactoryDefaults | null>;
+  /** Factory reset (SR2;): wipes ALL stored settings (band memories,
+   *  calibration included) to compile-time defaults and reboots the radio.
+   *  Resolves true once the radio acks with SR2;. */
+  factoryResetRadio: () => Promise<boolean>;
+  /** Reference-oscillator value in Hz (si5351.fxtal, menu "Ref frq") — the
+   *  frequency-calibration constant. Not polled; used by the calibration wizard. */
+  getRefFreq: () => Promise<number | null>;
+  /** SET the reference oscillator (14–28 MHz; firmware rejects out-of-range and
+   *  echoes the old value). Resolves with the radio-confirmed value. */
+  setRefFreq: (hz: number) => Promise<number | null>;
 }
 
 // ── Kenwood TS-series CAT protocol ───────────────────────────────────────────
@@ -91,7 +143,7 @@ export interface RadioCATControls {
 // PTT on:      TX;                      (no echo)
 // PTT off:     RX;                      (no echo)
 
-// ── uSDX BLACK_BRICK 4.00e — PU7FTW custom extensions ────────────────────────
+// ── uSDX BLACK_BRICK 4.00h — PU7FTW custom extensions ────────────────────────
 // Not part of the TS-480 spec. All SET commands echo the new value as a GET
 // reply, and are safe to include in a multi-command string (e.g. "VO;AT;A2;").
 // Query volume: VO;    → VOn;      (-1..16, -1 = mute)
@@ -111,12 +163,40 @@ export interface RadioCATControls {
 // Query S-meter: SM;   → SMn;      (signed dBm, read-only — there is no SM SET)
 // Query TX drive: DR;  → DRn;      (0..8, linear)
 // Set TX drive:   DRn; → DRn;
+// Query backlight: BL; → BLn;      (0=off, 1=on. Physical effect confirmed after
+//                                   the 2026-07-04 firmware fix moved BACKLIGHT_PIN
+//                                   to the correct pin, PD3.)
+// Set backlight:   BLn; → BLn;
+// Restart radio:  SR;  → SR1;      (acks, then watchdog-resets the MCU — a full
+//                                   soft power-cycle; radio is offline ~2-3s and
+//                                   re-announces with its boot IF; frame)
+// Factory reset:  SR2; → SR2;      (acks, invalidates the stored settings
+//                                   version and reboots — the boot-time version
+//                                   mismatch then rewrites ALL params with
+//                                   compile-time defaults: full wipe incl. band
+//                                   memories and ref-freq calibration)
+// Ref frequency: XF; → XFnnnnnnnn;  (si5351.fxtal in Hz, the "Ref frq"
+// Set ref freq:  XFnnnnnnnn; → echo  calibration value; SET accepts 14–28 MHz,
+//                                   applies live (retune) and saves to EEPROM;
+//                                   out-of-range echoes the old value. Used by
+//                                   the calibration wizard — never polled.)
+// Query factory defaults: FD; → FD<vol>,<att>,<att2>,<nr>,<agc>,<filt>,<drive>,
+//                                <backlight>,<pwm_min>,<pwm_max>,<md>;
+//                                   (one frame, values snapshotted at boot from
+//                                   the firmware's real initializers; md is the
+//                                   Kenwood mode digit. Not polled — fetched
+//                                   once when the advanced panel opens.)
+// Query PA bias:  PM; → PMn;  PX; → PXn;   (PWM lookup-table endpoints: PM = idle
+// Set PA bias:    PMn;/PXn;  → echo         bias 0..max-1, PX = full-drive 0..255,
+//                                   min < max enforced by firmware; out-of-range
+//                                   SETs are ignored and the echo returns the old
+//                                   value. NOT polled — changing them rebuilds the
+//                                   PA PWM LUT, so they're fetched/set on demand
+//                                   from the PA settings panel only.)
 // The firmware supports serialized/batched queries in one write, e.g.
-// "FA;MD;AG0;FW;VO;AT;A2;NR;SM;DR;" — replies come back concatenated in the same order.
-// Note: BL (backlight) exists in firmware but is intentionally not surfaced
-// here — its CAT-driven hardware effect could not be confirmed reliable.
+// "FA;MD;AG0;FW;VO;AT;A2;NR;SM;DR;BL;" — replies come back concatenated in the same order.
 
-const BLACKBRICK_POLL_CMDS = ['FA;', 'MD;', 'AG0;', 'FW;', 'VO;', 'AT;', 'A2;', 'NR;', 'SM;', 'DR;'];
+const BLACKBRICK_POLL_CMDS = ['FA;', 'MD;', 'AG0;', 'FW;', 'VO;', 'AT;', 'A2;', 'NR;', 'SM;', 'DR;', 'BL;'];
 
 const KENWOOD_MODE_MAP: Record<string, CATMode> = {
   '1': 'LSB', '2': 'USB', '3': 'CW', '4': 'FM', '5': 'AM', '6': 'RTTY',
@@ -154,6 +234,7 @@ export function useRadioCAT(): RadioCATControls {
     ptt: false, error: null, isSupported: false,
     volume: null, att1: null, att2: null, nr: null,
     agc: null, filter: null, sMeter: null, drive: null,
+    backlight: null,
   });
 
   useEffect(() => {
@@ -177,9 +258,15 @@ export function useRadioCAT(): RadioCATControls {
 
   const queueRef    = useRef<QueueEntry[]>([]);
   const inflightRef = useRef<QueueEntry | null>(null);
+  // True while a deliberate disconnect() is tearing the port down — lets the
+  // read loop distinguish "user clicked Disconnect" from "port vanished".
+  const closingRef  = useRef(false);
+  // Late-bound handle so startReadLoop (defined before disconnect) can trigger
+  // a clean teardown when the port disappears out from under us.
+  const disconnectRef = useRef<() => void>(() => {});
 
-  const lastSetRef = useRef<{ frequency: number; mode: number; volume: number; att1: number; att2: number; nr: number; agc: number; filter: number; drive: number }>({
-    frequency: 0, mode: 0, volume: 0, att1: 0, att2: 0, nr: 0, agc: 0, filter: 0, drive: 0,
+  const lastSetRef = useRef<{ frequency: number; mode: number; volume: number; att1: number; att2: number; nr: number; agc: number; filter: number; drive: number; backlight: number }>({
+    frequency: 0, mode: 0, volume: 0, att1: 0, att2: 0, nr: 0, agc: 0, filter: 0, drive: 0, backlight: 0,
   });
 
   const log = useCallback((level: 'debug' | 'info' | 'warn' | 'error', ...args: unknown[]) => {
@@ -350,6 +437,19 @@ export function useRadioCAT(): RadioCATControls {
         }
       } catch (e) {
         log('debug', 'read loop ended:', e);
+      } finally {
+        // The loop only exits when the stream ends. If nobody called
+        // disconnect(), the port was yanked out from under us (USB unplugged,
+        // radio power-cycled, device re-enumerated) — tear down cleanly and
+        // surface a friendly warning instead of an unhandled NetworkError.
+        if (!closingRef.current && portRef.current) {
+          log('warn', 'serial port lost unexpectedly (cable unplugged / device re-enumerated)');
+          disconnectRef.current();
+          setState(prev => ({
+            ...prev,
+            error: 'Radio connection lost — CAT cable unplugged or port closed. Reconnect when it’s back.',
+          }));
+        }
       }
     })();
   }, [log, handleResponse]);
@@ -416,9 +516,10 @@ export function useRadioCAT(): RadioCATControls {
           const nr        = byPrefix.has('NR') ? parseIntField(byPrefix.get('NR')!, 'NR') : null;
           const sMeter    = byPrefix.has('SM') ? parseIntField(byPrefix.get('SM')!, 'SM') : null;
           const drive     = byPrefix.has('DR') ? parseIntField(byPrefix.get('DR')!, 'DR') : null;
+          const backlight = byPrefix.has('BL') ? parseIntField(byPrefix.get('BL')!, 'BL') : null;
 
           log('debug', 'poll(batch) — freq:', freq, 'mode:', mode, 'agc:', agc, 'filt:', filter,
-            'vol:', volume, 'att1:', att1, 'att2:', att2, 'nr:', nr, 'sm:', sMeter, 'drive:', drive, `[q:${queueRef.current.length}]`);
+            'vol:', volume, 'att1:', att1, 'att2:', att2, 'nr:', nr, 'sm:', sMeter, 'drive:', drive, 'bl:', backlight, `[q:${queueRef.current.length}]`);
 
           setState(prev => ({
             ...prev,
@@ -431,6 +532,7 @@ export function useRadioCAT(): RadioCATControls {
             att2:      att2   !== null && (now - ls.att2      > SET_GRACE_MS) ? att2   : prev.att2,
             nr:        nr     !== null && (now - ls.nr        > SET_GRACE_MS) ? nr     : prev.nr,
             drive:     drive  !== null && (now - ls.drive     > SET_GRACE_MS) ? drive  : prev.drive,
+            backlight: backlight !== null && (now - ls.backlight > SET_GRACE_MS) ? backlight : prev.backlight,
             // sMeter is read-only telemetry — no grace period needed, always take the latest poll value.
             sMeter:    sMeter !== null ? sMeter : prev.sMeter,
           }));
@@ -463,6 +565,7 @@ export function useRadioCAT(): RadioCATControls {
 
   const disconnect = useCallback(() => {
     log('info', 'disconnecting');
+    closingRef.current = true;
     if (pollTimerRef.current) { clearTimeout(pollTimerRef.current); pollTimerRef.current = null; }
     pollRunningRef.current = false;
     if (inflightRef.current) {
@@ -472,9 +575,13 @@ export function useRadioCAT(): RadioCATControls {
     }
     for (const e of queueRef.current) e.resolve('__disconnected__');
     queueRef.current = [];
-    try { readerRef.current?.cancel(); } catch { /* ignore */ }
-    try { writerRef.current?.close();  } catch { /* ignore */ }
-    try { portRef.current?.close();    } catch { /* ignore */ }
+    // cancel()/close() return PROMISES — a bare try/catch only stops the
+    // synchronous throw. When the USB device is already gone they reject
+    // asynchronously ("NetworkError: Port has been closed"), which used to
+    // escape as an unhandled runtime error. Swallow both failure paths.
+    try { readerRef.current?.cancel().catch(() => {}); } catch { /* ignore */ }
+    try { writerRef.current?.close().catch(() => {});  } catch { /* ignore */ }
+    try { portRef.current?.close().catch(() => {});    } catch { /* ignore */ }
     readerRef.current = null;
     writerRef.current = null;
     portRef.current   = null;
@@ -482,8 +589,10 @@ export function useRadioCAT(): RadioCATControls {
     setState(prev => ({
       ...prev, connected: false, frequency: null, mode: null, ptt: false, error: null,
       volume: null, att1: null, att2: null, nr: null, agc: null, filter: null, sMeter: null, drive: null,
+      backlight: null,
     }));
   }, [log]);
+  disconnectRef.current = disconnect;  // keep the read loop's teardown handle current
 
   const connect = useCallback(async (config: CATConnectionConfig) => {
     debugRef.current = config.debug;
@@ -516,6 +625,7 @@ export function useRadioCAT(): RadioCATControls {
       timeoutMsRef.current     = config.timeoutMs;
       pollIntervalMsRef.current = config.pollIntervalMs;
       rigProfileRef.current    = config.rigProfile;
+      closingRef.current = false;  // fresh session — read-loop exit now means "port lost"
       portRef.current   = port;
       writerRef.current = port.writable.getWriter();
       const reader      = port.readable.getReader();
@@ -602,10 +712,85 @@ export function useRadioCAT(): RadioCATControls {
     await write(`DR${n};`);
   }, [log, write]);
 
+  const setBacklight = useCallback(async (n: number) => {
+    lastSetRef.current.backlight = Date.now();
+    log('info', 'setBacklight →', n);
+    setState(prev => ({ ...prev, backlight: n }));
+    await write(`BL${n};`);
+  }, [log, write]);
+
+  // ── PA bias (PM/PX) — on-demand only, never polled ─────────────────────────
+
+  const getPABias = useCallback(async (): Promise<PABias | null> => {
+    log('info', 'getPABias');
+    let resp = '';
+    try { resp = await queryBatch(['PM;', 'PX;']); } catch { return null; }
+    const min = parseIntField(resp.match(/PM\d+;/)?.[0] ?? '', 'PM');
+    const max = parseIntField(resp.match(/PX\d+;/)?.[0] ?? '', 'PX');
+    return min !== null && max !== null ? { min, max } : null;
+  }, [log, queryBatch]);
+
+  const setPABias = useCallback(async (which: 'min' | 'max', n: number): Promise<number | null> => {
+    const prefix = which === 'min' ? 'PM' : 'PX';
+    log('info', 'setPABias →', which, n);
+    let resp = '';
+    try { resp = await query(`${prefix}${n};`); } catch { return null; }
+    // The firmware echoes the effective value — the old one if the SET was
+    // rejected (out of range / min≥max) — so the caller can show the truth.
+    return parseIntField(resp, prefix);
+  }, [log, query]);
+
+  const resetRadio = useCallback(async (): Promise<boolean> => {
+    log('info', 'resetRadio — soft restart (SR;)');
+    let resp = '';
+    try { resp = await query('SR;'); } catch { return false; }
+    // After the SR1; ack the radio reboots: polls time out for a few seconds,
+    // then the batched poll refreshes every field — nothing else to do here.
+    return parseIntField(resp, 'SR') === 1;
+  }, [log, query]);
+
+  const getFactoryDefaults = useCallback(async (): Promise<FactoryDefaults | null> => {
+    log('info', 'getFactoryDefaults (FD;)');
+    let resp = '';
+    try { resp = await query('FD;'); } catch { return null; }
+    const m = resp.match(/^FD(-?\d+(?:,-?\d+){10});$/);
+    if (!m) return null;
+    const v = m[1].split(',').map(Number);
+    return {
+      volume: v[0], att1: v[1], att2: v[2], nr: v[3], agc: v[4],
+      filter: v[5], drive: v[6], backlight: v[7], paMin: v[8], paMax: v[9],
+      mode: KENWOOD_MODE_MAP[String(v[10])] ?? null,
+    };
+  }, [log, query]);
+
+  const factoryResetRadio = useCallback(async (): Promise<boolean> => {
+    log('info', 'factoryResetRadio — SR2; (full settings wipe + reboot)');
+    let resp = '';
+    try { resp = await query('SR2;'); } catch { return false; }
+    return parseIntField(resp, 'SR') === 2;
+  }, [log, query]);
+
+  const getRefFreq = useCallback(async (): Promise<number | null> => {
+    log('info', 'getRefFreq (XF;)');
+    let resp = '';
+    try { resp = await query('XF;'); } catch { return null; }
+    return parseIntField(resp, 'XF');
+  }, [log, query]);
+
+  const setRefFreq = useCallback(async (hz: number): Promise<number | null> => {
+    log('info', 'setRefFreq →', hz, 'Hz');
+    let resp = '';
+    try { resp = await query(`XF${Math.round(hz)};`); } catch { return null; }
+    // Firmware echoes the effective value — the old one if the SET was rejected.
+    return parseIntField(resp, 'XF');
+  }, [log, query]);
+
   useEffect(() => () => { disconnect(); }, [disconnect]);
 
   return {
     state, connect, disconnect, setFrequency, setMode, setPTT,
     setVolume, setAtt1, setAtt2, setNR, setAGC, setFilter, setDrive,
+    setBacklight, getPABias, setPABias, resetRadio,
+    getFactoryDefaults, factoryResetRadio, getRefFreq, setRefFreq,
   };
 }

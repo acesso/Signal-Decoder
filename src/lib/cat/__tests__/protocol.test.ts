@@ -1,13 +1,13 @@
 /**
- * CAT protocol unit tests — uSDX BLACK_BRICK 4.00e / TS-480 Kenwood dialect.
+ * CAT protocol unit tests — uSDX BLACK_BRICK 4.00h / TS-480 Kenwood dialect.
  *
  * These tests are pure JS: no hardware, no serial port, no browser APIs.
  * They validate command string construction, response parsing, multi-command
- * batching, and all custom PU7FTW extension commands (BL/VO/TQ/AT/A2/NR/AG0/FW/SM/DR).
- * Note: BL (backlight) is still a real firmware command (tested below for wire-
- * protocol correctness) but is intentionally NOT part of BLACKBRICK_POLL_CMDS —
- * its CAT-driven hardware effect could not be confirmed reliable, so the app
- * doesn't surface a backlight control.
+ * batching, and all custom PU7FTW extension commands (BL/VO/TQ/AT/A2/NR/AG0/FW/SM/DR/PM/PX).
+ * Note: BL (backlight) is polled and surfaced in the UI again since the
+ * 2026-07-04 firmware fix (BACKLIGHT_PIN moved to the correct pin, PD3).
+ * PM/PX (PA bias endpoints) are deliberately NOT polled — they're fetched
+ * on demand when the PA settings panel opens, and set from there only.
  *
  * Run with: npm test src/lib/cat/__tests__/protocol.test.ts
  */
@@ -125,6 +125,13 @@ describe('command construction', () => {
       expect(`DR${i};`).toMatch(/^DR\d;$/);
     }
   });
+
+  test('PM/PX set — PA bias endpoints, 1..3 digit PWM values', () => {
+    expect('PM10;').toMatch(/^PM\d{1,3};$/);
+    expect('PM0;').toMatch(/^PM\d{1,3};$/);
+    expect('PX160;').toMatch(/^PX\d{1,3};$/);
+    expect('PX255;').toMatch(/^PX\d{1,3};$/);
+  });
 });
 
 describe('response parsing — standard commands', () => {
@@ -219,14 +226,54 @@ describe('response parsing — custom BLACK_BRICK commands', () => {
     expect(parseIntField('DR8;', 'DR')).toBe(8);
     expect(parseIntField('DR;', 'DR')).toBeNull();
   });
+
+  test('PM/PX — PA bias endpoints (on-demand, not polled)', () => {
+    expect(parseIntField('PM10;', 'PM')).toBe(10);    // firmware default (bias min)
+    expect(parseIntField('PM0;', 'PM')).toBe(0);
+    expect(parseIntField('PX160;', 'PX')).toBe(160);  // firmware default (PA max)
+    expect(parseIntField('PX255;', 'PX')).toBe(255);
+    expect(parseIntField('PM;', 'PM')).toBeNull();
+    expect(parseIntField('PX;', 'PX')).toBeNull();
+  });
+
+  test('SR — soft restart acks SR1; before the watchdog reboots the radio', () => {
+    expect(parseIntField('SR1;', 'SR')).toBe(1);
+    expect(parseIntField('SR;', 'SR')).toBeNull();
+  });
+
+  test('SR2 — factory reset acks SR2; before wiping settings and rebooting', () => {
+    expect(parseIntField('SR2;', 'SR')).toBe(2);
+  });
+
+  test('XF — reference oscillator (calibration), 14–28 MHz, on-demand only', () => {
+    expect(parseIntField('XF25000000;', 'XF')).toBe(25_000_000);  // firmware default (25 MHz TCXO)
+    expect(parseIntField('XF24999989;', 'XF')).toBe(24_999_989);  // a corrected value
+    expect(parseIntField('XF;', 'XF')).toBeNull();
+    // wire format for SET
+    expect('XF24999989;').toMatch(/^XF\d{8};$/);
+  });
+
+  test('FD — factory defaults, one 11-value CSV frame (mirrors useRadioCAT.getFactoryDefaults)', () => {
+    const parse = (resp: string) => {
+      const m = resp.match(/^FD(-?\d+(?:,-?\d+){10});$/);
+      return m ? m[1].split(',').map(Number) : null;
+    };
+    // Firmware 4.00g defaults: vol,att,att2,nr,agc,filt,drive,backlight,pwm_min,pwm_max,md
+    const v = parse('FD11,0,0,0,1,0,4,1,10,160,2;');
+    expect(v).toEqual([11, 0, 0, 0, 1, 0, 4, 1, 10, 160, 2]);
+    expect(parse('FD11,0,0;')).toBeNull();       // wrong arity
+    expect(parse('FD;')).toBeNull();
+    // volume can be negative (-1 = mute)
+    expect(parse('FD-1,0,0,0,1,0,4,1,10,160,2;')![0]).toBe(-1);
+  });
 });
 
 describe('multi-command / batched poll parsing', () => {
-  const BATCH_RESPONSE = 'FA00014225000;MD2;AG01;FW3;VO8;AT2;A216;NR4;SM-68;DR5;';
+  const BATCH_RESPONSE = 'FA00014225000;MD2;AG01;FW3;VO8;AT2;A216;NR4;SM-68;DR5;BL1;';
 
-  test('splitFrames — all 10 frames', () => {
+  test('splitFrames — all 11 frames', () => {
     const frames = splitFrames(BATCH_RESPONSE);
-    expect(frames).toHaveLength(10);
+    expect(frames).toHaveLength(11);
     expect(frames[0]).toBe('FA00014225000;');
     expect(frames[1]).toBe('MD2;');
     expect(frames[2]).toBe('AG01;');
@@ -237,6 +284,7 @@ describe('multi-command / batched poll parsing', () => {
     expect(frames[7]).toBe('NR4;');
     expect(frames[8]).toBe('SM-68;');
     expect(frames[9]).toBe('DR5;');
+    expect(frames[10]).toBe('BL1;');
   });
 
   test('framesByPrefix — lookup by 2-char prefix', () => {
@@ -252,6 +300,7 @@ describe('multi-command / batched poll parsing', () => {
     expect(map.get('NR')).toBe('NR4;');
     expect(map.get('SM')).toBe('SM-68;');
     expect(map.get('DR')).toBe('DR5;');
+    expect(map.get('BL')).toBe('BL1;');
   });
 
   test('full batch parse — all fields', () => {
@@ -269,6 +318,7 @@ describe('multi-command / batched poll parsing', () => {
     expect(parseIntField(map.get('NR')!, 'NR')).toBe(4);
     expect(parseIntField(map.get('SM')!, 'SM')).toBe(-68);
     expect(parseIntField(map.get('DR')!, 'DR')).toBe(5);
+    expect(parseIntField(map.get('BL')!, 'BL')).toBe(1);
   });
 
   test('partial batch — missing fields stay null', () => {
@@ -281,6 +331,7 @@ describe('multi-command / batched poll parsing', () => {
     expect(map.has('FW')).toBe(false);
     expect(map.has('SM')).toBe(false);
     expect(map.has('DR')).toBe(false);
+    expect(map.has('BL')).toBe(false);
   });
 });
 
@@ -314,10 +365,10 @@ describe('IF frame parsing', () => {
 });
 
 describe('BLACKBRICK_POLL_CMDS array', () => {
-  const BLACKBRICK_POLL_CMDS = ['FA;', 'MD;', 'AG0;', 'FW;', 'VO;', 'AT;', 'A2;', 'NR;', 'SM;', 'DR;'];
+  const BLACKBRICK_POLL_CMDS = ['FA;', 'MD;', 'AG0;', 'FW;', 'VO;', 'AT;', 'A2;', 'NR;', 'SM;', 'DR;', 'BL;'];
 
-  test('10 commands in poll array', () => {
-    expect(BLACKBRICK_POLL_CMDS).toHaveLength(10);
+  test('11 commands in poll array', () => {
+    expect(BLACKBRICK_POLL_CMDS).toHaveLength(11);
   });
 
   test('AG0; is included', () => {
@@ -336,13 +387,18 @@ describe('BLACKBRICK_POLL_CMDS array', () => {
     expect(BLACKBRICK_POLL_CMDS).toContain('DR;');
   });
 
-  test('BL; is intentionally NOT in the poll array (see file header note)', () => {
-    expect(BLACKBRICK_POLL_CMDS).not.toContain('BL;');
+  test('BL; is included (backlight confirmed working since the PD3 pin fix)', () => {
+    expect(BLACKBRICK_POLL_CMDS).toContain('BL;');
+  });
+
+  test('PM;/PX; are intentionally NOT polled — on-demand from the PA settings panel only', () => {
+    expect(BLACKBRICK_POLL_CMDS).not.toContain('PM;');
+    expect(BLACKBRICK_POLL_CMDS).not.toContain('PX;');
   });
 
   test('prefixes derived from commands', () => {
     const prefixes = BLACKBRICK_POLL_CMDS.map(c => c.substring(0, 2));
-    expect(prefixes).toEqual(['FA', 'MD', 'AG', 'FW', 'VO', 'AT', 'A2', 'NR', 'SM', 'DR']);
+    expect(prefixes).toEqual(['FA', 'MD', 'AG', 'FW', 'VO', 'AT', 'A2', 'NR', 'SM', 'DR', 'BL']);
   });
 });
 
@@ -406,5 +462,16 @@ describe('range validation', () => {
     expect(valid(4)).toBe(true);  // firmware init default
     expect(valid(8)).toBe(true);
     expect(valid(9)).toBe(false);
+  });
+
+  test('PM/PX ranges — firmware enforces min < max, max ≤ 255 (menu "PA bias min"/"PA max")', () => {
+    // Mirrors Command_PM_SET (v < pwm_max) and Command_PX_SET (v >= pwm_min && v <= 255).
+    const validMin = (v: number, max: number) => v >= 0 && v < max;
+    const validMax = (v: number, min: number) => v >= min && v <= 255;
+    expect(validMin(10, 160)).toBe(true);   // firmware defaults
+    expect(validMin(160, 160)).toBe(false); // min must stay below max
+    expect(validMax(160, 10)).toBe(true);
+    expect(validMax(255, 10)).toBe(true);
+    expect(validMax(5, 10)).toBe(false);    // max must not drop below min
   });
 });
