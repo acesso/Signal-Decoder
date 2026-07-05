@@ -22,6 +22,30 @@ import { audioRecorder, REC_DURATION_CHOICES_SEC } from '@/lib/audio/ringRecorde
 
 type DecoderMode = 'rtty' | 'sstv' | 'cw' | 'ft' | 'mfsk';
 
+// ── Mode selection persistence — restores the decoder tab and FT sub-mode
+// across page reloads/sessions. ──────────────────────────────────────────────
+const LS_MODE    = 'decoder_mode';
+const LS_FT_MODE = 'ft_mode';
+const VALID_MODES: DecoderMode[] = ['rtty', 'sstv', 'cw', 'ft', 'mfsk'];
+const VALID_FT_MODES: FTMode[] = ['FT8', 'FT4', 'FT2'];
+
+function loadMode(): DecoderMode {
+  if (typeof window === 'undefined') return 'rtty';
+  const stored = localStorage.getItem(LS_MODE);
+  return VALID_MODES.includes(stored as DecoderMode) ? (stored as DecoderMode) : 'rtty';
+}
+function saveMode(v: DecoderMode) {
+  if (typeof window !== 'undefined') localStorage.setItem(LS_MODE, v);
+}
+function loadFTMode(): FTMode {
+  if (typeof window === 'undefined') return 'FT8';
+  const stored = localStorage.getItem(LS_FT_MODE);
+  return VALID_FT_MODES.includes(stored as FTMode) ? (stored as FTMode) : 'FT8';
+}
+function saveFTMode(v: FTMode) {
+  if (typeof window !== 'undefined') localStorage.setItem(LS_FT_MODE, v);
+}
+
 const MODE_META: Record<DecoderMode, { label: string; description: string }> = {
   rtty: {
     label: 'RTTY',
@@ -396,6 +420,21 @@ function TxSummaryChips({ s }: { s: TxStatus | null }) {
           auto
         </span>
       )}
+      {/* Auto-CQ / Auto-PTT / Consecutive-TX — dim when off, colored to match their full-panel toggle */}
+      <span className="inline-flex items-center gap-1">
+        <span className="font-mono text-[9px] font-bold px-1 py-0.5 rounded" style={{
+          color:      s.autoCQ ? '#3fb950' : '#484f58',
+          background: s.autoCQ ? 'rgba(46,160,67,0.12)' : 'transparent',
+        }} title="Auto-CQ">CQ</span>
+        <span className="font-mono text-[9px] font-bold px-1 py-0.5 rounded" style={{
+          color:      s.autoPTT ? '#e3b341' : '#484f58',
+          background: s.autoPTT ? 'rgba(227,179,65,0.12)' : 'transparent',
+        }} title="Auto-PTT">PTT</span>
+        <span className="font-mono text-[9px] font-bold px-1 py-0.5 rounded" style={{
+          color:      s.allowConsecutiveTx ? '#f85149' : '#484f58',
+          background: s.allowConsecutiveTx ? 'rgba(248,81,73,0.12)' : 'transparent',
+        }} title="Consecutive TX">TX×N</span>
+      </span>
     </span>
   );
 }
@@ -403,6 +442,10 @@ function TxSummaryChips({ s }: { s: TxStatus | null }) {
 // ── Page ────────────────────────────────────────────────────────────────────
 
 export default function Home() {
+  // Start with the SSR-safe default and apply the persisted value after mount
+  // (see the useEffect below) — reading localStorage during the initial
+  // render would make the client's first render disagree with the
+  // server-rendered HTML and trigger a hydration error.
   const [mode, setMode]     = useState<DecoderMode>('rtty');
   const [ftMode, setFTMode] = useState<FTMode>('FT8');
   const [ftContacts, setFtContacts] = useState<Map<string, Contact>>(new Map());
@@ -410,6 +453,25 @@ export default function Home() {
   const [ftMyGrid, setFtMyGrid] = useState('');
   const [txStatus, setTxStatus] = useState<TxStatus | null>(null);
   const txAudioHz = txStatus?.txAudioHz ?? 0;
+
+  // Restore the persisted mode/sub-mode once mounted (client-only — see the
+  // SSR-safe defaults above). Runs once; subsequent changes are saved by
+  // handleModeChange/handleFTModeChange directly.
+  useEffect(() => {
+    setMode(loadMode());
+    setFTMode(loadFTMode());
+  }, []);
+
+  // ── Sticky CAT panel — collapses to its main bar once the body scrolls past
+  // it, so the frequency/mode/PTT controls stay reachable while the decoder
+  // content below scrolls. Re-expands once scrolled back near the top. ─────
+  const scrollBodyRef = useRef<HTMLDivElement>(null);
+  const [catCollapsed, setCatCollapsed] = useState(false);
+  const handleBodyScroll = useCallback(() => {
+    const el = scrollBodyRef.current;
+    if (!el) return;
+    setCatCollapsed(el.scrollTop > 24);
+  }, []);
 
   // ── Radio CAT — lifted here so VFO frequency flows to all decoders ────────
   const cat = useRadioCAT();
@@ -468,6 +530,11 @@ export default function Home() {
     clearSentRef.current?.();
   }, [activeRef]);
 
+  const handleFTModeChange = useCallback((m: FTMode) => {
+    setFTMode(m);
+    saveFTMode(m);
+  }, []);
+
   // Switching mode: stop previous decoder (but keep global audio), connect new decoder
   const handleModeChange = useCallback(async (newMode: DecoderMode) => {
     if (newMode === modeRef.current) return;
@@ -475,6 +542,7 @@ export default function Home() {
     const wasRecording = isRecording;
     if (wasRecording) prevRef.current?.stop();
     setMode(newMode);
+    saveMode(newMode);
     const nextRef = refForMode(newMode);
     if (wasRecording && analyserRef.current) {
       // Start the new decoder immediately using the stable ref (no React state lag)
@@ -532,16 +600,17 @@ export default function Home() {
           controls={globalControls}
           mode={mode}
           ftMode={ftMode}
-          onFTModeChange={setFTMode}
+          onFTModeChange={handleFTModeChange}
         />
       </div>
 
       {/* Scrollable body — CAT + TX panel + decoder content */}
-      <div className="flex-1 min-h-0 overflow-y-auto px-4 sm:px-6 lg:px-8 pb-8">
+      <div ref={scrollBodyRef} onScroll={handleBodyScroll} className="flex-1 min-h-0 overflow-y-auto px-4 sm:px-6 lg:px-8 pb-8">
 
-        {/* CAT radio control panel */}
-        <div className="pb-3">
-          <RadioCATPanel cat={cat} />
+        {/* CAT radio control panel — sticky: stays visible while scrolling,
+            collapsing to just its main bar so it doesn't eat too much space. */}
+        <div className="sticky top-0 z-10 bg-[#0d1117] pb-3">
+          <RadioCATPanel cat={cat} collapsed={catCollapsed} />
         </div>
 
         {/* FT Transmit panel — only shown when FT mode is active */}
@@ -551,7 +620,7 @@ export default function Home() {
             <style>{`
               details[open] .tx-summary-chips { display: none !important; }
             `}</style>
-            <details className="bg-[#161b22] border border-[#30363d] rounded-lg" open>
+            <details className="bg-[#161b22] border border-[#30363d] rounded-lg">
               <summary className="cursor-pointer px-4 py-3 sm:px-5 font-semibold text-sm hover:bg-[#21262d] rounded-lg transition-colors select-none flex items-center">
                 Transmit
                 <TxSummaryChips s={txStatus} />

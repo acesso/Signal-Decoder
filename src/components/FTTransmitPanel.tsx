@@ -320,6 +320,9 @@ export interface TxStatus {
   queueLen: number;
   pendingReplies: number; // contacts that have messaged us but we haven't replied yet
   autoReply: boolean;
+  autoCQ: boolean;
+  autoPTT: boolean;
+  allowConsecutiveTx: boolean;
   windowSec: number;
   txAudioHz: number;    // current TX audio frequency in Hz (baseFreq)
 }
@@ -426,8 +429,12 @@ export default function FTTransmitPanel({ mode, contacts, vfoFrequency = 0, onMy
       const addressedUs = c.msgs.some(m => m.role === 'tx' && m.parsed.callee?.toUpperCase() === myCallUp);
       if (addressedUs) pendingReplies++;
     }
-    onStatusChange({ status: state.status, isRunning, queueLen: state.queue.length, pendingReplies, autoReply, windowSec: FT_WINDOW_SECONDS[mode] ?? 15, txAudioHz: baseFreq });
-  }, [state.status, isRunning, state.queue.length, contacts, myCall, autoReply, mode, onStatusChange, baseFreq]);
+    onStatusChange({
+      status: state.status, isRunning, queueLen: state.queue.length, pendingReplies, autoReply,
+      autoCQ: state.autoCQ, autoPTT: state.autoPTT, allowConsecutiveTx: state.allowConsecutiveTx,
+      windowSec: FT_WINDOW_SECONDS[mode] ?? 15, txAudioHz: baseFreq,
+    });
+  }, [state.status, isRunning, state.queue.length, contacts, myCall, autoReply, state.autoCQ, state.autoPTT, state.allowConsecutiveTx, mode, onStatusChange, baseFreq]);
 
   useEffect(() => {
     if (!autoReply || !isRunning || !canOperate) return;

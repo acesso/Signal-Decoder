@@ -1,5 +1,5 @@
 /**
- * CAT hardware test bed — uSDX BLACK_BRICK 4.00e.
+ * CAT hardware test bed — uSDX BLACK_BRICK 4.00h.
  *
  * Talks to the real, flashed radio over its CAT serial port and validates
  * that live behavior matches what src/lib/cat/__tests__/protocol.test.ts
@@ -7,14 +7,21 @@
  * the unit tests only check JS-side parsing, not that the .hex actually
  * behaves as documented (see CLAUDE.md).
  *
- * Usage: npm run test:cat-hardware -- [/dev/ttyACM1] [baud]
+ * Usage: npm run test:cat-hardware -- [/dev/ttyACM1] [baud] [--factory-reset]
+ *
+ * --factory-reset additionally exercises SR2; (factory reset). It WIPES all
+ * stored settings — band memories and ref-freq calibration included — so it
+ * is opt-in and should only be run when that's acceptable (e.g. right after
+ * a fresh flash whose version bump already reset the settings).
  */
 
 import { execFileSync } from 'node:child_process';
 import { openSync, closeSync, readSync, writeSync, constants as fsConstants } from 'node:fs';
 
-const PORT = process.argv[2] ?? '/dev/ttyACM1';
-const BAUD = process.argv[3] ?? '38400';
+const args = process.argv.slice(2).filter(a => !a.startsWith('--'));
+const PORT = args[0] ?? '/dev/ttyACM1';
+const BAUD = args[1] ?? '38400';
+const RUN_FACTORY_RESET = process.argv.includes('--factory-reset');
 
 function configurePort(path: string, baud: string): void {
   execFileSync('stty', ['-F', path, baud, 'raw', '-echo']);
@@ -66,9 +73,10 @@ function framesByPrefix(frames: string[]): Map<string, string> {
   return m;
 }
 
-// BL (backlight) is a real firmware command but intentionally NOT polled by
-// the app — its CAT-driven hardware effect could not be confirmed reliable.
-const BLACKBRICK_POLL_CMDS = ['FA;', 'MD;', 'AG0;', 'FW;', 'VO;', 'AT;', 'A2;', 'NR;', 'SM;', 'DR;'];
+// BL (backlight) is polled again since the 2026-07-04 firmware fix (BACKLIGHT_PIN
+// moved to the correct pin, PD3). PM/PX (PA bias) are deliberately NOT polled —
+// the app fetches them on demand when its PA settings panel opens.
+const BLACKBRICK_POLL_CMDS = ['FA;', 'MD;', 'AG0;', 'FW;', 'VO;', 'AT;', 'A2;', 'NR;', 'SM;', 'DR;', 'BL;'];
 
 // ── Test bed ──────────────────────────────────────────────────────────────────
 
@@ -99,14 +107,14 @@ function main(): void {
     const ifOk = /^IF\d{11}00000\+0000000000\d\d000000;$/.test(ifResp);
     record('IF; returns well-formed 38-char status frame', ifOk, JSON.stringify(ifResp));
 
-    // ── Batched poll returns all 10 frames in order ──
+    // ── Batched poll returns all frames in order ──
     const pollResp = send(fd, BLACKBRICK_POLL_CMDS.join(''), 600);
     const frames = splitFrames(pollResp);
     const map = framesByPrefix(frames);
     const expectedPrefixes = BLACKBRICK_POLL_CMDS.map(c => c.substring(0, 2));
     const gotPrefixes = frames.map(f => f.substring(0, 2));
     record(
-      'Batched poll returns all 10 frames in order',
+      `Batched poll returns all ${BLACKBRICK_POLL_CMDS.length} frames in order`,
       JSON.stringify(gotPrefixes) === JSON.stringify(expectedPrefixes),
       JSON.stringify(pollResp),
     );
@@ -190,9 +198,120 @@ function main(): void {
       record('DR restored to its original value', restored === drBefore, JSON.stringify(restoreResp));
     }
 
+    // ── SET/GET round-trip on the backlight (BL), restoring original.
+    // Regression check for the PD3 pin fix — the wire round-trip always worked,
+    // this validates the protocol; the physical LED needs eyes on the radio. ──
+    const blBeforeResp = send(fd, 'BL;');
+    const blBefore = parseIntField(blBeforeResp, 'BL');
+    record('BL; GET returns 0/1', blBefore === 0 || blBefore === 1, JSON.stringify(blBeforeResp));
+
+    if (blBefore !== null) {
+      const blProbe = blBefore === 1 ? 0 : 1;
+      const blSetResp = send(fd, `BL${blProbe};`);
+      record('BL SET echoes the new value', parseIntField(blSetResp, 'BL') === blProbe, JSON.stringify(blSetResp));
+      const blRestoreResp = send(fd, `BL${blBefore};`);
+      record('BL restored to its original value', parseIntField(blRestoreResp, 'BL') === blBefore, JSON.stringify(blRestoreResp));
+    }
+
+    // ── SET/GET round-trips on the PA bias endpoints (PM/PX), restoring
+    // originals. Safe in RX: the rebuilt PWM LUT is only consumed during TX. ──
+    const pmBeforeResp = send(fd, 'PM;');
+    const pmBefore = parseIntField(pmBeforeResp, 'PM');
+    record('PM; GET returns a value', pmBefore !== null, JSON.stringify(pmBeforeResp));
+
+    const pxBeforeResp = send(fd, 'PX;');
+    const pxBefore = parseIntField(pxBeforeResp, 'PX');
+    record('PX; GET returns a value', pxBefore !== null, JSON.stringify(pxBeforeResp));
+
+    if (pmBefore !== null && pxBefore !== null) {
+      const pmProbe = pmBefore + 1 < pxBefore ? pmBefore + 1 : pmBefore - 1; // stay in [0, max-1]
+      const pmSetResp = send(fd, `PM${pmProbe};`);
+      record('PM SET echoes the new value', parseIntField(pmSetResp, 'PM') === pmProbe, JSON.stringify(pmSetResp));
+      const pmRestoreResp = send(fd, `PM${pmBefore};`);
+      record('PM restored to its original value', parseIntField(pmRestoreResp, 'PM') === pmBefore, JSON.stringify(pmRestoreResp));
+
+      const pxProbe = pxBefore > pmBefore + 1 ? pxBefore - 1 : pxBefore + 1; // stay in [min+1, 255]
+      const pxSetResp = send(fd, `PX${pxProbe};`);
+      record('PX SET echoes the new value', parseIntField(pxSetResp, 'PX') === pxProbe, JSON.stringify(pxSetResp));
+      const pxRestoreResp = send(fd, `PX${pxBefore};`);
+      record('PX restored to its original value', parseIntField(pxRestoreResp, 'PX') === pxBefore, JSON.stringify(pxRestoreResp));
+
+      // Out-of-range SET must be rejected: the echo returns the unchanged value.
+      const pxRejectResp = send(fd, 'PX999;');
+      record('PX SET beyond 255 is rejected (echo returns old value)', parseIntField(pxRejectResp, 'PX') === pxBefore, JSON.stringify(pxRejectResp));
+      const pmRejectResp = send(fd, `PM${pxBefore};`);
+      record('PM SET at/above PX is rejected (echo returns old value)', parseIntField(pmRejectResp, 'PM') === pmBefore, JSON.stringify(pmRejectResp));
+    }
+
+    // ── SET/GET round-trip on the reference oscillator (XF, calibration),
+    // restoring the original. ±5 Hz is far below any usable calibration, so
+    // the probe never meaningfully detunes the radio even if restore failed. ──
+    const xfBeforeResp = send(fd, 'XF;');
+    const xfBefore = parseIntField(xfBeforeResp, 'XF');
+    record('XF; GET returns a plausible ref frequency', xfBefore !== null && xfBefore > 14_000_000 && xfBefore < 28_000_000, JSON.stringify(xfBeforeResp));
+
+    if (xfBefore !== null) {
+      const xfProbe = xfBefore + 5;
+      const xfSetResp = send(fd, `XF${xfProbe};`);
+      record('XF SET echoes the new value', parseIntField(xfSetResp, 'XF') === xfProbe, JSON.stringify(xfSetResp));
+      const xfRestoreResp = send(fd, `XF${xfBefore};`);
+      record('XF restored to its original value', parseIntField(xfRestoreResp, 'XF') === xfBefore, JSON.stringify(xfRestoreResp));
+      // Out-of-range must be rejected (echo returns unchanged value)
+      const xfRejectResp = send(fd, 'XF999;');
+      record('XF SET below 14 MHz is rejected (echo returns old value)', parseIntField(xfRejectResp, 'XF') === xfBefore, JSON.stringify(xfRejectResp));
+    }
+
+    // ── FD; factory-defaults frame — one 11-value CSV frame. NOTE: SR2;
+    // (factory reset) is deliberately NOT exercised here — it wipes band
+    // memories and calibration on every run. Test it manually from the UI. ──
+    const fdResp = send(fd, 'FD;');
+    record('FD; returns an 11-value factory-defaults frame', /^FD-?\d+(,-?\d+){10};$/.test(fdResp), JSON.stringify(fdResp));
+
     // ── Unknown command should not desync the parser (firmware replies "?;") ──
     const unknownResp = send(fd, 'ZZ;');
     record('Unknown command gets a reply (does not hang)', unknownResp.length > 0, JSON.stringify(unknownResp));
+
+    // ── SR soft-restart — deliberately the LAST check: the radio watchdog-
+    // reboots and is off the wire for a few seconds afterwards. ──
+    const srResp = send(fd, 'SR;');
+    record('SR; acks with SR1; before rebooting', srResp.includes('SR1;'), JSON.stringify(srResp));
+
+    if (srResp.includes('SR1;')) {
+      const bootNoise = readAvailable(fd, 6000); // ride out the reboot; collects the boot IF; frame
+      const faResp = send(fd, 'FA;', 600);
+      record(
+        'Radio responsive again after SR restart',
+        /^FA\d{11};$/.test(faResp),
+        `boot=${JSON.stringify(bootNoise)} fa=${JSON.stringify(faResp)}`,
+      );
+    }
+
+    // ── SR2; factory reset — OPT-IN ONLY (--factory-reset): wipes band
+    // memories and calibration, so it is never part of the routine run. ──
+    if (RUN_FACTORY_RESET) {
+      const fdBefore = send(fd, 'FD;', 600);
+      const dm = fdBefore.match(/FD(-?\d+(?:,-?\d+){10});/);
+      const d = dm ? dm[1].split(',').map(Number) : null;
+      record('FD; readable before factory reset', d !== null, JSON.stringify(fdBefore));
+
+      const sr2Resp = send(fd, 'SR2;');
+      record('SR2; acks before factory-reset reboot', sr2Resp.includes('SR2;'), JSON.stringify(sr2Resp));
+
+      if (d !== null && sr2Resp.includes('SR2;')) {
+        readAvailable(fd, 8000); // reboot + the "Reset settings.." pause takes longer than a plain restart
+        const after = send(fd, 'VO;PM;PX;MD;', 800);
+        const map2 = framesByPrefix(splitFrames(after));
+        const vo = parseIntField(map2.get('VO') ?? '', 'VO');
+        const pm = parseIntField(map2.get('PM') ?? '', 'PM');
+        const px = parseIntField(map2.get('PX') ?? '', 'PX');
+        const md = map2.get('MD') ?? '';
+        record(
+          'Live values equal the FD; defaults after factory reset',
+          vo === d[0] && pm === d[8] && px === d[9] && md === `MD${d[10]};`,
+          `after=${JSON.stringify(after)} expected vol=${d[0]} pm=${d[8]} px=${d[9]} md=${d[10]}`,
+        );
+      }
+    }
   } finally {
     closeSync(fd);
   }

@@ -48,12 +48,18 @@ export function createMockSerialPort(opts: MockSerialOptions = {}) {
     modeDigit: opts.modeDigit ?? 2, // USB
     agc: 1, filter: 1, volume: 10, att1: 0, att2: 0, nr: 0, drive: 4,
     sMeter: 7,
+    backlight: 1,
+    pwmMin: 10, pwmMax: 160,  // PA bias endpoints (firmware defaults)
+    fxtal: 25_000_000,        // reference oscillator (XF, menu "Ref frq")
     tx: false,
   };
 
   const stats: MockStats = { polls: 0, lastPollAt: 0, maxPollGapMs: 0, avgPollGapMs: 0 };
   if (typeof window !== 'undefined') {
     (window as unknown as Record<string, unknown>).__catMockStats = stats;
+    // Live rig state for test harnesses (calibration e2e asserts tune/restore
+    // against it, and its fake-audio stub derives the tone frequency from it).
+    (window as unknown as Record<string, unknown>).__catMockRig = rig;
   }
 
   let readController: ReadableStreamDefaultController<Uint8Array> | null = null;
@@ -74,6 +80,25 @@ export function createMockSerialPort(opts: MockSerialOptions = {}) {
       if (prefix === 'A2') rig.att2 = parseInt(val, 10);
       if (prefix === 'NR') rig.nr = parseInt(val, 10);
       if (prefix === 'DR') rig.drive = parseInt(val, 10);
+      if (prefix === 'BL') rig.backlight = parseInt(val, 10);
+      // PA bias SETs echo the effective value (the old one if rejected),
+      // like the real firmware — the UI awaits this echo as confirmation.
+      if (prefix === 'PM') {
+        const v = parseInt(val, 10);
+        if (v >= 0 && v < rig.pwmMax) rig.pwmMin = v;
+        return `PM${rig.pwmMin};`;
+      }
+      if (prefix === 'PX') {
+        const v = parseInt(val, 10);
+        if (v >= rig.pwmMin && v <= 255) rig.pwmMax = v;
+        return `PX${rig.pwmMax};`;
+      }
+      // Reference oscillator (calibration) — validated echo like the firmware.
+      if (prefix === 'XF') {
+        const v = parseInt(val, 10);
+        if (v >= 14_000_000 && v <= 28_000_000) rig.fxtal = v;
+        return `XF${rig.fxtal};`;
+      }
       return '';
     }
     switch (cmd) {
@@ -91,6 +116,24 @@ export function createMockSerialPort(opts: MockSerialOptions = {}) {
         return `SM${rig.sMeter};`;
       }
       case 'DR': return `DR${rig.drive};`;
+      case 'BL': return `BL${rig.backlight};`;
+      case 'PM': return `PM${rig.pwmMin};`;
+      case 'PX': return `PX${rig.pwmMax};`;
+      // Soft restart: real firmware acks SR1; then watchdog-reboots (offline
+      // ~2-3s, settings reload from EEPROM). The mock just acks — simulating
+      // the outage would only make the perf testbed flaky.
+      case 'SR': return 'SR1;';
+      // Factory reset: acks SR2; and restores the firmware defaults (the real
+      // radio also reboots — same "no simulated outage" caveat as SR).
+      case 'SR2':
+        rig.modeDigit = 2; rig.agc = 1; rig.filter = 0; rig.volume = 11;
+        rig.att1 = 0; rig.att2 = 0; rig.nr = 0; rig.drive = 4;
+        rig.backlight = 1; rig.pwmMin = 10; rig.pwmMax = 160;
+        return 'SR2;';
+      // Factory-default values as one FD frame — mirrors the firmware's
+      // compile-time initializers (vol,att,att2,nr,agc,filt,drive,bl,pm,px,md).
+      case 'FD': return 'FD11,0,0,0,1,0,4,1,10,160,2;';
+      case 'XF': return `XF${rig.fxtal};`;
       case 'TX': rig.tx = true; return '';
       case 'RX': rig.tx = false; return '';
       case 'IF': {
