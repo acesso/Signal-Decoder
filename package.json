@@ -44,6 +44,7 @@
     "test:watch": "jest --watch",
     "test:coverage": "jest --coverage",
     "test:cat-hardware": "tsx scripts/cat-hardware-test.ts",
+    "test:calibration-live": "tsx scripts/calibration-live-test.ts",
     "test:perf": "tsx scripts/perf-testbed.ts",
     "dev:test": "PORT=3002 next dev"
   },
