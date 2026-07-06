@@ -50,15 +50,19 @@ export interface RadioState {
   error: string | null;
   /** false on SSR, true once mounted in a supporting browser */
   isSupported: boolean;
-  /** uSDX BLACK_BRICK 4.00h extension state — null unless rigProfile is 'usdx-blackbrick' */
+  /** uSDX BLACK_BRICK 4.01a extension state — null unless rigProfile is 'usdx-blackbrick' */
   volume: number | null;
   att1: number | null;
   att2: number | null;
   nr: number | null;
-  /** AGC state: 0=OFF, 1=ON. The firmware CAT command allows values up to 2
-   *  ("Slow"), but this build has FAST_AGC undefined, so only agc==1 has a
-   *  distinct code path — 2 behaves identically to 0. Treated as a toggle. */
+  /** AGC state: 0=OFF, 1=ON (single algorithm: M0PUB fast-attack/slow-decay).
+   *  Since firmware 2026-07-06 the old Fast/Slow tri-state is gone and the CAT
+   *  command rejects values above 1 (echo returns the old value). */
   agc: number | null;
+  /** AGC target level, 1..14 (AL command). Output peaks are held between
+   *  level*256 and level*384; default 4 = the original 1024..1536 window.
+   *  Higher = louder audio before the AGC clamps. */
+  agcLevel: number | null;
   /** Filter bandwidth index: 0=Full, 1=3000Hz, 2=2400Hz, 3=1800Hz, 4=500Hz, 5=200Hz, 6=100Hz, 7=50Hz */
   filter: number | null;
   /** S-meter reading in dBm. Read-only — there is no corresponding setter. */
@@ -105,6 +109,7 @@ export interface RadioCATControls {
   setAtt2: (n: number) => Promise<void>;
   setNR: (n: number) => Promise<void>;
   setAGC: (n: number) => Promise<void>;
+  setAgcLevel: (n: number) => Promise<void>;
   setFilter: (n: number) => Promise<void>;
   setDrive: (n: number) => Promise<void>;
   setBacklight: (n: number) => Promise<void>;
@@ -143,7 +148,7 @@ export interface RadioCATControls {
 // PTT on:      TX;                      (no echo)
 // PTT off:     RX;                      (no echo)
 
-// ── uSDX BLACK_BRICK 4.00h — PU7FTW custom extensions ────────────────────────
+// ── uSDX BLACK_BRICK 4.01a — PU7FTW custom extensions ────────────────────────
 // Not part of the TS-480 spec. All SET commands echo the new value as a GET
 // reply, and are safe to include in a multi-command string (e.g. "VO;AT;A2;").
 // Query volume: VO;    → VOn;      (-1..16, -1 = mute)
@@ -154,10 +159,13 @@ export interface RadioCATControls {
 // Set ATT2:     A2n;   → A2n;
 // Query NR:     NR;    → NRn;      (0..8, 0 = off)
 // Set NR:       NRn;   → NRn;
-// Query AGC:    AG0;   → AG0n;     (0=OFF, 1=ON — firmware accepts up to 2,
-//                                   but this build has FAST_AGC undefined so
-//                                   2 ["Slow"] is not a distinct state from 0)
+// Query AGC:    AG0;   → AG0n;     (0=OFF, 1=ON — single M0PUB algorithm since
+//                                   firmware 2026-07-06; SET rejects n>1 and
+//                                   echoes the old value)
 // Set AGC:      AG0n;  → AG0n;     (n in 0..1)
+// Query AGC level: AL; → ALn;      (1..14 — AGC target window: peaks held in
+// Set AGC level:  ALn; → ALn;       [n*256..n*384], default 4; out-of-range
+//                                   SETs are ignored, echo returns old value)
 // Query filter: FW;    → FWn;      (0=Full 1=3000 2=2400 3=1800 4=500 5=200 6=100 7=50 Hz)
 // Set filter:   FWn;   → FWn;      (n in 0..7)
 // Query S-meter: SM;   → SMn;      (signed dBm, read-only — there is no SM SET)
@@ -194,9 +202,9 @@ export interface RadioCATControls {
 //                                   PA PWM LUT, so they're fetched/set on demand
 //                                   from the PA settings panel only.)
 // The firmware supports serialized/batched queries in one write, e.g.
-// "FA;MD;AG0;FW;VO;AT;A2;NR;SM;DR;BL;" — replies come back concatenated in the same order.
+// "FA;MD;AG0;FW;VO;AT;A2;NR;SM;DR;BL;AL;" — replies come back concatenated in the same order.
 
-const BLACKBRICK_POLL_CMDS = ['FA;', 'MD;', 'AG0;', 'FW;', 'VO;', 'AT;', 'A2;', 'NR;', 'SM;', 'DR;', 'BL;'];
+const BLACKBRICK_POLL_CMDS = ['FA;', 'MD;', 'AG0;', 'FW;', 'VO;', 'AT;', 'A2;', 'NR;', 'SM;', 'DR;', 'BL;', 'AL;'];
 
 const KENWOOD_MODE_MAP: Record<string, CATMode> = {
   '1': 'LSB', '2': 'USB', '3': 'CW', '4': 'FM', '5': 'AM', '6': 'RTTY',
@@ -233,7 +241,7 @@ export function useRadioCAT(): RadioCATControls {
     connected: false, frequency: null, mode: null,
     ptt: false, error: null, isSupported: false,
     volume: null, att1: null, att2: null, nr: null,
-    agc: null, filter: null, sMeter: null, drive: null,
+    agc: null, agcLevel: null, filter: null, sMeter: null, drive: null,
     backlight: null,
   });
 
@@ -265,8 +273,8 @@ export function useRadioCAT(): RadioCATControls {
   // a clean teardown when the port disappears out from under us.
   const disconnectRef = useRef<() => void>(() => {});
 
-  const lastSetRef = useRef<{ frequency: number; mode: number; volume: number; att1: number; att2: number; nr: number; agc: number; filter: number; drive: number; backlight: number }>({
-    frequency: 0, mode: 0, volume: 0, att1: 0, att2: 0, nr: 0, agc: 0, filter: 0, drive: 0, backlight: 0,
+  const lastSetRef = useRef<{ frequency: number; mode: number; volume: number; att1: number; att2: number; nr: number; agc: number; agcLevel: number; filter: number; drive: number; backlight: number }>({
+    frequency: 0, mode: 0, volume: 0, att1: 0, att2: 0, nr: 0, agc: 0, agcLevel: 0, filter: 0, drive: 0, backlight: 0,
   });
 
   const log = useCallback((level: 'debug' | 'info' | 'warn' | 'error', ...args: unknown[]) => {
@@ -517,8 +525,9 @@ export function useRadioCAT(): RadioCATControls {
           const sMeter    = byPrefix.has('SM') ? parseIntField(byPrefix.get('SM')!, 'SM') : null;
           const drive     = byPrefix.has('DR') ? parseIntField(byPrefix.get('DR')!, 'DR') : null;
           const backlight = byPrefix.has('BL') ? parseIntField(byPrefix.get('BL')!, 'BL') : null;
+          const agcLevel  = byPrefix.has('AL') ? parseIntField(byPrefix.get('AL')!, 'AL') : null;
 
-          log('debug', 'poll(batch) — freq:', freq, 'mode:', mode, 'agc:', agc, 'filt:', filter,
+          log('debug', 'poll(batch) — freq:', freq, 'mode:', mode, 'agc:', agc, 'agcLvl:', agcLevel, 'filt:', filter,
             'vol:', volume, 'att1:', att1, 'att2:', att2, 'nr:', nr, 'sm:', sMeter, 'drive:', drive, 'bl:', backlight, `[q:${queueRef.current.length}]`);
 
           setState(prev => ({
@@ -526,6 +535,7 @@ export function useRadioCAT(): RadioCATControls {
             frequency: freq   !== null && (now - ls.frequency > SET_GRACE_MS) ? freq   : prev.frequency,
             mode:      mode   !== null && (now - ls.mode      > SET_GRACE_MS) ? mode   : prev.mode,
             agc:       agc    !== null && (now - ls.agc       > SET_GRACE_MS) ? agc    : prev.agc,
+            agcLevel:  agcLevel !== null && (now - ls.agcLevel > SET_GRACE_MS) ? agcLevel : prev.agcLevel,
             filter:    filter !== null && (now - ls.filter    > SET_GRACE_MS) ? filter : prev.filter,
             volume:    volume !== null && (now - ls.volume    > SET_GRACE_MS) ? volume : prev.volume,
             att1:      att1   !== null && (now - ls.att1      > SET_GRACE_MS) ? att1   : prev.att1,
@@ -588,7 +598,7 @@ export function useRadioCAT(): RadioCATControls {
     rxBufRef.current  = '';
     setState(prev => ({
       ...prev, connected: false, frequency: null, mode: null, ptt: false, error: null,
-      volume: null, att1: null, att2: null, nr: null, agc: null, filter: null, sMeter: null, drive: null,
+      volume: null, att1: null, att2: null, nr: null, agc: null, agcLevel: null, filter: null, sMeter: null, drive: null,
       backlight: null,
     }));
   }, [log]);
@@ -698,6 +708,13 @@ export function useRadioCAT(): RadioCATControls {
     await write(`AG0${n};`);
   }, [log, write]);
 
+  const setAgcLevel = useCallback(async (n: number) => {
+    lastSetRef.current.agcLevel = Date.now();
+    log('info', 'setAgcLevel →', n);
+    setState(prev => ({ ...prev, agcLevel: n }));
+    await write(`AL${n};`);
+  }, [log, write]);
+
   const setFilter = useCallback(async (n: number) => {
     lastSetRef.current.filter = Date.now();
     log('info', 'setFilter →', n);
@@ -789,7 +806,7 @@ export function useRadioCAT(): RadioCATControls {
 
   return {
     state, connect, disconnect, setFrequency, setMode, setPTT,
-    setVolume, setAtt1, setAtt2, setNR, setAGC, setFilter, setDrive,
+    setVolume, setAtt1, setAtt2, setNR, setAGC, setAgcLevel, setFilter, setDrive,
     setBacklight, getPABias, setPABias, resetRadio,
     getFactoryDefaults, factoryResetRadio, getRefFreq, setRefFreq,
   };
