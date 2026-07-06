@@ -22,7 +22,7 @@ interface RadioPreset {
 }
 
 const RADIO_PRESETS: RadioPreset[] = [
-  { label: 'uSDX BLACK_BRICK 4.00h',            baudRate: 38400,  dataBits: 8, stopBits: 1, parity: 'none', notes: 'PU7FTW custom firmware — adds volume, attenuator, noise reduction, AGC, filter, TX drive, backlight, PA bias and S-meter controls, batched CAT polling', rigProfile: 'usdx-blackbrick' },
+  { label: 'uSDX BLACK_BRICK 4.01a',            baudRate: 38400,  dataBits: 8, stopBits: 1, parity: 'none', notes: 'PU7FTW custom firmware — adds volume, attenuator, noise reduction, AGC, filter, TX drive, backlight, PA bias and S-meter controls, batched CAT polling', rigProfile: 'usdx-blackbrick' },
   { label: 'Kenwood TS-480 / TS-590 / TS-2000', baudRate: 9600,   dataBits: 8, stopBits: 1, parity: 'none', notes: 'Default 9600 8N1', rigProfile: 'generic' },
   { label: 'Kenwood TS-480 (high speed)',        baudRate: 57600,  dataBits: 8, stopBits: 1, parity: 'none', notes: 'Configure in menu 60', rigProfile: 'generic' },
   { label: 'Icom IC-7300 / IC-7610',             baudRate: 9600,   dataBits: 8, stopBits: 1, parity: 'none', notes: 'Set CI-V USB Baud Rate to 9600', rigProfile: 'generic' },
@@ -392,12 +392,15 @@ const DIGITAL_ATTENUATOR_DB_LABELS = [
 // (this rig runs at 20MHz), param enum FILTER, EEPROM 0x13.
 const FILTER_LABELS = ['Full', '3kHz', '2.4kHz', '1.8kHz', '500Hz', '200Hz', '100Hz', '50Hz'];
 
-// AGC firmware behavior note: FAST_AGC is undefined in this build (usdxBLACKBRICK.ino),
-// so the runtime only branches on agc==1 vs agc==0 (process_agc_fast vs no AGC) — agc==2
-// ("Slow") has no distinct code path and is indistinguishable from off. The menu itself
-// (case AGC, offon_label) exposes only OFF/ON. So the UI mirrors that as a toggle.
+// AGC firmware behavior note: since the 2026-07-06 firmware the radio has a single
+// AGC algorithm (M0PUB fast-attack/slow-decay, ~60dB range) as a plain OFF/ON toggle —
+// the old FAST_AGC Fast/Slow tri-state is gone and AG0 SET rejects values above 1.
+// The AGC target level is a separate 1..14 setting (AL command, default 4): output
+// peaks are held between level*256 and level*384, so higher = louder before clamping.
 const AGC_ON = 1;
 const AGC_OFF = 0;
+const AGC_LEVEL_MIN = 1;
+const AGC_LEVEL_MAX = 14;
 
 // ── SMeterDisplay ─────────────────────────────────────────────────────────────
 // Read-only dBm readout — no +/- controls, since there is no SM SET command.
@@ -492,18 +495,19 @@ function FactoryResetButton({ onConfirm }: { onConfirm: () => void }) {
 }
 
 // ── BlackBrickControls ────────────────────────────────────────────────────────
-// uSDX BLACK_BRICK 4.00h custom extension controls: volume, attenuators, noise
+// uSDX BLACK_BRICK 4.01a custom extension controls: volume, attenuators, noise
 // reduction, AGC, filter, TX drive, backlight. Wraps onto its own row below the
 // main toolbar. S-Meter is shown separately in the main toolbar since it's a
 // read-only reading, not a control. PA bias lives in its own on-demand panel
 // (PABiasPanel) behind the wrench button — not polled, queried when opened.
 
-function BlackBrickControls({ volume, att1, att2, nr, agc, filter, drive, backlight, paOpen, onVolume, onAtt1, onAtt2, onNR, onAGC, onFilter, onDrive, onBacklight, onTogglePA, onReset }: {
+function BlackBrickControls({ volume, att1, att2, nr, agc, agcLevel, filter, drive, backlight, paOpen, onVolume, onAtt1, onAtt2, onNR, onAGC, onAgcLevel, onFilter, onDrive, onBacklight, onTogglePA, onReset }: {
   volume: number | null;
   att1: number | null;
   att2: number | null;
   nr: number | null;
   agc: number | null;
+  agcLevel: number | null;
   filter: number | null;
   drive: number | null;
   backlight: number | null;
@@ -513,6 +517,7 @@ function BlackBrickControls({ volume, att1, att2, nr, agc, filter, drive, backli
   onAtt2: (n: number) => void;
   onNR: (n: number) => void;
   onAGC: (n: number) => void;
+  onAgcLevel: (n: number) => void;
   onFilter: (n: number) => void;
   onDrive: (n: number) => void;
   onBacklight: (n: number) => void;
@@ -543,6 +548,11 @@ function BlackBrickControls({ volume, att1, att2, nr, agc, filter, drive, backli
           {agc === null ? '—' : agcOn ? 'ON' : 'OFF'}
         </button>
       </div>
+
+      {/* AGC target level (AL command) — only meaningful while AGC is on */}
+      {agcOn && (
+        <NumberStepper label="AGC Level" value={agcLevel} min={AGC_LEVEL_MIN} max={AGC_LEVEL_MAX} onChange={onAgcLevel} />
+      )}
 
       <BacklightToggle backlight={backlight} onToggle={onBacklight} />
 
@@ -739,8 +749,8 @@ const DEFAULT_CONFIG: CATConnectionConfig & { presetIdx: number } = {
 };
 
 export default function RadioCATPanel({ cat, collapsed = false }: { cat: ReturnType<typeof useRadioCAT>; collapsed?: boolean }) {
-  const { state, connect, disconnect, setFrequency, setMode, setPTT, setVolume, setAtt1, setAtt2, setNR, setAGC, setFilter, setDrive, setBacklight, getPABias, setPABias, resetRadio, getFactoryDefaults, factoryResetRadio } = cat;
-  const { connected, frequency, mode, ptt, error, isSupported, volume, att1, att2, nr, agc, filter, sMeter, drive, backlight } = state;
+  const { state, connect, disconnect, setFrequency, setMode, setPTT, setVolume, setAtt1, setAtt2, setNR, setAGC, setAgcLevel, setFilter, setDrive, setBacklight, getPABias, setPABias, resetRadio, getFactoryDefaults, factoryResetRadio } = cat;
+  const { connected, frequency, mode, ptt, error, isSupported, volume, att1, att2, nr, agc, agcLevel, filter, sMeter, drive, backlight } = state;
 
   const [showSettings, setShowSettings] = useState(false);
   const [showPABias, setShowPABias] = useState(false);
@@ -756,6 +766,7 @@ export default function RadioCATPanel({ cat, collapsed = false }: { cat: ReturnT
   const handleAtt2       = useCallback((n: number) => { setAtt2(n).catch(() => {}); }, [setAtt2]);
   const handleNR         = useCallback((n: number) => { setNR(n).catch(() => {}); }, [setNR]);
   const handleAGC        = useCallback((n: number) => { setAGC(n).catch(() => {}); }, [setAGC]);
+  const handleAgcLevel   = useCallback((n: number) => { setAgcLevel(n).catch(() => {}); }, [setAgcLevel]);
   const handleFilter     = useCallback((n: number) => { setFilter(n).catch(() => {}); }, [setFilter]);
   const handleDrive      = useCallback((n: number) => { setDrive(n).catch(() => {}); }, [setDrive]);
   const handleBacklight  = useCallback((n: number) => { setBacklight(n).catch(() => {}); }, [setBacklight]);
@@ -835,15 +846,15 @@ export default function RadioCATPanel({ cat, collapsed = false }: { cat: ReturnT
             {/* PTT */}
             <PTTButton ptt={ptt} onToggle={handlePTTToggle} />
 
-            {/* uSDX BLACK_BRICK 4.00h extensions */}
+            {/* uSDX BLACK_BRICK 4.01a extensions */}
             {config.rigProfile === 'usdx-blackbrick' && !collapsed && (
               <BlackBrickControls
                 volume={volume} att1={att1} att2={att2} nr={nr}
-                agc={agc} filter={filter} drive={drive} backlight={backlight}
+                agc={agc} agcLevel={agcLevel} filter={filter} drive={drive} backlight={backlight}
                 paOpen={showPABias}
                 onVolume={handleVolume} onAtt1={handleAtt1} onAtt2={handleAtt2}
                 onNR={handleNR}
-                onAGC={handleAGC} onFilter={handleFilter} onDrive={handleDrive}
+                onAGC={handleAGC} onAgcLevel={handleAgcLevel} onFilter={handleFilter} onDrive={handleDrive}
                 onBacklight={handleBacklight} onTogglePA={handleTogglePA}
                 onReset={handleReset}
               />

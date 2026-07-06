@@ -1,5 +1,6 @@
 import {
   parseFTMsg, mergeContacts, isValidCallsign, gridToLatLon, haversineKm,
+  generateADIF, isConfirmedQSO,
 } from '../parser';
 import { callsignCountry } from '../prefixes';
 
@@ -107,6 +108,44 @@ describe('mergeContacts', () => {
     expect(c.grids).toEqual(['HI72', 'HI73']);
     expect(c.grid).toBe('HI72'); // most recent report
     expect(c.latLon).toEqual(gridToLatLon('HI72'));
+  });
+});
+
+describe('generateADIF', () => {
+  const t = new Date('2026-06-12T12:00:00Z');
+  // Standard WSJT-X exchange: THEM calls CQ, ME answers and completes the QSO.
+  const me   = 'K1ABC';
+  const them = 'W9XYZ';
+  const qsoMsgs = [
+    `CQ ${them} FN42`,
+    `${them} ${me} FN31`,
+    `${me} ${them} -10`,
+    `${them} ${me} R-05`,
+    `${me} ${them} RR73`,
+  ];
+  const merge = (msgs: string[]) =>
+    mergeContacts(new Map(), t, msgs.map(msg => ({ msg, freq: 1500, snr: -10 })), 0);
+
+  it('never emits a record for our own callsign (the self-QSO bug)', () => {
+    const contacts = merge(qsoMsgs);
+    // mergeContacts tracks every caller/callee it sees, including us —
+    // confirm the self-entry exists so this test actually exercises the guard.
+    expect(contacts.has(me)).toBe(true);
+
+    const adif = generateADIF(contacts, 'FT8' as any, { myCall: me, myGrid: 'FN31' });
+    expect(adif).not.toContain(`<CALL:${me.length}>${me}`);
+  });
+
+  it('records CALL as the other station and STATION_CALLSIGN as ours', () => {
+    const contacts = merge(qsoMsgs);
+    const adif = generateADIF(contacts, 'FT8' as any, { myCall: me, myGrid: 'FN31' });
+    expect(adif).toContain(`<CALL:${them.length}>${them}`);
+    expect(adif).toContain(`<STATION_CALLSIGN:${me.length}>${me}`);
+  });
+
+  it('marks a completed exchange with the peer as a confirmed QSO', () => {
+    const contacts = merge(qsoMsgs);
+    expect(isConfirmedQSO(contacts.get(them)!, me)).toBe(true);
   });
 });
 

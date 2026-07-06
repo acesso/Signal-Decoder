@@ -430,12 +430,15 @@ function segmentQSOs(msgs: ContactMsg[]): ContactMsg[][] {
 //      - I sent them a report (I reported their signal).
 //   This covers all standard FT8 QSO flows regardless of who called CQ.
 // Without myCall we cannot determine participation, so all contacts pass through.
+// NOTE: `msgs` belongs to the PEER's contact record (c), not mine — role='tx'
+// means the peer transmitted, role='rx' means the peer was addressed (i.e. I
+// transmitted to them).
 function segmentIsConfirmed(msgs: ContactMsg[], me: string): boolean {
-  // Messages I transmitted (I am the caller, role='tx' on my contact entry)
-  const iSent    = msgs.filter(m => m.role === 'tx' && m.parsed.caller?.toUpperCase() === me);
-  // Messages they transmitted to me (they are the caller, callee=me, role='tx' on their entry
-  // but stored as role='rx' on my contact because I was addressed)
-  const theySent = msgs.filter(m => m.role === 'rx' && m.parsed.callee?.toUpperCase() === me);
+  // Messages they transmitted (peer is caller, role='tx' on the peer's contact entry)
+  const theySent = msgs.filter(m => m.role === 'tx' && m.parsed.callee?.toUpperCase() === me);
+  // Messages I transmitted to them (peer is callee, role='rx' on the peer's contact entry
+  // because the peer was addressed while I was the caller)
+  const iSent    = msgs.filter(m => m.role === 'rx' && m.parsed.caller?.toUpperCase() === me);
   if (iSent.length === 0 || theySent.length === 0) return false;
   const iSentReport    = iSent.some(m => REPORT_TYPES.has(m.parsed.type));
   const theySentReport = theySent.some(m => REPORT_TYPES.has(m.parsed.type));
@@ -473,12 +476,19 @@ export function generateADIF(
   const me = (myCall ?? '').toUpperCase();
 
   for (const c of contacts.values()) {
+    // Skip the entry keyed by our own callsign — mergeContacts tracks every
+    // caller/callee it sees, including us, so a "contact" for myCall is not a
+    // real QSO partner. Without this guard a completed exchange produces an
+    // ADIF record with CALL === STATION_CALLSIGN (a bogus self-worked QSO).
+    if (me && c.callsign.toUpperCase() === me) continue;
     // Each confirmed QSO segment with this callsign becomes a separate ADIF record.
+    // NOTE: `seg` messages belong to the PEER's contact record (c) — role='tx'
+    // means the peer transmitted, role='rx' means the peer was addressed (I transmitted).
     for (const seg of confirmedSegments(c, me)) {
-      // Messages I transmitted: role='tx' on my contact, I am the caller
-      const iSentMsgs    = seg.filter(m => m.role === 'tx' && m.parsed.caller?.toUpperCase() === me);
-      // Messages they transmitted to me: role='rx' on my contact (I was addressed), they are caller
-      const theySentMsgs = seg.filter(m => m.role === 'rx' && m.parsed.callee?.toUpperCase() === me);
+      // Messages I transmitted to them: role='rx' on their contact (they were addressed), I am the caller
+      const iSentMsgs    = seg.filter(m => m.role === 'rx' && m.parsed.caller?.toUpperCase() === me);
+      // Messages they transmitted to me: role='tx' on their contact (they are caller), callee=me
+      const theySentMsgs = seg.filter(m => m.role === 'tx' && m.parsed.callee?.toUpperCase() === me);
 
       // RST_RCVD = best SNR on signals I received from them (their tx, stored as my rx)
       const bestSnrRcvd = theySentMsgs.reduce((best, m) => m.snr > best ? m.snr : best, -99);

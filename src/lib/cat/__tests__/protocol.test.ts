@@ -1,9 +1,9 @@
 /**
- * CAT protocol unit tests — uSDX BLACK_BRICK 4.00h / TS-480 Kenwood dialect.
+ * CAT protocol unit tests — uSDX BLACK_BRICK 4.01a / TS-480 Kenwood dialect.
  *
  * These tests are pure JS: no hardware, no serial port, no browser APIs.
  * They validate command string construction, response parsing, multi-command
- * batching, and all custom PU7FTW extension commands (BL/VO/TQ/AT/A2/NR/AG0/FW/SM/DR/PM/PX).
+ * batching, and all custom PU7FTW extension commands (BL/VO/TQ/AT/A2/NR/AG0/AL/FW/SM/DR/PM/PX).
  * Note: BL (backlight) is polled and surfaced in the UI again since the
  * 2026-07-04 firmware fix (BACKLIGHT_PIN moved to the correct pin, PD3).
  * PM/PX (PA bias endpoints) are deliberately NOT polled — they're fetched
@@ -106,12 +106,17 @@ describe('command construction', () => {
     expect(`VO0;`).toMatch(/^VO-?\d+;$/);
   });
 
-  test('AG0 set — wire format accepts 0..2, though this build only uses 0/1', () => {
-    // Firmware Command_AG0_SET allows v<=2, but FAST_AGC is undefined in this
-    // build, so agc==2 has no distinct runtime code path from agc==0 (see
-    // usdxBLACKBRICK.ino ~line 3305-3318). The UI only ever sends 0 or 1.
+  test('AG0 set — firmware accepts only 0/1 since the single-algorithm AGC change', () => {
+    // Since the 2026-07-06 firmware, Command_AG0_SET rejects v>1 (echo returns
+    // the old value). The old FAST_AGC Fast/Slow tri-state is gone: agc==1 is
+    // the single M0PUB fast-attack/slow-decay algorithm.
     expect(`AG00;`).toBe('AG00;');
     expect(`AG01;`).toBe('AG01;');
+  });
+
+  test('AL set — AGC level, 1..14', () => {
+    expect('AL4;').toMatch(/^AL\d{1,2};$/);
+    expect('AL14;').toMatch(/^AL\d{1,2};$/);
   });
 
   test('FW set — 0..7', () => {
@@ -195,10 +200,17 @@ describe('response parsing — custom BLACK_BRICK commands', () => {
     expect(parseIntField('NR8;', 'NR')).toBe(8);
   });
 
-  test('AG0 — AGC: 0=OFF 1=ON (this build has FAST_AGC undefined, so the UI toggle only uses 0/1)', () => {
+  test('AG0 — AGC: 0=OFF 1=ON (single M0PUB algorithm; SET rejects values above 1)', () => {
     expect(parseIntField('AG00;', 'AG0')).toBe(0);
     expect(parseIntField('AG01;', 'AG0')).toBe(1);
     expect(parseIntField('AG0;', 'AG0')).toBeNull();
+  });
+
+  test('AL — AGC target level 1..14 (default 4; peaks held in [lvl*256..lvl*384])', () => {
+    expect(parseIntField('AL4;', 'AL')).toBe(4);   // firmware default
+    expect(parseIntField('AL1;', 'AL')).toBe(1);
+    expect(parseIntField('AL14;', 'AL')).toBe(14);
+    expect(parseIntField('AL;', 'AL')).toBeNull();
   });
 
   test('FW — filter index 0..7', () => {
@@ -230,7 +242,7 @@ describe('response parsing — custom BLACK_BRICK commands', () => {
   test('PM/PX — PA bias endpoints (on-demand, not polled)', () => {
     expect(parseIntField('PM10;', 'PM')).toBe(10);    // firmware default (bias min)
     expect(parseIntField('PM0;', 'PM')).toBe(0);
-    expect(parseIntField('PX160;', 'PX')).toBe(160);  // firmware default (PA max)
+    expect(parseIntField('PX130;', 'PX')).toBe(130);  // firmware default (PA bias max, 130 since 4.01a)
     expect(parseIntField('PX255;', 'PX')).toBe(255);
     expect(parseIntField('PM;', 'PM')).toBeNull();
     expect(parseIntField('PX;', 'PX')).toBeNull();
@@ -259,21 +271,21 @@ describe('response parsing — custom BLACK_BRICK commands', () => {
       return m ? m[1].split(',').map(Number) : null;
     };
     // Firmware 4.00g defaults: vol,att,att2,nr,agc,filt,drive,backlight,pwm_min,pwm_max,md
-    const v = parse('FD11,0,0,0,1,0,4,1,10,160,2;');
-    expect(v).toEqual([11, 0, 0, 0, 1, 0, 4, 1, 10, 160, 2]);
+    const v = parse('FD11,0,0,0,1,0,4,1,10,130,2;');
+    expect(v).toEqual([11, 0, 0, 0, 1, 0, 4, 1, 10, 130, 2]);
     expect(parse('FD11,0,0;')).toBeNull();       // wrong arity
     expect(parse('FD;')).toBeNull();
     // volume can be negative (-1 = mute)
-    expect(parse('FD-1,0,0,0,1,0,4,1,10,160,2;')![0]).toBe(-1);
+    expect(parse('FD-1,0,0,0,1,0,4,1,10,130,2;')![0]).toBe(-1);
   });
 });
 
 describe('multi-command / batched poll parsing', () => {
-  const BATCH_RESPONSE = 'FA00014225000;MD2;AG01;FW3;VO8;AT2;A216;NR4;SM-68;DR5;BL1;';
+  const BATCH_RESPONSE = 'FA00014225000;MD2;AG01;FW3;VO8;AT2;A216;NR4;SM-68;DR5;BL1;AL4;';
 
-  test('splitFrames — all 11 frames', () => {
+  test('splitFrames — all 12 frames', () => {
     const frames = splitFrames(BATCH_RESPONSE);
-    expect(frames).toHaveLength(11);
+    expect(frames).toHaveLength(12);
     expect(frames[0]).toBe('FA00014225000;');
     expect(frames[1]).toBe('MD2;');
     expect(frames[2]).toBe('AG01;');
@@ -365,10 +377,10 @@ describe('IF frame parsing', () => {
 });
 
 describe('BLACKBRICK_POLL_CMDS array', () => {
-  const BLACKBRICK_POLL_CMDS = ['FA;', 'MD;', 'AG0;', 'FW;', 'VO;', 'AT;', 'A2;', 'NR;', 'SM;', 'DR;', 'BL;'];
+  const BLACKBRICK_POLL_CMDS = ['FA;', 'MD;', 'AG0;', 'FW;', 'VO;', 'AT;', 'A2;', 'NR;', 'SM;', 'DR;', 'BL;', 'AL;'];
 
-  test('11 commands in poll array', () => {
-    expect(BLACKBRICK_POLL_CMDS).toHaveLength(11);
+  test('12 commands in poll array', () => {
+    expect(BLACKBRICK_POLL_CMDS).toHaveLength(12);
   });
 
   test('AG0; is included', () => {
@@ -398,7 +410,7 @@ describe('BLACKBRICK_POLL_CMDS array', () => {
 
   test('prefixes derived from commands', () => {
     const prefixes = BLACKBRICK_POLL_CMDS.map(c => c.substring(0, 2));
-    expect(prefixes).toEqual(['FA', 'MD', 'AG', 'FW', 'VO', 'AT', 'A2', 'NR', 'SM', 'DR', 'BL']);
+    expect(prefixes).toEqual(['FA', 'MD', 'AG', 'FW', 'VO', 'AT', 'A2', 'NR', 'SM', 'DR', 'BL', 'AL']);
   });
 });
 
@@ -468,7 +480,7 @@ describe('range validation', () => {
     // Mirrors Command_PM_SET (v < pwm_max) and Command_PX_SET (v >= pwm_min && v <= 255).
     const validMin = (v: number, max: number) => v >= 0 && v < max;
     const validMax = (v: number, min: number) => v >= min && v <= 255;
-    expect(validMin(10, 160)).toBe(true);   // firmware defaults
+    expect(validMin(10, 130)).toBe(true);   // firmware defaults
     expect(validMin(160, 160)).toBe(false); // min must stay below max
     expect(validMax(160, 10)).toBe(true);
     expect(validMax(255, 10)).toBe(true);

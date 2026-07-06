@@ -46,10 +46,10 @@ export function createMockSerialPort(opts: MockSerialOptions = {}) {
   const rig = {
     frequency: opts.initialFrequency ?? 7074000,
     modeDigit: opts.modeDigit ?? 2, // USB
-    agc: 1, filter: 1, volume: 10, att1: 0, att2: 0, nr: 0, drive: 4,
+    agc: 1, agcLevel: 4, filter: 1, volume: 10, att1: 0, att2: 0, nr: 0, drive: 4,
     sMeter: 7,
     backlight: 1,
-    pwmMin: 10, pwmMax: 160,  // PA bias endpoints (firmware defaults)
+    pwmMin: 10, pwmMax: 130,  // PA bias endpoints (firmware defaults)
     fxtal: 25_000_000,        // reference oscillator (XF, menu "Ref frq")
     tx: false,
   };
@@ -69,6 +69,15 @@ export function createMockSerialPort(opts: MockSerialOptions = {}) {
   let rxBuffer = '';
 
   function respond(cmd: string): string {
+    // AGC level SET — handled before the generic set path because single-digit
+    // sets ("AL5") are only 3 chars and the generic path requires length > 3.
+    // Validated echo like the firmware: 1..14, out-of-range keeps the old value.
+    const alSet = cmd.match(/^AL(\d+)$/);
+    if (alSet) {
+      const v = parseInt(alSet[1], 10);
+      if (v >= 1 && v <= 14) rig.agcLevel = v;
+      return `AL${rig.agcLevel};`;
+    }
     // set-commands carry a payload and (like the real firmware) get no reply
     const set = cmd.match(/^([A-Z]{2})([0-9-]+.*)$/);
     if (set && cmd.length > 3) {
@@ -93,6 +102,12 @@ export function createMockSerialPort(opts: MockSerialOptions = {}) {
         if (v >= rig.pwmMin && v <= 255) rig.pwmMax = v;
         return `PX${rig.pwmMax};`;
       }
+      // AGC on/off — firmware accepts only 0/1 since the single-algorithm change
+      if (prefix === 'AG') {
+        const v = parseInt(val.slice(1), 10); // "AG0n" — val is "0n"
+        if (v <= 1) rig.agc = v;
+        return '';
+      }
       // Reference oscillator (calibration) — validated echo like the firmware.
       if (prefix === 'XF') {
         const v = parseInt(val, 10);
@@ -116,6 +131,7 @@ export function createMockSerialPort(opts: MockSerialOptions = {}) {
         return `SM${rig.sMeter};`;
       }
       case 'DR': return `DR${rig.drive};`;
+      case 'AL': return `AL${rig.agcLevel};`;
       case 'BL': return `BL${rig.backlight};`;
       case 'PM': return `PM${rig.pwmMin};`;
       case 'PX': return `PX${rig.pwmMax};`;
@@ -126,13 +142,13 @@ export function createMockSerialPort(opts: MockSerialOptions = {}) {
       // Factory reset: acks SR2; and restores the firmware defaults (the real
       // radio also reboots — same "no simulated outage" caveat as SR).
       case 'SR2':
-        rig.modeDigit = 2; rig.agc = 1; rig.filter = 0; rig.volume = 11;
+        rig.modeDigit = 2; rig.agc = 1; rig.agcLevel = 4; rig.filter = 0; rig.volume = 11;
         rig.att1 = 0; rig.att2 = 0; rig.nr = 0; rig.drive = 4;
-        rig.backlight = 1; rig.pwmMin = 10; rig.pwmMax = 160;
+        rig.backlight = 1; rig.pwmMin = 10; rig.pwmMax = 130;
         return 'SR2;';
       // Factory-default values as one FD frame — mirrors the firmware's
       // compile-time initializers (vol,att,att2,nr,agc,filt,drive,bl,pm,px,md).
-      case 'FD': return 'FD11,0,0,0,1,0,4,1,10,160,2;';
+      case 'FD': return 'FD11,0,0,0,1,0,4,1,10,130,2;';
       case 'XF': return `XF${rig.fxtal};`;
       case 'TX': rig.tx = true; return '';
       case 'RX': rig.tx = false; return '';

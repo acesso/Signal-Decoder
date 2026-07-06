@@ -471,20 +471,31 @@ If the port is busy or silent, make sure no other CAT application (hamlib, rigct
 
 ### Custom CAT commands (PU7FTW extensions)
 
-All commands terminate with `;`. All SET commands echo the new value as a GET reply. Commands are safe to batch in a single write — the firmware processes them in order and concatenates replies, e.g. `FA;MD;AG0;FW;VO;AT;A2;NR;BL;` returns all 9 replies in one read window.
+All commands terminate with `;`. All SET commands echo the effective value as a GET reply — if a SET is rejected (out of range), the echo returns the **old** value, which the web app relies on. Commands are safe to batch in a single write — the firmware processes them in order and concatenates replies, e.g. `FA;MD;AG0;FW;VO;AT;A2;NR;SM;DR;BL;AL;` (the app's poll batch) returns all 12 replies in one read window.
 
 | Command | Query | Set | Range | Notes |
 |---------|-------|-----|-------|-------|
 | **VO** — volume | `VO;` → `VOn;` | `VOn;` | −1…16 | −1 = mute |
-| **AT** — ATT1 | `AT;` → `ATn;` | `ATn;` | 0…7 | dB steps: 0/−13/−20/−33/−40/−53/−60/−73 dB |
-| **A2** — ATT2 | `A2;` → `A2n;` | `A2n;` | 0…16 | linear index |
+| **AT** — analog attenuator | `AT;` → `ATn;` | `ATn;` | 0…7 | dB steps: 0/−13/−20/−33/−40/−53/−60/−73 dB |
+| **A2** — digital attenuator | `A2;` → `A2n;` | `A2n;` | 0…16 | −6.02 dB per step |
 | **NR** — noise reduction | `NR;` → `NRn;` | `NRn;` | 0…8 | 0 = off |
 | **BL** — backlight | `BL;` → `BL0;`/`BL1;` | `BL0;`/`BL1;` | 0…1 | |
-| **AG0** — AGC | `AG0;` → `AG0n;` | `AG0n;` | 0…2 | 0=OFF 1=Fast 2=Slow |
+| **AG0** — AGC on/off | `AG0;` → `AG0n;` | `AG0n;` | 0…1 | single algorithm (M0PUB fast-attack/slow-decay); values >1 rejected |
+| **AL** — AGC level | `AL;` → `ALn;` | `ALn;` | 1…14 | target window: output peaks held in [n·256 … n·384]; default 4 |
 | **FW** — filter BW | `FW;` → `FWn;` | `FWn;` | 0…7 | 0=Full 1=3k 2=2.4k 3=1.8k 4=500 5=200 6=100 7=50 Hz |
+| **SM** — S-meter | `SM;` → `SMn;` | — | dBm (signed) | read-only; integer-math dBm, ±1 dB vs the old float version |
+| **DR** — TX drive | `DR;` → `DRn;` | `DRn;` | 0…8 | pre-clipping input gain (each step doubles the envelope); 8 = always max |
+| **PM** — PA bias min | `PM;` → `PMn;` | `PMn;` | 0…max−1 | PWM LUT idle endpoint; SET rebuilds the LUT live |
+| **PX** — PA bias max | `PX;` → `PXn;` | `PXn;` | min+1…255 | PWM LUT full-drive endpoint — the real output-power control for digital modes |
+| **XF** — ref frequency | `XF;` → `XFnnnnnnnn;` | `XFnnnnnnnn;` | 14–28 MHz | si5351 fxtal calibration; used by the calibration wizard |
+| **FD** — factory defaults | `FD;` → one CSV frame | — | 11 values | `FD<vol>,<att>,<att2>,<nr>,<agc>,<filt>,<drive>,<bl>,<pm>,<px>,<md>;` |
+| **SR** — soft restart | `SR;` → `SR1;` | — | | acks then watchdog-reboots (≈2–3 s off the wire) |
+| **SR2** — factory reset | `SR2;` → `SR2;` | — | | wipes ALL settings incl. band data and calibration, then reboots |
 | **TQ** — PTT state | `TQ;` → `TQ0;`/`TQ1;` | `TQ0;`/`TQ1;` | 0…1 | firmware also broadcasts `TQ0;`/`TQ1;` unsolicited on PTT transitions |
 
-Standard TS-480 commands also supported: `FA` (VFO A freq get/set), `MD` (mode), `IF` (37-byte info frame), `TX`/`RX` (PTT), `ID`, `PS`, `AI`, `VX`.
+Standard TS-480 commands also supported: `FA` (frequency get/set — single VFO), `MD` (mode; digits 4/5 = FM/AM are selectable for **RX only**, out-of-range digits clamp to LSB), `IF` (status frame), `TX`/`RX` (PTT — **ignored unless mode is LSB/USB**; AM/FM/CW are receive-only in this build), `ID`, `PS`, `AI`, `VX`.
+
+> **Removed vs. earlier 4.00x builds (2026-07-06):** VOX + noise gate, RIT (`RTS` offset command), TX offset (`XO`), VFO B/Split, CW/AM/FM transmit, the Fast AGC variant (replaced by `AL` level control), and all float math (integer dBm S-meter). See [`firmware/usdxBLACKBRICK/README.md`](firmware/usdxBLACKBRICK/README.md) for the complete lineage vs. the original QCX-SSB R1.02w firmware.
 
 ## Testing
 
@@ -509,7 +520,7 @@ npm run test:coverage
 
 - TS-480 command construction (`FA`, `MD`)
 - Response parsing helpers (`parseFrequency`, `parseMode`, `parseIntField`, `parseBoolField`)
-- All 8 custom BLACK_BRICK commands (`VO`, `AT`, `A2`, `NR`, `BL`, `AG0`, `FW`, `TQ`)
+- All custom BLACK_BRICK commands (`VO`, `AT`, `A2`, `NR`, `BL`, `AG0`, `AL`, `FW`, `SM`, `DR`, `PM`, `PX`, `XF`, `FD`, `SR`, `TQ`)
 - Multi-command batch response splitting and 2-char prefix lookup map
 - IF frame parsing against the exact frame layout emitted by the firmware
 - Range validation for every writable parameter
@@ -517,8 +528,6 @@ npm run test:coverage
 ```bash
 npm test -- src/lib/cat/__tests__/protocol.test.ts
 ```
-
-Expected result: **35 tests, 35 passed**.
 
 ### Testbed setup (live radio required)
 
