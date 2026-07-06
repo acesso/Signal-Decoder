@@ -50,7 +50,7 @@ Global variables use 1499 bytes (73%) of dynamic memory, leaving 549 bytes for l
 */
 
 //  G8RDI Modifications log:
-#define VERSION   "4.00h"    // Fixed format "9.99z" : Additions and changes Copyright 2022-2023 GW8RDI - You can use and distribute if you maintain the copyright message, commercial use is prohibited.
+#define VERSION   "4.01a"    // Fixed format "9.99z" : Additions and changes Copyright 2022-2023 GW8RDI - You can use and distribute if you maintain the copyright message, commercial use is prohibited.
 
 //  2022/03/04 - Added delay to show serial number at start - G8RDI mod
 //               Added band change direction based on last freq step directions. See "case BE | DC:" - GW8RDI mod
@@ -156,7 +156,7 @@ Global variables use 1499 bytes (73%) of dynamic memory, leaving 549 bytes for l
 #define LPF_SWITCHING_DL2MAN_USDX_REV3 1    // Default 8 band latching relays IM43
 
 
-//#define FAST_AGC         1   // Adds fast AGC option (good for CW) Slow mode not recommended.  Remove for CAT if memory errors.
+//#define FAST_AGC       1   // Removed 2026-07-06: instead of two AGC algorithms, this build keeps only the better M0PUB one (fast attack, slow decay, ~60dB range) as plain AGC OFF/ON, plus an "AGC level" target adjustment (menu 1.8, CAT AL command)
 
 #define CAT              1   // CAT-interface - OTHER OPTIONS, SUCH AS CW_MESSAGES and KEEP_BAND_DATA MAY TO BE DISABLED TO MAKE SPACE FOR CAT
 //#define CAT_EXT        1   // Extended CAT support: remote button and screen control commands over CAT
@@ -165,7 +165,7 @@ Global variables use 1499 bytes (73%) of dynamic memory, leaving 549 bytes for l
 
 #ifdef CAT
 #define CAT_TX_CMD          1  // Send TX and RX status CAT cmds as PTT is pressed and released
-#define CAT_XO_CMD          1  // Set TX offset freq.
+//#define CAT_XO_CMD        1  // Removed 2026-07-06: TX offset (XO command) — unused by the web app and by hamlib's TS-480 driver
 #endif
 
 // Lines below NEEDED FOR CW, removed to make space for CAT
@@ -205,9 +205,7 @@ Global variables use 1499 bytes (73%) of dynamic memory, leaving 549 bytes for l
 ///G8RDI comment out FAST_AGC & DIAG below to save mem space for CAT
 //#define DIAG             1   // Hardware diagnostics on startup (use to debug problems)
 
-#ifndef CAT_XO_CMD  // Undefined CW_VOLUME to make space for CAT_XO_CMD
-#define CW_VOLUME        1    // Enable separate CW tone volume in the menu
-#endif
+//#define CW_VOLUME      1   // Removed 2026-07-06 along with the rest of CW TX (was only auto-enabled when CAT_XO_CMD was off anyway)
 
 //#define CW_DECODER       1   // CW decoder (removed - not used on BLACK_BRICK)
 //#define CW_INTERMEDIATE  1   // CW decoder shows intermediate characters (only available for LCD and F_MCU at 20M), sequences like:  EIS[HV] EIUF EAW[JP] EARL TMO TMG[ZQ] TND[BX] TNK[YC], may be good to learn CW; a full list of possible sequences:  EISH5 EISV3 EIUF EIUU2 EAWJ1 EAWP EARL TMOO0 TMOO9 TMOO8 TMGZ7 TMGQ TNDB6 TNDX TNKY TNKC
@@ -240,10 +238,12 @@ Global variables use 1499 bytes (73%) of dynamic memory, leaving 549 bytes for l
 // Advanced configuration switches
 //#define CONDENSED      1   // Display in 4 line mode (for OLED and LCD2004 modules)
 #define TX_ENABLE        1   // Disable this for RX only (no transmit), e.g. to support uSDX for kids idea: https://groups.io/g/ucx/topic/81030243#6276
-#define SEMI_QSK         1   // Just after keying the transmitter, keeps the RX muted for a short amount of time in the anticipation for continued keying
-#define RIT_ENABLE       1   // Receive-In-Transit alternates the receiving frequency with an user-defined offset to compensate for any necessary tuning needed on receive
-#define VOX_ENABLE       1   // Voice-On-Xmit which is switching the transceiver into transmit as soon audio is detected (above noise gate level)
+//#define SEMI_QSK       1   // Removed 2026-07-06 with the rest of CW TX (CW is RX-only now)   // Just after keying the transmitter, keeps the RX muted for a short amount of time in the anticipation for continued keying
+//#define CW_TX          1   // Removed 2026-07-06: CW transmit (dsp_tx_cw/sidetone/key shaping) — this rig transmits SSB only, fed by external audio; CW RX (narrow filters + cw_offset tuning) is kept and keying TX in CW mode is blocked in switch_rxtx
+//#define RIT_ENABLE       1  // Removed: digital-modes-only rig — RIT is pointless when the PC tunes via CAT   // Receive-In-Transit alternates the receiving frequency with an user-defined offset to compensate for any necessary tuning needed on receive
+//#define VOX_ENABLE       1  // Removed: digital-modes-only rig, PTT is CAT-controlled   // Voice-On-Xmit which is switching the transceiver into transmit as soon audio is detected (above noise gate level)
 //#define MOX_ENABLE     1   // Monitor-On-Xmit which is audio monitoring on speaker during transmit
+//#define AM_FM_TX       1   // Removed: digital-modes-only rig — AM/FM RX (listening) is kept, but their transmitters (dsp_tx_am/dsp_tx_fm) are gone and keying TX while in AM/FM is blocked in switch_rxtx (can't accidentally transmit over a broadcast station)
 
 //#define ONEBUTTON      1   // Use single (encoder) button to control full the rig; optionally use L/R buttons to completely replace rotory encoder function
 //#define DEBUG          1   // for development purposes only (adds debugging features such as CPU, sample-rate measurement, additional parameters)
@@ -1913,9 +1913,9 @@ public:
   uint32_t P2; // Synth config register P2
   uint32_t P3; // Synth config register P3
 
-  P1 = (uint32_t)(128 * ((float)num / (float)denom));
+  P1 = (128UL * num) / denom;  // integer floor(128*num/denom) — exact per the SI5351 datasheet formula (num,denom <= 0xFFFFF so 128*num fits uint32); the old float version could round the ratio up and land one step off
   P1 = (uint32_t)(128 * (uint32_t)(divider) + P1 - 512);
-  P2 = (uint32_t)(128 * ((float)num / (float)denom));
+  P2 = (128UL * num) / denom;
   P2 = (uint32_t)(128 * num - denom * P2);
   P3 = denom;
 
@@ -2353,6 +2353,11 @@ volatile uint8_t tone_vol = 12;
 volatile uint8_t cw_tone = 1;
 const uint32_t tones[] = { F_MCU * 700ULL / 20000000, F_MCU * 600ULL / 20000000, F_MCU * 700ULL / 20000000 };  // G8RDI todo ULL to divisor?
 
+void dummy()
+{
+}
+
+#ifdef CW_TX
 volatile int8_t p_sin = 0;     // initialized with A*sin(0) = 0
 volatile int8_t n_cos = 448 / 4; // initialized with A*cos(t) = A
 inline void process_minsky() // Minsky circle sample [source: https://www.cl.cam.ac.uk/~am21/hakmemc.html, ITEM 149]: p_sin+=n_cos*2*PI*f/fs; n_cos-=p_sin*2*PI*f/fs;
@@ -2365,14 +2370,10 @@ inline void process_minsky() // Minsky circle sample [source: https://www.cl.cam
 // CW Key-click shaping, ramping up/down amplitude with sample-interval of 60us. Tnx: Yves HB9EWY https://groups.io/g/ucx/message/5107
 const uint8_t ramp[] PROGMEM = { 255, 254, 252, 249, 245, 239, 233, 226, 217, 208, 198, 187, 176, 164, 152, 139, 127, 115, 102, 90, 78, 67, 56, 46, 37, 28, 21, 15, 9, 5, 2 }; // raised-cosine(i) = 255 * sq(cos(HALF_PI * i/32))
 
-void dummy()
-{
-}
-
 void dsp_tx_cw()
 { // jitter dependent things first
 #ifdef KEY_CLICK
-	if (OCR1BL < lut[255]) { //check if already ramped up: ramp up of amplitude 
+	if (OCR1BL < lut[255]) { //check if already ramped up: ramp up of amplitude
 		for (uint16_t i = 31; i != 0; i--) {   // soft rising slope against key-clicks
 			OCR1BL = lut[pgm_read_byte_near(ramp[i])];
 			delayMicroseconds(60);
@@ -2389,7 +2390,9 @@ void dsp_tx_cw()
 	OCR1AL = (p_sin >> (16 - volume)) + 128;
 #endif
 }
+#endif //CW_TX
 
+#ifdef AM_FM_TX
 void dsp_tx_am()
 { // jitter dependent things first
 	ADCSRA |= (1 << ADSC);    // start next ADC conversion (trigger ADC interrupt if ADIE flag is set)
@@ -2416,6 +2419,7 @@ void dsp_tx_fm()
 	int16_t df = in;
 	si5351.freq_calc_fast(df);           // calculate SI5351 registers based on frequency shift and carrier frequency
 }
+#endif //AM_FM_TX
 
 #define EA(y, x, one_over_alpha)  (y) = (y) + ((x) - (y)) / (one_over_alpha); // exponental averaging [Lyons 13.33.1]
 #define MLEA(y, x, L, M)  (y)  = (y) + ((((x) - (y)) >> (L)) - (((x) - (y)) >> (M))); // multiplierless exponental averaging [Lyons 13.33.1], with alpha=1/2^L - 1/2^M
@@ -2695,19 +2699,8 @@ volatile uint8_t att = 0;
 volatile uint8_t att2 = 0;  // note: values >=2 help prevent numeric overflow on strong signals
 volatile uint8_t _init = 0;
 
-// Old AGC algorithm which only increases gain, but does not decrease it for very strong signals.
-// Maximum possible gain is x32 (in practice, x31) so AGC range is x1 to x31 = 30dB approx.
-// Decay time is fine (about 1s) but attack time is much slower than I like. 
-// For weak/medium signals it aims to keep the sample value between 1024 and 2048. 
-static int16_t gain = 1024;
-inline int16_t process_agc_fast(int16_t in)
-{
-	int16_t out = (gain >= 1024) ? (gain >> 10) * in : in;
-	int16_t accum = (1 - abs(out >> 10));
-	if ((INT16_MAX - gain) > accum) gain = gain + accum;
-	if (gain < 1) gain = 1;
-	return out;
-}
+// The old gain-increase-only AGC algorithm (process_agc_fast, ~30dB range, slow attack)
+// was removed 2026-07-06 — this build has a single AGC: the M0PUB algorithm below.
 
 // Contribution by Alan, M0PUB: Experimental new AGC algorithm.
 // ASSUMES: Input sample values are constrained to a maximum of +/-4096 to avoid integer overflow in earlier
@@ -2731,6 +2724,11 @@ static uint16_t decayCount = DECAY_FACTOR;
 #define HI(x)  ((x) >> 8)
 #define LO(x)  ((x) & 0xFF)
 
+// AGC target level ("AGC level" menu item, Slow mode only): the algorithm keeps output
+// peaks inside the window [agc_lvl*256 .. agc_lvl*384]. Default 4 reproduces the original
+// hardcoded window of 1024..1536; higher = louder output before AGC clamps.
+volatile uint8_t agc_lvl = 4;
+
 inline int16_t process_agc(int16_t in)
 {
 	static bool small = true;
@@ -2742,11 +2740,11 @@ inline int16_t process_agc(int16_t in)
 		out = (centiGain >> 2) * (in >> 3);  // net gain < 1
 	out >>= 2;
 
-	if (HI(abs(out)) > HI(1536)) {
+	if (HI(abs(out)) > (agc_lvl + (agc_lvl >> 1))) {  // upper bound = agc_lvl*384 (default 4 -> HI(1536))
 		centiGain -= (centiGain >> 4);       // Fast attack time when big signal encountered (relies on CentiGain >= 16)
 	}
 	else {
-		if (HI(abs(out)) > HI(1024))
+		if (HI(abs(out)) > agc_lvl)          // lower bound = agc_lvl*256 (default 4 -> HI(1024))
 			small = false;
 		if (--decayCount == 0) {               // But slow ramp up of gain when signal disappears
 			if (small) {                         // 400 samples below lower threshold - increase gain
@@ -3249,7 +3247,7 @@ inline int16_t slow_dsp(int16_t i_ac2, int16_t q_ac2)
 				ac = ac - dc;
 		*/
 		static int16_t as_last;   // GW8RDI mod - replaced LP filter: DC removal done in sdr_rx()
-		int16_t as = ac + (int16_t)((float)as_last * 0.9999f); // Reduce from 0.9999f for less bass response
+		int16_t as = ac + (int16_t)(((int32_t)as_last * 32765L) >> 15); // Q15 for the old 0.9999f pole (32765/32768) — integer keeps this per-sample path float-free (a float multiply costs ~100 cycles on AVR); lower the coefficient for less bass response
 		ac = as - as_last;
 		as_last = as;
 
@@ -3304,19 +3302,9 @@ inline int16_t slow_dsp(int16_t i_ac2, int16_t q_ac2)
 	if (!(absavg256cnt--)) { _absavg256 = absavg256; absavg256 = 0; }   // Set S-Meter level
 	else absavg256 += abs(acm); // G8RDI mod - acm
 
-#ifdef FAST_AGC
-	if (agc == 2) {
+	if (agc) {
 		ac = process_agc(ac);
 		ac = ac >> (16 - volume);
-	}
-	else if (agc == 1) {
-		ac = process_agc_fast(ac);
-		ac = ac >> (16 - volume);
-#else
-	if (agc == 1) {
-		ac = process_agc_fast(ac);
-		ac = ac >> (16 - volume);
-#endif //!FAST_AGC
 	}
 	else {
 		//ac = ac >> (16-volume);
@@ -4209,10 +4197,8 @@ volatile bool change = true;
 volatile bool changedMode = 0;
 volatile bool changedModeCAT = 0;
 volatile int32_t freq = 14000000;
-static int32_t vfo[] = { 7074000, 14074000 };
-static uint8_t vfomode[] = { USB, USB };  // default both VFOs to USB
-enum vfo_t { VFOA = 0, VFOB = 1, SPLIT = 2 };
-volatile uint8_t vfosel = VFOA;
+// VFO B / Split removed 2026-07-06: single-VFO rig (CAT tunes `freq` directly via FA;).
+// FREQA/MODEA persist the live freq/mode; FREQB/MODEB param slots were dropped.
 volatile int32_t rit = 0;	// GW8RDI mod - changed to int32_t from int16_t
 #ifdef CAT_XO_CMD
 volatile int32_t tit = 0;	// GW8RDI mod - added Transit offset, used with Quantum Spectrum module
@@ -4237,10 +4223,25 @@ int16_t smeter(int16_t ref = 0)
 	// activity — see cat_active handling). Only the LCD writes below stay
 	// gated on smode, since those are purely a display concern.
 	if ((++smeter_cnt % 2048) == 0) {   // slowed down display slightly
-		float rms = (float)max_absavg256 * (float)(1 << att2);
-		if (dsp_cap == SDR) rms /= (256.0 * 1024.0 * (float)R * 8.0 * 500.0 * 1.414 / (0.707 * 1.1));   // = -98.8dB  1 rx gain stage: rmsV = ADC value * AREF / [ADC DR * processing gain * receiver gain * "RMS compensation"]
-		else               rms /= (256.0 * 1024.0 * (float)R * 2.0 * 100.0 * 120.0 / (1.750 * 5.0));   // = -94.6dB
-		dbm = 10 * log10((rms * rms) / 50) + 30 - ref; //from rmsV to dBm at 50R
+		// Integer dBm (2026-07-06): replaces the old float+log10 version — dropping the
+		// only libm log10 user (and, with the other two float sites converted, the whole
+		// float-support library) from the build. Same math, log2-based:
+		//   dbm = 20*log10(rms) + 13.01,  rms = max_absavg256 * 2^att2 / K
+		//       = 6.0206 * log2(max_absavg256 * 2^att2) - (20*log10(K) - 13.01)
+		// K(SDR)    = 256*1024*R*8*500*1.414/(0.707*1.1) = 7.63e9 -> constant -184
+		// K(analog) = 256*1024*R*2*100*120/(1.750*5.0)   = 2.88e9 -> constant -175
+		// (constants tuned +1 vs the exact -184.6/-175.6 to match the old float
+		// version's truncation-toward-zero of negative dBm; validated numerically
+		// against the float formula: 60% exact, rest within +/-1 dB)
+		// log2 in 1/16 steps (0.376 dB granularity) via MSB position + 4 mantissa bits.
+		uint32_t x = max_absavg256 * (uint32_t)(1UL << att2);
+		if (!x) x = 1;
+		uint8_t msb = 0; for (uint32_t v = x; v >>= 1;) msb++;
+		static const uint8_t log2frac16[16] PROGMEM = { 0, 1, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 15 }; // round(16*log2(1 + i/16))
+		uint8_t frac = (msb >= 4) ? (x >> (msb - 4)) & 0x0F : (x << (4 - msb)) & 0x0F;
+		uint16_t l2_16 = ((uint16_t)msb << 4) + pgm_read_byte(&log2frac16[frac]);
+		// 6.0206 dB/octave / 16 steps = 0.376288 ~= 385/1024
+		dbm = (int16_t)(((int32_t)l2_16 * 385 + 512) >> 10) + ((dsp_cap == SDR) ? -184 : -175) - ref;
 		max_absavg256 /= 2;  // Implement peak hold/decay for all meter types — must run every cycle regardless of smode, not just when the LCD display branches below execute
 
 		if (!smode) return dbm;
@@ -4341,6 +4342,9 @@ uint32_t semi_qsk_timeout = 0;
 // Set RX or TX mode, with RIT support and CW offset
 void switch_rxtx(uint8_t tx_enable)
 {
+#ifndef AM_FM_TX
+	if (tx_enable && (mode != LSB) && (mode != USB)) return;  // Only SSB can key TX in this build: AM/FM/CW are RX-only (listening) modes — never transmit over the station being received, whether from PTT or CAT TX;. All TX audio comes from an external source via the mic input (digital modes).
+#endif //!AM_FM_TX
 	//GW8RDI - NOTE: Best use the PA line to trigger the Spectrum mode instead of CAT as gives near instant audio control. TX RFI can interfere with RS232 as TX starts to xmit.
 #ifdef CAT_TX_CMD
   if (cat_enabled && mode != CW)  // To mute Spectrum DSP audio in CW mode connect the PA line to the Spectrum module PA input.
@@ -4400,9 +4404,15 @@ void switch_rxtx(uint8_t tx_enable)
 		{
       case USB:
       case LSB: func_ptr = dsp_tx; break;
+#ifdef CW_TX
 		  case CW:  func_ptr = dsp_tx_cw; break;
+#endif //CW_TX
+#ifdef AM_FM_TX
 		  case AM:  func_ptr = dsp_tx_am; break;
 		  case FM:  func_ptr = dsp_tx_fm; break;
+#else
+		  default:  func_ptr = dsp_tx; break;  // unreachable (AM/FM TX blocked at function entry) but func_ptr must never be left unset during TX
+#endif //AM_FM_TX
 		}
 	}
 	else
@@ -4454,10 +4464,12 @@ void switch_rxtx(uint8_t tx_enable)
 
 			lcd.setCursor(15, 1); lcd.print('T');   // Show Transmitting on LCD
 
+#ifdef CW_TX
 			if (mode == CW)
 			{
 				si5351.freq_calc_fast(-cw_offset); si5351.SendPLLRegisterBulk();
 			} // for CW, TX at freq
+#endif //CW_TX (CW is RX-only in this build — TX in CW mode is blocked at function entry)
 #ifdef RIT_ENABLE   // GW8RDI mod - restore freq
 			else
 			{
@@ -4644,8 +4656,7 @@ void show_banner() {
 	lcd.print('\x01'); lcd_blanks(); lcd_blanks();
 }
 
-const char* vfosel_label[] = { "A", "B"/*, "Split"*/ };
-///const char* vfosel_label[] = { "A", "B", "Split" };   // GW8RDI note - to add Split to the menu, will need a control adding to show mode, and change receive offset (int16_t rit)
+//const char* vfosel_label[] = { "A", "B"/*, "Split"*/ };  // removed with VFO B/Split
 const char* mode_label[5] = { "LSB", "USB", "CW ", "FM ", "AM " };
 
 // Display frequency on LCD.  If RIT is enabled, displays just the receiver offset unless in TX
@@ -4653,7 +4664,7 @@ inline void display_vfo(int32_t f)
 {
 	lcd.setCursor(0, 1);
 
-	lcd.print((rit) ? ' ' : ((vfosel % 2) | ((vfosel == SPLIT) & tx)) ? '\x07' : '\x06');  // RIT, VFO A/B
+	lcd.print('\x06');  // single-VFO build: always the VFO-A glyph (RIT and VFO B removed)
 
 #ifdef CAT_XO_CMD
 	if (tx && tit != 0)	// GW8RDI mod - TX offset
@@ -4823,7 +4834,7 @@ static uint8_t vox_sample = 0;
 static uint16_t vox_adc = 0;
 
 static uint8_t pwm_min = 10;
-static uint8_t pwm_max = 160;  // PWM value for which PA reaches its maximum: 128 for BS170, 160 for IRFI510G
+static uint8_t pwm_max = 130;  // PWM value for which PA reaches its maximum: 128 for BS170, 160 for IRFI510G; 130 default for this BLACK_BRICK unit (PU7FTW 2026-07-06)
 
 const char* offon_label[2] = { "OFF", "ON" };
 #if(F_MCU > 16000000)
@@ -4854,17 +4865,17 @@ const char* cw_tone_label[] = { "700", "600" };
 #ifdef KEYER
 const char* keyer_mode_label[] = { "IambicA", "IambicB","Straight" };  // GW8RDI mod - byte saving was "Iambic A"
 #endif
-const char* agc_label[] = { "OFF", "Fast", "Slow" };
+//const char* agc_label[] = { "OFF", "Fast", "Slow" };  // removed with the two-algorithm AGC — plain offon_label is used now
 
 #define _N(a) sizeof(a)/sizeof(a[0])
 
 #define N_PARAMS 44  // last visible menu param enum value (BACKL=44); update when adding/removing menu items
 #ifdef KEEP_BAND_DATA
 #define I_PARAMS 5+9
-enum params_t { _NULL, VOLUME, MODE, FILTER, BAND, STEP, VFOSEL, RIT, AGC, NR, ATT, ATT2, SMETER, CWDEC, CWTONE, CWOFF, KEY_WPM, KEY_MODE, KEY_PIN, TONE_VOL, VOX, VOXGAIN, DRIVE, TXDELAY, MOX, CWINTERVAL, CWMSG1, CWMSG2, CWMSG3, CWMSG4, CWMSG5, CWMSG6, PWM_MIN, PWM_MAX, SIFXTAL, IQ_ADJ, CAT_ACTIVE, CAT_BAUD, CALIB, SR, CPULOAD, PARAM_A, PARAM_B, PARAM_C, BACKL, FREQA, FREQB, MODEA, MODEB, VERS, BAND_DATA0, BAND_DATA1, BAND_DATA2, BAND_DATA3, BAND_DATA4, BAND_DATA5, BAND_DATA6, BAND_DATA7, BAND_DATA8, ALL = 0xff };
+enum params_t { _NULL, VOLUME, MODE, FILTER, BAND, STEP, VFOSEL, RIT, AGC, AGC_LVL, NR, ATT, ATT2, SMETER, CWDEC, CWTONE, CWOFF, KEY_WPM, KEY_MODE, KEY_PIN, TONE_VOL, VOX, VOXGAIN, DRIVE, TXDELAY, MOX, CWINTERVAL, CWMSG1, CWMSG2, CWMSG3, CWMSG4, CWMSG5, CWMSG6, PWM_MIN, PWM_MAX, SIFXTAL, IQ_ADJ, CAT_ACTIVE, CAT_BAUD, CALIB, SR, CPULOAD, PARAM_A, PARAM_B, PARAM_C, BACKL, FREQA, FREQB, MODEA, MODEB, VERS, BAND_DATA0, BAND_DATA1, BAND_DATA2, BAND_DATA3, BAND_DATA4, BAND_DATA5, BAND_DATA6, BAND_DATA7, BAND_DATA8, ALL = 0xff };
 #else
 #define I_PARAMS 5
-enum params_t { _NULL, VOLUME, MODE, FILTER, BAND, STEP, VFOSEL, RIT, AGC, NR, ATT, ATT2, SMETER, CWDEC, CWTONE, CWOFF, KEY_WPM, KEY_MODE, KEY_PIN, TONE_VOL, VOX, VOXGAIN, DRIVE, TXDELAY, MOX, CWINTERVAL, CWMSG1, CWMSG2, CWMSG3, CWMSG4, CWMSG5, CWMSG6, PWM_MIN, PWM_MAX, SIFXTAL, IQ_ADJ, CAT_ACTIVE, CAT_BAUD, CALIB, SR, CPULOAD, PARAM_A, PARAM_B, PARAM_C, BACKL, FREQA, FREQB, MODEA, MODEB, VERS, ALL = 0xff };
+enum params_t { _NULL, VOLUME, MODE, FILTER, BAND, STEP, VFOSEL, RIT, AGC, AGC_LVL, NR, ATT, ATT2, SMETER, CWDEC, CWTONE, CWOFF, KEY_WPM, KEY_MODE, KEY_PIN, TONE_VOL, VOX, VOXGAIN, DRIVE, TXDELAY, MOX, CWINTERVAL, CWMSG1, CWMSG2, CWMSG3, CWMSG4, CWMSG5, CWMSG6, PWM_MIN, PWM_MAX, SIFXTAL, IQ_ADJ, CAT_ACTIVE, CAT_BAUD, CALIB, SR, CPULOAD, PARAM_A, PARAM_B, PARAM_C, BACKL, FREQA, FREQB, MODEA, MODEB, VERS, ALL = 0xff };
 #endif
 #define N_ALL_PARAMS (N_PARAMS+I_PARAMS)  // number of parameters
 
@@ -4877,20 +4888,17 @@ int8_t paramAction(uint8_t action, uint8_t id = ALL)  // list of parameters
 	if (id == ALL) for (id = 1; id != N_ALL_PARAMS + 1; id++) paramAction(action, id);  // for all parameters
 
 	switch (id) {    // Visible parameters
-	case VOLUME:  paramAction(action, volume, 0x11, F("Vol"), NULL, -1, 16, false); break;  // GW8RDI mod - "Volume"
+	case VOLUME:  paramAction(action, volume, 0x11, F("Volume"), NULL, -1, 16, false); break;
 	case MODE:    paramAction(action, mode, 0x12, F("Mode"), mode_label, 0, _N(mode_label) - 1, false); break;
 	case FILTER:  paramAction(action, filt, 0x13, F("FilterBW"), filt_label, 0, _N(filt_label) - 1, false); break;
 	case BAND:    paramAction(action, bandval, 0x14, F("Band"), band_label, 1, _N(band_label) - 2, false); break;
 	case STEP:    paramAction(action, stepsize, 0x15, F("Tune Rate"), stepsize_label, 0, _N(stepsize_label) - 1, false); break;
-	case VFOSEL:  paramAction(action, vfosel, 0x16, F("VFO Mode"), vfosel_label, 0, _N(vfosel_label) - 1, false); break;
+	// VFOSEL menu removed 2026-07-06 (single-VFO build)
 #ifdef RIT_ENABLE
 	case RIT:     paramAction(action, rit, 0x17, F("RIT"), offon_label, 0, 1, false); break;
 #endif
-#ifdef FAST_AGC
-	case AGC:     paramAction(action, agc, 0x18, F("AGC"), agc_label, 0, _N(agc_label) - 1, false); break;
-#else
-	case AGC:     paramAction(action, agc, 0x18, F("AGC"), offon_label, 0, 1, false); break;
-#endif // FAST_AGC
+	case AGC:     paramAction(action, agc, 0x17, F("AGC"), offon_label, 0, 1, false); break;  // moved to menu 1.7 (freed by RIT removal) so AGC level can sit next to it; ON = M0PUB slow-decay algorithm
+	case AGC_LVL: paramAction(action, agc_lvl, 0x18, F("AGC level"), NULL, 1, 14, false); break;  // AGC target level: output peaks held in [lvl*256 .. lvl*384]; default 4 = original 1024..1536 window
 #ifdef NR_FIR
 	case NR:
 		if ((int32_t)nr + encoder_val < 3)
@@ -4898,15 +4906,15 @@ int8_t paramAction(uint8_t action, uint8_t id = ALL)  // list of parameters
 		else
 			paramAction(action, nr, 0x19, F("DSP NR"), NULL, 0, 8, false);
 #else
-	case NR:      paramAction(action, nr, 0x19, F("NR"), NULL, 0, 8, false);
+	case NR:      paramAction(action, nr, 0x19, F("Noise Reduce"), NULL, 0, 8, false);  // 12 chars = exact visible fit after the "1.9 " menu prefix on the 16x2 LCD ("Noise reduction" would truncate)
 #endif
 #ifdef NR_FIR
 		if (nr > 2)
 			FirFilterSetup(7 + (((nr - 2) - 1) * 2), filt_val[filt], F_SAMP_RX / 8);  // GW8RDI mod
 #endif
 		break;
-	case ATT:     paramAction(action, att, 0x1A, F("ATT"), att_label, 0, 7, false); break;
-	case ATT2:    paramAction(action, att2, 0x1B, F("ATT2"), NULL, 0, 16, false); break;
+	case ATT:     paramAction(action, att, 0x1A, F("Analog Att"), att_label, 0, 7, false); break;   // menu 1.10: 5-char prefix leaves 11 visible chars — "Analog attenuation" would truncate
+	case ATT2:    paramAction(action, att2, 0x1B, F("Digital Att"), NULL, 0, 16, false); break;     // menu 1.11: 11 chars = exact visible fit
 	case SMETER:  paramAction(action, smode, 0x1C, F("S-Meter"), smode_label, 0, _N(smode_label) - 1, false); break;
 #ifdef CW_DECODER
 	case CWDEC:   paramAction(action, cwdec, 0x21, F("CW Decoder"), offon_label, 0, 1, false); break;
@@ -4949,8 +4957,7 @@ int8_t paramAction(uint8_t action, uint8_t id = ALL)  // list of parameters
 #endif
 #endif
 	case PWM_MIN: paramAction(action, pwm_min, 0x81, F("PA bias min"), NULL, 0, pwm_max - 1, false); break;
-	case PWM_MAX: paramAction(action, pwm_max, 0x82, F("PA max"), NULL, pwm_min, 255, false); break;
-  ///case PWM_MAX: paramAction(action, pwm_max, 0x82, F("PA Bias max"), NULL, pwm_min, 255, false); break;
+	case PWM_MAX: paramAction(action, pwm_max, 0x82, F("PA bias max"), NULL, pwm_min, 255, false); break;
 	case SIFXTAL: paramAction(action, si5351.fxtal, 0x83, F("Ref frq"), NULL, 14000000, 28000000, false); break;
 	case IQ_ADJ:  paramAction(action, rx_ph_q, 0x84, F("IQ phase"), NULL, 0, 180, false); break;
 #ifdef CAL_IQ
@@ -4971,10 +4978,8 @@ int8_t paramAction(uint8_t action, uint8_t id = ALL)  // list of parameters
 #endif
 	case BACKL:   paramAction(action, backlight, 0xA1, F("Light"), offon_label, 0, 1, false); break;   // GW8RDI "Backlight" workaround for varying N_PARAM and not being able to overflowing default cases properly
 		// Invisible parameters
-	case FREQA:   paramAction(action, vfo[VFOA], 0, NULL, NULL, 0, 0, false); break;
-	case FREQB:   paramAction(action, vfo[VFOB], 0, NULL, NULL, 0, 0, false); break;
-	case MODEA:   paramAction(action, vfomode[VFOA], 0, NULL, NULL, 0, 0, false); break;
-	case MODEB:   paramAction(action, vfomode[VFOB], 0, NULL, NULL, 0, 0, false); break;
+	case FREQA:   paramAction(action, freq, 0, NULL, NULL, 0, 0, false); break;  // single-VFO: persists the live frequency directly
+	case MODEA:   paramAction(action, mode, 0, NULL, NULL, 0, 0, false); break;  // single-VFO: persists the live mode directly (FREQB/MODEB dropped)
 	case VERS:    paramAction(action, eeprom_version, 0, NULL, NULL, 0, 0, false); break;
 /* #ifdef KEEP_BAND_DATA
 	case BAND_DATA0:      // G8RDI mod - added
@@ -5099,6 +5104,8 @@ void analyseCATcmd()    // Supported Kenwood TS-480 protocol CAT commands
 	else if (CMD('T','X','2'))                              Command_TX2();
 	else if (CMD4('A','G','0',';'))                         Command_AG0_GET();
 	else if (CMD('A','G','0') && CATcmd[4]==';')            Command_AG0_SET();
+	else if (CMD('A','L',';'))                              Command_AL_GET();
+	else if (CMD2('A','L') && CATcmd[2]!=';')              Command_AL_SET();
 	else if (CMD('F','W',';'))                              Command_FW_GET();
 	else if (CMD2('F','W') && CATcmd[3]==';')               Command_FW_SET();
 	else if (CMD('X','T','1'))                              Command_XT1();
@@ -5165,7 +5172,7 @@ void serialEvent() {
 			CATcmd[cat_ptr] = '\0'; // terminate the array
 			cat_ptr = 0;            // reset for next CAT command
 #ifdef _SERIAL
-			if (!cat_active) { cat_active = 1; smode = 0; } // disable smeter to reduce display activity
+			if (!cat_active) { cat_active = 1; } // was also forcing smode = 0 here to reduce display activity, but smode never got restored, so the LCD S-meter/dBm field froze permanently once CAT started polling (dbm itself keeps updating live for SM; regardless of smode, see smeter() comment)
 #endif
 			analyseCATcmd();
 			delay(10);
@@ -5440,14 +5447,31 @@ void Command_VO_SET()
 void Command_AG0_GET()
 {
 	char buf[6];
-	sprintf(buf, "AG0%u;", (uint8_t)agc);  // 0=OFF 1=Fast 2=Slow
+	sprintf(buf, "AG0%u;", (uint8_t)agc);  // 0=OFF 1=ON (M0PUB slow-decay AGC; the old 2=Slow tri-state is gone)
 	Serial.print(buf);
 }
 void Command_AG0_SET()
 {
 	uint8_t v = CATcmd[3] - '0';
-	if (v <= 2) { agc = v; paramAction(SAVE, AGC); }
+	if (v <= 1) { agc = v; paramAction(SAVE, AGC); }
 	Command_AG0_GET();
+}
+
+// AL; → get AGC level, ALn; → set AGC level (1..14). Target window for the AGC:
+// output peaks held between level*256 and level*384 (default 4 = 1024..1536).
+// Plain variable read in slow_dsp()'s process_agc() every sample — no hardware
+// re-apply needed (same live-variable pattern as DR/A2).
+void Command_AL_GET()
+{
+	char buf[7];
+	sprintf(buf, "AL%u;", (uint8_t)agc_lvl);
+	Serial.print(buf);
+}
+void Command_AL_SET()
+{
+	uint8_t v = (uint8_t)atoi(CATcmd + 2);
+	if (v >= 1 && v <= 14) { agc_lvl = v; paramAction(SAVE, AGC_LVL); }
+	Command_AL_GET();
 }
 
 // FW; → get filter index (0..7), FWn; → set filter index
@@ -5894,8 +5918,7 @@ void setup()
 	vox = false;  // disable VOX
 	//nr = 2; // set 2 default / 0 disable NR
 	rit = false;  // disable RIT
-	freq = vfo[vfosel % 2];
-	mode = vfomode[vfosel % 2];
+	// single-VFO: freq/mode were already populated by paramAction(LOAD, ALL) via FREQA/MODEA
 
 #ifdef NR_FIR
 	if (nr > 2)
@@ -6191,8 +6214,7 @@ void loop()
 				filt = prev_filt[mode == CW];  // backup filter setting for previous mode, restore previous filter setting for current selected mode; filter settings captured for either CQ or other modes.
 #endif
 				//paramAction(UPDATE, MODE);
-				vfomode[vfosel % 2] = mode;
-				paramAction(SAVE, (vfosel % 2) ? MODEB : MODEA);  // save vfoa/b changes
+				paramAction(SAVE, MODEA);  // single-VFO: persist mode
 				paramAction(SAVE, MODE);
 				paramAction(SAVE, FILTER);
 				si5351.iqmsa = 0;  // enforce PLL reset
@@ -6250,21 +6272,8 @@ void loop()
 				//for(;micros() < next;);  next = micros() + 16;   // sync every 1000000/62500=16ms (or later if missed)
 			} //
 #endif //SIMPLE_RX
-#ifdef RIT_ENABLE
-			rit = !rit;
-			stepsize = (rit) ? STEP_10 : prev_stepsize[mode == CW];
-			if (!rit) {  // after RIT comes VFO A/B swap
-#else
-			{
-#endif //RIT_ENABLE
-        vfosel = !vfosel;
-        freq = vfo[vfosel % 2];  // todo: share code with menumode
-        mode = vfomode[vfosel % 2];
-        // make more generic: 
-        if (mode != CW) stepsize = STEP_1k; else stepsize = STEP_500;
-        if (mode == CW) { filt = 4; nr = 0; }
-        else filt = 0;
-			}
+			// RIT toggle and VFO A/B swap removed 2026-07-06 (single-VFO build) — this
+			// double-click is now a no-op apart from a display refresh.
 				change = true;
 				break;
 				//#define TUNING_DIAL  1
@@ -6300,8 +6309,8 @@ void loop()
 			prev_mode = mode;
 			if (bandval > 0 && bandval <= BANDCOUNT)   // bandval 1-5/8 (0 is 6m, 9 is 160m)
 			{
-				freq_last[bandval - 1] = freq;  //vfo[vfosel % 2]    // G8RDI mod - Save freq and mode last used on this band
-				mode_last[bandval - 1] = vfomode[vfosel % 2];
+				freq_last[bandval - 1] = freq;    // G8RDI mod - Save freq and mode last used on this band
+				mode_last[bandval - 1] = mode;
 			}
 #ifdef DEBUG_G8RDI
 			else
@@ -6379,8 +6388,7 @@ void loop()
 				prev_filt[prev_mode == CW] = filt; filt = prev_filt[mode == CW];  // backup filter setting for previous mode, restore previous filter setting for current selected mode; filter settings captured for either CQ or other modes.
 #endif
 				//paramAction(UPDATE, MODE);
-				vfomode[vfosel % 2] = mode;
-				paramAction(SAVE, (vfosel % 2) ? MODEB : MODEA);  // save vfoa/b changes
+				paramAction(SAVE, MODEA);  // single-VFO: persist mode
 				paramAction(SAVE, MODE);
 				paramAction(SAVE, FILTER);
 				si5351.iqmsa = 0;  // enforce PLL reset
@@ -6473,8 +6481,7 @@ void loop()
         filt = prev_filt[mode == CW];  // backup filter setting for previous mode, restore previous filter setting for current selected mode; filter settings captured for either CQ or other modes.
 #endif
         //paramAction(UPDATE, MODE);
-        vfomode[vfosel % 2] = mode;
-        paramAction(SAVE, (vfosel % 2) ? MODEB : MODEA);  // save vfoa/b changes
+        paramAction(SAVE, MODEA);  // single-VFO: persist mode
         paramAction(SAVE, MODE);
         paramAction(SAVE, FILTER);
         si5351.iqmsa = 0;  // enforce PLL reset
@@ -6517,8 +6524,7 @@ void loop()
 			if (encoder_change) {
 				lcd.setCursor(0, 1); lcd.cursor();  // edits menu item value; make cursor visible
 				if (menu == MODE) { // post-handling Mode parameter
-					vfomode[vfosel % 2] = mode;
-					paramAction(SAVE, (vfosel % 2) ? MODEB : MODEA);  // save vfoa/b changes
+					paramAction(SAVE, MODEA);  // single-VFO: persist mode
 					change = true;
 					si5351.iqmsa = 0;  // enforce PLL reset
 					// make more generic: 
@@ -6530,15 +6536,7 @@ void loop()
 					change = true;
 				}
 				//if(menu == NR){ if(mode == CW) nr = false; }
-				if (menu == VFOSEL) {
-					freq = vfo[vfosel % 2];
-					mode = vfomode[vfosel % 2];
-					// make more generic: 
-					if (mode != CW) stepsize = STEP_1k; else stepsize = STEP_500;
-					if (mode == CW) { filt = 4; nr = 0; }
-					else filt = 0;
-					change = true;
-				}
+				// menu == VFOSEL post-handler removed 2026-07-06 (single-VFO build)
 #ifdef RIT_ENABLE
 				if (menu == RIT) {
 					stepsize = (rit) ? STEP_10 : STEP_500;
@@ -6662,14 +6660,12 @@ void loop()
 			freq = band[bandval];   // Change to new band freq start
 #endif
 			//paramAction(UPDATE, MODE);
-			vfomode[vfosel % 2] = mode;
-			paramAction(SAVE, (vfosel % 2) ? MODEB : MODEA);  // save vfoa/b changes
+			paramAction(SAVE, MODEA);  // single-VFO: persist mode
 			paramAction(SAVE, MODE);
 			paramAction(SAVE, FILTER);
 			si5351.iqmsa = 0;  // enforce PLL reset
 		}
 
-		vfo[vfosel % 2] = freq;
 		//save_event_time = millis() + 1000;  // schedule time to save freq (no save while tuning, hence no EEPROM wear out - G8RDI "Datasheet: Write/erase cycles: 10,000 flash/100,000 EEPROM")
 		save_event_time = millis() + 2000;  // G8RDI mod - increased to 2 seconds // schedule time to save freq (no save while tuning, hence no EEPROM wear out - G8RDI "Datasheet: Write/erase cycles: 10,000 flash/100,000 EEPROM")
 
@@ -6706,11 +6702,11 @@ void loop()
 	}
 
 	if (save_event_time && (millis() > save_event_time)) {  // save freq when time has reached schedule - reduce EEPROM writes as 10k limit to burnout (G8RDI)!
-		paramAction(SAVE, (vfosel % 2) ? FREQB : FREQA);  // save vfoa/b changes
+		paramAction(SAVE, FREQA);  // single-VFO: persist frequency
 
 #ifdef KEEP_BAND_DATA  // G8RDI mod
-		freq_last[bandval - 1] = vfo[vfosel % 2];       // = freq;
-		mode_last[bandval - 1] = vfomode[vfosel % 2];   // = mode;
+		freq_last[bandval - 1] = freq;
+		mode_last[bandval - 1] = mode;
 
 /* 230401
 		switch (bandval - 1)    // G8RDI mod - added Save only changed
