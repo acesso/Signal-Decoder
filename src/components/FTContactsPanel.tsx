@@ -19,6 +19,17 @@ const CARD_GAP_H = 6;
 const COLLAPSED_CARD_H = 30 + CARD_GAP_H;
 const EXPANDED_CARD_FALLBACK_H = 420;
 
+// Map day/night overlay preference — a UI-only toggle, remembered per browser
+// so it doesn't reset to off every time the page loads.
+const LS_SHOW_TERMINATOR = 'ft_map_show_terminator';
+function loadShowTerminator(): boolean {
+  if (typeof window === 'undefined') return false;
+  return localStorage.getItem(LS_SHOW_TERMINATOR) === 'true';
+}
+function saveShowTerminator(v: boolean) {
+  if (typeof window !== 'undefined') localStorage.setItem(LS_SHOW_TERMINATOR, String(v));
+}
+
 // Format a stored absolute frequency. Values > 1 MHz are already absolute (VFO
 // was set at decode time); smaller values are raw audio offsets (no VFO then).
 function formatMsgFreq(freq: number): string {
@@ -555,6 +566,7 @@ export default function FTContactsPanel({ contacts, mode, myCall = '', myGrid = 
   const [quickFilter,    setQuickFilter]   = useState<QuickFilter | null>(null);
   const [countryFilter,  setCountryFilter] = useState<string>(''); // country code or ''
   const [mapHeight,     setMapHeight]     = useState(160);
+  const [showTerminator, setShowTerminator] = useState(loadShowTerminator);
   const panelRef    = useRef<HTMLDivElement>(null);
   const mapDragRef  = useRef<{ startY: number; startH: number } | null>(null);
 
@@ -818,12 +830,25 @@ export default function FTContactsPanel({ contacts, mode, myCall = '', myGrid = 
       <div className="shrink-0 mb-0">
         <div className="text-[10px] text-[#484f58] font-mono mb-1 flex items-center justify-between">
           <span>World Map</span>
-          <span className="text-[#30363d]">
-            {withLocation > 0 ? `${withLocation} located` : 'no positions yet'}
-          </span>
+          <div className="flex items-center gap-1.5">
+            <button
+              onClick={() => setShowTerminator(v => { saveShowTerminator(!v); return !v; })}
+              title={showTerminator ? 'Hide day/night shading' : 'Show day/night shading'}
+              className={`text-[9px] font-mono px-1.5 py-0.5 rounded border transition-colors ${
+                showTerminator
+                  ? 'border-[#2ea043]/50 text-[#2ea043] bg-[#2ea043]/10'
+                  : 'border-[#30363d] text-[#8b949e] hover:text-[#c9d1d9]'
+              }`}
+            >
+              🌓 day/night
+            </button>
+            <span className="text-[#30363d]">
+              {withLocation > 0 ? `${withLocation} located` : 'no positions yet'}
+            </span>
+          </div>
         </div>
         <div className="rounded overflow-hidden border border-[#21262d]" style={{ height: mapHeight }}>
-          <FTLeafletMap contacts={contacts} onSelect={select} selected={expanded} />
+          <FTLeafletMap contacts={contacts} onSelect={select} selected={expanded} showTerminator={showTerminator} />
         </div>
         {/* Drag handle to resize map */}
         <div

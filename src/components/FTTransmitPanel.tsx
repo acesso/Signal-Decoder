@@ -350,7 +350,7 @@ export default function FTTransmitPanel({ mode, contacts, vfoFrequency = 0, onMy
   const [isRunning, setIsRunning]  = useState(false);
   const [geoStatus, setGeoStatus]  = useState<'idle' | 'loading' | 'done' | 'denied'>('idle');
 
-  const { state, start, stop, enqueue, enqueueFirst, dequeue, moveUp, setAutoCQ, setAutoCQMessage, setOutputDevice, setTxGain, setAutoPTT, setAllowConsecutiveTx, clearSent } =
+  const { state, start, stop, enqueue, enqueueFirst, dequeue, moveUp, setAutoCQ, setAutoCQIntervalMin, setAutoCQMessage, setOutputDevice, setTxGain, setAutoPTT, setAllowConsecutiveTx, clearSent } =
     useFTTransmit(mode, baseFreq, vfoFrequency, onSetPTT);
 
   // Register clearSent with parent so the global Reset button can clear TX history
@@ -664,6 +664,16 @@ export default function FTTransmitPanel({ mode, contacts, vfoFrequency = 0, onMy
               </div>
               <span className="text-[10px] text-[#8b949e] whitespace-nowrap">Auto-CQ</span>
             </div>
+            {/* Auto-CQ interval — minimum minutes between unattended CQ transmissions */}
+            <div className={`flex items-center gap-1 ${!state.autoCQ ? 'opacity-40' : ''}`}
+              title="Minimum time between automatic CQ transmissions">
+              <input type="number" value={state.autoCQIntervalMin}
+                onChange={e => setAutoCQIntervalMin(Number(e.target.value))}
+                disabled={!state.autoCQ}
+                min={1} max={60} step={1}
+                className="bg-[#0d1117] border border-[#30363d] rounded px-1.5 py-1 text-xs font-mono text-[#c9d1d9] w-12 focus:outline-none focus:border-[#388bfd] disabled:cursor-not-allowed" />
+              <span className="text-[10px] text-[#8b949e] whitespace-nowrap">min</span>
+            </div>
             {/* Auto-PTT */}
             <div onClick={() => setAutoPTT(!state.autoPTT)}
               title={onSetPTT ? 'Automatically key radio PTT via CAT while transmitting' : 'Auto-PTT requires CAT connection'}
@@ -952,7 +962,7 @@ export default function FTTransmitPanel({ mode, contacts, vfoFrequency = 0, onMy
               </span>
               <div className="flex-1 min-w-0">
                 <div className="font-mono text-xs text-[#c9d1d9] truncate">{buildFTMessage('cq', myCall.toUpperCase(), '', undefined, myGrid.toUpperCase())}</div>
-                <div className="text-[#484f58] text-[10px]">Auto-CQ · repeats every eligible window</div>
+                <div className="text-[#484f58] text-[10px]">Auto-CQ · every {state.autoCQIntervalMin} min</div>
               </div>
               <button onClick={() => setAutoCQ(false)}
                 className="text-[#484f58] hover:text-[#f85149] text-xs px-1 shrink-0" title="Disable Auto-CQ">✕</button>
