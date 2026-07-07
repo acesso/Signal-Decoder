@@ -302,11 +302,11 @@ describe('response parsing — custom BLACK_BRICK commands', () => {
 });
 
 describe('multi-command / batched poll parsing', () => {
-  const BATCH_RESPONSE = 'FA00014225000;MD2;AG01;FW3;VO8;AT2;A216;NR4;SM-68;DR5;BL1;AL4;TT180;';
+  const BATCH_RESPONSE = 'FA00014225000;MD2;AG01;FW3;VO8;AT2;A216;NR4;SM-68;DR5;BL1;AL4;';
 
-  test('splitFrames — all 13 frames', () => {
+  test('splitFrames — all 12 frames', () => {
     const frames = splitFrames(BATCH_RESPONSE);
-    expect(frames).toHaveLength(13);
+    expect(frames).toHaveLength(12);
     expect(frames[0]).toBe('FA00014225000;');
     expect(frames[1]).toBe('MD2;');
     expect(frames[2]).toBe('AG01;');
@@ -398,10 +398,10 @@ describe('IF frame parsing', () => {
 });
 
 describe('BLACKBRICK_POLL_CMDS array', () => {
-  const BLACKBRICK_POLL_CMDS = ['FA;', 'MD;', 'AG0;', 'FW;', 'VO;', 'AT;', 'A2;', 'NR;', 'SM;', 'DR;', 'BL;', 'AL;', 'TT;'];
+  const BLACKBRICK_POLL_CMDS = ['FA;', 'MD;', 'AG0;', 'FW;', 'VO;', 'AT;', 'A2;', 'NR;', 'SM;', 'DR;', 'BL;', 'AL;'];
 
-  test('13 commands in poll array', () => {
-    expect(BLACKBRICK_POLL_CMDS).toHaveLength(13);
+  test('12 commands in poll array', () => {
+    expect(BLACKBRICK_POLL_CMDS).toHaveLength(12);
   });
 
   test('AG0; is included', () => {
@@ -424,14 +424,15 @@ describe('BLACKBRICK_POLL_CMDS array', () => {
     expect(BLACKBRICK_POLL_CMDS).toContain('BL;');
   });
 
-  test('PM;/PX; are intentionally NOT polled — on-demand from the PA settings panel only', () => {
+  test('PM;/PX;/TT; are intentionally NOT polled — on-demand from the advanced settings panel only', () => {
     expect(BLACKBRICK_POLL_CMDS).not.toContain('PM;');
     expect(BLACKBRICK_POLL_CMDS).not.toContain('PX;');
+    expect(BLACKBRICK_POLL_CMDS).not.toContain('TT;');
   });
 
   test('prefixes derived from commands', () => {
     const prefixes = BLACKBRICK_POLL_CMDS.map(c => c.substring(0, 2));
-    expect(prefixes).toEqual(['FA', 'MD', 'AG', 'FW', 'VO', 'AT', 'A2', 'NR', 'SM', 'DR', 'BL', 'AL', 'TT']);
+    expect(prefixes).toEqual(['FA', 'MD', 'AG', 'FW', 'VO', 'AT', 'A2', 'NR', 'SM', 'DR', 'BL', 'AL']);
   });
 });
 
