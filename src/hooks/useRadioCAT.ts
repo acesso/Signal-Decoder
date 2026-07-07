@@ -50,7 +50,7 @@ export interface RadioState {
   error: string | null;
   /** false on SSR, true once mounted in a supporting browser */
   isSupported: boolean;
-  /** uSDX BLACK_BRICK 4.01a extension state — null unless rigProfile is 'usdx-blackbrick' */
+  /** uSDX BLACK_BRICK extension state — null unless rigProfile is 'usdx-blackbrick' */
   volume: number | null;
   att1: number | null;
   att2: number | null;
@@ -73,8 +73,12 @@ export interface RadioState {
   backlight: number | null;
   /** TX time-out timer in seconds (TT command), 0 = disabled. Firmware
    *  force-unkeys the PA when a TX exceeds this — guardrail against a stuck
-   *  PTT overheating the finals. Default 180. */
+   *  PTT overheating the finals. Default 30. */
   txTimeout: number | null;
+  /** Firmware version reported by the radio itself (FV; command, e.g. "4.01a").
+   *  null until the post-connect query answers — the UI gates the PU7FTW
+   *  extension controls on this instead of hardcoding a version anywhere. */
+  firmwareVersion: string | null;
 }
 
 /** PA bias PWM endpoints (see PM/PX commands) — not polled; fetched on demand. */
@@ -153,7 +157,7 @@ export interface RadioCATControls {
 // PTT on:      TX;                      (no echo)
 // PTT off:     RX;                      (no echo)
 
-// ── uSDX BLACK_BRICK 4.01a — PU7FTW custom extensions ────────────────────────
+// ── uSDX BLACK_BRICK — PU7FTW custom extensions ────────────────────────
 // Not part of the TS-480 spec. All SET commands echo the new value as a GET
 // reply, and are safe to include in a multi-command string (e.g. "VO;AT;A2;").
 // Query volume: VO;    → VOn;      (-1..16, -1 = mute)
@@ -173,7 +177,8 @@ export interface RadioCATControls {
 //                                   SETs are ignored, echo returns old value)
 // Query filter: FW;    → FWn;      (0=Full 1=3000 2=2400 3=1800 4=500 5=200 6=100 7=50 Hz)
 // Set filter:   FWn;   → FWn;      (n in 0..7)
-// Query S-meter: SM;   → SMn;      (signed dBm, read-only — there is no SM SET)
+// Query S-meter: SM;   → SMn;      (signed dBm, read-only — no SM SET. During TX
+//                                   replies an empty "SM;": no RX signal to measure)
 // Query TX drive: DR;  → DRn;      (0..8, linear)
 // Set TX drive:   DRn; → DRn;
 // Query backlight: BL; → BLn;      (0=off, 1=on. Physical effect confirmed after
@@ -206,6 +211,8 @@ export interface RadioCATControls {
 //                                   value. NOT polled — changing them rebuilds the
 //                                   PA PWM LUT, so they're fetched/set on demand
 //                                   from the PA settings panel only.)
+// Query firmware version: FV; → FV4.01a; (read-only — the app gates extension
+//                                   features on this instead of hardcoding)
 // Query TX timeout: TT; → TTn;    (0..255 s, 0 = disabled — TOT guardrail that
 // Set TX timeout:  TTn; → TTn;     force-unkeys a stuck TX; out-of-range SETs
 //                                   are ignored, echo returns the old value)
@@ -250,7 +257,7 @@ export function useRadioCAT(): RadioCATControls {
     ptt: false, error: null, isSupported: false,
     volume: null, att1: null, att2: null, nr: null,
     agc: null, agcLevel: null, filter: null, sMeter: null, drive: null,
-    backlight: null, txTimeout: null,
+    backlight: null, txTimeout: null, firmwareVersion: null,
   });
 
   useEffect(() => {
@@ -530,7 +537,12 @@ export function useRadioCAT(): RadioCATControls {
           const att1      = byPrefix.has('AT') ? parseIntField(byPrefix.get('AT')!, 'AT') : null;
           const att2      = byPrefix.has('A2') ? parseIntField(byPrefix.get('A2')!, 'A2') : null;
           const nr        = byPrefix.has('NR') ? parseIntField(byPrefix.get('NR')!, 'NR') : null;
-          const sMeter    = byPrefix.has('SM') ? parseIntField(byPrefix.get('SM')!, 'SM') : null;
+          // SM is special: during TX the firmware replies an empty "SM;" (nothing to
+          // measure — the ADC samples the mic). Frame present but valueless → reading
+          // is genuinely unavailable (null). Frame absent → dropped by line noise,
+          // keep the previous value.
+          const smRaw     = byPrefix.get('SM') ?? null;
+          const sMeter    = smRaw ? parseIntField(smRaw, 'SM') : null;
           const drive     = byPrefix.has('DR') ? parseIntField(byPrefix.get('DR')!, 'DR') : null;
           const backlight = byPrefix.has('BL') ? parseIntField(byPrefix.get('BL')!, 'BL') : null;
           const agcLevel  = byPrefix.has('AL') ? parseIntField(byPrefix.get('AL')!, 'AL') : null;
@@ -554,7 +566,7 @@ export function useRadioCAT(): RadioCATControls {
             drive:     drive  !== null && (now - ls.drive     > SET_GRACE_MS) ? drive  : prev.drive,
             backlight: backlight !== null && (now - ls.backlight > SET_GRACE_MS) ? backlight : prev.backlight,
             // sMeter is read-only telemetry — no grace period needed, always take the latest poll value.
-            sMeter:    sMeter !== null ? sMeter : prev.sMeter,
+            sMeter:    smRaw !== null ? sMeter : prev.sMeter,
           }));
         } else {
           const safeQuery = async (cmd: string): Promise<string> => {
@@ -609,7 +621,7 @@ export function useRadioCAT(): RadioCATControls {
     setState(prev => ({
       ...prev, connected: false, frequency: null, mode: null, ptt: false, error: null,
       volume: null, att1: null, att2: null, nr: null, agc: null, agcLevel: null, filter: null, sMeter: null, drive: null,
-      backlight: null, txTimeout: null,
+      backlight: null, txTimeout: null, firmwareVersion: null,
     }));
   }, [log]);
   disconnectRef.current = disconnect;  // keep the read loop's teardown handle current
@@ -654,6 +666,22 @@ export function useRadioCAT(): RadioCATControls {
       setState(prev => ({ ...prev, connected: true, error: null }));
       log('info', 'polling every', config.pollIntervalMs + 'ms');
       schedulePoll();
+      if (config.rigProfile === 'usdx-blackbrick') {
+        // Ask the radio which firmware it runs (FV;) — retried a few times since
+        // the reply can be eaten by the LCD/UART pin-share noise. The UI shows
+        // the PU7FTW extension controls only once this answers, so a stock rig
+        // on the blackbrick preset degrades gracefully to generic TS-480.
+        (async () => {
+          for (let i = 0; i < 3; i++) {
+            let resp = '';
+            try { resp = await query('FV;'); } catch { /* retry */ }
+            const m = resp.match(/FV(\d\.\d\d[a-z]?);/);
+            if (m) { log('info', 'firmware version:', m[1]); setState(prev => ({ ...prev, firmwareVersion: m[1] })); return; }
+            await new Promise(r => setTimeout(r, 300));
+          }
+          log('warn', 'radio did not answer FV; — PU7FTW extensions hidden');
+        })();
+      }
     } catch (err) {
       log('info', 'connection failed:', err);
       setState(prev => ({

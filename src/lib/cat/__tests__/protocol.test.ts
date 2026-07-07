@@ -218,8 +218,15 @@ describe('response parsing — custom BLACK_BRICK commands', () => {
     expect(parseIntField('AL;', 'AL')).toBeNull();
   });
 
-  test('TT — TX time-out timer 0..255 s (default 180; firmware force-unkeys TX past the limit)', () => {
-    expect(parseIntField('TT180;', 'TT')).toBe(180);  // firmware default
+  test('FV — firmware version string, read-only (the app gates extensions on it)', () => {
+    const parse = (r: string) => r.match(/FV(\d\.\d\d[a-z]?);/)?.[1] ?? null;
+    expect(parse('FV4.01a;')).toBe('4.01a');
+    expect(parse('FV1.02;')).toBe('1.02');
+    expect(parse('?;')).toBeNull();
+  });
+
+  test('TT — TX time-out timer 0..255 s (default 30; firmware force-unkeys TX past the limit)', () => {
+    expect(parseIntField('TT30;', 'TT')).toBe(30);    // firmware default
     expect(parseIntField('TT0;', 'TT')).toBe(0);      // disabled
     expect(parseIntField('TT;', 'TT')).toBeNull();
   });
@@ -240,6 +247,9 @@ describe('response parsing — custom BLACK_BRICK commands', () => {
     expect(parseIntField('SM-73;', 'SM')).toBe(-73);
     expect(parseIntField('SM0;', 'SM')).toBe(0);
     expect(parseIntField('SM-127;', 'SM')).toBe(-127);
+    // During TX the firmware replies an empty "SM;" — there is no RX signal to
+    // measure (the ADC samples the mic). Must parse as "no reading", and the
+    // frame keeps batched polls aligned.
     expect(parseIntField('SM;', 'SM')).toBeNull();
   });
 

@@ -22,7 +22,7 @@ interface RadioPreset {
 }
 
 const RADIO_PRESETS: RadioPreset[] = [
-  { label: 'uSDX BLACK_BRICK 4.01a',            baudRate: 38400,  dataBits: 8, stopBits: 1, parity: 'none', notes: 'PU7FTW custom firmware — adds volume, attenuator, noise reduction, AGC, filter, TX drive, backlight, PA bias and S-meter controls, batched CAT polling', rigProfile: 'usdx-blackbrick' },
+  { label: 'uSDX BLACK_BRICK (PU7FTW)',          baudRate: 38400,  dataBits: 8, stopBits: 1, parity: 'none', notes: 'PU7FTW custom firmware — adds volume, attenuator, noise reduction, AGC, filter, TX drive, backlight, PA bias and S-meter controls, batched CAT polling', rigProfile: 'usdx-blackbrick' },
   { label: 'Kenwood TS-480 / TS-590 / TS-2000', baudRate: 9600,   dataBits: 8, stopBits: 1, parity: 'none', notes: 'Default 9600 8N1', rigProfile: 'generic' },
   { label: 'Kenwood TS-480 (high speed)',        baudRate: 57600,  dataBits: 8, stopBits: 1, parity: 'none', notes: 'Configure in menu 60', rigProfile: 'generic' },
   { label: 'Icom IC-7300 / IC-7610',             baudRate: 9600,   dataBits: 8, stopBits: 1, parity: 'none', notes: 'Set CI-V USB Baud Rate to 9600', rigProfile: 'generic' },
@@ -501,7 +501,7 @@ function FactoryResetButton({ onConfirm }: { onConfirm: () => void }) {
 // read-only reading, not a control. PA bias lives in its own on-demand panel
 // (PABiasPanel) behind the wrench button — not polled, queried when opened.
 
-function BlackBrickControls({ volume, att1, att2, nr, agc, agcLevel, filter, drive, backlight, txTimeout, paOpen, onVolume, onAtt1, onAtt2, onNR, onAGC, onAgcLevel, onFilter, onDrive, onBacklight, onTxTimeout, onTogglePA, onReset }: {
+function BlackBrickControls({ volume, att1, att2, nr, agc, agcLevel, filter, drive, backlight, txTimeout, firmwareVersion, paOpen, onVolume, onAtt1, onAtt2, onNR, onAGC, onAgcLevel, onFilter, onDrive, onBacklight, onTxTimeout, onTogglePA, onReset }: {
   volume: number | null;
   att1: number | null;
   att2: number | null;
@@ -512,6 +512,7 @@ function BlackBrickControls({ volume, att1, att2, nr, agc, agcLevel, filter, dri
   drive: number | null;
   backlight: number | null;
   txTimeout: number | null;
+  firmwareVersion: string | null;
   paOpen: boolean;
   onVolume: (n: number) => void;
   onAtt1: (n: number) => void;
@@ -559,6 +560,12 @@ function BlackBrickControls({ volume, att1, att2, nr, agc, agcLevel, filter, dri
       )}
 
       <BacklightToggle backlight={backlight} onToggle={onBacklight} />
+
+      {firmwareVersion && (
+        <span className="text-[10px] text-[#8b949e] whitespace-nowrap" title="Firmware version reported by the radio (FV command)">
+          FW {firmwareVersion}
+        </span>
+      )}
 
       <div className="ml-auto flex items-center gap-1.5">
         <RestartRadioButton onReset={onReset} />
@@ -754,7 +761,7 @@ const DEFAULT_CONFIG: CATConnectionConfig & { presetIdx: number } = {
 
 export default function RadioCATPanel({ cat, collapsed = false }: { cat: ReturnType<typeof useRadioCAT>; collapsed?: boolean }) {
   const { state, connect, disconnect, setFrequency, setMode, setPTT, setVolume, setAtt1, setAtt2, setNR, setAGC, setAgcLevel, setTxTimeout, setFilter, setDrive, setBacklight, getPABias, setPABias, resetRadio, getFactoryDefaults, factoryResetRadio } = cat;
-  const { connected, frequency, mode, ptt, error, isSupported, volume, att1, att2, nr, agc, agcLevel, filter, sMeter, drive, backlight, txTimeout } = state;
+  const { connected, frequency, mode, ptt, error, isSupported, volume, att1, att2, nr, agc, agcLevel, filter, sMeter, drive, backlight, txTimeout, firmwareVersion } = state;
 
   const [showSettings, setShowSettings] = useState(false);
   const [showPABias, setShowPABias] = useState(false);
@@ -828,7 +835,7 @@ export default function RadioCATPanel({ cat, collapsed = false }: { cat: ReturnT
 
         {connected && (
           <>
-            {config.rigProfile === 'usdx-blackbrick' && (
+            {config.rigProfile === 'usdx-blackbrick' && firmwareVersion !== null && (
               <>
                 <div className="w-px h-6 bg-[#30363d] shrink-0" />
                 {/* S-Meter — read-only, shown right after Connect/Disconnect */}
@@ -852,10 +859,10 @@ export default function RadioCATPanel({ cat, collapsed = false }: { cat: ReturnT
             <PTTButton ptt={ptt} onToggle={handlePTTToggle} />
 
             {/* uSDX BLACK_BRICK 4.01a extensions */}
-            {config.rigProfile === 'usdx-blackbrick' && !collapsed && (
+            {config.rigProfile === 'usdx-blackbrick' && firmwareVersion !== null && !collapsed && (
               <BlackBrickControls
                 volume={volume} att1={att1} att2={att2} nr={nr}
-                agc={agc} agcLevel={agcLevel} filter={filter} drive={drive} backlight={backlight} txTimeout={txTimeout}
+                agc={agc} agcLevel={agcLevel} filter={filter} drive={drive} backlight={backlight} txTimeout={txTimeout} firmwareVersion={firmwareVersion}
                 paOpen={showPABias}
                 onVolume={handleVolume} onAtt1={handleAtt1} onAtt2={handleAtt2}
                 onNR={handleNR}

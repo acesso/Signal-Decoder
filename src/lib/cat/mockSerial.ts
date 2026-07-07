@@ -46,7 +46,7 @@ export function createMockSerialPort(opts: MockSerialOptions = {}) {
   const rig = {
     frequency: opts.initialFrequency ?? 7074000,
     modeDigit: opts.modeDigit ?? 2, // USB
-    agc: 1, agcLevel: 4, txTimeout: 180, filter: 1, volume: 10, att1: 0, att2: 0, nr: 0, drive: 4,
+    agc: 1, agcLevel: 4, txTimeout: 30, filter: 1, volume: 10, att1: 0, att2: 0, nr: 0, drive: 4,
     sMeter: 7,
     backlight: 1,
     pwmMin: 10, pwmMax: 130,  // PA bias endpoints (firmware defaults)
@@ -132,6 +132,7 @@ export function createMockSerialPort(opts: MockSerialOptions = {}) {
       case 'A2': return `A2${rig.att2};`;
       case 'NR': return `NR${rig.nr};`;
       case 'SM': {
+        if (rig.tx) return 'SM;';  // no reading during TX (like the real firmware)
         // noisy band: random-walk the S-meter so every poll differs
         rig.sMeter = Math.max(0, Math.min(15, rig.sMeter + (Math.random() < 0.5 ? -1 : 1)));
         return `SM${rig.sMeter};`;
@@ -139,6 +140,7 @@ export function createMockSerialPort(opts: MockSerialOptions = {}) {
       case 'DR': return `DR${rig.drive};`;
       case 'AL': return `AL${rig.agcLevel};`;
       case 'TT': return `TT${rig.txTimeout};`;
+      case 'FV': return 'FV4.01a;';  // firmware version (FV, read-only)
       case 'BL': return `BL${rig.backlight};`;
       case 'PM': return `PM${rig.pwmMin};`;
       case 'PX': return `PX${rig.pwmMax};`;
@@ -149,7 +151,7 @@ export function createMockSerialPort(opts: MockSerialOptions = {}) {
       // Factory reset: acks SR2; and restores the firmware defaults (the real
       // radio also reboots — same "no simulated outage" caveat as SR).
       case 'SR2':
-        rig.modeDigit = 2; rig.agc = 1; rig.agcLevel = 4; rig.txTimeout = 180; rig.filter = 0; rig.volume = 11;
+        rig.modeDigit = 2; rig.agc = 1; rig.agcLevel = 4; rig.txTimeout = 30; rig.filter = 0; rig.volume = 11;
         rig.att1 = 0; rig.att2 = 0; rig.nr = 0; rig.drive = 4;
         rig.backlight = 1; rig.pwmMin = 10; rig.pwmMax = 130;
         return 'SR2;';
