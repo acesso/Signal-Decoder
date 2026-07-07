@@ -1,8 +1,8 @@
 'use client';
 
 // This file is loaded via dynamic() with { ssr: false } — safe to import Leaflet here
-import { Fragment, useEffect, useState } from 'react';
-import { MapContainer, TileLayer, Marker, Popup, Polyline, CircleMarker, Tooltip, useMap } from 'react-leaflet';
+import { Fragment, useEffect, useMemo, useState } from 'react';
+import { MapContainer, TileLayer, Marker, Popup, Polyline, Polygon, CircleMarker, Tooltip, useMap } from 'react-leaflet';
 import L from 'leaflet';
 import 'leaflet/dist/leaflet.css';
 import { Contact, haversineKm } from '@/lib/ft/parser';
@@ -10,6 +10,87 @@ import { Contact, haversineKm } from '@/lib/ft/parser';
 // QSO line colors by direction relative to the hovered station
 const TX_COLOR = '#2ea043'; // hovered station transmitting (solid)
 const RX_COLOR = '#79c0ff'; // hovered station receiving (dashed)
+
+// ── Day/night terminator ────────────────────────────────────────────────────
+// Same subsolar-point + great-circle approach as the Leaflet.Terminator
+// plugin, reimplemented directly so no extra dependency is needed. Computes
+// the night-side polygon at `date` and returns it as a lat/lon ring the
+// caller draws as a shaded overlay.
+const RAD = Math.PI / 180;
+const DEG = 180 / Math.PI;
+
+function julianDay(date: Date): number {
+  return date.getTime() / 86400000 + 2440587.5;
+}
+
+// Sun's ecliptic position → declination and right ascension (low-precision,
+// ~0.01° error — plenty for a visual day/night overlay).
+function sunEqCoords(jd: number): { decl: number; ra: number } {
+  const d = jd - 2451545.0; // days since J2000.0
+  const meanLon = (280.460 + 0.9856474 * d) % 360;
+  const meanAnom = ((357.528 + 0.9856003 * d) % 360) * RAD;
+  const eclLon = (meanLon + 1.915 * Math.sin(meanAnom) + 0.020 * Math.sin(2 * meanAnom)) * RAD;
+  const obliquity = (23.439 - 0.0000004 * d) * RAD;
+  const ra = Math.atan2(Math.cos(obliquity) * Math.sin(eclLon), Math.cos(eclLon));
+  const decl = Math.asin(Math.sin(obliquity) * Math.sin(eclLon));
+  return { decl, ra: ra * DEG };
+}
+
+// Greenwich Mean Sidereal Time in degrees — needed to convert the sun's RA
+// into a geographic longitude (the subsolar point).
+function gmstDeg(jd: number): number {
+  const d = jd - 2451545.0;
+  return (280.46061837 + 360.98564736629 * d) % 360;
+}
+
+/** Night-side polygon ring (lat/lon pairs) for the given moment. */
+function nightPolygon(date: Date): [number, number][] {
+  const jd = julianDay(date);
+  const { decl, ra } = sunEqCoords(jd);
+  const subsolarLon = (((ra - gmstDeg(jd)) % 360) + 540) % 360 - 180; // wrap to [-180,180]
+
+  // For each longitude, the terminator's latitude satisfies
+  // tan(lat) = -cos(hourAngle) / tan(decl)  (decl in radians)
+  const ring: [number, number][] = [];
+  const tanDecl = Math.tan(decl);
+  for (let lon = -180; lon <= 180; lon += 2) {
+    const hourAngle = (lon - subsolarLon) * RAD;
+    let lat: number;
+    if (Math.abs(tanDecl) < 1e-9) {
+      lat = 0; // equinox: terminator is the meridian great circle through the poles
+    } else {
+      lat = Math.atan(-Math.cos(hourAngle) / tanDecl) * DEG;
+    }
+    ring.push([lat, lon]);
+  }
+
+  // Close the ring over whichever pole is currently in polar night, so the
+  // shaded area covers the full night hemisphere rather than just the curve.
+  const northPoleIsNight = decl < 0;
+  if (northPoleIsNight) {
+    ring.push([90, 180], [90, -180]);
+  } else {
+    ring.push([-90, 180], [-90, -180]);
+  }
+  return ring;
+}
+
+// Recomputed once a minute — the terminator moves ~0.25°/min, imperceptible
+// at map scale over that interval, so no need for a tighter tick.
+function DayNightOverlay() {
+  const [now, setNow] = useState(() => new Date());
+  useEffect(() => {
+    const id = setInterval(() => setNow(new Date()), 60_000);
+    return () => clearInterval(id);
+  }, []);
+  const ring = useMemo(() => nightPolygon(now), [now]);
+  return (
+    <Polygon
+      positions={ring}
+      pathOptions={{ color: 'transparent', fillColor: '#000000', fillOpacity: 0.35, interactive: false }}
+    />
+  );
+}
 
 function makeIcon(color: string) {
   return L.divIcon({
@@ -63,6 +144,8 @@ interface Props {
   contacts: Map<string, Contact>;
   onSelect?: (callsign: string) => void;
   selected?: string | null;
+  /** Shade the night hemisphere with a live day/night terminator overlay. */
+  showTerminator?: boolean;
 }
 
 interface QsoLine {
@@ -73,7 +156,7 @@ interface QsoLine {
   peer: string;
 }
 
-export default function FTLeafletMap({ contacts, onSelect, selected }: Props) {
+export default function FTLeafletMap({ contacts, onSelect, selected, showTerminator = false }: Props) {
   const [hoverCs, setHoverCs] = useState<string | null>(null);
   const markers = Array.from(contacts.values()).filter(c => c.latLon);
   const selContact = selected ? contacts.get(selected) : undefined;
@@ -117,6 +200,7 @@ export default function FTLeafletMap({ contacts, onSelect, selected }: Props) {
       <InvalidateOnShow />
       <AutoBounds count={markers.length} />
       <FlyTo pos={selContact?.latLon ?? null} />
+      {showTerminator && <DayNightOverlay />}
       {selContact?.latLon && (
         <CircleMarker
           center={selContact.latLon}
