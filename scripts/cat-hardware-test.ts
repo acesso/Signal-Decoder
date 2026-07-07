@@ -98,7 +98,7 @@ function framesByPrefix(frames: string[]): Map<string, string> {
 // BL (backlight) is polled again since the 2026-07-04 firmware fix (BACKLIGHT_PIN
 // moved to the correct pin, PD3). PM/PX (PA bias) are deliberately NOT polled —
 // the app fetches them on demand when its PA settings panel opens.
-const BLACKBRICK_POLL_CMDS = ['FA;', 'MD;', 'AG0;', 'FW;', 'VO;', 'AT;', 'A2;', 'NR;', 'SM;', 'DR;', 'BL;', 'AL;'];
+const BLACKBRICK_POLL_CMDS = ['FA;', 'MD;', 'AG0;', 'FW;', 'VO;', 'AT;', 'A2;', 'NR;', 'SM;', 'DR;', 'BL;', 'AL;', 'TT;'];
 
 // ── Test bed ──────────────────────────────────────────────────────────────────
 
@@ -291,6 +291,23 @@ function main(): void {
       record('AL restored to its original value', parseIntField(alRestoreResp, 'AL') === alBefore, JSON.stringify(alRestoreResp));
       const alRejectResp = send(fd, 'AL0;');
       record('AL SET of 0 is rejected (echo returns old value)', parseIntField(alRejectResp, 'AL') === alBefore, JSON.stringify(alRejectResp));
+    }
+
+    // ── SET/GET round-trip on the TX time-out timer (TT, 0..255 s), restoring
+    // original. The guard itself (force-unkey) is NOT exercised — that would
+    // require keying TX, which automated tests never do. ──
+    const ttBeforeResp = sendGet(fd, 'TT;', 'TT');
+    const ttBefore = parseIntField(ttBeforeResp, 'TT');
+    record('TT; GET returns a value in 0..255', ttBefore !== null && ttBefore >= 0 && ttBefore <= 255, JSON.stringify(ttBeforeResp));
+
+    if (ttBefore !== null) {
+      const ttProbe = ttBefore === 60 ? 120 : 60;
+      const ttSetResp = send(fd, `TT${ttProbe};`);
+      record('TT SET echoes the new value', parseIntField(ttSetResp, 'TT') === ttProbe, JSON.stringify(ttSetResp));
+      const ttRestoreResp = send(fd, `TT${ttBefore};`);
+      record('TT restored to its original value', parseIntField(ttRestoreResp, 'TT') === ttBefore, JSON.stringify(ttRestoreResp));
+      const ttRejectResp = send(fd, 'TT999;');
+      record('TT SET beyond 255 is rejected (echo returns old value)', parseIntField(ttRejectResp, 'TT') === ttBefore, JSON.stringify(ttRejectResp));
     }
 
     // ── AG0 SET beyond 1 must be rejected since the single-algorithm AGC change ──

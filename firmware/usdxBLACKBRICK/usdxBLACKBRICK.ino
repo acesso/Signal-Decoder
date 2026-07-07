@@ -4246,6 +4246,20 @@ int16_t smeter(int16_t ref = 0)
 
 		if (!smode) return dbm;
 
+		// While a CAT session is live, every LCD write is audible in the RX audio
+		// (shared UART/LCD pins — pre()/post() mask the serial port per nibble,
+		// "NOISE LEAK INTO RX!!!"). The pre-2026-07-06 firmware avoided that by
+		// disabling the S-meter display outright on CAT connect — which froze the
+		// LCD value (the bug we fixed). Compromise: while cat_active, redraw at
+		// most once per second and only when the reading actually changed. Set
+		// menu S-Meter to OFF for a fully silent display.
+		if (cat_active) {
+			static int16_t dbm_drawn = INT16_MAX;
+			static uint32_t next_draw = 0;
+			if ((dbm == dbm_drawn) || (millis() < next_draw)) return dbm;
+			dbm_drawn = dbm; next_draw = millis() + 1000;
+		}
+
 		lcd.noCursor();
 		if (smode == 1) { // dBm meter
 			lcd.setCursor(9, 0); lcd.print((int16_t)dbm); lcd.print(F("dBm "));
@@ -4339,6 +4353,12 @@ int16_t _centiGain = 0;
 uint8_t txdelay = 0;
 uint32_t semi_qsk_timeout = 0;
 
+// TX time-out timer (TOT): hard guardrail against a stuck PTT overheating the PA.
+// tot = limit in seconds (0 = disabled); armed by switch_rxtx(1), checked from
+// loop() (CAT TX) and inside the physical-PTT hold loop (which blocks loop()).
+volatile uint8_t tot = 180;
+volatile uint32_t tx_timeout_at = 0;
+
 // Set RX or TX mode, with RIT support and CW offset
 void switch_rxtx(uint8_t tx_enable)
 {
@@ -4396,6 +4416,7 @@ void switch_rxtx(uint8_t tx_enable)
 	if (tx_enable)
 	{
 		// TX
+		tx_timeout_at = (tot) ? millis() + 1000UL * tot : 0;  // arm the TX time-out guard
 		_centiGain = centiGain;  // backup AGC setting
 #ifdef SEMI_QSK
 		semi_qsk_timeout = 0;
@@ -4418,6 +4439,7 @@ void switch_rxtx(uint8_t tx_enable)
 	else
 	{
 		// RX
+		tx_timeout_at = 0;  // disarm the TX time-out guard
 		if ((mode == CW) && (!(semi_qsk_timeout))) {
 #ifdef SEMI_QSK
 #ifdef KEYER
@@ -4869,13 +4891,13 @@ const char* keyer_mode_label[] = { "IambicA", "IambicB","Straight" };  // GW8RDI
 
 #define _N(a) sizeof(a)/sizeof(a[0])
 
-#define N_PARAMS 44  // last visible menu param enum value (BACKL=44); update when adding/removing menu items
+#define N_PARAMS 46  // last visible menu param enum value (BACKL=46 after the AGC_LVL and TOT enum insertions); update when adding/removing enum entries BEFORE BACKL — getting this wrong makes a blank "hidden" menu slot appear at the wrap and drops the Backlight item
 #ifdef KEEP_BAND_DATA
 #define I_PARAMS 5+9
-enum params_t { _NULL, VOLUME, MODE, FILTER, BAND, STEP, VFOSEL, RIT, AGC, AGC_LVL, NR, ATT, ATT2, SMETER, CWDEC, CWTONE, CWOFF, KEY_WPM, KEY_MODE, KEY_PIN, TONE_VOL, VOX, VOXGAIN, DRIVE, TXDELAY, MOX, CWINTERVAL, CWMSG1, CWMSG2, CWMSG3, CWMSG4, CWMSG5, CWMSG6, PWM_MIN, PWM_MAX, SIFXTAL, IQ_ADJ, CAT_ACTIVE, CAT_BAUD, CALIB, SR, CPULOAD, PARAM_A, PARAM_B, PARAM_C, BACKL, FREQA, FREQB, MODEA, MODEB, VERS, BAND_DATA0, BAND_DATA1, BAND_DATA2, BAND_DATA3, BAND_DATA4, BAND_DATA5, BAND_DATA6, BAND_DATA7, BAND_DATA8, ALL = 0xff };
+enum params_t { _NULL, VOLUME, MODE, FILTER, BAND, STEP, VFOSEL, RIT, AGC, AGC_LVL, NR, ATT, ATT2, SMETER, CWDEC, CWTONE, CWOFF, KEY_WPM, KEY_MODE, KEY_PIN, TONE_VOL, VOX, VOXGAIN, DRIVE, TOT, TXDELAY, MOX, CWINTERVAL, CWMSG1, CWMSG2, CWMSG3, CWMSG4, CWMSG5, CWMSG6, PWM_MIN, PWM_MAX, SIFXTAL, IQ_ADJ, CAT_ACTIVE, CAT_BAUD, CALIB, SR, CPULOAD, PARAM_A, PARAM_B, PARAM_C, BACKL, FREQA, FREQB, MODEA, MODEB, VERS, BAND_DATA0, BAND_DATA1, BAND_DATA2, BAND_DATA3, BAND_DATA4, BAND_DATA5, BAND_DATA6, BAND_DATA7, BAND_DATA8, ALL = 0xff };
 #else
 #define I_PARAMS 5
-enum params_t { _NULL, VOLUME, MODE, FILTER, BAND, STEP, VFOSEL, RIT, AGC, AGC_LVL, NR, ATT, ATT2, SMETER, CWDEC, CWTONE, CWOFF, KEY_WPM, KEY_MODE, KEY_PIN, TONE_VOL, VOX, VOXGAIN, DRIVE, TXDELAY, MOX, CWINTERVAL, CWMSG1, CWMSG2, CWMSG3, CWMSG4, CWMSG5, CWMSG6, PWM_MIN, PWM_MAX, SIFXTAL, IQ_ADJ, CAT_ACTIVE, CAT_BAUD, CALIB, SR, CPULOAD, PARAM_A, PARAM_B, PARAM_C, BACKL, FREQA, FREQB, MODEA, MODEB, VERS, ALL = 0xff };
+enum params_t { _NULL, VOLUME, MODE, FILTER, BAND, STEP, VFOSEL, RIT, AGC, AGC_LVL, NR, ATT, ATT2, SMETER, CWDEC, CWTONE, CWOFF, KEY_WPM, KEY_MODE, KEY_PIN, TONE_VOL, VOX, VOXGAIN, DRIVE, TOT, TXDELAY, MOX, CWINTERVAL, CWMSG1, CWMSG2, CWMSG3, CWMSG4, CWMSG5, CWMSG6, PWM_MIN, PWM_MAX, SIFXTAL, IQ_ADJ, CAT_ACTIVE, CAT_BAUD, CALIB, SR, CPULOAD, PARAM_A, PARAM_B, PARAM_C, BACKL, FREQA, FREQB, MODEA, MODEB, VERS, ALL = 0xff };
 #endif
 #define N_ALL_PARAMS (N_PARAMS+I_PARAMS)  // number of parameters
 
@@ -4937,6 +4959,7 @@ int8_t paramAction(uint8_t action, uint8_t id = ALL)  // list of parameters
 	case VOXGAIN: paramAction(action, vox_thresh, 0x32, F("Noise Gate"), NULL, 0, 255, false); break; // GW8RDI mod - "Noise Gate" save bytes
 #endif
 	case DRIVE:   paramAction(action, drive, 0x33, F("TX Drive"), NULL, 0, 8, false); break;
+	case TOT:     paramAction(action, tot, 0x34, F("TX Timeout"), NULL, 0, 255, false); break;  // TX time-out timer, seconds; 0 = disabled — force-unkeys the PA if PTT sticks
 #ifdef TX_DELAY
 	case TXDELAY: paramAction(action, txdelay, 0x34, F("TX Delay"), NULL, 0, 255, false); break;
 #endif
@@ -5106,6 +5129,8 @@ void analyseCATcmd()    // Supported Kenwood TS-480 protocol CAT commands
 	else if (CMD('A','G','0') && CATcmd[4]==';')            Command_AG0_SET();
 	else if (CMD('A','L',';'))                              Command_AL_GET();
 	else if (CMD2('A','L') && CATcmd[2]!=';')              Command_AL_SET();
+	else if (CMD('T','T',';'))                              Command_TT_GET();
+	else if (CMD2('T','T') && CATcmd[2]!=';')              Command_TT_SET();
 	else if (CMD('F','W',';'))                              Command_FW_GET();
 	else if (CMD2('F','W') && CATcmd[3]==';')               Command_FW_SET();
 	else if (CMD('X','T','1'))                              Command_XT1();
@@ -5472,6 +5497,22 @@ void Command_AL_SET()
 	uint8_t v = (uint8_t)atoi(CATcmd + 2);
 	if (v >= 1 && v <= 14) { agc_lvl = v; paramAction(SAVE, AGC_LVL); }
 	Command_AL_GET();
+}
+
+// TT; → get TX time-out timer (seconds, 0=disabled), TTn; → set (0..255).
+// Guardrail against a stuck PTT overheating the PA. Note: changing it does not
+// re-arm an already-running TX — the new limit applies from the next keying.
+void Command_TT_GET()
+{
+	char buf[7];
+	sprintf(buf, "TT%u;", (uint8_t)tot);
+	Serial.print(buf);
+}
+void Command_TT_SET()
+{
+	uint16_t v = (uint16_t)atoi(CATcmd + 2);
+	if (v <= 255) { tot = (uint8_t)v; paramAction(SAVE, TOT); }
+	Command_TT_GET();
 }
 
 // FW; → get filter index (0..7), FWn; → set filter index
@@ -5960,6 +6001,10 @@ static int32_t _step = 0;
 
 void loop()
 {
+	if (tx && tx_timeout_at && (millis() > tx_timeout_at)) {  // TX time-out guard (CAT-keyed TX; the physical-PTT hold loop has its own copy)
+		switch_rxtx(0);
+		lcd.setCursor(0, 1); lcd.print(F("TX TIMEOUT!")); lcd_blanks();
+	}
 #ifdef VOX_ENABLE
 	if ((vox) && ((mode == LSB) || (mode == USB))) {  // If VOX enabled (and in LSB/USB mode), then take mic samples and feed ssb processing function, to derive amplitude, and potentially detect cross vox_threshold to detect a TX or RX event: this is expressed in tx variable
 		if (!vox_tx) { // VOX not active
@@ -6107,6 +6152,12 @@ void loop()
 					wdt_reset();
 					delay((mode == CW) ? 10 : 100);  // keep the tx keyed for a while before sensing (helps against RFI issues on DAH/DAH line)
 					if (inv ^ _digitalRead(BUTTONS)) break;  // break if button is pressed (to prevent potential lock-up)
+					if (tx_timeout_at && (millis() > tx_timeout_at)) {  // TX time-out guard: loop() is blocked while the key is held, so check here too
+						switch_rxtx(0);
+						lcd.setCursor(0, 1); lcd.print(F("TX TIMEOUT!")); lcd_blanks();
+						for (; !_digitalRead(pin);) wdt_reset();  // require key release before TX can be keyed again
+						break;
+					}
 				} while (!_digitalRead(pin)); // until released
 				switch_rxtx(0);
 			}
