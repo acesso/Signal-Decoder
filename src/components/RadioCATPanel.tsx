@@ -501,7 +501,7 @@ function FactoryResetButton({ onConfirm }: { onConfirm: () => void }) {
 // read-only reading, not a control. PA bias lives in its own on-demand panel
 // (PABiasPanel) behind the wrench button — not polled, queried when opened.
 
-function BlackBrickControls({ volume, att1, att2, nr, agc, agcLevel, filter, drive, backlight, paOpen, onVolume, onAtt1, onAtt2, onNR, onAGC, onAgcLevel, onFilter, onDrive, onBacklight, onTogglePA, onReset }: {
+function BlackBrickControls({ volume, att1, att2, nr, agc, agcLevel, filter, drive, backlight, txTimeout, paOpen, onVolume, onAtt1, onAtt2, onNR, onAGC, onAgcLevel, onFilter, onDrive, onBacklight, onTxTimeout, onTogglePA, onReset }: {
   volume: number | null;
   att1: number | null;
   att2: number | null;
@@ -511,6 +511,7 @@ function BlackBrickControls({ volume, att1, att2, nr, agc, agcLevel, filter, dri
   filter: number | null;
   drive: number | null;
   backlight: number | null;
+  txTimeout: number | null;
   paOpen: boolean;
   onVolume: (n: number) => void;
   onAtt1: (n: number) => void;
@@ -521,6 +522,7 @@ function BlackBrickControls({ volume, att1, att2, nr, agc, agcLevel, filter, dri
   onFilter: (n: number) => void;
   onDrive: (n: number) => void;
   onBacklight: (n: number) => void;
+  onTxTimeout: (n: number) => void;
   onTogglePA: () => void;
   onReset: () => void;
 }) {
@@ -533,6 +535,8 @@ function BlackBrickControls({ volume, att1, att2, nr, agc, agcLevel, filter, dri
       <NumberStepper label="Noise Reduction" value={nr} min={0} max={8} onChange={onNR} />
       <NumberStepper label="Filter Bandwidth" value={filter} min={0} max={7} valueLabels={FILTER_LABELS} onChange={onFilter} />
       <NumberStepper label="TX Driver" value={drive} min={0} max={8} onChange={onDrive} />
+      {/* TX time-out guard (TT, seconds; 0 = disabled) — firmware force-unkeys a stuck TX */}
+      <NumberStepper label="TX Timeout (s)" value={txTimeout} min={0} max={255} onChange={onTxTimeout} />
 
       <div className="flex items-center gap-1.5" title="Auto Gain Control">
         <span className="text-[10px] font-semibold text-[#8b949e] whitespace-nowrap">Auto Gain Control</span>
@@ -749,8 +753,8 @@ const DEFAULT_CONFIG: CATConnectionConfig & { presetIdx: number } = {
 };
 
 export default function RadioCATPanel({ cat, collapsed = false }: { cat: ReturnType<typeof useRadioCAT>; collapsed?: boolean }) {
-  const { state, connect, disconnect, setFrequency, setMode, setPTT, setVolume, setAtt1, setAtt2, setNR, setAGC, setAgcLevel, setFilter, setDrive, setBacklight, getPABias, setPABias, resetRadio, getFactoryDefaults, factoryResetRadio } = cat;
-  const { connected, frequency, mode, ptt, error, isSupported, volume, att1, att2, nr, agc, agcLevel, filter, sMeter, drive, backlight } = state;
+  const { state, connect, disconnect, setFrequency, setMode, setPTT, setVolume, setAtt1, setAtt2, setNR, setAGC, setAgcLevel, setTxTimeout, setFilter, setDrive, setBacklight, getPABias, setPABias, resetRadio, getFactoryDefaults, factoryResetRadio } = cat;
+  const { connected, frequency, mode, ptt, error, isSupported, volume, att1, att2, nr, agc, agcLevel, filter, sMeter, drive, backlight, txTimeout } = state;
 
   const [showSettings, setShowSettings] = useState(false);
   const [showPABias, setShowPABias] = useState(false);
@@ -767,6 +771,7 @@ export default function RadioCATPanel({ cat, collapsed = false }: { cat: ReturnT
   const handleNR         = useCallback((n: number) => { setNR(n).catch(() => {}); }, [setNR]);
   const handleAGC        = useCallback((n: number) => { setAGC(n).catch(() => {}); }, [setAGC]);
   const handleAgcLevel   = useCallback((n: number) => { setAgcLevel(n).catch(() => {}); }, [setAgcLevel]);
+  const handleTxTimeout  = useCallback((n: number) => { setTxTimeout(n).catch(() => {}); }, [setTxTimeout]);
   const handleFilter     = useCallback((n: number) => { setFilter(n).catch(() => {}); }, [setFilter]);
   const handleDrive      = useCallback((n: number) => { setDrive(n).catch(() => {}); }, [setDrive]);
   const handleBacklight  = useCallback((n: number) => { setBacklight(n).catch(() => {}); }, [setBacklight]);
@@ -850,12 +855,12 @@ export default function RadioCATPanel({ cat, collapsed = false }: { cat: ReturnT
             {config.rigProfile === 'usdx-blackbrick' && !collapsed && (
               <BlackBrickControls
                 volume={volume} att1={att1} att2={att2} nr={nr}
-                agc={agc} agcLevel={agcLevel} filter={filter} drive={drive} backlight={backlight}
+                agc={agc} agcLevel={agcLevel} filter={filter} drive={drive} backlight={backlight} txTimeout={txTimeout}
                 paOpen={showPABias}
                 onVolume={handleVolume} onAtt1={handleAtt1} onAtt2={handleAtt2}
                 onNR={handleNR}
                 onAGC={handleAGC} onAgcLevel={handleAgcLevel} onFilter={handleFilter} onDrive={handleDrive}
-                onBacklight={handleBacklight} onTogglePA={handleTogglePA}
+                onBacklight={handleBacklight} onTxTimeout={handleTxTimeout} onTogglePA={handleTogglePA}
                 onReset={handleReset}
               />
             )}

@@ -3,7 +3,7 @@
  *
  * These tests are pure JS: no hardware, no serial port, no browser APIs.
  * They validate command string construction, response parsing, multi-command
- * batching, and all custom PU7FTW extension commands (BL/VO/TQ/AT/A2/NR/AG0/AL/FW/SM/DR/PM/PX).
+ * batching, and all custom PU7FTW extension commands (BL/VO/TQ/AT/A2/NR/AG0/AL/TT/FW/SM/DR/PM/PX).
  * Note: BL (backlight) is polled and surfaced in the UI again since the
  * 2026-07-04 firmware fix (BACKLIGHT_PIN moved to the correct pin, PD3).
  * PM/PX (PA bias endpoints) are deliberately NOT polled — they're fetched
@@ -119,6 +119,11 @@ describe('command construction', () => {
     expect('AL14;').toMatch(/^AL\d{1,2};$/);
   });
 
+  test('TT set — TX time-out seconds, 0..255 (0 = disabled)', () => {
+    expect('TT0;').toMatch(/^TT\d{1,3};$/);
+    expect('TT180;').toMatch(/^TT\d{1,3};$/);
+  });
+
   test('FW set — 0..7', () => {
     for (let i = 0; i <= 7; i++) {
       expect(`FW${i};`).toMatch(/^FW\d;$/);
@@ -213,6 +218,12 @@ describe('response parsing — custom BLACK_BRICK commands', () => {
     expect(parseIntField('AL;', 'AL')).toBeNull();
   });
 
+  test('TT — TX time-out timer 0..255 s (default 180; firmware force-unkeys TX past the limit)', () => {
+    expect(parseIntField('TT180;', 'TT')).toBe(180);  // firmware default
+    expect(parseIntField('TT0;', 'TT')).toBe(0);      // disabled
+    expect(parseIntField('TT;', 'TT')).toBeNull();
+  });
+
   test('FW — filter index 0..7', () => {
     expect(parseIntField('FW0;', 'FW')).toBe(0);  // Full
     expect(parseIntField('FW4;', 'FW')).toBe(4);  // 500 Hz
@@ -281,11 +292,11 @@ describe('response parsing — custom BLACK_BRICK commands', () => {
 });
 
 describe('multi-command / batched poll parsing', () => {
-  const BATCH_RESPONSE = 'FA00014225000;MD2;AG01;FW3;VO8;AT2;A216;NR4;SM-68;DR5;BL1;AL4;';
+  const BATCH_RESPONSE = 'FA00014225000;MD2;AG01;FW3;VO8;AT2;A216;NR4;SM-68;DR5;BL1;AL4;TT180;';
 
-  test('splitFrames — all 12 frames', () => {
+  test('splitFrames — all 13 frames', () => {
     const frames = splitFrames(BATCH_RESPONSE);
-    expect(frames).toHaveLength(12);
+    expect(frames).toHaveLength(13);
     expect(frames[0]).toBe('FA00014225000;');
     expect(frames[1]).toBe('MD2;');
     expect(frames[2]).toBe('AG01;');
@@ -377,10 +388,10 @@ describe('IF frame parsing', () => {
 });
 
 describe('BLACKBRICK_POLL_CMDS array', () => {
-  const BLACKBRICK_POLL_CMDS = ['FA;', 'MD;', 'AG0;', 'FW;', 'VO;', 'AT;', 'A2;', 'NR;', 'SM;', 'DR;', 'BL;', 'AL;'];
+  const BLACKBRICK_POLL_CMDS = ['FA;', 'MD;', 'AG0;', 'FW;', 'VO;', 'AT;', 'A2;', 'NR;', 'SM;', 'DR;', 'BL;', 'AL;', 'TT;'];
 
-  test('12 commands in poll array', () => {
-    expect(BLACKBRICK_POLL_CMDS).toHaveLength(12);
+  test('13 commands in poll array', () => {
+    expect(BLACKBRICK_POLL_CMDS).toHaveLength(13);
   });
 
   test('AG0; is included', () => {
@@ -410,7 +421,7 @@ describe('BLACKBRICK_POLL_CMDS array', () => {
 
   test('prefixes derived from commands', () => {
     const prefixes = BLACKBRICK_POLL_CMDS.map(c => c.substring(0, 2));
-    expect(prefixes).toEqual(['FA', 'MD', 'AG', 'FW', 'VO', 'AT', 'A2', 'NR', 'SM', 'DR', 'BL', 'AL']);
+    expect(prefixes).toEqual(['FA', 'MD', 'AG', 'FW', 'VO', 'AT', 'A2', 'NR', 'SM', 'DR', 'BL', 'AL', 'TT']);
   });
 });
 
