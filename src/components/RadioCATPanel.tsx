@@ -498,10 +498,10 @@ function FactoryResetButton({ onConfirm }: { onConfirm: () => void }) {
 // uSDX BLACK_BRICK 4.01a custom extension controls: volume, attenuators, noise
 // reduction, AGC, filter, TX drive, backlight. Wraps onto its own row below the
 // main toolbar. S-Meter is shown separately in the main toolbar since it's a
-// read-only reading, not a control. PA bias lives in its own on-demand panel
-// (PABiasPanel) behind the wrench button — not polled, queried when opened.
+// read-only reading, not a control. PA bias and TX timeout live in the
+// advanced-settings panel (PABiasPanel) behind the wrench button.
 
-function BlackBrickControls({ volume, att1, att2, nr, agc, agcLevel, filter, drive, backlight, txTimeout, firmwareVersion, paOpen, onVolume, onAtt1, onAtt2, onNR, onAGC, onAgcLevel, onFilter, onDrive, onBacklight, onTxTimeout, onTogglePA, onReset }: {
+function BlackBrickControls({ volume, att1, att2, nr, agc, agcLevel, filter, drive, backlight, firmwareVersion, paOpen, onVolume, onAtt1, onAtt2, onNR, onAGC, onAgcLevel, onFilter, onDrive, onBacklight, onTogglePA, onReset }: {
   volume: number | null;
   att1: number | null;
   att2: number | null;
@@ -511,7 +511,6 @@ function BlackBrickControls({ volume, att1, att2, nr, agc, agcLevel, filter, dri
   filter: number | null;
   drive: number | null;
   backlight: number | null;
-  txTimeout: number | null;
   firmwareVersion: string | null;
   paOpen: boolean;
   onVolume: (n: number) => void;
@@ -523,7 +522,6 @@ function BlackBrickControls({ volume, att1, att2, nr, agc, agcLevel, filter, dri
   onFilter: (n: number) => void;
   onDrive: (n: number) => void;
   onBacklight: (n: number) => void;
-  onTxTimeout: (n: number) => void;
   onTogglePA: () => void;
   onReset: () => void;
 }) {
@@ -536,8 +534,6 @@ function BlackBrickControls({ volume, att1, att2, nr, agc, agcLevel, filter, dri
       <NumberStepper label="Noise Reduction" value={nr} min={0} max={8} onChange={onNR} />
       <NumberStepper label="Filter Bandwidth" value={filter} min={0} max={7} valueLabels={FILTER_LABELS} onChange={onFilter} />
       <NumberStepper label="TX Driver" value={drive} min={0} max={8} onChange={onDrive} />
-      {/* TX time-out guard (TT, seconds; 0 = disabled) — firmware force-unkeys a stuck TX */}
-      <NumberStepper label="TX Timeout (s)" value={txTimeout} min={0} max={255} onChange={onTxTimeout} />
 
       <div className="flex items-center gap-1.5" title="Auto Gain Control">
         <span className="text-[10px] font-semibold text-[#8b949e] whitespace-nowrap">Auto Gain Control</span>
@@ -570,10 +566,10 @@ function BlackBrickControls({ volume, att1, att2, nr, agc, agcLevel, filter, dri
       <div className="ml-auto flex items-center gap-1.5">
         <RestartRadioButton onReset={onReset} />
 
-        {/* PA bias settings — tucked away, opens the on-demand panel */}
+        {/* Advanced settings — tucked away, opens the on-demand panel */}
         <button
           onClick={onTogglePA}
-          title="PA bias settings (advanced)"
+          title="Advanced settings"
           className={`w-7 h-7 flex items-center justify-center rounded border transition-colors
             ${paOpen
               ? 'bg-[#21262d] border-[#388bfd] text-[#79c0ff]'
@@ -591,19 +587,23 @@ function BlackBrickControls({ volume, att1, att2, nr, agc, agcLevel, filter, dri
 }
 
 // ── PABiasPanel ───────────────────────────────────────────────────────────────
-// On-demand advanced radio options: PA bias endpoints editor (PM = idle bias,
-// PX = full-drive PWM) plus the factory-reset control. Deliberately NOT part
-// of the poll loop: PA bias and the factory-default values are read once when
-// the panel opens (so the user sees the radio's current numbers before
-// touching anything) and written only on commit. Plain bounded number inputs,
-// no sliders.
+// On-demand advanced settings: PA bias endpoints editor (PM = idle bias,
+// PX = full-drive PWM), the TX time-out guard, and the factory-reset control.
+// Deliberately NOT part of the poll loop: PA bias and the factory-default
+// values, and TX timeout, are read once when the panel opens (so the user
+// sees the radio's current numbers before touching anything) and written
+// only on commit — none of this is part of the poll loop, to save the radio
+// cycles on options that only matter while this panel is visible. Plain
+// bounded number inputs, no sliders.
 
-function PABiasPanel({ getPABias, setPABias, getFactoryDefaults, onFactoryReset, onOpenCalibration }: {
+function PABiasPanel({ getPABias, setPABias, getFactoryDefaults, onFactoryReset, onOpenCalibration, getTxTimeout, setTxTimeout }: {
   getPABias: () => Promise<PABias | null>;
   setPABias: (which: 'min' | 'max', n: number) => Promise<number | null>;
   getFactoryDefaults: () => Promise<FactoryDefaults | null>;
   onFactoryReset: () => void;
   onOpenCalibration: () => void;
+  getTxTimeout: () => Promise<number | null>;
+  setTxTimeout: (n: number) => Promise<number | null>;
 }) {
   const [bias, setBias]         = useState<PABias | null>(null);
   const [defaults, setDefaults] = useState<FactoryDefaults | null>(null);
@@ -611,10 +611,12 @@ function PABiasPanel({ getPABias, setPABias, getFactoryDefaults, onFactoryReset,
   const [minDraft, setMinDraft] = useState('');
   const [maxDraft, setMaxDraft] = useState('');
   const [busy, setBusy]         = useState(false);
+  const [txTimeout, setTxTimeoutState] = useState<number | null>(null);
+  const [ttBusy, setTtBusy]     = useState(false);
 
   const load = useCallback(async () => {
-    setBias(null); setDefaults(null); setFailed(false);
-    const [b, d] = await Promise.all([getPABias(), getFactoryDefaults()]);
+    setBias(null); setDefaults(null); setFailed(false); setTxTimeoutState(null);
+    const [b, d, tt] = await Promise.all([getPABias(), getFactoryDefaults(), getTxTimeout()]);
     if (b) {
       setBias(b);
       setMinDraft(String(b.min));
@@ -623,9 +625,19 @@ function PABiasPanel({ getPABias, setPABias, getFactoryDefaults, onFactoryReset,
       setFailed(true);
     }
     setDefaults(d);
-  }, [getPABias, getFactoryDefaults]);
+    setTxTimeoutState(tt);
+  }, [getPABias, getFactoryDefaults, getTxTimeout]);
 
   useEffect(() => { load(); }, [load]);  // query on open
+
+  const commitTxTimeout = async (n: number) => {
+    if (ttBusy) return;
+    setTtBusy(true);
+    const confirmed = await setTxTimeout(n);
+    setTtBusy(false);
+    // Trust the radio's echo (it returns the old value if the SET was rejected)
+    setTxTimeoutState(prev => confirmed ?? prev);
+  };
 
   const commit = async (which: 'min' | 'max') => {
     if (!bias || busy) return;
@@ -674,7 +686,7 @@ function PABiasPanel({ getPABias, setPABias, getFactoryDefaults, onFactoryReset,
   return (
     <div className="mt-2 bg-[#161b22] border border-[#30363d] rounded-lg p-4 flex flex-col gap-3">
       <span className="text-[10px] font-bold uppercase tracking-widest text-[#8b949e] select-none">
-        Advanced Radio Options
+        Advanced Settings
       </span>
 
       {failed ? (
@@ -722,6 +734,15 @@ function PABiasPanel({ getPABias, setPABias, getFactoryDefaults, onFactoryReset,
         Too-high values can overheat the finals — change with care.
       </p>
 
+      {/* ── TX time-out guard ── */}
+      <div className="border-t border-[#21262d] pt-3 flex items-center gap-3 flex-wrap">
+        <NumberStepper label="TX Timeout (s)" value={txTimeout} min={0} max={255} onChange={commitTxTimeout} />
+        {ttBusy && <span className="text-[10px] text-[#8b949e]">writing…</span>}
+        <p className="text-[10px] text-[#8b949e] flex-1 min-w-[16rem]">
+          Firmware force-unkeys the PA if TX stays keyed past this many seconds. 0 disables the guard.
+        </p>
+      </div>
+
       {/* ── Frequency calibration ── */}
       <div className="border-t border-[#21262d] pt-3 flex items-center gap-3 flex-wrap">
         <button
@@ -760,8 +781,8 @@ const DEFAULT_CONFIG: CATConnectionConfig & { presetIdx: number } = {
 };
 
 export default function RadioCATPanel({ cat, collapsed = false }: { cat: ReturnType<typeof useRadioCAT>; collapsed?: boolean }) {
-  const { state, connect, disconnect, setFrequency, setMode, setPTT, setVolume, setAtt1, setAtt2, setNR, setAGC, setAgcLevel, setTxTimeout, setFilter, setDrive, setBacklight, getPABias, setPABias, resetRadio, getFactoryDefaults, factoryResetRadio } = cat;
-  const { connected, frequency, mode, ptt, error, isSupported, volume, att1, att2, nr, agc, agcLevel, filter, sMeter, drive, backlight, txTimeout, firmwareVersion } = state;
+  const { state, connect, disconnect, setFrequency, setMode, setPTT, setVolume, setAtt1, setAtt2, setNR, setAGC, setAgcLevel, setFilter, setDrive, setBacklight, getPABias, setPABias, getTxTimeout, setTxTimeout, resetRadio, getFactoryDefaults, factoryResetRadio } = cat;
+  const { connected, frequency, mode, ptt, error, isSupported, volume, att1, att2, nr, agc, agcLevel, filter, sMeter, drive, backlight, firmwareVersion } = state;
 
   const [showSettings, setShowSettings] = useState(false);
   const [showPABias, setShowPABias] = useState(false);
@@ -778,7 +799,6 @@ export default function RadioCATPanel({ cat, collapsed = false }: { cat: ReturnT
   const handleNR         = useCallback((n: number) => { setNR(n).catch(() => {}); }, [setNR]);
   const handleAGC        = useCallback((n: number) => { setAGC(n).catch(() => {}); }, [setAGC]);
   const handleAgcLevel   = useCallback((n: number) => { setAgcLevel(n).catch(() => {}); }, [setAgcLevel]);
-  const handleTxTimeout  = useCallback((n: number) => { setTxTimeout(n).catch(() => {}); }, [setTxTimeout]);
   const handleFilter     = useCallback((n: number) => { setFilter(n).catch(() => {}); }, [setFilter]);
   const handleDrive      = useCallback((n: number) => { setDrive(n).catch(() => {}); }, [setDrive]);
   const handleBacklight  = useCallback((n: number) => { setBacklight(n).catch(() => {}); }, [setBacklight]);
@@ -862,12 +882,12 @@ export default function RadioCATPanel({ cat, collapsed = false }: { cat: ReturnT
             {config.rigProfile === 'usdx-blackbrick' && firmwareVersion !== null && !collapsed && (
               <BlackBrickControls
                 volume={volume} att1={att1} att2={att2} nr={nr}
-                agc={agc} agcLevel={agcLevel} filter={filter} drive={drive} backlight={backlight} txTimeout={txTimeout} firmwareVersion={firmwareVersion}
+                agc={agc} agcLevel={agcLevel} filter={filter} drive={drive} backlight={backlight} firmwareVersion={firmwareVersion}
                 paOpen={showPABias}
                 onVolume={handleVolume} onAtt1={handleAtt1} onAtt2={handleAtt2}
                 onNR={handleNR}
                 onAGC={handleAGC} onAgcLevel={handleAgcLevel} onFilter={handleFilter} onDrive={handleDrive}
-                onBacklight={handleBacklight} onTxTimeout={handleTxTimeout} onTogglePA={handleTogglePA}
+                onBacklight={handleBacklight} onTogglePA={handleTogglePA}
                 onReset={handleReset}
               />
             )}
@@ -897,6 +917,7 @@ export default function RadioCATPanel({ cat, collapsed = false }: { cat: ReturnT
           getPABias={getPABias} setPABias={setPABias}
           getFactoryDefaults={getFactoryDefaults} onFactoryReset={handleFactoryReset}
           onOpenCalibration={handleOpenCalibration}
+          getTxTimeout={getTxTimeout} setTxTimeout={setTxTimeout}
         />
       )}
 

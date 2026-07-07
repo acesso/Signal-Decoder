@@ -71,10 +71,6 @@ export interface RadioState {
   drive: number | null;
   /** LCD backlight: 0=off, 1=on. */
   backlight: number | null;
-  /** TX time-out timer in seconds (TT command), 0 = disabled. Firmware
-   *  force-unkeys the PA when a TX exceeds this — guardrail against a stuck
-   *  PTT overheating the finals. Default 30. */
-  txTimeout: number | null;
   /** Firmware version reported by the radio itself (FV; command, e.g. "4.01a").
    *  null until the post-connect query answers — the UI gates the PU7FTW
    *  extension controls on this instead of hardcoding a version anywhere. */
@@ -118,7 +114,6 @@ export interface RadioCATControls {
   setNR: (n: number) => Promise<void>;
   setAGC: (n: number) => Promise<void>;
   setAgcLevel: (n: number) => Promise<void>;
-  setTxTimeout: (n: number) => Promise<void>;
   setFilter: (n: number) => Promise<void>;
   setDrive: (n: number) => Promise<void>;
   setBacklight: (n: number) => Promise<void>;
@@ -129,6 +124,13 @@ export interface RadioCATControls {
   /** SET one PA bias endpoint and resolve with the value the radio confirmed
    *  (its echo), or null on timeout/rejection. Firmware clamps: min < max, max ≤ 255. */
   setPABias: (which: 'min' | 'max', n: number) => Promise<number | null>;
+  /** One-shot query of the TX time-out guard (TT;), 0..255 seconds, 0 =
+   *  disabled. Not part of the poll loop — call when opening the advanced
+   *  settings panel, same pattern as getPABias. */
+  getTxTimeout: () => Promise<number | null>;
+  /** SET the TX time-out guard and resolve with the radio-confirmed value
+   *  (its echo, or the old value if the SET was rejected). */
+  setTxTimeout: (n: number) => Promise<number | null>;
   /** Soft-restart the radio (SR; — watchdog reset, equivalent to a power
    *  cycle). Resolves true once the radio acks with SR1;. The rig drops off
    *  the wire for a few seconds while it reboots; the poll loop rides through
@@ -215,11 +217,13 @@ export interface RadioCATControls {
 //                                   features on this instead of hardcoding)
 // Query TX timeout: TT; → TTn;    (0..255 s, 0 = disabled — TOT guardrail that
 // Set TX timeout:  TTn; → TTn;     force-unkeys a stuck TX; out-of-range SETs
-//                                   are ignored, echo returns the old value)
+//                                   are ignored, echo returns the old value.
+//                                   NOT polled — fetched/set on demand from
+//                                   the advanced settings panel only.)
 // The firmware supports serialized/batched queries in one write, e.g.
-// "FA;MD;AG0;FW;VO;AT;A2;NR;SM;DR;BL;AL;TT;" — replies come back concatenated in the same order.
+// "FA;MD;AG0;FW;VO;AT;A2;NR;SM;DR;BL;AL;" — replies come back concatenated in the same order.
 
-const BLACKBRICK_POLL_CMDS = ['FA;', 'MD;', 'AG0;', 'FW;', 'VO;', 'AT;', 'A2;', 'NR;', 'SM;', 'DR;', 'BL;', 'AL;', 'TT;'];
+const BLACKBRICK_POLL_CMDS = ['FA;', 'MD;', 'AG0;', 'FW;', 'VO;', 'AT;', 'A2;', 'NR;', 'SM;', 'DR;', 'BL;', 'AL;'];
 
 const KENWOOD_MODE_MAP: Record<string, CATMode> = {
   '1': 'LSB', '2': 'USB', '3': 'CW', '4': 'FM', '5': 'AM', '6': 'RTTY',
@@ -257,7 +261,7 @@ export function useRadioCAT(): RadioCATControls {
     ptt: false, error: null, isSupported: false,
     volume: null, att1: null, att2: null, nr: null,
     agc: null, agcLevel: null, filter: null, sMeter: null, drive: null,
-    backlight: null, txTimeout: null, firmwareVersion: null,
+    backlight: null, firmwareVersion: null,
   });
 
   useEffect(() => {
@@ -288,8 +292,8 @@ export function useRadioCAT(): RadioCATControls {
   // a clean teardown when the port disappears out from under us.
   const disconnectRef = useRef<() => void>(() => {});
 
-  const lastSetRef = useRef<{ frequency: number; mode: number; volume: number; att1: number; att2: number; nr: number; agc: number; agcLevel: number; filter: number; drive: number; backlight: number; txTimeout: number }>({
-    frequency: 0, mode: 0, volume: 0, att1: 0, att2: 0, nr: 0, agc: 0, agcLevel: 0, filter: 0, drive: 0, backlight: 0, txTimeout: 0,
+  const lastSetRef = useRef<{ frequency: number; mode: number; volume: number; att1: number; att2: number; nr: number; agc: number; agcLevel: number; filter: number; drive: number; backlight: number }>({
+    frequency: 0, mode: 0, volume: 0, att1: 0, att2: 0, nr: 0, agc: 0, agcLevel: 0, filter: 0, drive: 0, backlight: 0,
   });
 
   const log = useCallback((level: 'debug' | 'info' | 'warn' | 'error', ...args: unknown[]) => {
@@ -546,7 +550,6 @@ export function useRadioCAT(): RadioCATControls {
           const drive     = byPrefix.has('DR') ? parseIntField(byPrefix.get('DR')!, 'DR') : null;
           const backlight = byPrefix.has('BL') ? parseIntField(byPrefix.get('BL')!, 'BL') : null;
           const agcLevel  = byPrefix.has('AL') ? parseIntField(byPrefix.get('AL')!, 'AL') : null;
-          const txTimeout = byPrefix.has('TT') ? parseIntField(byPrefix.get('TT')!, 'TT') : null;
 
           log('debug', 'poll(batch) — freq:', freq, 'mode:', mode, 'agc:', agc, 'agcLvl:', agcLevel, 'filt:', filter,
             'vol:', volume, 'att1:', att1, 'att2:', att2, 'nr:', nr, 'sm:', sMeter, 'drive:', drive, 'bl:', backlight, `[q:${queueRef.current.length}]`);
@@ -557,7 +560,6 @@ export function useRadioCAT(): RadioCATControls {
             mode:      mode   !== null && (now - ls.mode      > SET_GRACE_MS) ? mode   : prev.mode,
             agc:       agc    !== null && (now - ls.agc       > SET_GRACE_MS) ? agc    : prev.agc,
             agcLevel:  agcLevel !== null && (now - ls.agcLevel > SET_GRACE_MS) ? agcLevel : prev.agcLevel,
-            txTimeout: txTimeout !== null && (now - ls.txTimeout > SET_GRACE_MS) ? txTimeout : prev.txTimeout,
             filter:    filter !== null && (now - ls.filter    > SET_GRACE_MS) ? filter : prev.filter,
             volume:    volume !== null && (now - ls.volume    > SET_GRACE_MS) ? volume : prev.volume,
             att1:      att1   !== null && (now - ls.att1      > SET_GRACE_MS) ? att1   : prev.att1,
@@ -621,7 +623,7 @@ export function useRadioCAT(): RadioCATControls {
     setState(prev => ({
       ...prev, connected: false, frequency: null, mode: null, ptt: false, error: null,
       volume: null, att1: null, att2: null, nr: null, agc: null, agcLevel: null, filter: null, sMeter: null, drive: null,
-      backlight: null, txTimeout: null, firmwareVersion: null,
+      backlight: null, firmwareVersion: null,
     }));
   }, [log]);
   disconnectRef.current = disconnect;  // keep the read loop's teardown handle current
@@ -753,12 +755,6 @@ export function useRadioCAT(): RadioCATControls {
     await write(`AL${n};`);
   }, [log, write]);
 
-  const setTxTimeout = useCallback(async (n: number) => {
-    lastSetRef.current.txTimeout = Date.now();
-    log('info', 'setTxTimeout →', n);
-    setState(prev => ({ ...prev, txTimeout: n }));
-    await write(`TT${n};`);
-  }, [log, write]);
 
   const setFilter = useCallback(async (n: number) => {
     lastSetRef.current.filter = Date.now();
@@ -800,6 +796,24 @@ export function useRadioCAT(): RadioCATControls {
     // The firmware echoes the effective value — the old one if the SET was
     // rejected (out of range / min≥max) — so the caller can show the truth.
     return parseIntField(resp, prefix);
+  }, [log, query]);
+
+  // ── TX timeout (TT) — on-demand only, never polled ─────────────────────────
+
+  const getTxTimeout = useCallback(async (): Promise<number | null> => {
+    log('info', 'getTxTimeout');
+    let resp = '';
+    try { resp = await query('TT;'); } catch { return null; }
+    return parseIntField(resp, 'TT');
+  }, [log, query]);
+
+  const setTxTimeout = useCallback(async (n: number): Promise<number | null> => {
+    log('info', 'setTxTimeout →', n);
+    let resp = '';
+    try { resp = await query(`TT${n};`); } catch { return null; }
+    // The firmware echoes the effective value — the old one if the SET was
+    // rejected (out of range) — so the caller can show the truth.
+    return parseIntField(resp, 'TT');
   }, [log, query]);
 
   const resetRadio = useCallback(async (): Promise<boolean> => {
@@ -851,8 +865,8 @@ export function useRadioCAT(): RadioCATControls {
 
   return {
     state, connect, disconnect, setFrequency, setMode, setPTT,
-    setVolume, setAtt1, setAtt2, setNR, setAGC, setAgcLevel, setTxTimeout, setFilter, setDrive,
-    setBacklight, getPABias, setPABias, resetRadio,
+    setVolume, setAtt1, setAtt2, setNR, setAGC, setAgcLevel, setFilter, setDrive,
+    setBacklight, getPABias, setPABias, getTxTimeout, setTxTimeout, resetRadio,
     getFactoryDefaults, factoryResetRadio, getRefFreq, setRefFreq,
   };
 }
