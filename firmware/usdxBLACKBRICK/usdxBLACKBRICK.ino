@@ -4248,17 +4248,13 @@ int16_t smeter(int16_t ref = 0)
 
 		// While a CAT session is live, every LCD write is audible in the RX audio
 		// (shared UART/LCD pins — pre()/post() mask the serial port per nibble,
-		// "NOISE LEAK INTO RX!!!"). The pre-2026-07-06 firmware avoided that by
-		// disabling the S-meter display outright on CAT connect — which froze the
-		// LCD value (the bug we fixed). Compromise: while cat_active, redraw at
-		// most once per second and only when the reading actually changed. Set
-		// menu S-Meter to OFF for a fully silent display.
-		if (cat_active) {
-			static int16_t dbm_drawn = INT16_MAX;
-			static uint32_t next_draw = 0;
-			if ((dbm == dbm_drawn) || (millis() < next_draw)) return dbm;
-			dbm_drawn = dbm; next_draw = millis() + 1000;
-		}
+		// "NOISE LEAK INTO RX!!!"). A once-per-second throttle (tried 2026-07-06)
+		// was still a clearly audible periodic tick, and CAT already delivers a
+		// live reading via `SM;` — so the LCD field just doesn't redraw at all
+		// while cat_active, exactly like the original firmware's intent, except
+		// `smode` itself is left untouched, so the display resumes the instant
+		// CAT disconnects (the bug we originally fixed).
+		if (cat_active) return dbm;
 
 		lcd.noCursor();
 		if (smode == 1) { // dBm meter

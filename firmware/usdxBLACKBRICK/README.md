@@ -94,6 +94,13 @@ is a board-level design constraint, not a firmware bug.
 
 4.01a (same day) additionally sets the PA bias max default to 130 (was 160) for this unit's PA.
 
+A later same-day fix replaced a 1-Hz throttled LCD S-meter redraw (still an
+audible periodic tick over the shared LCD/UART pins) with full suppression of
+the LCD S-meter/dBm field while a CAT session is active — CAT already delivers
+a live reading via `SM;`, so nothing is lost functionally, and `smode` itself
+is left untouched so the LCD resumes updating immediately if `cat_active`
+is ever cleared.
+
 ## Build / flash / test
 
 See the [project README](../../README.md#usdx-black_brick-firmware) for the
