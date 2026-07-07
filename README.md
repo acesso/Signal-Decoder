@@ -471,7 +471,7 @@ If the port is busy or silent, make sure no other CAT application (hamlib, rigct
 
 ### Custom CAT commands (PU7FTW extensions)
 
-All commands terminate with `;`. All SET commands echo the effective value as a GET reply — if a SET is rejected (out of range), the echo returns the **old** value, which the web app relies on. Commands are safe to batch in a single write — the firmware processes them in order and concatenates replies, e.g. `FA;MD;AG0;FW;VO;AT;A2;NR;SM;DR;BL;AL;` (the app's poll batch) returns all 12 replies in one read window.
+All commands terminate with `;`. All SET commands echo the effective value as a GET reply — if a SET is rejected (out of range), the echo returns the **old** value, which the web app relies on. Commands are safe to batch in a single write — the firmware processes them in order and concatenates replies, e.g. `FA;MD;AG0;FW;VO;AT;A2;NR;SM;DR;BL;AL;TT;` (the app's poll batch) returns all 13 replies in one read window.
 
 | Command | Query | Set | Range | Notes |
 |---------|-------|-----|-------|-------|
@@ -483,8 +483,10 @@ All commands terminate with `;`. All SET commands echo the effective value as a 
 | **AG0** — AGC on/off | `AG0;` → `AG0n;` | `AG0n;` | 0…1 | single algorithm (M0PUB fast-attack/slow-decay); values >1 rejected |
 | **AL** — AGC level | `AL;` → `ALn;` | `ALn;` | 1…14 | target window: output peaks held in [n·256 … n·384]; default 4 |
 | **FW** — filter BW | `FW;` → `FWn;` | `FWn;` | 0…7 | 0=Full 1=3k 2=2.4k 3=1.8k 4=500 5=200 6=100 7=50 Hz |
-| **SM** — S-meter | `SM;` → `SMn;` | — | dBm (signed) | read-only; integer-math dBm, ±1 dB vs the old float version |
+| **SM** — S-meter | `SM;` → `SMn;` | — | dBm (signed) | read-only; integer-math dBm, ±1 dB vs the old float version. During TX replies an empty `SM;` (no RX signal to measure) |
 | **DR** — TX drive | `DR;` → `DRn;` | `DRn;` | 0…8 | pre-clipping input gain (each step doubles the envelope); 8 = always max |
+| **TT** — TX time-out | `TT;` → `TTn;` | `TTn;` | 0…255 s | TOT guardrail: force-unkeys the PA past the limit; 0 = disabled, default 30 |
+| **FV** — firmware version | `FV;` → `FV4.01a;` | — | | read-only; the web app gates its extension controls on this instead of hardcoding the version |
 | **PM** — PA bias min | `PM;` → `PMn;` | `PMn;` | 0…max−1 | PWM LUT idle endpoint; SET rebuilds the LUT live |
 | **PX** — PA bias max | `PX;` → `PXn;` | `PXn;` | min+1…255 | PWM LUT full-drive endpoint — the real output-power control for digital modes |
 | **XF** — ref frequency | `XF;` → `XFnnnnnnnn;` | `XFnnnnnnnn;` | 14–28 MHz | si5351 fxtal calibration; used by the calibration wizard |
