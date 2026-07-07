@@ -613,10 +613,20 @@ function PABiasPanel({ getPABias, setPABias, getFactoryDefaults, onFactoryReset,
   const [busy, setBusy]         = useState(false);
   const [txTimeout, setTxTimeoutState] = useState<number | null>(null);
   const [ttBusy, setTtBusy]     = useState(false);
+  // Guards against overlapping load() runs: the effect below re-fires whenever
+  // its callback deps get a new identity (they're recreated on parent
+  // re-renders), which was queuing duplicate PM/PX/FD/TT queries — the CAT
+  // queue's own dedup then resolved the second copy of each with a sentinel
+  // ('__dedup__') instead of the real reply, and whichever run's state update
+  // landed last could stomp a good reading with that garbage. Only the latest
+  // call is allowed to commit its results.
+  const loadSeqRef = useRef(0);
 
   const load = useCallback(async () => {
+    const seq = ++loadSeqRef.current;
     setBias(null); setDefaults(null); setFailed(false); setTxTimeoutState(null);
     const [b, d, tt] = await Promise.all([getPABias(), getFactoryDefaults(), getTxTimeout()]);
+    if (seq !== loadSeqRef.current) return;  // a newer load() superseded this one
     if (b) {
       setBias(b);
       setMinDraft(String(b.min));
