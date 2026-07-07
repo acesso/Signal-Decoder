@@ -5097,6 +5097,22 @@ void initPins() {
 #define CATCMD_SIZE   32
 char CATcmd[CATCMD_SIZE];
 
+// Validates a variable-width numeric SET payload: CATcmd[from..] must be an
+// optional '-', then one or more digits, then ';' and nothing else. Guards
+// the atoi()-based SET commands (VO/AL/TT/A2/PM/PX/XF) against the shared
+// LCD/UART pins dropping a ';' out of the incoming stream — without this, a
+// dropped terminator lets two adjacent commands concatenate into one buffer
+// (e.g. losing the ';' between "VO;" and "AT0;" yields "VOAT0;", which
+// atoi() would silently parse as 0 and apply as if it were a real VO SET).
+bool isValidNumericSet(uint8_t from)
+{
+	uint8_t i = from;
+	if (CATcmd[i] == '-') i++;
+	if (CATcmd[i] < '0' || CATcmd[i] > '9') return false;  // at least one digit required
+	while (CATcmd[i] >= '0' && CATcmd[i] <= '9') i++;
+	return CATcmd[i] == ';' && CATcmd[i + 1] == '\0';
+}
+
 void analyseCATcmd()    // Supported Kenwood TS-480 protocol CAT commands
 {
 // CMD2: match first two bytes only (for SET commands where [2] holds the value)
@@ -5124,9 +5140,9 @@ void analyseCATcmd()    // Supported Kenwood TS-480 protocol CAT commands
 	else if (CMD4('A','G','0',';'))                         Command_AG0_GET();
 	else if (CMD('A','G','0') && CATcmd[4]==';')            Command_AG0_SET();
 	else if (CMD('A','L',';'))                              Command_AL_GET();
-	else if (CMD2('A','L') && CATcmd[2]!=';')              Command_AL_SET();
+	else if (CMD2('A','L') && isValidNumericSet(2))         Command_AL_SET();
 	else if (CMD('T','T',';'))                              Command_TT_GET();
-	else if (CMD2('T','T') && CATcmd[2]!=';')              Command_TT_SET();
+	else if (CMD2('T','T') && isValidNumericSet(2))         Command_TT_SET();
 	else if (CMD('F','V',';'))                              Command_FV();
 	else if (CMD('F','W',';'))                              Command_FW_GET();
 	else if (CMD2('F','W') && CATcmd[3]==';')               Command_FW_SET();
@@ -5148,25 +5164,25 @@ void analyseCATcmd()    // Supported Kenwood TS-480 protocol CAT commands
 	else if (CMD('B','L',';'))                              Command_BL_GET();
 	else if (CMD2('B','L') && CATcmd[3]==';')               Command_BL_SET(CATcmd[2]-'0');
 	else if (CMD('V','O',';'))                              Command_VO_GET();
-	else if (CMD2('V','O') && CATcmd[2]!=';')              Command_VO_SET();
+	else if (CMD2('V','O') && isValidNumericSet(2))         Command_VO_SET();
 	else if (CMD('A','T',';'))                              Command_AT_GET();
 	else if (CMD2('A','T') && CATcmd[3]==';')               Command_AT_SET();
 	else if (CMD('A','2',';'))                              Command_A2_GET();
-	else if (CMD2('A','2') && CATcmd[2]!=';')              Command_A2_SET();
+	else if (CMD2('A','2') && isValidNumericSet(2))         Command_A2_SET();
 	else if (CMD('N','R',';'))                              Command_NR_GET();
-	else if (CMD2('N','R') && CATcmd[3]==';')               Command_NR_SET();
+	else if (CMD2('N','R') && isValidNumericSet(2))         Command_NR_SET();
 	else if (CMD('S','M',';'))                              Command_SM_GET();
 	else if (CMD('D','R',';'))                              Command_DR_GET();
-	else if (CMD2('D','R') && CATcmd[3]==';')               Command_DR_SET();
+	else if (CMD2('D','R') && isValidNumericSet(2))         Command_DR_SET();
 	else if (CMD('P','M',';'))                              Command_PM_GET();
-	else if (CMD2('P','M') && CATcmd[2]!=';')              Command_PM_SET();
+	else if (CMD2('P','M') && isValidNumericSet(2))         Command_PM_SET();
 	else if (CMD('P','X',';'))                              Command_PX_GET();
-	else if (CMD2('P','X') && CATcmd[2]!=';')              Command_PX_SET();
+	else if (CMD2('P','X') && isValidNumericSet(2))         Command_PX_SET();
 	else if (CMD('S','R',';'))                              Command_SR();
 	else if (CMD('S','R','2') && CATcmd[3]==';')            Command_SR2();
 	else if (CMD('F','D',';'))                              Command_FD();
 	else if (CMD('X','F',';'))                              Command_XF_GET();
-	else if (CMD2('X','F') && CATcmd[2]!=';')              Command_XF_SET();
+	else if (CMD2('X','F') && isValidNumericSet(2))         Command_XF_SET();
 #ifdef CAT_EXT
 	else if (CMD2('U','K') && CATcmd[4]==';')               Command_UK(CATcmd[2], CATcmd[3]);
 	else if (CMD('U','D',';'))                              Command_UD();
