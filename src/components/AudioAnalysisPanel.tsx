@@ -163,29 +163,6 @@ function drawChannelMarker(
   ctx.font='10px monospace';ctx.textAlign='center';ctx.fillStyle=color;ctx.fillText(label,tX,14);
 }
 
-// ── Signal meter ──────────────────────────────────────────────────────────────
-
-function SignalMeter({ envelopeLevel }: { envelopeLevel: number }) {
-  const db  = envelopeLevel > 1e-9 ? 20 * Math.log10(envelopeLevel) : -80;
-  const pct = Math.max(0, Math.min(100, Math.round(((db + 80) / 60) * 100)));
-  return (
-    <div className="flex items-center gap-2">
-      <span className="text-xs text-[#8b949e]">Signal</span>
-      <div className="flex items-center gap-1">
-        {[0, 1, 2, 3, 4].map((bar) => {
-          const isActive = pct > bar * 20;
-          const color = !isActive ? 'bg-[#21262d]'
-            : pct < 30 ? 'bg-[#da3633]'
-            : pct < 60 ? 'bg-[#e3b341]'
-            : 'bg-[#2ea043]';
-          return <div key={bar} className={`w-1.5 sm:w-2 rounded-sm transition-colors ${color}`} style={{ height: `${8 + bar * 3}px` }} />;
-        })}
-      </div>
-      <span className="text-xs font-mono text-[#c9d1d9] min-w-[3ch]">{pct}%</span>
-    </div>
-  );
-}
-
 // ── Public interface ──────────────────────────────────────────────────────────
 
 export interface AudioMarker {
@@ -205,7 +182,6 @@ export interface AudioAnalysisPanelProps {
   onSquelchChange?: (v: number) => void;
   showGrid?: boolean;
   gridSize?: number;
-  signalLevel?: number;
   /** Initial max Hz for the view range (default 3000) */
   defaultMaxHz?: number;
   /** Optional MFSKChannel array for the GL spectrogram bands (advanced usage) */
@@ -230,7 +206,6 @@ export default function AudioAnalysisPanel({
   onSquelchChange,
   showGrid = false,
   gridSize = 48,
-  signalLevel = 0,
   defaultMaxHz = 3000,
   glBands,
   vfoFrequency,
@@ -240,7 +215,6 @@ export default function AudioAnalysisPanel({
 }: AudioAnalysisPanelProps) {
   const [displayMinHz, setDisplayMinHz] = useState(0);
   const [displayMaxHz, setDisplayMaxHz] = useState(defaultMaxHz);
-  const [lockCenter,   setLockCenter]   = useState(true);
   const [centerFreqInput, setCenterFreqInput] = useState('');
   const [sgView,    setSgView]    = useState<SpectrogramView>('legacy');
   const [sgGamma,   setSgGamma]   = useState(2.0);
@@ -514,9 +488,8 @@ export default function AudioAnalysisPanel({
   return (
     <div className={`bg-[#161b22] border border-[#30363d] rounded-lg p-3 sm:p-4 flex flex-col${className ? ` ${className}` : ''}`} style={style}>
       {/* Header */}
-      <div className="flex items-center justify-between mb-2 shrink-0">
+      <div className="mb-2 shrink-0">
         <h2 className="text-lg sm:text-xl font-semibold">Audio Analysis</h2>
-        <SignalMeter envelopeLevel={signalLevel} />
       </div>
 
       <div className="shrink-0">
@@ -605,7 +578,7 @@ export default function AudioAnalysisPanel({
           ))}
         </div>
 
-        {/* Squelch + lock/free */}
+        {/* Squelch */}
         <div className="flex items-center justify-between mt-0.5">
           {onSquelchChange ? (
             <div className="flex items-center gap-2 text-xs text-[#8b949e]">
@@ -620,23 +593,6 @@ export default function AudioAnalysisPanel({
               {isRecording ? 'Receiving audio' : 'Start decoding to see spectrum'}
             </p>
           )}
-          <button
-            onClick={() => setLockCenter(v => !v)}
-            title={lockCenter ? 'View locked — click to free' : 'View free — click to lock'}
-            className={`flex items-center gap-1 px-1.5 py-0.5 rounded border text-[10px] transition-colors ${
-              lockCenter ? 'border-[#2ea043]/50 bg-[#238636]/20 text-[#2ea043]' : 'border-[#30363d] text-[#484f58] hover:text-[#8b949e]'
-            }`}>
-            {lockCenter ? (
-              <svg xmlns="http://www.w3.org/2000/svg" className="h-3 w-3" viewBox="0 0 20 20" fill="currentColor">
-                <path fillRule="evenodd" d="M5 9V7a5 5 0 0110 0v2a2 2 0 012 2v5a2 2 0 01-2 2H5a2 2 0 01-2-2v-5a2 2 0 012-2zm8-2v2H7V7a3 3 0 016 0z" clipRule="evenodd"/>
-              </svg>
-            ) : (
-              <svg xmlns="http://www.w3.org/2000/svg" className="h-3 w-3" viewBox="0 0 20 20" fill="currentColor">
-                <path d="M10 2a5 5 0 00-5 5v2a2 2 0 00-2 2v5a2 2 0 002 2h10a2 2 0 002-2v-5a2 2 0 00-2-2H7V7a3 3 0 015.905-.75 1 1 0 001.937-.5A5.002 5.002 0 0010 2z"/>
-              </svg>
-            )}
-            {lockCenter ? 'Locked' : 'Free'}
-          </button>
         </div>
       </div>
 

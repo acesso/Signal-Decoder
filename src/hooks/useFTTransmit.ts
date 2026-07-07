@@ -31,6 +31,7 @@ export interface FTTransmitState {
   queue: TxQueueEntry[];
   sent: SentEntry[];
   autoCQ: boolean;
+  autoCQIntervalMin: number;
   autoPTT: boolean;
   allowConsecutiveTx: boolean;
   error: string | null;
@@ -48,6 +49,7 @@ const LS_GAIN            = 'ft_tx_gain';
 const LS_AUTOPTT         = 'ft_auto_ptt';
 const LS_CONSECUTIVE_TX  = 'ft_consecutive_tx';
 const LS_BASE_FREQ       = 'ft_base_freq';
+const LS_AUTOCQ_INTERVAL = 'ft_autocq_interval_min';
 
 export const DEFAULT_BASE_FREQ = 1850;
 export function loadBaseFreq(): number {
@@ -102,6 +104,21 @@ export function loadAllowConsecutiveTx(): boolean {
 }
 export function saveAllowConsecutiveTx(v: boolean) {
   if (typeof window !== 'undefined') localStorage.setItem(LS_CONSECUTIVE_TX, String(v));
+}
+
+// Minimum gap between unattended auto-CQ transmissions. Left unchecked, the
+// TX loop would send a CQ in every eligible window (as often as every ~15s
+// for FT8) — far too aggressive for a beacon nobody is watching. Default 5
+// minutes is a reasonable, still-discoverable cadence; 1..60 min range.
+export const DEFAULT_AUTOCQ_INTERVAL_MIN = 5;
+export function loadAutoCQIntervalMin(): number {
+  if (typeof window === 'undefined') return DEFAULT_AUTOCQ_INTERVAL_MIN;
+  const stored = localStorage.getItem(LS_AUTOCQ_INTERVAL);
+  const n = stored !== null ? parseInt(stored, 10) : NaN;
+  return Number.isFinite(n) && n > 0 ? n : DEFAULT_AUTOCQ_INTERVAL_MIN;
+}
+export function saveAutoCQIntervalMin(v: number) {
+  if (typeof window !== 'undefined') localStorage.setItem(LS_AUTOCQ_INTERVAL, String(v));
 }
 
 const LS_AUTOREPLY = 'ft_auto_reply';
@@ -171,6 +188,7 @@ export function useFTTransmit(
     queue: [],
     sent: [],
     autoCQ: false,
+    autoCQIntervalMin: loadAutoCQIntervalMin(),
     autoPTT: loadAutoPTT(),
     allowConsecutiveTx: loadAllowConsecutiveTx(),
     error: null,
@@ -185,6 +203,8 @@ export function useFTTransmit(
   const vfoFreqRef            = useRef(vfoFrequency);
   const outputDeviceRef       = useRef(state.outputDeviceId);
   const autoCQRef             = useRef(false);
+  const autoCQIntervalMinRef  = useRef(loadAutoCQIntervalMin());
+  const lastAutoCQAtMsRef     = useRef(0); // epoch ms of the last auto-CQ transmission, 0 = none sent yet this session
   const autoPTTRef            = useRef(loadAutoPTT());
   const allowConsecutiveTxRef = useRef(loadAllowConsecutiveTx());
   const lastTxWindowRef       = useRef<number>(-1); // epoch ms of last window we transmitted in
@@ -344,9 +364,13 @@ export function useFTTransmit(
       }
 
       // Decide what to transmit this window.
-      // Queued entries take priority; auto-CQ fills in when the queue is empty.
-      const queuedEntry = queueRef.current[0] ?? null;
-      const useAutoCQ   = !queuedEntry && autoCQRef.current && !!autoCQSamplesRef.current;
+      // Queued entries take priority; auto-CQ fills in when the queue is empty
+      // AND at most once per configured interval — otherwise an unattended
+      // beacon would key up in every eligible window (every ~15s on FT8).
+      const queuedEntry     = queueRef.current[0] ?? null;
+      const autoCQDueMs     = lastAutoCQAtMsRef.current + autoCQIntervalMinRef.current * 60_000;
+      const autoCQDue       = nowMs >= autoCQDueMs;
+      const useAutoCQ       = !queuedEntry && autoCQRef.current && !!autoCQSamplesRef.current && autoCQDue;
 
       if (!queuedEntry && !useAutoCQ) {
         await sleepToNextBoundary(windowSec);
@@ -408,7 +432,7 @@ export function useFTTransmit(
       const txWindowBucket = windowStartMs - (windowStartMs % windowMs);
       lastTxWindowRef.current = txWindowBucket;
       // For auto-CQ, generate a unique sent-log id from exact playback time
-      if (useAutoCQ) txId = `autocq-${windowStartMs}`;
+      if (useAutoCQ) { txId = `autocq-${windowStartMs}`; lastAutoCQAtMsRef.current = windowStartMs; }
       setState(prev => ({ ...prev, status: 'playing', error: null }));
 
       // Auto-PTT on — race with a 500ms timeout so a non-responsive CAT never blocks TX
@@ -568,8 +592,18 @@ export function useFTTransmit(
   const setAutoCQ = useCallback((v: boolean) => {
     autoCQRef.current = v;
     syncAutoCQRef(v);
+    // Reset the cooldown on enable so the first CQ fires on the next eligible
+    // window instead of waiting out a stale interval from a previous session.
+    if (v) lastAutoCQAtMsRef.current = 0;
     setState(prev => ({ ...prev, autoCQ: v }));
   }, [syncAutoCQRef]);
+
+  const setAutoCQIntervalMin = useCallback((v: number) => {
+    const clamped = Math.max(1, Math.min(60, Math.round(v)));
+    autoCQIntervalMinRef.current = clamped;
+    saveAutoCQIntervalMin(clamped);
+    setState(prev => ({ ...prev, autoCQIntervalMin: clamped }));
+  }, []);
 
   const setAutoCQMessage = useCallback((msg: string) => {
     autoCQMessageRef.current = msg;
@@ -617,6 +651,7 @@ export function useFTTransmit(
     dequeue,
     moveUp,
     setAutoCQ,
+    setAutoCQIntervalMin,
     setAutoCQMessage,
     setOutputDevice,
     setTxGain,

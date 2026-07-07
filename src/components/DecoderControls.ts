@@ -15,7 +15,6 @@ export interface AudioPanelInfo {
   markers?: AudioMarker[];
   squelch?: number;
   onSquelchChange?: (v: number) => void;
-  signalLevel?: number;
 }
 
 export interface DecoderProps {

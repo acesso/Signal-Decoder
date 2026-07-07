@@ -15,7 +15,7 @@
  * re-measured per render.
  */
 
-import { ReactNode, useEffect, useMemo, useRef, useState } from 'react';
+import { ReactNode, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 
 export default function VirtualList<T>({
   items,
@@ -27,6 +27,7 @@ export default function VirtualList<T>({
   heightsVersion = 0,
   scrollToIndex = -1,
   empty = null,
+  preserveScrollOnPrepend = false,
 }: {
   items: T[];
   itemKey: (item: T, index: number) => string;
@@ -40,6 +41,16 @@ export default function VirtualList<T>({
   /** when >= 0, smooth-scrolls that index into view (re-triggers on change) */
   scrollToIndex?: number;
   empty?: ReactNode;
+  /**
+   * For lists where new items are PREPENDED (newest-first feeds): when the
+   * user has scrolled away from the top, keep whatever content they're
+   * reading pinned in place as new rows land above it, instead of silently
+   * shifting everything down by the height of what just arrived. Anchors on
+   * the first key shared between the old and new item lists. Does nothing
+   * while scrolled to (or within a few px of) the top, so watching new items
+   * arrive live still works as expected.
+   */
+  preserveScrollOnPrepend?: boolean;
 }) {
   const scrollRef = useRef<HTMLDivElement>(null);
   const [viewport, setViewport] = useState({ top: 0, height: 0 });
@@ -53,6 +64,41 @@ export default function VirtualList<T>({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [items, heightsVersion]);
   const totalHeight = items.length ? offsets[items.length] : 0;
+
+  // Remember the previous render's items/offsets/keys so a prepend can be
+  // detected and compensated for before the browser paints the new layout.
+  const prevRef = useRef<{ items: T[]; offsets: Float64Array; keys: Map<string, number> } | null>(null);
+
+  useLayoutEffect(() => {
+    const el = scrollRef.current;
+    const prev = prevRef.current;
+    if (preserveScrollOnPrepend && el && prev && prev.items.length > 0 && items.length > 0) {
+      // Only compensate once the user has scrolled away from the very top —
+      // at the top they're watching live, so let new rows appear naturally.
+      if (el.scrollTop > 4) {
+        // Find the first item still present in both lists (walk the new list
+        // top-down so a block prepend — e.g. a whole decode window — resolves
+        // to the shift in one step instead of one row at a time).
+        for (let i = 0; i < items.length; i++) {
+          const key = itemKey(items[i], i);
+          const prevIndex = prev.keys.get(key);
+          if (prevIndex !== undefined) {
+            const shift = offsets[i] - prev.offsets[prevIndex];
+            if (shift !== 0) el.scrollTop += shift;
+            break;
+          }
+        }
+      }
+    }
+    prevRef.current = {
+      items,
+      offsets,
+      keys: new Map(items.map((it, i) => [itemKey(it, i), i])),
+    };
+    // itemKey is assumed stable (callers pass a pure function); only items/offsets
+    // identity should retrigger this comparison
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [items, offsets, preserveScrollOnPrepend]);
 
   // Track scroll position (rAF-coalesced) and viewport size (ResizeObserver).
   useEffect(() => {

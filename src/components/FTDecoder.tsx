@@ -5,7 +5,7 @@ import type { DecoderControls, DecoderProps } from './DecoderControls';
 import { fmtAbsHz } from '@/lib/formatFreq';
 import AudioAnalysisPanel from './AudioAnalysisPanel';
 import { useFTProcessor } from '@/hooks/useFTProcessor';
-import { FTMode, FT_WINDOW_SECONDS } from '@/lib/ft/decoder';
+import { FTMode, FTMessage, FT_WINDOW_SECONDS } from '@/lib/ft/decoder';
 import { Contact, mergeContacts, parseFTMsg, parseFTMsgCached, parseADIF, isValidCallsign, gridToLatLon, CONTACT_PALETTE } from '@/lib/ft/parser';
 import FTContactsPanel from './FTContactsPanel';
 import FTWasmPanel from './FTWasmPanel';
@@ -168,6 +168,32 @@ const CONTACTS_PUBLISH_MS = 800;
 // fixed widths so independently-rendered rows stay column-aligned.
 const MSG_GRID_COLS = 'grid grid-cols-[78px_92px_54px_46px_minmax(0,1fr)]';
 
+type MsgSortCol = 'freq' | 'snr' | 'dt' | 'msg';
+
+function SortableHeader({ label, col, sortKey, sortRev, onSort, align, title }: {
+  label: string;
+  col: MsgSortCol;
+  sortKey: MsgSortCol | null;
+  sortRev: boolean;
+  onSort: (col: MsgSortCol) => void;
+  align: 'left' | 'right';
+  title?: string;
+}) {
+  const active = sortKey === col;
+  return (
+    <button
+      onClick={() => onSort(col)}
+      title={title ?? (active ? `Sort by ${label} — click to ${sortRev ? 'clear' : 'reverse'}` : `Sort by ${label}`)}
+      className={`py-1.5 px-2 flex items-center gap-0.5 hover:text-[#c9d1d9] transition-colors ${
+        align === 'right' ? 'justify-end' : 'justify-start'
+      } ${active ? 'text-[#2ea043]' : ''}`}
+    >
+      {label}
+      {active && <span className="text-[9px]">{sortRev ? '↑' : '↓'}</span>}
+    </button>
+  );
+}
+
 const MessageRow = memo(function MessageRow({ row, timeStr, myCall, getContact, onSelect }: {
   row: MsgRowData;
   timeStr: string;
@@ -268,6 +294,22 @@ const FTDecoder = forwardRef<DecoderControls, { ftMode: FTMode; myCall?: string;
   // ── Contact tracking ────────────────────────────────────────────────────────
   const [contacts, setContacts] = useState<Map<string, Contact>>(new Map());
   const [contactFocus, setContactFocus] = useState<{ cs: string; n: number } | null>(null);
+
+  // Message-table column sort: applied WITHIN each decode window only — a
+  // window's messages are re-ordered among themselves, but windows never mix,
+  // so a freshly-decoded window always lands in its own natural (newest-first)
+  // slot rather than jumping around the list. null = natural decode order.
+  const [sortKey, setSortKey] = useState<MsgSortCol | null>(null);
+  const [sortRev, setSortRev] = useState(false);
+  const toggleSort = useCallback((key: MsgSortCol) => {
+    setSortKey(prev => {
+      if (prev !== key) { setSortRev(false); return key; }
+      // second click reverses, third click clears back to natural order
+      if (!sortRev) { setSortRev(true); return key; }
+      setSortRev(false);
+      return null;
+    });
+  }, [sortRev]);
   const selectContact = useCallback(
     (cs: string) => setContactFocus(prev => ({ cs, n: (prev?.n ?? 0) + 1 })),
     [],
@@ -475,13 +517,29 @@ const FTDecoder = forwardRef<DecoderControls, { ftMode: FTMode; myCall?: string;
 
   const myCallUpper = myCall.toUpperCase();
 
+  // Sort comparator for messages WITHIN one window — never applied across
+  // windows, so a click here only reorders each window's own rows in place.
+  const sortMessages = useCallback((msgs: FTMessage[]): FTMessage[] => {
+    if (!sortKey) return msgs;
+    const sorted = msgs.slice().sort((a, b) => {
+      const cmp =
+        sortKey === 'freq' ? a.freq - b.freq :
+        sortKey === 'snr'  ? a.snr  - b.snr  :
+        sortKey === 'dt'   ? a.dt   - b.dt   :
+        a.msg.localeCompare(b.msg);
+      return sortRev ? -cmp : cmp;
+    });
+    return sorted;
+  }, [sortKey, sortRev]);
+
   // Use the VFO that was active at the moment each window was decoded (frozen).
   const tableRows: TableRow[] = useMemo(() => results.flatMap((r, ri) => {
     // Fall back to the live VFO for the newest window whose entry isn't frozen yet
     const frozenVfo = frozenVfoRef.current.get(r.windowStart.getTime()) ?? vfoRef.current;
+    const msgs = sortMessages(r.messages);
     return [
       { kind: 'sep' as const, time: r.windowStart, mode: r.mode, empty: r.messages.length === 0, decoding: !!r.decoding, decodeMs: r.decodeMs, key: `sep-${ri}` },
-      ...r.messages.map((m, mi) => {
+      ...msgs.map((m) => {
         const parsed = parseFTMsgCached(m.msg);
         const addressedToMe = !!myCallUpper && parsed.callee?.toUpperCase() === myCallUpper;
         // Signature of everything row rendering depends on beyond its own text:
@@ -497,13 +555,15 @@ const FTDecoder = forwardRef<DecoderControls, { ftMode: FTMode; myCall?: string;
           absFreq: formatFreq(m.freq, frozenVfo),
           dt: m.dt, snr: m.snr, msg: m.msg,
           time: r.windowStart, addressedToMe, colorSig,
-          key: `msg-${ri}-${mi}`,
+          // Content-derived key (not array index) so React tracks each message
+          // stably across re-sorts instead of reusing a position's old row.
+          key: `msg-${ri}-${m.freq}-${m.dt}-${m.snr}-${m.msg}`,
         };
       }),
     ];
   // frozenVfoRef is a ref — not a dep, but results changing is the only trigger needed
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }), [results, myCallUpper, contacts]);
+  }), [results, myCallUpper, contacts, sortMessages]);
 
   const controls: DecoderControls = {
     isRecording: state.isRecording,
@@ -584,14 +644,16 @@ const FTDecoder = forwardRef<DecoderControls, { ftMode: FTMode; myCall?: string;
           )}
 
 
-          {/* column header (outside the scroller — no sticky tricks needed) */}
+          {/* column header (outside the scroller — no sticky tricks needed).
+              Hz/dB/Δ/Message are sortable — but only WITHIN each decode window;
+              windows themselves always stay in newest-first decode order. */}
           {results.length > 0 && (
             <div className={`${MSG_GRID_COLS} font-mono text-xs text-[#8b949e] border-b border-[#30363d] font-semibold shrink-0`}>
               <div className="text-left py-1.5 px-2 whitespace-nowrap">UTC</div>
-              <div className="text-right py-1.5 px-2">Hz</div>
-              <div className="text-right py-1.5 px-2">dB</div>
-              <div className="text-right py-1.5 px-2" title="Time offset vs UTC window">Δ</div>
-              <div className="text-left py-1.5 px-2">Message</div>
+              <SortableHeader label="Hz" col="freq" sortKey={sortKey} sortRev={sortRev} onSort={toggleSort} align="right" />
+              <SortableHeader label="dB" col="snr" sortKey={sortKey} sortRev={sortRev} onSort={toggleSort} align="right" />
+              <SortableHeader label="Δ" col="dt" sortKey={sortKey} sortRev={sortRev} onSort={toggleSort} align="right" title="Time offset vs UTC window" />
+              <SortableHeader label="Message" col="msg" sortKey={sortKey} sortRev={sortRev} onSort={toggleSort} align="left" />
             </div>
           )}
           {/* Windowed list: DOM size stays constant regardless of history length */}
@@ -601,6 +663,7 @@ const FTDecoder = forwardRef<DecoderControls, { ftMode: FTMode; myCall?: string;
             itemKey={row => row.key}
             itemHeight={row => (row.kind === 'sep' ? SEP_ROW_H : MSG_ROW_H)}
             overscan={10}
+            preserveScrollOnPrepend
             empty={
               <div className="flex items-center justify-center h-full">
                 <div className="text-center text-[#484f58] space-y-2">
