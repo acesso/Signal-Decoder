@@ -4356,7 +4356,7 @@ uint32_t semi_qsk_timeout = 0;
 // TX time-out timer (TOT): hard guardrail against a stuck PTT overheating the PA.
 // tot = limit in seconds (0 = disabled); armed by switch_rxtx(1), checked from
 // loop() (CAT TX) and inside the physical-PTT hold loop (which blocks loop()).
-volatile uint8_t tot = 180;
+volatile uint8_t tot = 30;
 volatile uint32_t tx_timeout_at = 0;
 
 // Set RX or TX mode, with RIT support and CW offset
@@ -5131,6 +5131,7 @@ void analyseCATcmd()    // Supported Kenwood TS-480 protocol CAT commands
 	else if (CMD2('A','L') && CATcmd[2]!=';')              Command_AL_SET();
 	else if (CMD('T','T',';'))                              Command_TT_GET();
 	else if (CMD2('T','T') && CATcmd[2]!=';')              Command_TT_SET();
+	else if (CMD('F','V',';'))                              Command_FV();
 	else if (CMD('F','W',';'))                              Command_FW_GET();
 	else if (CMD2('F','W') && CATcmd[3]==';')               Command_FW_SET();
 	else if (CMD('X','T','1'))                              Command_XT1();
@@ -5499,6 +5500,14 @@ void Command_AL_SET()
 	Command_AL_GET();
 }
 
+// FV; → get firmware version (read-only), e.g. "FV4.01a;" — mirrors Kenwood's
+// FV command. Lets CAT clients (the web app) discover the running firmware and
+// enable only the features it supports, instead of hardcoding the version.
+void Command_FV()
+{
+	Serial.print(F("FV" VERSION ";"));
+}
+
 // TT; → get TX time-out timer (seconds, 0=disabled), TTn; → set (0..255).
 // Guardrail against a stuck PTT overheating the PA. Note: changing it does not
 // re-arm an already-running TX — the new limit applies from the next keying.
@@ -5576,6 +5585,11 @@ void Command_NR_SET()
 // display mode (smode) — see the smeter() comment for why that matters.
 void Command_SM_GET()
 {
+	// During TX there is no RX signal to measure (the single ADC samples the mic,
+	// the QSD is muted) — `dbm` would just be the stale last-RX value. Reply an
+	// empty "SM;" frame instead: batched polls stay aligned (prefix present) and
+	// clients parse it as "no reading" rather than a misleading number.
+	if (tx) { Serial.print("SM;"); return; }
 	char buf[8];
 	sprintf(buf, "SM%d;", (int)dbm);
 	Serial.print(buf);

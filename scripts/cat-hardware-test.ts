@@ -69,6 +69,19 @@ function sendGet(fd: number, cmd: string, prefix: string, waitMs = 400): string 
   return send(fd, cmd, waitMs);
 }
 
+// For RESTORE SETs only: absolute-value SETs (ATn;, DRn;, ...) are idempotent,
+// so re-sending after a noise-eaten echo is safe — and a restore MUST be
+// confirmed, or the radio is left drifted (an unconfirmed AT7 restore once left
+// the attenuator stuck at max, -73dB, making the radio seem dead/frozen).
+function sendSetVerified(fd: number, cmd: string, prefix: string, expected: number): string {
+  let resp = '';
+  for (let i = 0; i < 3; i++) {
+    resp = send(fd, cmd);
+    if (parseIntField(resp, prefix) === expected) return resp;
+  }
+  return resp;
+}
+
 // ── Same parse helpers as useRadioCAT.ts / protocol.test.ts ──────────────────
 
 // This board's LCD shares its data pins with the UART (see usdxBLACKBRICK.ino
@@ -184,7 +197,7 @@ function main(): void {
       const confirmed = parseIntField(confirmResp, 'AT');
       record('AT GET reflects the newly set value', confirmed === probe, JSON.stringify(confirmResp));
 
-      const restoreResp = send(fd, `AT${before};`);
+      const restoreResp = sendSetVerified(fd, `AT${before};`, 'AT', before);
       const restored = parseIntField(restoreResp, 'AT');
       record('AT restored to its original value', restored === before, JSON.stringify(restoreResp));
     }
@@ -199,15 +212,15 @@ function main(): void {
     record('SM; GET returns a reading before attenuator change', smBefore !== null, JSON.stringify(smBeforeResp));
 
     if (smBefore !== null && before !== null) {
-      send(fd, 'AT7;'); // max analog attenuation (-73dB per att_label[])
-      const smAfterResp = send(fd, 'SM;', 600);
+      sendSetVerified(fd, 'AT7;', 'AT', 7); // max analog attenuation (-73dB per att_label[])
+      const smAfterResp = sendGet(fd, 'SM;', 'SM-', 600); // retry: the throttled LCD redraw fires exactly when dBm changes and can eat this reply
       const smAfter = parseIntField(smAfterResp, 'SM');
       record(
         'SM; reading changes after a real hardware attenuation change (not frozen)',
         smAfter !== null && smAfter !== smBefore,
         `before=${smBefore} after=${smAfter}`,
       );
-      const smRestoreResp = send(fd, `AT${before};`);
+      const smRestoreResp = sendSetVerified(fd, `AT${before};`, 'AT', before);
       record('AT restored after S-meter liveness check', parseIntField(smRestoreResp, 'AT') === before, JSON.stringify(smRestoreResp));
     }
 
@@ -226,7 +239,7 @@ function main(): void {
       const confirmed = parseIntField(confirmResp, 'DR');
       record('DR GET reflects the newly set value', confirmed === probe, JSON.stringify(confirmResp));
 
-      const restoreResp = send(fd, `DR${drBefore};`);
+      const restoreResp = sendSetVerified(fd, `DR${drBefore};`, 'DR', drBefore);
       const restored = parseIntField(restoreResp, 'DR');
       record('DR restored to its original value', restored === drBefore, JSON.stringify(restoreResp));
     }
@@ -242,7 +255,7 @@ function main(): void {
       const blProbe = blBefore === 1 ? 0 : 1;
       const blSetResp = send(fd, `BL${blProbe};`);
       record('BL SET echoes the new value', parseIntField(blSetResp, 'BL') === blProbe, JSON.stringify(blSetResp));
-      const blRestoreResp = send(fd, `BL${blBefore};`);
+      const blRestoreResp = sendSetVerified(fd, `BL${blBefore};`, 'BL', blBefore);
       record('BL restored to its original value', parseIntField(blRestoreResp, 'BL') === blBefore, JSON.stringify(blRestoreResp));
     }
 
@@ -273,7 +286,8 @@ function main(): void {
 
       send(fd, `MD${mdBefore};`);
       sleepMs(150);
-      const mdRestored = sendGet(fd, 'MD;', 'MD');
+      let mdRestored = sendGet(fd, 'MD;', 'MD');
+      if (parseIntField(mdRestored, 'MD') !== mdBefore) { send(fd, `MD${mdBefore};`); sleepMs(150); mdRestored = sendGet(fd, 'MD;', 'MD'); }
       record('MD restored to its original value', parseIntField(mdRestored, 'MD') === mdBefore, JSON.stringify(mdRestored));
     }
 
@@ -287,7 +301,7 @@ function main(): void {
       const alProbe = alBefore === 4 ? 6 : 4;
       const alSetResp = send(fd, `AL${alProbe};`);
       record('AL SET echoes the new value', parseIntField(alSetResp, 'AL') === alProbe, JSON.stringify(alSetResp));
-      const alRestoreResp = send(fd, `AL${alBefore};`);
+      const alRestoreResp = sendSetVerified(fd, `AL${alBefore};`, 'AL', alBefore);
       record('AL restored to its original value', parseIntField(alRestoreResp, 'AL') === alBefore, JSON.stringify(alRestoreResp));
       const alRejectResp = send(fd, 'AL0;');
       record('AL SET of 0 is rejected (echo returns old value)', parseIntField(alRejectResp, 'AL') === alBefore, JSON.stringify(alRejectResp));
@@ -304,7 +318,7 @@ function main(): void {
       const ttProbe = ttBefore === 60 ? 120 : 60;
       const ttSetResp = send(fd, `TT${ttProbe};`);
       record('TT SET echoes the new value', parseIntField(ttSetResp, 'TT') === ttProbe, JSON.stringify(ttSetResp));
-      const ttRestoreResp = send(fd, `TT${ttBefore};`);
+      const ttRestoreResp = sendSetVerified(fd, `TT${ttBefore};`, 'TT', ttBefore);
       record('TT restored to its original value', parseIntField(ttRestoreResp, 'TT') === ttBefore, JSON.stringify(ttRestoreResp));
       const ttRejectResp = send(fd, 'TT999;');
       record('TT SET beyond 255 is rejected (echo returns old value)', parseIntField(ttRejectResp, 'TT') === ttBefore, JSON.stringify(ttRejectResp));
@@ -333,13 +347,13 @@ function main(): void {
       const pmProbe = pmBefore + 1 < pxBefore ? pmBefore + 1 : pmBefore - 1; // stay in [0, max-1]
       const pmSetResp = send(fd, `PM${pmProbe};`);
       record('PM SET echoes the new value', parseIntField(pmSetResp, 'PM') === pmProbe, JSON.stringify(pmSetResp));
-      const pmRestoreResp = send(fd, `PM${pmBefore};`);
+      const pmRestoreResp = sendSetVerified(fd, `PM${pmBefore};`, 'PM', pmBefore);
       record('PM restored to its original value', parseIntField(pmRestoreResp, 'PM') === pmBefore, JSON.stringify(pmRestoreResp));
 
       const pxProbe = pxBefore > pmBefore + 1 ? pxBefore - 1 : pxBefore + 1; // stay in [min+1, 255]
       const pxSetResp = send(fd, `PX${pxProbe};`);
       record('PX SET echoes the new value', parseIntField(pxSetResp, 'PX') === pxProbe, JSON.stringify(pxSetResp));
-      const pxRestoreResp = send(fd, `PX${pxBefore};`);
+      const pxRestoreResp = sendSetVerified(fd, `PX${pxBefore};`, 'PX', pxBefore);
       record('PX restored to its original value', parseIntField(pxRestoreResp, 'PX') === pxBefore, JSON.stringify(pxRestoreResp));
 
       // Out-of-range SET must be rejected: the echo returns the unchanged value.
@@ -360,12 +374,16 @@ function main(): void {
       const xfProbe = xfBefore + 5;
       const xfSetResp = send(fd, `XF${xfProbe};`);
       record('XF SET echoes the new value', parseIntField(xfSetResp, 'XF') === xfProbe, JSON.stringify(xfSetResp));
-      const xfRestoreResp = send(fd, `XF${xfBefore};`);
+      const xfRestoreResp = sendSetVerified(fd, `XF${xfBefore};`, 'XF', xfBefore);
       record('XF restored to its original value', parseIntField(xfRestoreResp, 'XF') === xfBefore, JSON.stringify(xfRestoreResp));
       // Out-of-range must be rejected (echo returns unchanged value)
       const xfRejectResp = send(fd, 'XF999;');
       record('XF SET below 14 MHz is rejected (echo returns old value)', parseIntField(xfRejectResp, 'XF') === xfBefore, JSON.stringify(xfRejectResp));
     }
+
+    // ── FV; firmware version (read-only) ──
+    const fvResp = sendGet(fd, 'FV;', 'FV');
+    record('FV; returns a firmware version string', /FV\d\.\d\d[a-z]?;/.test(fvResp), JSON.stringify(fvResp));
 
     // ── FD; factory-defaults frame — one 11-value CSV frame. NOTE: SR2;
     // (factory reset) is deliberately NOT exercised here — it wipes band
