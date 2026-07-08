@@ -1,7 +1,7 @@
 'use client';
 
 import dynamic from 'next/dynamic';
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from 'react';
 import { createPortal } from 'react-dom';
 import {
   Contact, ContactMsg, MSG_TYPE_LABEL, MSG_TYPE_COLOR, generateADIF, parseADIF, gridToLatLon, haversineKm, isConfirmedQSO,
@@ -79,16 +79,28 @@ function qrzUrl(callsign: string): string {
 // suffix length) and whether the callsign uses FT8/FT4's "nonstandard"
 // (58-bit) wire encoding — compound/portable form, a 3-char prefix, or a
 // longer special-event-style suffix that doesn't fit the compact 28-bit field.
-function callsignBadge(callsign: string): { text: string; title: string } | null {
+// Brazilian license classes read as a rank ladder — style them like medals:
+// A gold, B silver, C bronze. Compound/special keep the neutral blue.
+const BADGE_STYLE = {
+  gold:   { background: 'rgba(227,179,65,0.15)',  color: '#e3b341', border: '1px solid rgba(227,179,65,0.45)' },
+  silver: { background: 'rgba(176,186,196,0.15)', color: '#b1bac4', border: '1px solid rgba(176,186,196,0.45)' },
+  bronze: { background: 'rgba(205,127,80,0.15)',  color: '#d0885a', border: '1px solid rgba(205,127,80,0.45)' },
+  blue:   { background: 'rgba(88,166,255,0.15)',  color: '#58a6ff', border: '1px solid rgba(88,166,255,0.4)' },
+} as const;
+
+function callsignBadge(callsign: string): { text: string; title: string; style: CSSProperties } | null {
   const info = classifyCallsign(callsign);
   if (info.brazilLicenseClass) {
-    return { text: `BR-${info.brazilLicenseClass}`, title: `Brazil Class ${info.brazilLicenseClass} license` };
+    const style = info.brazilLicenseClass === 'A' ? BADGE_STYLE.gold
+                : info.brazilLicenseClass === 'B' ? BADGE_STYLE.silver
+                : BADGE_STYLE.bronze;
+    return { text: `BR-${info.brazilLicenseClass}`, title: `Brazil Class ${info.brazilLicenseClass} license`, style };
   }
   if (info.kind === 'compound') {
-    return { text: 'CPD', title: 'Compound/portable callsign (58-bit encoding)' };
+    return { text: 'CPD', title: 'Compound/portable callsign (58-bit encoding)', style: BADGE_STYLE.blue };
   }
   if (info.kind === 'nonstandard') {
-    return { text: 'SPEC', title: 'Special/nonstandard-format callsign (58-bit encoding)' };
+    return { text: 'SPEC', title: 'Special/nonstandard-format callsign (58-bit encoding)', style: BADGE_STYLE.blue };
   }
   return null;
 }
@@ -341,7 +353,7 @@ function ContactCard({
         {badge && (
           <span
             className="shrink-0 text-[9px] font-bold font-mono px-1 py-px rounded"
-            style={{ background: 'rgba(88,166,255,0.15)', color: '#58a6ff', border: '1px solid rgba(88,166,255,0.4)' }}
+            style={badge.style}
             title={badge.title}
           >
             {badge.text}

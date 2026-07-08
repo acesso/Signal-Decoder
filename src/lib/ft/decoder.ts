@@ -8,6 +8,18 @@ export interface FTMessage {
   sync: number;
   /** subtraction pass that produced this decode (ft8mon engine only) */
   pass?: number;
+  /**
+   * Decode method (ft8mon engine only): -1/undefined = clean LDPC decode;
+   * >=0 = OSD "best guess" fallback at this search depth — prone to false
+   * positives on marginal signals. FT4/ft8_lib never sets it: that engine
+   * only emits zero-error CRC-verified decodes.
+   */
+  osd?: number;
+}
+
+/** True when a decode came from the OSD fallback rather than clean LDPC. */
+export function isLowConfidence(m: FTMessage): boolean {
+  return (m.osd ?? -1) >= 0;
 }
 
 export interface FTDecodeResult {
@@ -517,6 +529,10 @@ const DEDUP_DT_SEC  = 0.1;
 // FTMessage) is a much stronger "trust this decode" signal than SNR, which
 // only measures audio power and says nothing about decode correctness.
 function isBetterDecode(a: FTMessage, b: FTMessage): boolean {
+  // A clean LDPC decode always beats an OSD "best guess" of the same signal,
+  // regardless of the post-decode correct_bits count (which stays high even
+  // for wrong OSD output).
+  if (isLowConfidence(a) !== isLowConfidence(b)) return !isLowConfidence(a);
   if (a.sync !== b.sync) return a.sync > b.sync;
   return a.snr > b.snr;
 }

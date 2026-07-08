@@ -158,7 +158,7 @@ describe('classifyCallsign', () => {
 describe('mergeContacts', () => {
   const t = new Date('2026-06-12T12:00:00Z');
   const merge = (msgs: string[]) =>
-    mergeContacts(new Map(), t, msgs.map(msg => ({ msg, freq: 1500, snr: -10 })), 0);
+    mergeContacts(new Map(), t, msgs.map(msg => ({ msg, freq: 1500, snr: -10 })), 0).contacts;
 
   it('records grids from partial captures (the old bug)', () => {
     const contacts = merge(['<...> PU7FTW HI72']);
@@ -217,7 +217,7 @@ describe('generateADIF', () => {
     `${me} ${them} RR73`,
   ];
   const merge = (msgs: string[]) =>
-    mergeContacts(new Map(), t, msgs.map(msg => ({ msg, freq: 1500, snr: -10 })), 0);
+    mergeContacts(new Map(), t, msgs.map(msg => ({ msg, freq: 1500, snr: -10 })), 0).contacts;
 
   it('never emits a record for our own callsign (the self-QSO bug)', () => {
     const contacts = merge(qsoMsgs);
