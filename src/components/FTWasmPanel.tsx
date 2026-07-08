@@ -18,14 +18,17 @@ import {
   FTDecoderStatus,
   ensureDecoderReady,
   getDecoderParams,
+  getDecoderPoolSize,
   reloadDecoder,
   setDecoderParams,
+  setDecoderPoolSize,
   subscribeDecoderActivity,
   subscribeDecoderStats,
   subscribeDecoderStatus,
 } from '@/lib/ft/decoder';
 
 const STORAGE_KEY = 'ft-decoder-params-v1';
+const POOL_SIZE_KEY = 'ft-decoder-pool-size-v1';
 
 function loadStoredParams(): Partial<FTDecoderParams> | null {
   try {
@@ -113,6 +116,7 @@ export default function FTWasmPanel({ ftMode }: { ftMode: string }) {
   const [activity, setActivity] = useState<FTDecoderActivity>({ inFlight: 0, startedAt: null, decodedSoFar: 0 });
   const [open,     setOpen]     = useState(false);
   const [params,   setParams]   = useState<FTDecoderParams>(DEFAULT_DECODER_PARAMS);
+  const [poolSize, setPoolSize] = useState(getDecoderPoolSize);
   const restored = useRef(false);
 
   useEffect(() => {
@@ -123,13 +127,27 @@ export default function FTWasmPanel({ ftMode }: { ftMode: string }) {
         setDecoderParams(stored);
       }
       setParams(getDecoderParams());
+      // Pool size must be restored before the first ensureDecoderReady() spawns
+      // it, or the stored preference wouldn't take effect until a reload.
+      const storedPool = parseInt(localStorage.getItem(POOL_SIZE_KEY) ?? '', 10);
+      if (Number.isFinite(storedPool)) {
+        setDecoderPoolSize(storedPool);
+        setPoolSize(getDecoderPoolSize());
+      }
     }
-    ensureDecoderReady(); // spawn worker + load WASM before the first decode
+    ensureDecoderReady(); // spawn the worker pool + load WASM before the first decode
     const unsubStats    = subscribeDecoderStats(setStats);
     const unsubStatus   = subscribeDecoderStatus(setStatus);
     const unsubActivity = subscribeDecoderActivity(setActivity);
     return () => { unsubStats(); unsubStatus(); unsubActivity(); };
   }, []);
+
+  const updatePoolSize = (n: number) => {
+    setDecoderPoolSize(n);
+    setPoolSize(getDecoderPoolSize());
+    try { localStorage.setItem(POOL_SIZE_KEY, String(getDecoderPoolSize())); } catch { /* ignore */ }
+    reloadDecoder(); // new size only takes effect once the pool respawns
+  };
 
   const update = (key: keyof FTDecoderParams, value: number) => {
     setDecoderParams({ [key]: value });
@@ -243,10 +261,20 @@ export default function FTWasmPanel({ ftMode }: { ftMode: string }) {
               );
             })}
           </div>
-          <div className="mt-2 flex justify-end">
+          <div className="mt-2 pt-2 border-t border-[#21262d] flex items-center justify-between gap-2">
+            <label className="flex items-center gap-2 min-w-0" title="Independent decoder workers running in parallel — each window is assigned to one, so up to this many windows decode concurrently instead of queueing behind each other. Changing this reloads WASM.">
+              <span className="text-[#8b949e] text-[10px] whitespace-nowrap">Parallel workers</span>
+              <input
+                type="range" min={1} max={8} step={1}
+                value={poolSize}
+                onChange={e => updatePoolSize(Number(e.target.value))}
+                className="w-20 h-1 accent-[#1f6feb] cursor-pointer"
+              />
+              <span className="font-mono text-[#c9d1d9] w-4 text-right shrink-0">{poolSize}</span>
+            </label>
             <button
               onClick={resetDefaults}
-              className="px-1.5 py-0.5 rounded border border-[#30363d] text-[10px] text-[#8b949e] hover:text-[#c9d1d9] hover:border-[#484f58] transition-colors"
+              className="px-1.5 py-0.5 rounded border border-[#30363d] text-[10px] text-[#8b949e] hover:text-[#c9d1d9] hover:border-[#484f58] transition-colors shrink-0"
             >
               Reset defaults
             </button>
