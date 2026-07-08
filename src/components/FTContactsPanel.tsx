@@ -9,9 +9,15 @@ import {
 } from '@/lib/ft/parser';
 import { callsignCountry } from '@/lib/ft/prefixes';
 
-import type { FTMode } from '@/lib/ft/decoder';
+import { FT_WINDOW_SECONDS, type FTMode } from '@/lib/ft/decoder';
 import { fmtAbsHz } from '@/lib/formatFreq';
 import VirtualList from './VirtualList';
+import { loadNumber, saveNumber, loadBoolean, saveBoolean } from '@/lib/storage';
+
+const LS_MAP_HEIGHT       = 'ft_map_height';
+const LS_CONTACTS_SORT_KEY = 'ft_contacts_sort_key';
+const LS_CONTACTS_SORT_REV = 'ft_contacts_sort_rev';
+const CONTACTS_SORT_KEYS = ['date', 'tx', 'rx', 'worked', 'alpha', 'snr-hi', 'snr-lo', 'near', 'far'] as const;
 
 // Virtualized contact list geometry: collapsed cards are fixed-height
 // (summary row 28px + 2px borders + 6px gap); the expanded card is measured
@@ -29,6 +35,18 @@ function loadShowTerminator(): boolean {
 }
 function saveShowTerminator(v: boolean) {
   if (typeof window !== 'undefined') localStorage.setItem(LS_SHOW_TERMINATOR, String(v));
+}
+
+// Map tile style preference — dark (default) or light basemap. Remembered
+// per browser like the terminator toggle.
+type MapTileStyle = 'dark' | 'light';
+const LS_MAP_STYLE = 'ft_map_tile_style';
+function loadMapStyle(): MapTileStyle {
+  if (typeof window === 'undefined') return 'dark';
+  return localStorage.getItem(LS_MAP_STYLE) === 'light' ? 'light' : 'dark';
+}
+function saveMapStyle(v: MapTileStyle) {
+  if (typeof window !== 'undefined') localStorage.setItem(LS_MAP_STYLE, v);
 }
 
 // Format a stored absolute frequency. Values > 1 MHz are already absolute (VFO
@@ -225,7 +243,7 @@ function ConversationBalloon({
 // ── Contact card ──────────────────────────────────────────────────────────────
 
 function ContactCard({
-  contact, expanded, onToggle, onSelect, contactMap, myCall = '',
+  contact, expanded, onToggle, onSelect, contactMap, myCall = '', newFraction = 0,
 }: {
   contact: Contact;
   expanded: boolean;
@@ -233,6 +251,8 @@ function ContactCard({
   onSelect: (callsign: string) => void;
   contactMap: Map<string, Contact>;
   myCall?: string;
+  /** 1 = just added, fading to 0 over the decode window; 0 = no highlight. */
+  newFraction?: number;
 }) {
   const [hoveredPeer, setHoveredPeer] = useState<string | null>(null);
   const [balloonPos,  setBalloonPos]  = useState<{ top: number; left: number } | null>(null);
@@ -328,8 +348,12 @@ function ContactCard({
 
   return (
     <div
-      className="mb-1.5 rounded-md border border-[#21262d]"
-      style={{ borderLeftColor: contact.color, borderLeftWidth: '3px' }}
+      className="mb-1.5 rounded-md border border-[#21262d] transition-shadow duration-500"
+      style={{
+        borderLeftColor: contact.color,
+        borderLeftWidth: '3px',
+        boxShadow: newFraction > 0 ? `0 0 0 1px ${contact.color}${Math.round(newFraction * 55).toString(16).padStart(2, '0')}` : undefined,
+      }}
     >
       {/* Summary row */}
       <div
@@ -588,6 +612,12 @@ interface Props {
 type SortKey = 'date' | 'tx' | 'rx' | 'worked' | 'alpha' | 'snr-hi' | 'snr-lo' | 'near' | 'far';
 type QuickFilter = 'full-qso' | 'handshake' | 'tx-only' | 'rx-only'; // country handled by separate select
 
+function loadContactsSortKey(): SortKey {
+  if (typeof window === 'undefined') return 'date';
+  const raw = localStorage.getItem(LS_CONTACTS_SORT_KEY);
+  return (CONTACTS_SORT_KEYS as readonly string[]).includes(raw ?? '') ? (raw as SortKey) : 'date';
+}
+
 const SORT_OPTIONS: Array<{ key: SortKey; label: string; title: string }> = [
   { key: 'date',   label: 'Time',     title: 'Most recently heard first' },
   { key: 'tx',     label: 'TX',       title: 'Most transmissions first' },
@@ -602,12 +632,23 @@ const SORT_OPTIONS: Array<{ key: SortKey; label: string; title: string }> = [
 
 export default function FTContactsPanel({ contacts, mode, myCall = '', myGrid = '', vfoHz = 0, onClearContacts, onImportADIF, focus }: Props) {
   const [expanded,       setExpanded]      = useState<string | null>(null);
+  // Sort prefs start at the SSR-safe default, restored from localStorage
+  // post-mount (see the mode-restore comment in page.tsx for why).
   const [sortKey,        setSortKey]       = useState<SortKey>('date');
   const [sortRev,        setSortRev]       = useState(false);
+  useEffect(() => {
+    setSortKey(loadContactsSortKey());
+    setSortRev(loadBoolean(LS_CONTACTS_SORT_REV, false));
+  }, []);
+  useEffect(() => { if (typeof window !== 'undefined') localStorage.setItem(LS_CONTACTS_SORT_KEY, sortKey); }, [sortKey]);
+  useEffect(() => { saveBoolean(LS_CONTACTS_SORT_REV, sortRev); }, [sortRev]);
   const [query,          setQuery]         = useState('');
   const [quickFilter,    setQuickFilter]   = useState<QuickFilter | null>(null);
   const [countryFilter,  setCountryFilter] = useState<string>(''); // country code or ''
+  // Starts at the SSR-safe default, restored from localStorage post-mount.
   const [mapHeight,     setMapHeight]     = useState(160);
+  useEffect(() => { setMapHeight(loadNumber(LS_MAP_HEIGHT, 160)); }, []);
+  useEffect(() => { saveNumber(LS_MAP_HEIGHT, mapHeight); }, [mapHeight]);
   // Always starts false (matching what the server renders, since it has no
   // localStorage) and is synced from storage in an effect below — reading
   // localStorage directly in the initializer make the client's first render
@@ -615,8 +656,26 @@ export default function FTContactsPanel({ contacts, mode, myCall = '', myGrid = 
   // which is a React hydration-mismatch error, not just a cosmetic flash.
   const [showTerminator, setShowTerminator] = useState(false);
   useEffect(() => { setShowTerminator(loadShowTerminator()); }, []);
+  const [mapStyle, setMapStyle] = useState<MapTileStyle>('dark');
+  useEffect(() => { setMapStyle(loadMapStyle()); }, []);
   const panelRef    = useRef<HTMLDivElement>(null);
   const mapDragRef  = useRef<{ startY: number; startH: number } | null>(null);
+
+  // "New contact" highlight — cards (and map markers) fade in a highlight for
+  // one decode window after firstSeen. Ticks only while any contact is still
+  // within that window, so the interval goes idle on a quiet band.
+  const windowMs = FT_WINDOW_SECONDS[mode] * 1000;
+  const [highlightTick, setHighlightTick] = useState(0);
+  useEffect(() => {
+    const hasRecent = () => {
+      const now = Date.now();
+      for (const c of contacts.values()) if (now - c.firstSeen.getTime() < windowMs) return true;
+      return false;
+    };
+    if (!hasRecent()) return;
+    const id = setInterval(() => setHighlightTick(t => t + 1), 250);
+    return () => clearInterval(id);
+  }, [contacts, windowMs, highlightTick]);
 
   useEffect(() => {
     const onMove = (e: MouseEvent) => {
@@ -890,13 +949,32 @@ export default function FTContactsPanel({ contacts, mode, myCall = '', myGrid = 
             >
               🌓 day/night
             </button>
+            <button
+              onClick={() => setMapStyle(v => { const next = v === 'dark' ? 'light' : 'dark'; saveMapStyle(next); return next; })}
+              title={mapStyle === 'dark' ? 'Switch to light map' : 'Switch to dark map'}
+              className={`text-[9px] font-mono px-1.5 py-0.5 rounded border transition-colors ${
+                mapStyle === 'light'
+                  ? 'border-[#2ea043]/50 text-[#2ea043] bg-[#2ea043]/10'
+                  : 'border-[#30363d] text-[#8b949e] hover:text-[#c9d1d9]'
+              }`}
+            >
+              {mapStyle === 'dark' ? '☀️ light map' : '🌑 dark map'}
+            </button>
             <span className="text-[#30363d]">
               {withLocation > 0 ? `${withLocation} located` : 'no positions yet'}
             </span>
           </div>
         </div>
         <div className="rounded overflow-hidden border border-[#21262d]" style={{ height: mapHeight }}>
-          <FTLeafletMap contacts={contacts} onSelect={select} selected={expanded} showTerminator={showTerminator} />
+          <FTLeafletMap
+            contacts={contacts}
+            onSelect={select}
+            selected={expanded}
+            showTerminator={showTerminator}
+            tileStyle={mapStyle}
+            newWindowMs={windowMs}
+            myCall={myCall}
+          />
         </div>
         {/* Drag handle to resize map */}
         <div
@@ -1057,18 +1135,24 @@ export default function FTContactsPanel({ contacts, mode, myCall = '', myGrid = 
             </div>
           </div>
         }
-        renderItem={c => (
-          <div ref={c.callsign === expanded ? measureExpanded : undefined} style={{ overflow: c.callsign === expanded ? 'visible' : 'hidden' }}>
-            <ContactCard
-              contact={c}
-              expanded={expanded === c.callsign}
-              onToggle={() => setExpanded(p => p === c.callsign ? null : c.callsign)}
-              onSelect={select}
-              contactMap={contacts}
-              myCall={myCall}
-            />
-          </div>
-        )}
+        renderItem={c => {
+          void highlightTick; // re-render on tick so the fraction below stays current
+          const age = Date.now() - c.firstSeen.getTime();
+          const newFraction = age < windowMs ? 1 - age / windowMs : 0;
+          return (
+            <div ref={c.callsign === expanded ? measureExpanded : undefined} style={{ overflow: c.callsign === expanded ? 'visible' : 'hidden' }}>
+              <ContactCard
+                contact={c}
+                expanded={expanded === c.callsign}
+                onToggle={() => setExpanded(p => p === c.callsign ? null : c.callsign)}
+                onSelect={select}
+                contactMap={contacts}
+                myCall={myCall}
+                newFraction={newFraction}
+              />
+            </div>
+          );
+        }}
       />
     </div>
   );

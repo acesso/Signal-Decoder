@@ -12,6 +12,50 @@ them into a version section when cutting a release.
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-07-08
+
+### Added
+
+- FT8/FT4 decode confidence gate: OSD-decode marking, grid-vs-callsign geo
+  plausibility check, and callsign quarantine before contacts/map admission.
+- Hard-filter decoded callsigns by ITU prefix allocation, cutting false
+  positives from marginal/garbage decodes (~75 prefix-table entries added).
+- FT8 frequency-slice parallel decoding, replacing the time-window worker
+  pool for real speedup on multi-core machines.
+- Sortable FT message table and a live day/night terminator overlay on the
+  FT contacts map.
+- Firmware: TX time-out guardrail (TOT/TT), AGC level control (AL), PA bias
+  (PM/PX), restart/factory-reset (SR/FD), reference-oscillator calibration
+  (XF), and version query (FV) CAT commands, with matching web UI controls
+  and a guided calibration wizard.
+- FT contacts map: dark/light tile toggle, redesigned pin markers (with a
+  distinct marker for the operator's own callsign), curved QSO lines, and a
+  fading highlight on newly-added contacts.
+- Map view (center/zoom), drag-resized panel sizes, list sort order, and
+  spectrogram display preferences now persist across reloads for every
+  decoder mode.
+- Map centers on the browser's reported location by default (no marker
+  added) when no saved view exists yet.
+
+### Fixed
+
+- Firmware CAT SET command parser hardened against dropped-`;` corruption
+  on VO/AL/TT/A2/NR/DR/PM/PX/XF.
+- Advanced settings panel showing blank TX Timeout / factory defaults under
+  React StrictMode's double-invoked load effect.
+- LCD S-meter ticking noise and freeze-on-CAT-connect on the uSDX firmware.
+- Leaflet map losing sync with its container size after a manual resize,
+  causing the day/night terminator to misalign; the terminator now also
+  repeats correctly across wrapped world copies at low zoom.
+
+### Changed
+
+- FT8/FT4 workers load each WASM engine lazily on first use instead of
+  both up front, halving idle memory per pool worker.
+- Auto-CQ now respects a configurable minimum interval between unattended
+  transmissions instead of firing on every eligible TX window.
+- Firmware TX Timeout moved into advanced settings, queried on-demand.
+
 ## [0.3.0] - 2026-07-03
 
 ### Added
@@ -92,7 +136,8 @@ contact tracking / world map / ADIF export / auto-CQ + auto-reply transmit,
 MFSK4–128 with FEC, WebGL spectrograms, radio CAT control (Kenwood TS-480
 protocol, uSDX), PWA offline support.
 
-[Unreleased]: https://github.com/acesso/Signal-Decoder/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/acesso/Signal-Decoder/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/acesso/Signal-Decoder/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/acesso/Signal-Decoder/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/acesso/Signal-Decoder/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/acesso/Signal-Decoder/releases/tag/v0.1.0

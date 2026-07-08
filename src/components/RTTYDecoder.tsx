@@ -7,8 +7,11 @@ import { SessionCard } from '@/components/SessionCard';
 import { sessionsReducer, makeSession } from '@/lib/rtty/sessions';
 import type { RTTYConfig } from '@/lib/rtty/decoder';
 import AudioAnalysisPanel from './AudioAnalysisPanel';
+import { loadNumberArray, saveNumberArray } from '@/lib/storage';
 
 const DISPLAY_MAX_HZ = 1500;
+const DEFAULT_PANEL_WEIGHTS = [1, 1, 1];
+const LS_PANEL_WEIGHTS = 'rtty_panel_weights';
 
 const DEFAULT_CONFIG: RTTYConfig = {
   centerFreq: 500,
@@ -34,12 +37,15 @@ const RTTYDecoder = forwardRef<DecoderControls, DecoderProps>(function RTTYDecod
   const activeSession = sessions.find(s => s.id === activeSessionId) ?? sessions[0];
   const activeConfig  = activeSession.config;
 
-  // Resizable panels
+  // Resizable panels — starts at the SSR-safe default, restored from
+  // localStorage post-mount (see the mode-restore comment in page.tsx for why).
   const containerRef    = useRef<HTMLDivElement>(null);
-  const [panelWeights, setPanelWeights] = useState([1, 1, 1]);
-  const panelWeightsRef = useRef([1, 1, 1]);
+  const [panelWeights, setPanelWeights] = useState(DEFAULT_PANEL_WEIGHTS);
+  const panelWeightsRef = useRef(DEFAULT_PANEL_WEIGHTS);
   const dragRef = useRef<{ handle: number; startX: number; startWeights: number[] } | null>(null);
   useEffect(() => { panelWeightsRef.current = panelWeights; }, [panelWeights]);
+  useEffect(() => { setPanelWeights(loadNumberArray(LS_PANEL_WEIGHTS, DEFAULT_PANEL_WEIGHTS)); }, []);
+  useEffect(() => { saveNumberArray(LS_PANEL_WEIGHTS, panelWeights); }, [panelWeights]);
 
   const startDrag = (e: React.MouseEvent, handle: number) => {
     e.preventDefault();
@@ -370,6 +376,7 @@ const RTTYDecoder = forwardRef<DecoderControls, DecoderProps>(function RTTYDecod
           analyser={analyser ?? null}
           isRecording={isRecording}
           defaultMaxHz={DISPLAY_MAX_HZ}
+          storageKeyPrefix="rtty"
           markers={[
             { freq: markFreq,  color: '#58a6ff', label: 'M', bandwidthHz: halfBW * 2 },
             { freq: spaceFreq, color: '#f0883e', label: 'S', bandwidthHz: halfBW * 2 },
