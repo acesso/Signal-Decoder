@@ -67,9 +67,9 @@ export interface FTDecoderStats {
 }
 
 export interface FTDecoderStatus {
-  /** engines that finished loading in the current worker */
+  /** union of engines that finished loading across every pool slot */
   engines: string[];
-  /** increments every time the worker (and WASM) is respawned */
+  /** increments every time the whole pool (and WASM) is respawned */
   generation: number;
 }
 
@@ -95,20 +95,65 @@ export const FT_SUPPORTED: Record<FTMode, boolean> = {
   FT2: false,
 };
 
-// ── Worker-backed decoder ─────────────────────────────────────────────────────
-// Lazily created. If the worker crashes or a request times out the worker is
-// replaced automatically so subsequent decode windows recover without a reload.
+// ── Worker pool ───────────────────────────────────────────────────────────────
+// One decode window used to mean one postMessage to a single shared worker —
+// if window N's decode (budget up to ~12s) was still running when window N+1
+// finished capturing (every 7.5s on FT4), N+1 queued behind it on that
+// worker's single JS thread, backlogging decodes even though the machine had
+// idle cores. Each pool slot is a fully independent Worker + WASM instance
+// (no SharedArrayBuffer/pthreads — GitHub Pages can't serve the COOP/COEP
+// headers those need), so up to POOL_SIZE windows now decode concurrently.
+//
+// Trade-off: ft8mon's callsign hash tables (unpack.cc) persist for the life
+// of a WASM instance and help resolve hashed-callsign references (e.g. a
+// station replying with just a hash of a call seen earlier) — spreading
+// windows across N instances means each one only sees ~1/N of the traffic,
+// diluting that cache. Windows are assigned round-robin by a stable counter
+// (not "least busy") specifically so the same physical decode load pattern
+// is reproducible across runs for comparison, and so a given slot's hash
+// table fills predictably rather than depending on timing jitter.
+//
+// A misbehaving decode only tears down and respawns ITS OWN slot — the old
+// single-worker code reset with rejectAll() on any timeout/error, needlessly
+// discarding every other in-flight window along with it.
 
 const DECODE_TIMEOUT_MS = 45_000; // FT8 window is 15s; ft8mon budget can reach ~15s
 
-let worker: Worker | null = null;
+function defaultPoolSize(): number {
+  if (typeof navigator === 'undefined') return 1;
+  const cores = navigator.hardwareConcurrency || 4;
+  // Leave a core for the main thread (UI, audio capture) and don't bother
+  // pooling on genuinely single/dual-core machines.
+  return Math.max(1, Math.min(4, cores - 1));
+}
+
+interface PoolSlot {
+  worker: Worker;
+  /** requests currently in flight on this slot — used only for stats/UI, not routing */
+  inFlight: number;
+}
+
+let pool: PoolSlot[] = [];
+let poolSize = defaultPoolSize();
+let nextSlot = 0; // round-robin cursor
 let nextId = 0;
 let generation = 0;
 const pending = new Map<number, {
   resolve: (msgs: FTMessage[]) => void;
   timer: ReturnType<typeof setTimeout>;
   onPartial?: (msg: FTMessage) => void;
+  slot: number;
 }>();
+
+/** Set how many parallel decoder workers to run. Takes effect on next spawn
+ *  (call reloadDecoder() to apply immediately). 1 = old single-worker behavior. */
+export function setDecoderPoolSize(n: number): void {
+  poolSize = Math.max(1, Math.min(8, Math.round(n)));
+}
+
+export function getDecoderPoolSize(): number {
+  return poolSize;
+}
 
 // ── rolling tuning stats (ft8mon decodes only) ───────────────────────────────
 // lastMsgS: seconds into the decode when its final message appeared — the
@@ -173,21 +218,21 @@ export function getDecoderParams(): FTDecoderParams {
   return { ...currentParams };
 }
 
-/** Update decoder tuning; takes effect on the next decode window. */
+/** Update decoder tuning; takes effect on the next decode window on every slot. */
 export function setDecoderParams(patch: Partial<FTDecoderParams>): void {
   currentParams = { ...currentParams, ...patch };
-  worker?.postMessage({ type: 'params', params: currentParams });
+  for (const slot of pool) slot.worker.postMessage({ type: 'params', params: currentParams });
 }
 
-/** Tear down the worker and its WASM instances; the next decode spawns fresh. */
+/** Tear down the whole pool and its WASM instances; the next decode spawns fresh. */
 export function reloadDecoder(): void {
   rejectAll('manual reload');
-  spawnWorker(); // terminates the old worker, loads WASM anew
+  spawnPool(); // terminates the old pool, loads WASM anew in every slot
 }
 
-/** Spawn the worker (and start WASM loads) without waiting for a decode. */
+/** Spawn the pool (and start WASM loads in every slot) without waiting for a decode. */
 export function ensureDecoderReady(): void {
-  getWorker();
+  ensurePool();
 }
 
 function rejectAll(reason: string) {
@@ -197,29 +242,27 @@ function rejectAll(reason: string) {
   }
   pending.clear();
   notifyActivity();
-  console.warn('[ft8 decoder] worker reset:', reason);
+  console.warn('[ft8 decoder] pool reset:', reason);
 }
 
-function spawnWorker(): Worker {
-  if (worker) {
-    worker.onmessage = null;
-    worker.onerror   = null;
-    try { worker.terminate(); } catch { /* ignore */ }
-  }
-  generation += 1;
-  lastStatus = { engines: [], generation };
-  for (const cb of statusListeners) cb(lastStatus);
+// Engines seen ready across all slots so far this generation (union — a
+// decode can land on any slot, so the UI should show what's available
+// anywhere in the pool, not just slot 0's status).
+let readyEngines = new Set<string>();
 
-  worker = new Worker(new URL('./decoder.worker.ts', import.meta.url));
+function attachSlot(slotIndex: number): PoolSlot {
+  const w = new Worker(new URL('./decoder.worker.ts', import.meta.url));
+  const slot: PoolSlot = { worker: w, inFlight: 0 };
 
-  worker.onmessage = (e: MessageEvent) => {
+  w.onmessage = (e: MessageEvent) => {
     const data = e.data as
       | { type: 'result'; id: number; messages: FTMessage[]; stats: Omit<FTDecoderStats, 'at' | 'avgMsgs' | 'suggestedBudgetSec'>; error?: string }
       | { type: 'progress'; id: number; decoded: number; message: FTMessage }
       | { type: 'ready'; engines: string[] };
 
     if (data.type === 'ready') {
-      lastStatus = { engines: data.engines, generation };
+      for (const eng of data.engines) readyEngines.add(eng);
+      lastStatus = { engines: [...readyEngines], generation };
       for (const cb of statusListeners) cb(lastStatus);
       return;
     }
@@ -236,6 +279,7 @@ function spawnWorker(): Worker {
     }
 
     const entry = pending.get(data.id);
+    slot.inFlight = Math.max(0, slot.inFlight - 1);
     if (data.stats) {
       if (data.stats.engine === 'ft8mon' && !data.error) {
         recentDecodes.push({ msgs: data.messages?.length ?? 0, lastMsgS: currentLastMsgS });
@@ -252,19 +296,72 @@ function spawnWorker(): Worker {
     notifyActivity();
   };
 
-  worker.onerror = (err) => {
-    rejectAll(`worker error: ${err.message}`);
-    worker = null; // next call will spawn a fresh one
-  };
+  w.onerror = (err) => respawnSlot(slotIndex, `error: ${err.message}`);
 
-  // Push current tuning to the fresh worker before any decode arrives.
-  worker.postMessage({ type: 'params', params: currentParams });
-
-  return worker;
+  w.postMessage({ type: 'params', params: currentParams });
+  return slot;
 }
 
-function getWorker(): Worker {
-  return worker ?? spawnWorker();
+// Scoped to one slot only — reject just the requests routed there and
+// replace that slot's worker. The old single-worker code nuked every
+// in-flight decode on any error or timeout, which meant one bad window
+// could cost you several others that had nothing to do with it.
+function respawnSlot(slotIndex: number, reason: string) {
+  console.warn(`[ft8 decoder] slot ${slotIndex} ${reason} — respawning`);
+  for (const [id, entry] of pending) {
+    if (entry.slot !== slotIndex) continue;
+    clearTimeout(entry.timer);
+    entry.resolve([]);
+    pending.delete(id);
+  }
+  notifyActivity();
+  const fresh = attachSlot(slotIndex);
+  if (pool[slotIndex]) pool[slotIndex] = fresh;
+}
+
+function spawnPool(): PoolSlot[] {
+  for (const slot of pool) {
+    slot.worker.onmessage = null;
+    slot.worker.onerror   = null;
+    try { slot.worker.terminate(); } catch { /* ignore */ }
+  }
+  generation += 1;
+  readyEngines = new Set();
+  lastStatus = { engines: [], generation };
+  for (const cb of statusListeners) cb(lastStatus);
+
+  pool = Array.from({ length: poolSize }, (_, i) => attachSlot(i));
+  return pool;
+}
+
+function ensurePool(): PoolSlot[] {
+  return pool.length > 0 ? pool : spawnPool();
+}
+
+// Dev-only rolling log of real decode calls, keyed by (id, slot, timing) —
+// lets an external driver (Playwright perf comparison) read exactly when
+// each window was dispatched/finished and on which slot, without needing
+// React state or a mounted component. Tree-shaken out of production builds
+// (same guard as __ftInjectWindow); populated from inside decodeFTAudio
+// itself so it captures every real call, not just ones routed through a
+// separate debug entry point.
+interface DecodeLogEntry {
+  id: number;
+  slot: number;
+  dispatchedAt: number;
+  resolvedAt: number;
+  msgCount: number;
+}
+const decodeLog: DecodeLogEntry[] = [];
+const DEV_TELEMETRY = process.env.NODE_ENV === 'development' && typeof window !== 'undefined';
+if (DEV_TELEMETRY) {
+  (window as unknown as Record<string, unknown>).__ftDecodePoolDebug = {
+    setPoolSize: setDecoderPoolSize,
+    getPoolSize: getDecoderPoolSize,
+    reload: reloadDecoder,
+    getLog: () => decodeLog.slice(),
+    clearLog: () => { decodeLog.length = 0; },
+  };
 }
 
 export async function decodeFTAudio(
@@ -277,21 +374,36 @@ export async function decodeFTAudio(
   if (!FT_SUPPORTED[mode]) return [];
 
   const id = nextId++;
+  const slots = ensurePool();
+  // Round-robin by a stable counter, not "least busy" — see the comment
+  // above the pool declaration for why (reproducible hash-table locality
+  // per slot across comparable runs).
+  const slotIndex = nextSlot % slots.length;
+  nextSlot++;
+  const slot = slots[slotIndex];
+  const dispatchedAt = DEV_TELEMETRY ? performance.now() : 0;
+
   return new Promise(resolve => {
+    const wrappedResolve = (messages: FTMessage[]) => {
+      if (DEV_TELEMETRY) {
+        decodeLog.push({ id, slot: slotIndex, dispatchedAt, resolvedAt: performance.now(), msgCount: messages.length });
+      }
+      resolve(messages);
+    };
+
     const timer = setTimeout(() => {
       if (!pending.has(id)) return;
       pending.delete(id);
-      resolve([]);
+      wrappedResolve([]);
       notifyActivity();
-      console.warn(`[ft8 decoder] request ${id} timed out — respawning worker`);
-      rejectAll('timeout');
-      worker = null; // force respawn on next request
+      respawnSlot(slotIndex, `request ${id} timed out`);
     }, DECODE_TIMEOUT_MS);
 
-    pending.set(id, { resolve, timer, onPartial });
+    pending.set(id, { resolve: wrappedResolve, timer, onPartial, slot: slotIndex });
     if (oldestDecodeStart === null) oldestDecodeStart = Date.now();
+    slot.inFlight++;
     // Transfer the buffer — zero-copy, avoids serialisation overhead
-    getWorker().postMessage({ type: 'decode', id, samples, sampleRate, mode }, [samples.buffer]);
+    slot.worker.postMessage({ type: 'decode', id, samples, sampleRate, mode }, [samples.buffer]);
     notifyActivity();
   });
 }
