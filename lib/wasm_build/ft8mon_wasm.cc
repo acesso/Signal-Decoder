@@ -9,9 +9,12 @@
  *   ftm_decode(float* samples, int num_samples, int sample_rate,
  *              float min_hz, float max_hz, float budget_sec)
  *     → pointer to a null-terminated JSON string:
- *       "[{\"freq\":...,\"dt\":...,\"snr\":...,\"msg\":\"...\",\"sync\":...,\"pass\":...},...]"
+ *       "[{\"freq\":...,\"dt\":...,\"snr\":...,\"msg\":\"...\",\"sync\":...,\"pass\":...,\"osd\":...},...]"
  *     `sync` carries ft8mon's correct_bits (LDPC parity bits correct before
  *     decode) so the UI's existing sync column stays meaningful.
+ *     `osd` is -1 for a clean LDPC decode, or the OSD search depth (>=0) when
+ *     the decode came from the ordered-statistics fallback — those are the
+ *     "best guess" decodes prone to false positives.
  *
  *   ftm_set(const char* param, const char* val) → double
  *     Runtime tuning via ft8mon's own set() table (osd_depth, ldpc_iters,
@@ -67,8 +70,20 @@ struct Result {
     double snr;
     int    pass;
     int    correct_bits;
+    int    osd_depth;   // -1 = clean LDPC decode; >=0 = OSD fallback at this depth
     std::string msg;
 };
+
+/* ft8.cc stamps "OSD-<depth>-<ldpc_ok>" into the callback comment when the
+   decode came from the ordered-statistics fallback instead of a clean LDPC
+   convergence. Clean decodes leave the comment empty (or "hint1"/"hint2"). */
+static int parse_osd_depth(const char* comment)
+{
+    if (!comment) return -1;
+    const char* p = strstr(comment, "OSD-");
+    if (!p) return -1;
+    return atoi(p + 4);
+}
 
 static std::vector<Result>  results;
 static std::set<std::string> seen;
@@ -79,7 +94,7 @@ static int decode_cb(int* a91, double hz0, double hz1, double off,
                      const char* comment, double snr, int pass,
                      int correct_bits)
 {
-    (void)hz1; (void)comment;
+    (void)hz1;
     std::string msg = unpack(a91);
     if (seen.count(msg))
         return 1; // duplicate: keep, but don't re-subtract
@@ -91,6 +106,7 @@ static int decode_cb(int* a91, double hz0, double hz1, double off,
     r.snr          = snr;
     r.pass         = pass;
     r.correct_bits = correct_bits;
+    r.osd_depth    = parse_osd_depth(comment);
     r.msg          = msg;
     results.push_back(r);
 
@@ -99,9 +115,10 @@ static int decode_cb(int* a91, double hz0, double hz1, double off,
     // even while the WASM call is blocking.
     EM_ASM({
         if (typeof self !== 'undefined' && typeof self.__ftmProgress === 'function') {
-            self.__ftmProgress($0, $1, $2, $3, $4, $5, UTF8ToString($6));
+            self.__ftmProgress($0, $1, $2, $3, $4, $5, UTF8ToString($6), $7);
         }
-    }, (int)results.size(), r.hz, r.dt, r.snr, r.correct_bits, r.pass, r.msg.c_str());
+    }, (int)results.size(), r.hz, r.dt, r.snr, r.correct_bits, r.pass, r.msg.c_str(),
+       r.osd_depth);
 
     return 2; // new decode: subtract from residual for later passes
 }
@@ -141,10 +158,10 @@ const char* ftm_decode(float* samples, int num_samples, int sample_rate,
     for (size_t i = 0; i < results.size(); i++) {
         const Result& r = results[i];
         if (i) json_result += ',';
-        char buf[128];
+        char buf[160];
         snprintf(buf, sizeof(buf),
-                 "{\"freq\":%.2f,\"dt\":%.2f,\"snr\":%.1f,\"sync\":%d,\"pass\":%d,\"msg\":",
-                 r.hz, r.dt, r.snr, r.correct_bits, r.pass);
+                 "{\"freq\":%.2f,\"dt\":%.2f,\"snr\":%.1f,\"sync\":%d,\"pass\":%d,\"osd\":%d,\"msg\":",
+                 r.hz, r.dt, r.snr, r.correct_bits, r.pass, r.osd_depth);
         json_result += buf;
         json_escape(json_result, r.msg);
         json_result += '}';

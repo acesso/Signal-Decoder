@@ -36,8 +36,8 @@ export interface WorkerStats {
 }
 
 export type WorkerResponse =
-  | { type: 'result'; id: number; messages: Array<{ freq: number; dt: number; snr: number; msg: string; sync: number; pass?: number }>; stats: WorkerStats; error?: string }
-  | { type: 'progress'; id: number; decoded: number; message: { freq: number; dt: number; snr: number; msg: string; sync: number; pass: number } }
+  | { type: 'result'; id: number; messages: Array<{ freq: number; dt: number; snr: number; msg: string; sync: number; pass?: number; osd?: number }>; stats: WorkerStats; error?: string }
+  | { type: 'progress'; id: number; decoded: number; message: { freq: number; dt: number; snr: number; msg: string; sync: number; pass: number; osd?: number } }
   | { type: 'ready'; engines: string[] }
   | { type: 'resampled'; id: number; samples: Float32Array };
 
@@ -162,10 +162,10 @@ function decodeWithFt8Mon(
   // The WASM calls self.__ftmProgress synchronously per decoded message;
   // postMessage still delivers while the decode call is blocking this thread.
   (self as unknown as Record<string, unknown>).__ftmProgress =
-    (decoded: number, freq: number, dt: number, snr: number, sync: number, pass: number, msg: string) => {
+    (decoded: number, freq: number, dt: number, snr: number, sync: number, pass: number, msg: string, osd: number) => {
       self.postMessage({
         type: 'progress', id, decoded,
-        message: { freq, dt, snr, msg, sync, pass },
+        message: { freq, dt, snr, msg, sync, pass, osd },
       } satisfies WorkerResponse);
     };
   try {
