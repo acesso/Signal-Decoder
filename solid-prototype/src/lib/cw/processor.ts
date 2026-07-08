@@ -1,0 +1,280 @@
+// Port of src/hooks/useCWProcessor.ts (Next.js app).
+//
+// Squelch is applied per-buffer in processAudioChunk via FFT, not via a fixed
+// amplitude threshold — this ensures the visual squelch line on the canvas
+// directly gates the decoder.
+//
+// squelch: 0-100 (0 = open, 100 = completely closed). Internally maps to
+// 0-0.05 on a square curve so the low end is sensitive and the high end only
+// passes strong signals.
+import { createSignal } from 'solid-js'
+import { CWDecoder, type CWStats } from '$decoder-lib/cw/decoder'
+
+export interface TextToken {
+  text: string
+  channel: 0 | 1
+}
+
+export interface CWProcessorState {
+  isRecording: boolean
+  isSupported: boolean
+  error: string | null
+  stats: CWStats | null
+  stats2: CWStats | null
+  tokens: TextToken[]
+}
+
+export interface CWProcessorParams {
+  toneFreq: () => number
+  squelch: () => number
+  adaptiveDitLength: () => boolean
+  dualMode: () => boolean
+  toneFreq2: () => number
+  wpm: () => number
+  filterQ: () => number
+}
+
+export function createCWProcessor(params: CWProcessorParams) {
+  const [state, setState] = createSignal<CWProcessorState>({
+    isRecording: false,
+    isSupported:
+      typeof window !== 'undefined' &&
+      'AudioContext' in window &&
+      typeof navigator !== 'undefined' &&
+      !!navigator.mediaDevices?.getUserMedia,
+    error: null,
+    stats: null,
+    stats2: null,
+    tokens: [],
+  })
+
+  let audioContext: AudioContext | null = null
+  let analyser: AnalyserNode | null = null
+  let stream: MediaStream | null = null
+  let decoder: CWDecoder | null = null
+  let decoder2: CWDecoder | null = null
+  let processorNode: ScriptProcessorNode | null = null
+  let animFrame: number | null = null
+
+  let fftBuf: Uint8Array<ArrayBuffer> | null = null
+  let tokens: TextToken[] = []
+
+  let onElement: ((type: 'dot' | 'dash') => void) | null = null
+  let onChar: ((char: string, symbol: string) => void) | null = null
+  let onElement2: ((type: 'dot' | 'dash') => void) | null = null
+  let onChar2: ((char: string, symbol: string) => void) | null = null
+
+  function setOnChar(fn: ((char: string, symbol: string) => void) | null) {
+    onChar = fn
+  }
+  function setOnChar2(fn: ((char: string, symbol: string) => void) | null) {
+    onChar2 = fn
+  }
+  function setOnElement(fn: ((type: 'dot' | 'dash') => void) | null) {
+    onElement = fn
+  }
+  function setOnElement2(fn: ((type: 'dot' | 'dash') => void) | null) {
+    onElement2 = fn
+  }
+
+  // ── Sync params to live decoders — call this from a createEffect in the
+  // component so it re-runs whenever any of the params() signals change.
+  function syncParams() {
+    decoder?.setToneFreq(params.toneFreq())
+    const sql = params.squelch()
+    if (sql === 0) {
+      decoder?.setSquelch(0)
+      decoder2?.setSquelch(0)
+    }
+    decoder?.setAdaptiveDitLength(params.adaptiveDitLength())
+    decoder2?.setAdaptiveDitLength(params.adaptiveDitLength())
+    if (!params.adaptiveDitLength()) {
+      decoder?.setWpm(params.wpm())
+      decoder2?.setWpm(params.wpm())
+    }
+    decoder?.setFilterQ(params.filterQ())
+    decoder2?.setFilterQ(params.filterQ())
+    decoder2?.setToneFreq(params.toneFreq2())
+
+    const dual = params.dualMode()
+    if (dual && !decoder2 && audioContext) {
+      const sampleRate = audioContext.sampleRate
+      const d2 = new CWDecoder(sampleRate, params.toneFreq2(), params.wpm(), params.filterQ())
+      d2.setAdaptiveDitLength(params.adaptiveDitLength())
+      d2.onText = (chars) => {
+        tokens = [...tokens, { text: chars, channel: 1 }]
+      }
+      d2.onElement = (type) => onElement2?.(type)
+      d2.onCharDecoded = (char, sym) => onChar2?.(char, sym)
+      decoder2 = d2
+    } else if (!dual) {
+      decoder2 = null
+    }
+  }
+
+  function processAudioChunk(input: Float32Array) {
+    if (!decoder) return
+
+    const sql = params.squelch()
+    if (sql > 0 && analyser) {
+      const binCount = analyser.frequencyBinCount
+      if (!fftBuf || fftBuf.length !== binCount) {
+        fftBuf = new Uint8Array(binCount) as Uint8Array<ArrayBuffer>
+      }
+      analyser.getByteFrequencyData(fftBuf)
+      const nq = analyser.context.sampleRate / 2
+      const thr = sql / 100
+
+      const bin1 = Math.min(Math.round((params.toneFreq() / nq) * binCount), binCount - 1)
+      decoder.setSquelch(fftBuf[bin1] / 255 < thr ? Infinity : 0)
+
+      if (decoder2) {
+        const bin2 = Math.min(Math.round((params.toneFreq2() / nq) * binCount), binCount - 1)
+        decoder2.setSquelch(fftBuf[bin2] / 255 < thr ? Infinity : 0)
+      }
+    }
+
+    const stats = decoder.processSamples(input)
+    const stats2 = decoder2?.processSamples(input) ?? null
+    setState((prev) => ({ ...prev, stats, stats2, tokens }))
+  }
+
+  async function startRecording() {
+    try {
+      if (!state().isSupported) throw new Error('Web Audio API not supported')
+
+      const mediaStream = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false },
+      })
+      stream = mediaStream
+
+      const ctx = new AudioContext()
+      audioContext = ctx
+
+      const source = ctx.createMediaStreamSource(mediaStream)
+      const analyserNode = ctx.createAnalyser()
+      analyserNode.fftSize = 2048
+      analyser = analyserNode
+      source.connect(analyserNode)
+
+      const sampleRate = ctx.sampleRate
+      tokens = []
+
+      const d1 = new CWDecoder(sampleRate, params.toneFreq(), params.wpm(), params.filterQ())
+      d1.setAdaptiveDitLength(params.adaptiveDitLength())
+      d1.onText = (chars) => {
+        tokens = [...tokens, { text: chars, channel: 0 }]
+      }
+      d1.onElement = (type) => onElement?.(type)
+      d1.onCharDecoded = (char, sym) => onChar?.(char, sym)
+      decoder = d1
+
+      if (params.dualMode()) {
+        const d2 = new CWDecoder(sampleRate, params.toneFreq2(), params.wpm(), params.filterQ())
+        d2.setAdaptiveDitLength(params.adaptiveDitLength())
+        d2.onText = (chars) => {
+          tokens = [...tokens, { text: chars, channel: 1 }]
+        }
+        d2.onElement = (type) => onElement2?.(type)
+        d2.onCharDecoded = (char, sym) => onChar2?.(char, sym)
+        decoder2 = d2
+      }
+
+      let usingProcessor = false
+      try {
+        if (typeof ctx.createScriptProcessor === 'function') {
+          const proc = ctx.createScriptProcessor(4096, 1, 1)
+          processorNode = proc
+          proc.onaudioprocess = (e) => {
+            processAudioChunk(e.inputBuffer.getChannelData(0))
+          }
+          analyserNode.connect(proc)
+          proc.connect(ctx.destination)
+          usingProcessor = true
+        }
+      } catch {
+        /* fall through to RAF */
+      }
+
+      if (!usingProcessor) {
+        const gain = ctx.createGain()
+        gain.gain.value = 0.001
+        analyserNode.connect(gain)
+        gain.connect(ctx.destination)
+
+        const poll = () => {
+          if (!analyser) return
+          const buf = new Float32Array(analyserNode.fftSize)
+          analyserNode.getFloatTimeDomainData(buf)
+          processAudioChunk(buf)
+          animFrame = requestAnimationFrame(poll)
+        }
+        animFrame = requestAnimationFrame(poll)
+      }
+
+      setState((prev) => ({ ...prev, isRecording: true, error: null, tokens: [] }))
+    } catch (err) {
+      setState((prev) => ({
+        ...prev,
+        error: err instanceof Error ? err.message : 'Failed to access microphone',
+        isRecording: false,
+      }))
+    }
+  }
+
+  function stopRecording() {
+    stream?.getTracks().forEach((t) => t.stop())
+    stream = null
+    if (processorNode) {
+      processorNode.disconnect()
+      processorNode = null
+    }
+    if (analyser) {
+      analyser.disconnect()
+      analyser = null
+    }
+    if (audioContext) {
+      audioContext.close()
+      audioContext = null
+    }
+    if (animFrame) {
+      cancelAnimationFrame(animFrame)
+      animFrame = null
+    }
+    decoder = null
+    decoder2 = null
+    setState((prev) => ({ ...prev, isRecording: false }))
+  }
+
+  function clearText() {
+    tokens = []
+    setState((prev) => ({ ...prev, tokens: [] }))
+  }
+
+  function resetDecoder() {
+    decoder?.reset()
+    decoder2?.reset()
+    tokens = []
+    setState((prev) => ({ ...prev, stats: null, stats2: null, tokens: [] }))
+  }
+
+  function getAnalyser(): AnalyserNode | null {
+    return analyser
+  }
+
+  return {
+    state,
+    startRecording,
+    stopRecording,
+    clearText,
+    resetDecoder,
+    getAnalyser,
+    syncParams,
+    setOnChar,
+    setOnChar2,
+    setOnElement,
+    setOnElement2,
+  }
+}
+
+export type CWProcessor = ReturnType<typeof createCWProcessor>
