@@ -6,6 +6,10 @@ import AudioAnalysisPanel from './AudioAnalysisPanel';
 import { useAudioProcessor, CapturedImage, SSTVMode } from '@/hooks/useAudioProcessor';
 import { SSTV_MODES } from '@/lib/sstv/constants';
 import { DecoderState } from '@/lib/sstv/decoder';
+import { loadNumberArray, saveNumberArray } from '@/lib/storage';
+
+const DEFAULT_PANEL_WEIGHTS = [1.5, 1, 0.75];
+const LS_PANEL_WEIGHTS = 'sstv_panel_weights';
 
 // ── Gallery thumbnail card ────────────────────────────────────────────────────
 
@@ -129,12 +133,15 @@ const SSTVDecoder = forwardRef<DecoderControls, DecoderProps>(function SSTVDecod
   // Canvas refs
   const imageCanvasRef = useRef<HTMLCanvasElement>(null);
 
-  // Resizable panels
+  // Resizable panels — starts at the SSR-safe default, restored from
+  // localStorage post-mount (see the mode-restore comment in page.tsx for why).
   const containerRef    = useRef<HTMLDivElement>(null);
-  const [panelWeights, setPanelWeights] = useState([1.5, 1, 0.75]);
-  const panelWeightsRef = useRef([1.5, 1, 0.75]);
+  const [panelWeights, setPanelWeights] = useState(DEFAULT_PANEL_WEIGHTS);
+  const panelWeightsRef = useRef(DEFAULT_PANEL_WEIGHTS);
   const dragRef = useRef<{ handle: number; startX: number; startWeights: number[] } | null>(null);
   useEffect(() => { panelWeightsRef.current = panelWeights; }, [panelWeights]);
+  useEffect(() => { setPanelWeights(loadNumberArray(LS_PANEL_WEIGHTS, DEFAULT_PANEL_WEIGHTS)); }, []);
+  useEffect(() => { saveNumberArray(LS_PANEL_WEIGHTS, panelWeights); }, [panelWeights]);
 
   const startDrag = (e: React.MouseEvent, handle: number) => {
     e.preventDefault();
@@ -264,6 +271,7 @@ const SSTVDecoder = forwardRef<DecoderControls, DecoderProps>(function SSTVDecod
           analyser={analyser ?? null}
           isRecording={state.isRecording}
           vfoFrequency={vfoFrequency}
+          storageKeyPrefix="sstv"
           className="min-w-0"
           style={{ flex: panelWeights[1] }}
         />
