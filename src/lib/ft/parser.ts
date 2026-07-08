@@ -1,4 +1,5 @@
 import type { FTMode } from './decoder';
+import { isExactKnownPrefix } from './prefixes';
 
 export type MsgType = 'cq' | 'answer' | 'report' | 'r_report' | 'rrr' | 'rr73' | 'tx73' | 'other';
 
@@ -12,8 +13,71 @@ export interface ParsedFTMsg {
   clean: boolean;   // every word classified as a known FT token — safe to track
 }
 
-const CS = '[A-Z0-9]{1,3}[0-9][A-Z]{1,4}(?:/[A-Z0-9]+)?';
-const CS_EXACT = new RegExp(`^${CS}$`);
+// ── Callsign shape ───────────────────────────────────────────────────────────
+// FT8/FT4 pack callsigns one of two ways (see "The FT4 and FT8 Communication
+// Protocols", Taylor/Franke/Somerville, QEX): a "standard" callsign fits a
+// fixed 28-bit field — a 1-2 char prefix (at least one letter), a digit, and
+// a suffix of up to 3 letters. Anything that doesn't fit (compound calls like
+// PJ4/K1ABC, special-event calls like PA2EVENT or YW18FIFA with a longer or
+// irregular suffix) is packed instead as a 58-bit "nonstandard" field. Both
+// are real, valid callsigns — the encoding choice is a wire-format detail,
+// not a validity signal — so both shapes are accepted here; which one a
+// given callsign used is exposed separately via classifyCallsign() for the
+// UI to show a "special/compound" indicator, not to reject anything.
+// Each shape matcher below returns the MATCHED PREFIX substring (or null) —
+// not just a boolean — so isValidCallsign can check that exact substring
+// against the ITU allocation table (prefixes.ts), rather than independently
+// re-scanning 1/2/3 characters and risking a false match against a SHORTER
+// real prefix that happens to be a substring of a longer, non-allocated one
+// (e.g. "ZZ9" isn't real, but its first 2 chars "ZZ" coincidentally are —
+// checking the exact matched-prefix length avoids that false positive).
+
+// Standard/28-bit shape: 1-2 char prefix (≥1 letter) + 1 digit + ≤3 letter
+// suffix. See "The FT4 and FT8 Communication Protocols" (Taylor/Franke/
+// Somerville, QEX) for the packing this mirrors.
+const CS_STANDARD = /^([A-Z0-9]{1,2})[0-9][A-Z]{1,3}$/;
+function standardPrefix(w: string): string | null {
+  const m = w.match(CS_STANDARD);
+  return m && /[A-Z]/.test(m[1]) ? m[1] : null;
+}
+// Nonstandard/58-bit shape (no slash): everything real that doesn't fit the
+// 28-bit standard field above — a 3-character prefix (many real ITU
+// allocations are 3 chars, e.g. 3DA Eswatini — an ordinary callsign, just
+// outside the 28-bit prefix-length limit), OR a longer/irregular suffix
+// (special-event calls like YW18FIFA, PA2EVENT).
+const CS_NONSTANDARD_3CHAR_PREFIX = /^([A-Z0-9]{3})[0-9][A-Z0-9]{1,3}$/;
+const CS_NONSTANDARD_LONG_SUFFIX  = /^([A-Z0-9]{1,2})[0-9][A-Z0-9]{4,7}$/;
+function nonstandardPrefix(w: string): string | null {
+  const m3 = w.match(CS_NONSTANDARD_3CHAR_PREFIX);
+  if (m3 && /[A-Z]/.test(m3[1])) return m3[1];
+  const mLong = w.match(CS_NONSTANDARD_LONG_SUFFIX);
+  return mLong && /[A-Z]/.test(mLong[1]) ? mLong[1] : null;
+}
+
+function matchedPrefix(w: string): string | null {
+  return standardPrefix(w) ?? nonstandardPrefix(w);
+}
+
+// Compound/portable form (HOME/PORTABLE, e.g. PJ4/K1ABC or K1ABC/PJ4) — valid
+// if EITHER side alone is a standard- or nonstandard-shape callsign; the
+// other side is often just a bare prefix or region tag, not a full callsign.
+// Returns the matched prefix from whichever side matched, preferring the
+// side most likely to be the operator's actual identity (the non-prefix-only
+// side), which for ITU-prefix purposes is whichever side matched at all.
+function compoundPrefix(w: string): string | null {
+  const parts = w.split('/');
+  if (parts.length !== 2) return null;
+  for (const p of parts) {
+    const prefix = matchedPrefix(p);
+    if (prefix) return prefix;
+  }
+  return null;
+}
+
+function isRecognizedShape(w: string): boolean {
+  return matchedPrefix(w) !== null || compoundPrefix(w) !== null;
+}
+
 // "RR73" is lexically a valid Maidenhead square but is reserved as a QSO
 // sign-off message and must never be read as a locator (same as WSJT-X)
 const GRID_EXACT = /^(?!RR73)[A-R]{2}[0-9]{2}$/;
@@ -24,13 +88,53 @@ const RPT_EXACT = /^(R?)([+-][0-9]{1,2})$/;
 // payload — a legitimate token, but not a usable callsign
 const isPlaceholder = (w: string) => w.includes('<') || w.includes('>');
 const isCallsignish = (w: string | undefined): boolean =>
-  !!w && (CS_EXACT.test(w) || isPlaceholder(w));
+  !!w && (isRecognizedShape(w) || isPlaceholder(w));
 
-// "<...>" placeholders and the literal "CQ" are not callsigns
+// "<...>" placeholders and the literal "CQ" are not callsigns. Beyond shape,
+// also requires the EXACT matched prefix to be a real ITU allocation (see
+// prefixes.ts) — this is what catches shape-plausible garbage (a random
+// decode that happens to look like a callsign but whose "country" was never
+// assigned by any administration). Checking the exact matched-prefix
+// substring (not an independent 1/2/3-char rescan) avoids false-accepting a
+// non-allocated long prefix just because its first 1-2 characters happen to
+// coincide with a real, shorter allocation.
 export function isValidCallsign(cs: string | undefined): cs is string {
   if (!cs) return false;
   if (cs === 'CQ' || cs.includes('<') || cs.includes('>')) return false;
-  return CS_EXACT.test(cs);
+  const prefix = matchedPrefix(cs) ?? compoundPrefix(cs);
+  return prefix !== null && isExactKnownPrefix(prefix);
+}
+
+export interface CallsignInfo {
+  /** Which FT8/FT4 wire encoding this callsign's shape implies — a protocol
+   *  detail, not a validity signal (see the shape-matcher comments above).
+   *  'compound' covers portable/DXpedition form (HOME/PORTABLE). */
+  kind: 'standard' | 'nonstandard' | 'compound';
+  /** Brazilian amateur radio license class (ANATEL Resolução 449/2006),
+   *  undefined for non-Brazilian callsigns. Encoded in the prefix pair AND
+   *  suffix length, not just the prefix: PU is always Class C (3-letter
+   *  suffix); PP/PR/PS/PT/PV/PW/PY/ZV-ZZ are Class A (2-letter suffix) or
+   *  B (3-letter suffix). */
+  brazilLicenseClass?: 'A' | 'B' | 'C';
+}
+
+const BRAZIL_CLASS_C_PREFIX = /^PU[0-9]/;
+const BRAZIL_CLASS_AB_PREFIX = /^(?:P[PRSTVWY]|Z[VWXYZ])[0-9]/;
+
+function brazilLicenseClass(cs: string): 'A' | 'B' | 'C' | undefined {
+  const base = cs.split('/')[0];
+  const suffixLen = base.length - base.search(/[0-9]/) - 1;
+  if (BRAZIL_CLASS_C_PREFIX.test(base)) return 'C';
+  if (BRAZIL_CLASS_AB_PREFIX.test(base)) return suffixLen <= 2 ? 'A' : 'B';
+  return undefined;
+}
+
+/** Best-effort classification for UI display (contact card indicators) —
+ *  call only after isValidCallsign() has confirmed the callsign is real. */
+export function classifyCallsign(cs: string): CallsignInfo {
+  if (cs.includes('/')) return { kind: 'compound' };
+  const kind = standardPrefix(cs) !== null ? 'standard' : 'nonstandard';
+  return { kind, brazilLicenseClass: brazilLicenseClass(cs) };
 }
 
 // Parse results memoized by message text. The messages table re-renders on
@@ -63,10 +167,15 @@ export function parseFTMsg(raw: string): ParsedFTMsg {
   if (words[0] === 'CQ') {
     let i = 1;
     // Directed-CQ tag (DX, NA, POTA, …) — letters only, not a callsign or grid
-    if (words[i] && /^[A-Z]{1,4}$/.test(words[i]) && !CS_EXACT.test(words[i]) && !GRID_EXACT.test(words[i])) i++;
+    // (a letters-only word can never match a callsign shape, which requires a
+    // digit, so only the grid check is actually needed here)
+    if (words[i] && /^[A-Z]{1,4}$/.test(words[i]) && !GRID_EXACT.test(words[i])) i++;
     const caller = words[i] ?? raw;
     const grid   = words[i + 1] && GRID_EXACT.test(words[i + 1]) ? words[i + 1] : undefined;
-    const clean  = words.length <= i + 2 && isCallsignish(caller) &&
+    // isValidCallsign (not just isCallsignish) — a CQ's caller populates the
+    // map/contacts directly, so it needs the full ITU-prefix check too, not
+    // just shape-plausibility.
+    const clean  = words.length <= i + 2 && isValidCallsign(caller) &&
                    (words[i + 1] === undefined || grid !== undefined);
     return { type: 'cq', caller, grid, raw, clean };
   }

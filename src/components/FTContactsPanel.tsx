@@ -5,6 +5,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import {
   Contact, ContactMsg, MSG_TYPE_LABEL, MSG_TYPE_COLOR, generateADIF, parseADIF, gridToLatLon, haversineKm, isConfirmedQSO,
+  classifyCallsign,
 } from '@/lib/ft/parser';
 import { callsignCountry } from '@/lib/ft/prefixes';
 
@@ -71,6 +72,25 @@ function locationParts(contact: Contact): LocationParts | null {
 
 function qrzUrl(callsign: string): string {
   return `https://www.qrz.com/db/${encodeURIComponent(callsign.split('/')[0])}`;
+}
+
+// Visible badge shown in the card title next to the callsign: Brazilian
+// license class (A/B/C, per ANATEL Res. 449/2006 — encoded in prefix +
+// suffix length) and whether the callsign uses FT8/FT4's "nonstandard"
+// (58-bit) wire encoding — compound/portable form, a 3-char prefix, or a
+// longer special-event-style suffix that doesn't fit the compact 28-bit field.
+function callsignBadge(callsign: string): { text: string; title: string } | null {
+  const info = classifyCallsign(callsign);
+  if (info.brazilLicenseClass) {
+    return { text: `BR-${info.brazilLicenseClass}`, title: `Brazil Class ${info.brazilLicenseClass} license` };
+  }
+  if (info.kind === 'compound') {
+    return { text: 'CPD', title: 'Compound/portable callsign (58-bit encoding)' };
+  }
+  if (info.kind === 'nonstandard') {
+    return { text: 'SPEC', title: 'Special/nonstandard-format callsign (58-bit encoding)' };
+  }
+  return null;
 }
 
 function formatKm(km: number): string {
@@ -246,6 +266,7 @@ function ContactCard({
 
   const locParts = locationParts(contact);
   const longest = expanded ? longestDistances(contact, contactMap) : { tx: null, rx: null };
+  const badge = callsignBadge(contact.callsign);
 
   // Split peers into groups
   const receivedFrom = new Set<string>();
@@ -317,6 +338,15 @@ function ContactCard({
         >
           {contact.callsign}
         </a>
+        {badge && (
+          <span
+            className="shrink-0 text-[9px] font-bold font-mono px-1 py-px rounded"
+            style={{ background: 'rgba(88,166,255,0.15)', color: '#58a6ff', border: '1px solid rgba(88,166,255,0.4)' }}
+            title={badge.title}
+          >
+            {badge.text}
+          </span>
+        )}
         {/* QSO badge — only shown when the local operator has exchanged with this station */}
         {myQSOFull && (
           <span
