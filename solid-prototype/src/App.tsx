@@ -1,25 +1,33 @@
 // Incremental port of src/app/page.tsx's shell — grows a mode at a time as
-// each decoder is ported (RTTY, CW so far). All-mode wiring (FT contacts/map/
-// TX state, CAT VFO) lands once every decoder exists.
+// each decoder is ported (RTTY, CW, SSTV so far). All-mode wiring (FT
+// contacts/map/TX state, CAT VFO) lands once every decoder exists.
 import { createSignal, Show, type JSX } from 'solid-js'
 import { globalAudio } from './lib/audio/globalAudio'
 import RTTYDecoder from './components/RTTYDecoder'
 import CWDecoder from './components/CWDecoder'
+import SSTVDecoder from './components/SSTVDecoder'
 import type { DecoderControls } from './lib/decoderControls'
 
-type DecoderMode = 'rtty' | 'cw'
+type DecoderMode = 'rtty' | 'cw' | 'sstv'
+
+const MODE_META: Record<DecoderMode, string> = {
+  rtty: 'Real-time Radioteletype signal decoder from microphone',
+  cw: 'Continuous Wave (Morse code) decoder',
+  sstv: 'Slow Scan Television image decoder',
+}
 
 function App(): JSX.Element {
   const [mode, setMode] = createSignal<DecoderMode>('rtty')
 
   const rtty: { current: DecoderControls | null } = { current: null }
   const cw: { current: DecoderControls | null } = { current: null }
+  const sstv: { current: DecoderControls | null } = { current: null }
 
   const [isRecording, setIsRecording] = createSignal(false)
   const [error, setError] = createSignal<string | null>(null)
 
   function activeHandle() {
-    return mode() === 'rtty' ? rtty : cw
+    return mode() === 'rtty' ? rtty : mode() === 'cw' ? cw : sstv
   }
 
   async function handleStart() {
@@ -50,12 +58,10 @@ function App(): JSX.Element {
             <h1 class="mb-1 text-2xl font-bold text-[#c9d1d9] sm:text-3xl lg:text-4xl">
               Radio Signal Decoder <span class="text-base font-normal text-[#8b949e]">(SolidJS prototype)</span>
             </h1>
-            <p class="text-sm text-[#8b949e] sm:text-base">
-              {mode() === 'rtty' ? 'Real-time Radioteletype signal decoder from microphone' : 'Continuous Wave (Morse code) decoder'}
-            </p>
+            <p class="text-sm text-[#8b949e] sm:text-base">{MODE_META[mode()]}</p>
           </div>
           <div class="flex shrink-0 items-center gap-1 self-start rounded-lg border border-[#30363d] bg-[#0d1117] p-1 sm:self-auto">
-            {(['rtty', 'cw'] as DecoderMode[]).map((m) => (
+            {(['rtty', 'sstv', 'cw'] as DecoderMode[]).map((m) => (
               <button
                 onClick={() => handleModeChange(m)}
                 class={`rounded-md px-4 py-1.5 text-sm font-semibold transition-colors ${
@@ -107,6 +113,18 @@ function App(): JSX.Element {
             analyser={globalAudio.analyser()}
             onStateChange={(s) => {
               if (mode() === 'rtty') {
+                setIsRecording(s.isRecording)
+                setError(s.error)
+              }
+            }}
+          />
+        </div>
+        <div class={mode() === 'sstv' ? '' : 'hidden'}>
+          <SSTVDecoder
+            handle={sstv}
+            analyser={globalAudio.analyser()}
+            onStateChange={(s) => {
+              if (mode() === 'sstv') {
                 setIsRecording(s.isRecording)
                 setError(s.error)
               }
