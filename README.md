@@ -258,7 +258,17 @@ Every decode is listed with UTC time, audio frequency (Hz), SNR (dB), and time o
 
 `RR73` is never interpreted as a grid locator (it is lexically a valid Maidenhead square, but is reserved as a sign-off — same convention as WSJT-X).
 
-Each window's separator row shows the decode time plus admission counters: `N msg` (decodes this window), `+M new` (new validated contacts, counted by sender callsign), `K held` (suspicious new callsigns quarantined — see below), and `J dropped` (quarantined callsigns that expired uncorroborated + geographically implausible grids rejected). Messages decoded by ft8mon's OSD fallback (LDPC didn't converge cleanly — a "best guess" prone to false positives) carry a small `osd` tag.
+Each window's separator row shows the decode time plus admission counters:
+
+| Counter | Meaning |
+|---------|---------|
+| `N msg` | decodes this window |
+| `+M new` | new validated contacts, counted by sender callsign |
+| `K held` | suspicious new callsigns just quarantined (see below) |
+| `J expired` | previously-held callsigns dropped — never corroborated within 6 windows; will never become a contact |
+| `I bad grid` | a reported locator was geographically implausible for the callsign's country and was rejected (the contact's map position was not updated) |
+
+Messages decoded by ft8mon's OSD fallback (LDPC didn't converge cleanly — a "best guess" prone to false positives) carry a small `osd` tag.
 
 ### Decode confidence gate
 
