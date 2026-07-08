@@ -566,7 +566,13 @@ export default function FTContactsPanel({ contacts, mode, myCall = '', myGrid = 
   const [quickFilter,    setQuickFilter]   = useState<QuickFilter | null>(null);
   const [countryFilter,  setCountryFilter] = useState<string>(''); // country code or ''
   const [mapHeight,     setMapHeight]     = useState(160);
-  const [showTerminator, setShowTerminator] = useState(loadShowTerminator);
+  // Always starts false (matching what the server renders, since it has no
+  // localStorage) and is synced from storage in an effect below — reading
+  // localStorage directly in the initializer make the client's first render
+  // diverge from the server's whenever a prior visit had it saved as true,
+  // which is a React hydration-mismatch error, not just a cosmetic flash.
+  const [showTerminator, setShowTerminator] = useState(false);
+  useEffect(() => { setShowTerminator(loadShowTerminator()); }, []);
   const panelRef    = useRef<HTMLDivElement>(null);
   const mapDragRef  = useRef<{ startY: number; startH: number } | null>(null);
 

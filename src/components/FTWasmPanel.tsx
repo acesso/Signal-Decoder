@@ -262,7 +262,7 @@ export default function FTWasmPanel({ ftMode }: { ftMode: string }) {
             })}
           </div>
           <div className="mt-2 pt-2 border-t border-[#21262d] flex items-center justify-between gap-2">
-            <label className="flex items-center gap-2 min-w-0" title="Independent decoder workers running in parallel — each window is assigned to one, so up to this many windows decode concurrently instead of queueing behind each other. Changing this reloads WASM.">
+            <label className="flex items-center gap-2 min-w-0" title="Independent decoder workers running in parallel. FT8: each window's frequency band is split into this many slices, decoded concurrently (matches WSJT-X Improved/JTDX's approach — ft8mon has no interference-subtraction loop to parallelize otherwise). FT4 falls back to one window per worker, since ft8_lib's single-pass decoder has no per-slice work to split. Changing this reloads WASM.">
               <span className="text-[#8b949e] text-[10px] whitespace-nowrap">Parallel workers</span>
               <input
                 type="range" min={1} max={8} step={1}

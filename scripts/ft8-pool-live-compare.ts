@@ -208,10 +208,12 @@ async function setupAppTab(page: Page, poolSize: number) {
   await page.getByRole('button', { name: 'Start Decoding' }).click();
 }
 
+interface DecodeLogMessage { freq: number; dt: number; snr: number; msg: string; sync: number }
+interface DecodeLogEntry { id: number; slot: number; dispatchedAt: number; resolvedAt: number; msgCount: number; messages: DecodeLogMessage[] }
 interface PassResult {
   poolSize: number;
   durationMs: number;
-  decodeLog: Array<{ id: number; slot: number; dispatchedAt: number; resolvedAt: number; msgCount: number }>;
+  decodeLog: DecodeLogEntry[];
   finalMessageTexts: string[];
 }
 
@@ -260,6 +262,49 @@ async function runPass(browser: Browser, poolSize: number): Promise<PassResult> 
   return { poolSize, durationMs, decodeLog, finalMessageTexts };
 }
 
+// Groups decodeLog entries into logical windows: all slices of one
+// frequency-slice fan-out are dispatched within the same Promise.all(), so
+// their dispatchedAt timestamps land within a few ms of each other — group
+// anything within 500ms as belonging to the same window.
+function groupIntoWindows(decodeLog: DecodeLogEntry[]): DecodeLogEntry[][] {
+  const sorted = [...decodeLog].sort((a, b) => a.dispatchedAt - b.dispatchedAt);
+  const groups: DecodeLogEntry[][] = [];
+  for (const entry of sorted) {
+    const last = groups[groups.length - 1];
+    if (last && entry.dispatchedAt - last[0].dispatchedAt < 500) last.push(entry);
+    else groups.push([entry]);
+  }
+  return groups;
+}
+
+// Finds messages from DIFFERENT slices of the SAME logical window whose
+// (freq, dt) are close enough that they're almost certainly the same
+// physical signal decoded differently by each slice's independent OSD near
+// a shared overlap boundary — i.e. exactly what mergeSliceResults' proximity
+// dedup (in src/lib/ft/decoder.ts) is supposed to catch before this point.
+// Any survivor of that dedup logic showing up in the RAW per-slice log here
+// is expected — this checks the raw pre-merge data, not the merged output —
+// but a cluster of >2 near-identical entries with DIFFERENT text is the
+// signature to watch for (the KP4QVQ case: same caller, different message).
+function findSuspiciousClusters(decodeLog: DecodeLogEntry[]): string[] {
+  const findings: string[] = [];
+  for (const window of groupIntoWindows(decodeLog)) {
+    const all = window.flatMap(e => e.messages.map(m => ({ ...m, slot: e.slot })));
+    for (let i = 0; i < all.length; i++) {
+      for (let j = i + 1; j < all.length; j++) {
+        const a = all[i], b = all[j];
+        if (a.slot === b.slot) continue; // same-slice duplicates aren't the boundary artifact
+        const closeFreq = Math.abs(a.freq - b.freq) <= 15;
+        const closeDt   = Math.abs(a.dt - b.dt) <= 0.15;
+        if (closeFreq && closeDt && a.msg !== b.msg) {
+          findings.push(`slot${a.slot} "${a.msg}" (${a.freq}Hz,${a.dt}s) vs slot${b.slot} "${b.msg}" (${b.freq}Hz,${b.dt}s)`);
+        }
+      }
+    }
+  }
+  return findings;
+}
+
 function summarize(pass: PassResult) {
   const { decodeLog } = pass;
   const decodeMs = decodeLog.map(e => e.resolvedAt - e.dispatchedAt);
@@ -278,6 +323,7 @@ function summarize(pass: PassResult) {
     windowsOverCadence: overCadence,
     unresolvedHashedCallsigns: unresolvedHashes,
     slotUsage: decodeLog.reduce<Record<number, number>>((acc, e) => { acc[e.slot] = (acc[e.slot] ?? 0) + 1; return acc; }, {}),
+    suspiciousClusters: findSuspiciousClusters(decodeLog),
   };
 }
 
@@ -324,6 +370,8 @@ async function main() {
     console.log(`  windows over 15s cadence:   ${s.windowsOverCadence}  (backlog risk on single-worker)`);
     console.log(`  unresolved hashed calls:    ${s.unresolvedHashedCallsigns}  (hash-table dilution proxy)`);
     console.log(`  slot usage:                 ${JSON.stringify(s.slotUsage)}`);
+    console.log(`  suspicious near-dup clusters (raw, pre-merge-dedup): ${s.suspiciousClusters.length}`);
+    for (const c of s.suspiciousClusters) console.log(`    - ${c}`);
   }
   console.log(`\nfull results written to ${OUT}`);
 }

@@ -183,17 +183,23 @@ export function useFTTransmit(
   vfoFrequency = 0,
   onSetPTT?: (tx: boolean) => Promise<void>,
 ) {
+  // localStorage-backed fields below all start at fixed, SSR-safe defaults
+  // and are synced from storage in the effect further down — reading
+  // localStorage directly in the initializer makes the client's first
+  // render diverge from the server's (which has no localStorage), a React
+  // hydration-mismatch error, not just a cosmetic flash. (Found via the
+  // same bug in FTContactsPanel's day/night toggle.)
   const [state, setState] = useState<FTTransmitState>({
     status: 'idle',
     queue: [],
     sent: [],
     autoCQ: false,
-    autoCQIntervalMin: loadAutoCQIntervalMin(),
-    autoPTT: loadAutoPTT(),
-    allowConsecutiveTx: loadAllowConsecutiveTx(),
+    autoCQIntervalMin: DEFAULT_AUTOCQ_INTERVAL_MIN,
+    autoPTT: false,
+    allowConsecutiveTx: false,
     error: null,
-    outputDeviceId: loadOutputDevice(),
-    txGain: loadTxGain(),
+    outputDeviceId: '',
+    txGain: DEFAULT_GAIN,
     sinkIdSupported: false,
   });
 
@@ -203,13 +209,13 @@ export function useFTTransmit(
   const vfoFreqRef            = useRef(vfoFrequency);
   const outputDeviceRef       = useRef(state.outputDeviceId);
   const autoCQRef             = useRef(false);
-  const autoCQIntervalMinRef  = useRef(loadAutoCQIntervalMin());
+  const autoCQIntervalMinRef  = useRef(DEFAULT_AUTOCQ_INTERVAL_MIN);
   const lastAutoCQAtMsRef     = useRef(0); // epoch ms of the last auto-CQ transmission, 0 = none sent yet this session
-  const autoPTTRef            = useRef(loadAutoPTT());
-  const allowConsecutiveTxRef = useRef(loadAllowConsecutiveTx());
+  const autoPTTRef            = useRef(false);
+  const allowConsecutiveTxRef = useRef(false);
   const lastTxWindowRef       = useRef<number>(-1); // epoch ms of last window we transmitted in
   const onSetPTTRef           = useRef(onSetPTT);
-  const gainRef               = useRef(loadTxGain());
+  const gainRef               = useRef(DEFAULT_GAIN);
   const gainNodeRef           = useRef<GainNode | null>(null);
   const txTapRef              = useRef<ScriptProcessorNode | null>(null);
   const queueRef              = useRef<TxQueueEntry[]>([]);
@@ -218,6 +224,22 @@ export function useFTTransmit(
 
   useEffect(() => { vfoFreqRef.current = vfoFrequency; }, [vfoFrequency]);
   useEffect(() => { onSetPTTRef.current = onSetPTT; }, [onSetPTT]);
+
+  // One-time client-side sync of every localStorage-backed field, run after
+  // hydration completes — see the comment on the initial useState above.
+  useEffect(() => {
+    const autoCQIntervalMin = loadAutoCQIntervalMin();
+    const autoPTT = loadAutoPTT();
+    const allowConsecutiveTx = loadAllowConsecutiveTx();
+    const outputDeviceId = loadOutputDevice();
+    const txGain = loadTxGain();
+    autoCQIntervalMinRef.current = autoCQIntervalMin;
+    autoPTTRef.current = autoPTT;
+    allowConsecutiveTxRef.current = allowConsecutiveTx;
+    outputDeviceRef.current = outputDeviceId;
+    gainRef.current = txGain;
+    setState(prev => ({ ...prev, autoCQIntervalMin, autoPTT, allowConsecutiveTx, outputDeviceId, txGain }));
+  }, []);
 
   useEffect(() => {
     const supported = typeof AudioContext !== 'undefined' &&

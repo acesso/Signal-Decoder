@@ -17,8 +17,15 @@
 import type { FTMode, FTDecoderParams } from './decoder';
 
 export type WorkerRequest =
-  | { type: 'decode'; id: number; samples: Float32Array; sampleRate: number; mode: FTMode }
-  | { type: 'params'; params: FTDecoderParams };
+  | {
+      type: 'decode'; id: number; samples: Float32Array; sampleRate: number; mode: FTMode;
+      /** Per-call Hz sub-band override for frequency-slice parallel decoding
+       *  (FT8/ft8mon only) — when present, overrides params.minHz/maxHz for
+       *  just this one call without mutating the persisted tuning params. */
+      hzRange?: { min: number; max: number };
+    }
+  | { type: 'params'; params: FTDecoderParams }
+  | { type: 'resample'; id: number; samples: Float32Array; sampleRate: number };
 
 export interface WorkerStats {
   engine: 'ft8mon' | 'ft8_lib';
@@ -31,7 +38,8 @@ export interface WorkerStats {
 export type WorkerResponse =
   | { type: 'result'; id: number; messages: Array<{ freq: number; dt: number; snr: number; msg: string; sync: number; pass?: number }>; stats: WorkerStats; error?: string }
   | { type: 'progress'; id: number; decoded: number; message: { freq: number; dt: number; snr: number; msg: string; sync: number; pass: number } }
-  | { type: 'ready'; engines: string[] };
+  | { type: 'ready'; engines: string[] }
+  | { type: 'resampled'; id: number; samples: Float32Array };
 
 // ── WASM public-asset URL helper ────────────────────────────────────────────
 // Worker chunks are served from /_next/static/chunks/… (or /<basePath>/_next/…
@@ -145,7 +153,10 @@ Promise.allSettled([loadFt8Mon(), loadFt8Lib()]).then(settled => {
 // ── Decode helpers ───────────────────────────────────────────────────────────
 type Messages = Extract<WorkerResponse, { type: 'result' }>['messages'];
 
-function decodeWithFt8Mon(mod: FT8MonModule, samples: Float32Array, sampleRate: number, id: number): Messages {
+function decodeWithFt8Mon(
+  mod: FT8MonModule, samples: Float32Array, sampleRate: number, id: number,
+  hzRange?: { min: number; max: number },
+): Messages {
   const ptr = mod._malloc(samples.length * 4);
   if (!ptr) throw new Error('WASM malloc returned null');
   // The WASM calls self.__ftmProgress synchronously per decoded message;
@@ -159,8 +170,10 @@ function decodeWithFt8Mon(mod: FT8MonModule, samples: Float32Array, sampleRate: 
     };
   try {
     mod.HEAPF32.set(samples, ptr >> 2);
+    const minHz = hzRange?.min ?? params.minHz;
+    const maxHz = hzRange?.max ?? params.maxHz;
     const jsonPtr = mod._ftm_decode(ptr, samples.length, sampleRate,
-                                    params.minHz, params.maxHz, params.budgetSec);
+                                    minHz, maxHz, params.budgetSec);
     return JSON.parse(mod.UTF8ToString(jsonPtr));
   } finally {
     delete (self as unknown as Record<string, unknown>).__ftmProgress;
@@ -180,6 +193,33 @@ function decodeWithFt8Lib(mod: FT8LibModule, samples: Float32Array, sampleRate: 
   }
 }
 
+// ── Resample (moved off the main thread) ────────────────────────────────────
+// ft8mon's fixed internal decode rate (see ft8mon_wasm.cc's DECODE_RATE).
+// Mirrors resample_to_12k() in ft8mon_wasm.cc exactly (same linear-
+// interpolation formula, same edge clamping). Run once, in a worker, before
+// frequency-slice fan-out dispatches the same resampled audio to every
+// slice — a naive main-thread loop over a full 15s/48kHz window (~720k
+// samples) is expensive enough to visibly stutter the UI; doing the
+// identical work here keeps that off the thread that has to keep rendering.
+const FT8MON_DECODE_RATE = 12000;
+
+function resampleTo12k(samples: Float32Array, sampleRate: number): Float32Array {
+  if (sampleRate === FT8MON_DECODE_RATE) return samples;
+  const inLen = samples.length;
+  const nOut = Math.floor((inLen * FT8MON_DECODE_RATE) / sampleRate);
+  const out = new Float32Array(nOut);
+  const step = sampleRate / FT8MON_DECODE_RATE;
+  for (let i = 0; i < nOut; i++) {
+    const pos  = i * step;
+    const idx  = Math.floor(pos);
+    const frac = pos - idx;
+    const s0   = samples[idx];
+    const s1   = idx + 1 < inLen ? samples[idx + 1] : s0;
+    out[i] = s0 + frac * (s1 - s0);
+  }
+  return out;
+}
+
 // ── Message handler ──────────────────────────────────────────────────────────
 self.onmessage = async (e: MessageEvent<WorkerRequest>) => {
   const req = e.data;
@@ -191,7 +231,21 @@ self.onmessage = async (e: MessageEvent<WorkerRequest>) => {
     return;
   }
 
-  const { id, samples, sampleRate, mode } = req;
+  if (req.type === 'resample') {
+    const resampled = resampleTo12k(req.samples, req.sampleRate);
+    // The project's tsconfig uses lib "dom" (not "webworker"), so `self`
+    // types as Window here and its postMessage overloads don't include the
+    // (message, transfer[]) worker-side signature the other call sites in
+    // this file happen not to need — cast to the DedicatedWorkerGlobalScope
+    // shape actually in effect at runtime inside a Worker.
+    (self as unknown as { postMessage(message: unknown, transfer: Transferable[]): void }).postMessage(
+      { type: 'resampled', id: req.id, samples: resampled } satisfies WorkerResponse,
+      [resampled.buffer],
+    );
+    return;
+  }
+
+  const { id, samples, sampleRate, mode, hzRange } = req;
   try {
     let engine: WorkerStats['engine'];
     let messages: Messages;
@@ -202,7 +256,7 @@ self.onmessage = async (e: MessageEvent<WorkerRequest>) => {
     if (mode === 'FT8') {
       try {
         const mod = await loadFt8Mon();
-        messages      = decodeWithFt8Mon(mod, samples, sampleRate, id);
+        messages      = decodeWithFt8Mon(mod, samples, sampleRate, id, hzRange);
         heapBytes     = mod.HEAPU8.length;
         heapUsedBytes = mod._ftm_heap_used();
         engine        = 'ft8mon';
