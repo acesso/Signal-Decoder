@@ -1,5 +1,5 @@
 import {
-  parseFTMsg, mergeContacts, isValidCallsign, gridToLatLon, haversineKm,
+  parseFTMsg, mergeContacts, isValidCallsign, classifyCallsign, gridToLatLon, haversineKm,
   generateADIF, isConfirmedQSO,
 } from '../parser';
 import { callsignCountry } from '../prefixes';
@@ -59,6 +59,99 @@ describe('parseFTMsg', () => {
     const p = parseFTMsg('PU7FTW HI72');
     expect(p).toMatchObject({ caller: 'PU7FTW', grid: 'HI72', clean: true });
     expect(parseFTMsg('<...> HI72').clean).toBe(false); // placeholder owner is useless
+  });
+
+  // ft8mon's own internal fallback for an unrecognized message type/subtype
+  // ("i3=%d n3=%d" in ft8mon_wasm.cc) is a real observed false decode — no
+  // callsign-shaped word in it at all, so it must never register as clean.
+  it('rejects ft8mon\'s "i3=X n3=Y" internal fallback string', () => {
+    expect(parseFTMsg('i3=0 n3=5').clean).toBe(false);
+  });
+
+  it('rejects a CQ whose caller has an unallocated ITU prefix', () => {
+    // "Q" is not an allocated amateur-radio prefix — shape-plausible garbage
+    // that isValidCallsign's shape check alone wouldn't catch.
+    expect(parseFTMsg('CQ Q9AAA FN20').clean).toBe(false);
+  });
+
+  it('accepts compound/portable callsigns in a standard exchange', () => {
+    const p = parseFTMsg('PJ4/K1ABC W1AW RRR');
+    expect(p).toMatchObject({ type: 'rrr', caller: 'W1AW', callee: 'PJ4/K1ABC', clean: true });
+  });
+
+  it('accepts a special-event CQ (long/irregular suffix, no slash)', () => {
+    const p = parseFTMsg('CQ YW18FIFA FK68');
+    expect(p).toMatchObject({ type: 'cq', caller: 'YW18FIFA', clean: true });
+  });
+});
+
+describe('isValidCallsign — ITU prefix + shape', () => {
+  it('accepts standard-shape callsigns with an allocated prefix', () => {
+    expect(isValidCallsign('K1ABC')).toBe(true);
+    expect(isValidCallsign('PU7FTW')).toBe(true);
+    expect(isValidCallsign('VE3ABC')).toBe(true);
+  });
+
+  it('accepts a digit-led prefix as long as it has ≥1 letter (9A1AA, 3DA0XY)', () => {
+    expect(isValidCallsign('9A1AA')).toBe(true);   // Croatia, 2-char digit+letter prefix
+    expect(isValidCallsign('3DA0XY')).toBe(true);  // Eswatini, 3-char prefix (nonstandard shape)
+  });
+
+  it('accepts compound/portable form when either side is a real callsign', () => {
+    expect(isValidCallsign('PJ4/K1ABC')).toBe(true);
+    expect(isValidCallsign('K1ABC/PJ4')).toBe(true);
+  });
+
+  it('accepts special-event callsigns with a longer suffix', () => {
+    expect(isValidCallsign('YW18FIFA')).toBe(true);
+    expect(isValidCallsign('PA2EVENT')).toBe(true);
+  });
+
+  it('rejects an unallocated prefix even when the shape looks plausible', () => {
+    expect(isValidCallsign('Q9AAA')).toBe(false); // Q is not ITU-allocated
+  });
+
+  it('rejects a longer prefix that only coincidentally starts with a real one', () => {
+    // "ZZ" (Brazil) is real, but "ZZ9" as a 3-char prefix is not — must not
+    // fall back to the shorter allocation once a longer shape has matched.
+    expect(isValidCallsign('ZZ99ZZ')).toBe(false);
+  });
+
+  it('rejects non-callsign tokens regardless of shape', () => {
+    expect(isValidCallsign('CQ')).toBe(false);
+    expect(isValidCallsign('<...>')).toBe(false);
+    expect(isValidCallsign('13=0')).toBe(false);
+  });
+});
+
+describe('classifyCallsign', () => {
+  it('flags compound/portable callsigns', () => {
+    expect(classifyCallsign('PJ4/K1ABC').kind).toBe('compound');
+  });
+
+  it('flags nonstandard-shape (58-bit) callsigns', () => {
+    expect(classifyCallsign('YW18FIFA').kind).toBe('nonstandard');
+    expect(classifyCallsign('3DA0XY').kind).toBe('nonstandard');
+  });
+
+  it('flags standard-shape (28-bit) callsigns', () => {
+    expect(classifyCallsign('K1ABC').kind).toBe('standard');
+  });
+
+  it('derives Brazilian license class from prefix + suffix length', () => {
+    // PU is always Class C regardless of suffix length
+    expect(classifyCallsign('PU7FTW').brazilLicenseClass).toBe('C');
+    expect(classifyCallsign('PU1AB').brazilLicenseClass).toBe('C');
+    // PP/PR/PS/PT/PV/PW/PY/ZV-ZZ: 2-letter suffix = A, 3-letter suffix = B
+    expect(classifyCallsign('PY2AB').brazilLicenseClass).toBe('A');
+    expect(classifyCallsign('PY2ABC').brazilLicenseClass).toBe('B');
+    expect(classifyCallsign('PP5XYZ').brazilLicenseClass).toBe('B');
+    expect(classifyCallsign('ZZ1AB').brazilLicenseClass).toBe('A');
+  });
+
+  it('leaves brazilLicenseClass undefined for non-Brazilian callsigns', () => {
+    expect(classifyCallsign('K1ABC').brazilLicenseClass).toBeUndefined();
+    expect(classifyCallsign('9A1AA').brazilLicenseClass).toBeUndefined();
   });
 });
 
