@@ -258,11 +258,24 @@ Every decode is listed with UTC time, audio frequency (Hz), SNR (dB), and time o
 
 `RR73` is never interpreted as a grid locator (it is lexically a valid Maidenhead square, but is reserved as a sign-off — same convention as WSJT-X).
 
+Each window's separator row shows the decode time plus admission counters: `N msg` (decodes this window), `+M new` (new validated contacts, counted by sender callsign), `K held` (suspicious new callsigns quarantined — see below), and `J dropped` (quarantined callsigns that expired uncorroborated + geographically implausible grids rejected). Messages decoded by ft8mon's OSD fallback (LDPC didn't converge cleanly — a "best guess" prone to false positives) carry a small `osd` tag.
+
+### Decode confidence gate
+
+Every FT8 decoder produces occasional false decodes on marginal signals — plausible-looking callsigns in the wrong place on the map. Three offline defenses (no external lookups) keep them out of the contacts/map, in addition to the ITU callsign-prefix validation:
+
+- **Decode-method marking**: the ft8mon WASM wrapper reports whether each decode came from a clean LDPC convergence or the OSD (ordered-statistics) fallback, including the OSD depth. OSD decodes are the ones prone to fabricating messages out of noise; they are marked in the log and treated as low-confidence by the gate. FT4 (ft8_lib) only ever emits zero-error CRC-verified decodes, so every FT4 decode counts as clean.
+- **Geographic plausibility**: when a decode carries a grid, the grid's position is checked against the country implied by the callsign's ITU prefix (every country covered by one or more generous centroid+radius circles, including distant territories that share the parent prefix — Hawaii/Alaska/Puerto Rico for US calls, Azores/Madeira for Portugal, Svalbard for Norway, Brazil's oceanic islands…). A "Norwegian" station gridding in Korea is a false decode, not a trip: the grid never updates the map position, and for an unknown callsign it quarantines the whole decode. Compound/portable calls (`PJ4/K1ABC`) are exempt — operating away from home is their whole point. Table gaps fail open.
+- **Quarantine for suspicious new callsigns**: a never-heard callsign arriving via an OSD decode or with an implausible grid is held in a hidden table instead of becoming a contact. It is admitted (with its buffered messages replayed) once a clean sighting arrives, or after being heard in 3 distinct windows; it is silently dropped after 6 window cycles without corroboration. A held callsign that is a near-twin (≤2 substituted, non-adjacent characters) of an existing contact only gets out on a clean decode — a repeating marginal signal can make the OSD mis-decode the *same* wrong callsign every window, so repetition alone doesn't corroborate a twin. Established contacts are never gated.
+
+Automatic "correction" of near-miss callsigns toward known contacts was considered and deliberately **not** implemented: FT8 callsigns are integer-packed fields protected by CRC+LDPC over the whole payload, so a failed decode is a wholesale different codeword rather than a character-level corruption — rewriting what was decoded would fabricate QSO data. Near-twin similarity is used only as a *detection* signal (above), never to alter a decode.
+
 ### Contacts Panel
 
 Callsigns are extracted from decoded messages and tracked as contacts with full QSO history:
 
-- **Validation**: Only decodes with ≥3 readable words are parsed; `<...>` hashed-callsign placeholders and the literal `CQ` are never treated as callsigns
+- **Validation**: Only decodes with ≥3 readable words are parsed; `<...>` hashed-callsign placeholders and the literal `CQ` are never treated as callsigns; callsign prefixes must be real ITU allocations, and new callsigns pass the decode confidence gate (above) before appearing
+- **Callsign badges**: Brazilian license class shown as a rank-colored badge next to the callsign (`BR-A` gold, `BR-B` silver, `BR-C` bronze — class derived from prefix + suffix length per ANATEL Res. 449/2006); `CPD` marks compound/portable calls, `SPEC` special-event/nonstandard-format calls (FT8's 58-bit encoding)
 - **World map**: Located contacts (from their Maidenhead grid) are plotted on a Leaflet dark map, starting fully zoomed out
 - **Location labels**: Grids are reverse-geocoded asynchronously (OSM Nominatim, throttled and cached) into `🇧🇷 Joao Pessoa - HI72` style labels
 - **Operator lookup**: Name/email looked up asynchronously via hamdb.org (QRZ's API requires a paid authenticated session); the callsign in the list links to its qrz.com profile

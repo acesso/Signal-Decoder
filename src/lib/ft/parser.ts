@@ -1,5 +1,7 @@
 import type { FTMode } from './decoder';
-import { isExactKnownPrefix } from './prefixes';
+import { isExactKnownPrefix, callsignCountry } from './prefixes';
+import { latLonPlausibleForCountry } from './geo';
+import { DecodeGate, isNearTwin, type HoldReason, type PendingMsg } from './gate';
 
 export type MsgType = 'cq' | 'answer' | 'report' | 'r_report' | 'rrr' | 'rr73' | 'tx73' | 'other';
 
@@ -262,15 +264,50 @@ export interface Contact {
 // (virtualized lists keep render cost independent of contact count).
 const MAX_CONTACTS = 1200;
 
+/** One decoded message as fed into mergeContacts. `osd` is FTMessage.osd:
+ *  -1/undefined = clean LDPC decode, >=0 = OSD fallback (low confidence). */
+export interface MergeMsgIn {
+  msg: string;
+  freq: number;
+  snr: number;
+  osd?: number;
+}
+
+/** Per-call admission telemetry, aggregated per window by the UI. */
+export interface MergeStats {
+  /** new contacts created from a SENDER (caller) callsign */
+  newContacts: number;
+  /** new callsigns put into quarantine this call */
+  held: number;
+  /** quarantined callsigns released (admitted) this call */
+  released: number;
+  /** quarantine entries silently dropped (never corroborated) this call */
+  expired: number;
+  /** grids rejected as geographically implausible for the callsign's country */
+  gridRejected: number;
+}
+
+// Is this lat/lon plausible for the country of this callsign's ITU prefix?
+// Compound/portable calls (PJ4/K1ABC) are exempt — operating away from the
+// home country is their whole point. Unknown prefix/table gaps fail open.
+function gridPlausible(callsign: string, latLon: [number, number] | null): boolean {
+  if (!latLon || callsign.includes('/')) return true;
+  const cc = callsignCountry(callsign)?.countryCode;
+  return !cc || latLonPlausibleForCountry(cc, latLon);
+}
+
 export function mergeContacts(
   existing: Map<string, Contact>,
   windowStart: Date,
-  messages: Array<{ msg: string; freq: number; snr: number }>,
+  messages: MergeMsgIn[],
   colorOffset: number,
-): Map<string, Contact> {
+  gate?: DecodeGate,
+): { contacts: Map<string, Contact>; stats: MergeStats } {
   const contacts = new Map(existing);
+  const stats: MergeStats = { newContacts: 0, held: 0, released: 0, expired: 0, gridRejected: 0 };
+  stats.expired = gate?.beginWindow(windowStart).length ?? 0;
 
-  const getOrCreate = (callsign: string): Contact => {
+  const getOrCreate = (callsign: string, when: Date): Contact => {
     if (!contacts.has(callsign)) {
       const idx = (contacts.size + colorOffset) % CONTACT_PALETTE.length;
       contacts.set(callsign, {
@@ -279,64 +316,129 @@ export function mergeContacts(
         color: CONTACT_PALETTE[idx],
         msgs: [],
         peers: new Set(),
-        firstSeen: windowStart,
-        lastSeen: windowStart,
+        firstSeen: when,
+        lastSeen: when,
       });
     }
     return contacts.get(callsign)!;
   };
 
-  for (const { msg: raw, freq, snr } of messages) {
+  const hasNearTwin = (cs: string): boolean => {
+    for (const c of contacts.values()) if (isNearTwin(cs, c.callsign)) return true;
+    return false;
+  };
+
+  // Gate decision for one side of a message. Returns true when the callsign
+  // may be materialized in the contacts map right now; false when it was
+  // quarantined (or is still held). `release` receives buffered messages to
+  // replay when this sighting frees a held callsign.
+  const admitCallsign = (
+    cs: string,
+    confident: boolean,
+    pend: PendingMsg,
+    suspicions: HoldReason[],
+    release: (pending: PendingMsg[]) => void,
+  ): boolean => {
+    if (!gate || contacts.has(cs)) return true; // established → always admitted
+    if (gate.isHeld(cs)) {
+      const pending = gate.sighting(cs, confident, pend);
+      if (!pending) return false;
+      stats.released++;
+      release(pending);
+      return true;
+    }
+    if (suspicions.length === 0) return true;
+    const reasons = [...suspicions];
+    if (hasNearTwin(cs)) reasons.push('twin');
+    gate.hold(cs, reasons, pend);
+    stats.held++;
+    return false;
+  };
+
+  // `onlyFor` restricts processing to that callsign's side — used when
+  // replaying a released callsign's buffered messages, whose OTHER side was
+  // already handled (or separately quarantined) when the message first arrived.
+  const processMessage = (when: Date, { msg: raw, freq, snr, osd }: MergeMsgIn, onlyFor?: string): void => {
     const parsed = parseFTMsg(raw);
     // Garbled decodes (any unclassifiable word) are not tracked. Partial
     // captures with <...> placeholders ARE clean — their valid side is used.
-    if (!parsed.clean) continue;
+    if (!parsed.clean) return;
 
     const callerValid = isValidCallsign(parsed.caller);
     const calleeValid = isValidCallsign(parsed.callee);
-    if (!callerValid && !calleeValid) continue;
+    if (!callerValid && !calleeValid) return;
 
-    if (callerValid) {
-      const caller = getOrCreate(parsed.caller);
-      caller.msgs.push({ windowStart, raw, parsed, freq, snr, role: 'tx' });
-      // Keep only the last 60 messages per contact — enough for full QSO history
-      if (caller.msgs.length > 60) caller.msgs.splice(0, caller.msgs.length - 60);
-      caller.lastSeen = windowStart;
+    const lowConfidence = (osd ?? -1) >= 0;
+    const latLon  = parsed.grid && callerValid ? gridToLatLon(parsed.grid) : null;
+    const gridOk  = !callerValid || gridPlausible(parsed.caller, latLon);
+    const pend: PendingMsg = { windowStartMs: when.getTime(), msg: raw, freq, snr, osd };
+    const suspicions: HoldReason[] = [];
+    if (lowConfidence) suspicions.push('osd');
+    if (!gridOk) suspicions.push('geo');
+    const confident = suspicions.length === 0;
 
-      // The grid always belongs to the transmitting station. A station can
-      // legitimately report several locators (portable/rover) — keep them all,
-      // with `grid`/`latLon` tracking the most recent one
-      if (parsed.grid) {
-        if (!caller.grids.includes(parsed.grid)) caller.grids.push(parsed.grid);
-        if (caller.grids.length > 10) caller.grids.splice(0, caller.grids.length - 10);
-        if (caller.grid !== parsed.grid) {
-          caller.grid   = parsed.grid;
-          caller.latLon = gridToLatLon(parsed.grid) ?? undefined;
+    if (callerValid && (!onlyFor || parsed.caller === onlyFor)) {
+      // Replays (onlyFor set) bypass the gate — the callsign was just released
+      // and its buffered messages must not re-quarantine it.
+      if (onlyFor !== undefined ||
+          admitCallsign(parsed.caller, confident, pend, suspicions,
+                        pending => { for (const pm of pending) processMessage(new Date(pm.windowStartMs), pm, parsed.caller); })) {
+        // after admitCallsign: a release replay may have just created it
+        const wasNew = !contacts.has(parsed.caller);
+        const caller = getOrCreate(parsed.caller, when);
+        if (wasNew) stats.newContacts++;
+        caller.msgs.push({ windowStart: when, raw, parsed, freq, snr, role: 'tx' });
+        // Keep only the last 60 messages per contact — enough for full QSO history
+        if (caller.msgs.length > 60) caller.msgs.splice(0, caller.msgs.length - 60);
+        if (when.getTime() > caller.lastSeen.getTime()) caller.lastSeen = when;
+
+        // The grid always belongs to the transmitting station. A station can
+        // legitimately report several locators (portable/rover) — keep them all,
+        // with `grid`/`latLon` tracking the most recent one. Geographically
+        // implausible grids never update the position, even for established
+        // contacts — a "Norwegian" gridding in Korea is a false decode, not a trip.
+        if (parsed.grid && gridOk) {
+          if (!caller.grids.includes(parsed.grid)) caller.grids.push(parsed.grid);
+          if (caller.grids.length > 10) caller.grids.splice(0, caller.grids.length - 10);
+          if (caller.grid !== parsed.grid) {
+            caller.grid   = parsed.grid;
+            caller.latLon = latLon ?? undefined;
+          }
+        } else if (parsed.grid && !gridOk) {
+          stats.gridRejected++;
         }
-      }
-      if (calleeValid) {
-        caller.peers.add(parsed.callee!);
-        if (caller.peers.size > 50) {
-          const first = caller.peers.values().next().value;
-          if (first !== undefined) caller.peers.delete(first);
+        if (calleeValid) {
+          caller.peers.add(parsed.callee!);
+          if (caller.peers.size > 50) {
+            const first = caller.peers.values().next().value;
+            if (first !== undefined) caller.peers.delete(first);
+          }
         }
       }
     }
 
-    if (calleeValid) {
-      const callee = getOrCreate(parsed.callee!);
-      if (callerValid) {
-        callee.peers.add(parsed.caller);
-        if (callee.peers.size > 50) {
-          const first = callee.peers.values().next().value;
-          if (first !== undefined) callee.peers.delete(first);
+    if (calleeValid && (!onlyFor || parsed.callee === onlyFor)) {
+      // The callee never carries the grid, so geo suspicion of the caller
+      // still taints the whole decode — same suspicion set gates both sides.
+      if (onlyFor !== undefined ||
+          admitCallsign(parsed.callee!, confident, pend, suspicions,
+                        pending => { for (const pm of pending) processMessage(new Date(pm.windowStartMs), pm, parsed.callee); })) {
+        const callee = getOrCreate(parsed.callee!, when);
+        if (callerValid) {
+          callee.peers.add(parsed.caller);
+          if (callee.peers.size > 50) {
+            const first = callee.peers.values().next().value;
+            if (first !== undefined) callee.peers.delete(first);
+          }
         }
+        callee.msgs.push({ windowStart: when, raw, parsed, freq, snr, role: 'rx' });
+        if (callee.msgs.length > 60) callee.msgs.splice(0, callee.msgs.length - 60);
+        if (when.getTime() > callee.lastSeen.getTime()) callee.lastSeen = when;
       }
-      callee.msgs.push({ windowStart, raw, parsed, freq, snr, role: 'rx' });
-      if (callee.msgs.length > 60) callee.msgs.splice(0, callee.msgs.length - 60);
-      callee.lastSeen = windowStart;
     }
-  }
+  };
+
+  for (const m of messages) processMessage(windowStart, m);
 
   // Evict oldest contacts when over the limit — sort by lastSeen ascending,
   // drop the stalest ones. Never evict a contact that has messages in this window
@@ -352,7 +454,7 @@ export function mergeContacts(
     }
   }
 
-  return contacts;
+  return { contacts, stats };
 }
 
 export const MSG_TYPE_LABEL: Record<MsgType, string> = {

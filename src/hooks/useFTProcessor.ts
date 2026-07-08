@@ -175,12 +175,20 @@ export function useFTProcessor(mode: FTMode) {
     while (isRunningRef.current) {
       const curWindowSec = FT_WINDOW_SECONDS[modeRef.current];
 
-      // Arm accumulation buffer for this window
+      // Arm accumulation buffer for this window. Capacity has 2 s of headroom
+      // beyond the window length: when the boundary timer fires late (background
+      // tabs throttle setTimeout), the audio callback keeps filling THIS buffer
+      // past the window's end, and those samples belong to the next window —
+      // they're carried over at rollover below instead of being dropped.
       const sampleRate = audioContextRef.current?.sampleRate ?? 48000;
-      const capacity   = Math.ceil(curWindowSec * sampleRate) + 8192;
-      sampleBufRef.current   = new Float32Array(capacity);
-      sampleCountRef.current = 0;
-      windowStartRef.current = new Date();
+      const capacity   = Math.ceil((curWindowSec + 2) * sampleRate);
+      if (!sampleBufRef.current || sampleBufRef.current.length !== capacity) {
+        // First window, or mode/sample-rate change — start fresh. Otherwise the
+        // buffer re-armed at the previous rollover (with its carried tail) stands.
+        sampleBufRef.current   = new Float32Array(capacity);
+        sampleCountRef.current = 0;
+        windowStartRef.current = new Date();
+      }
       if (firstWindow) {
         firstWindow = false;
         setState(prev => ({ ...prev, status: 'recording' }));
@@ -189,7 +197,7 @@ export function useFTProcessor(mode: FTMode) {
       // Capture-start lateness vs the UTC boundary this window belongs to.
       // A uniformly positive decode Δ means the window opened late — surface
       // the number so drift is diagnosable from the console.
-      const lateMs = (windowStartRef.current.getTime()) % (curWindowSec * 1000);
+      const lateMs = (windowStartRef.current?.getTime() ?? 0) % (curWindowSec * 1000);
       if (lateMs > 300 && lateMs < curWindowSec * 1000 - 300) {
         console.debug(`[ft] window armed ${lateMs} ms after the UTC boundary — decode Δ will shift by ~+${(lateMs / 1000).toFixed(1)}s`);
       }
@@ -205,11 +213,29 @@ export function useFTProcessor(mode: FTMode) {
       // Snapshot captured audio and IMMEDIATELY re-arm the next window's
       // buffer before dispatching the decode — dispatch triggers React work
       // that must not delay the next capture start.
-      const captured    = sampleBufRef.current.slice(0, sampleCountRef.current);
+      //
+      // If this wake-up fired late (throttled timer), the samples captured
+      // since the UTC boundary belong to the NEXT window: carry them into the
+      // fresh buffer and date the new window at the boundary itself, so a
+      // late timer costs nothing instead of eating the window's first tones.
+      const nowMs         = Date.now();
+      const windowMs      = curWindowSec * 1000;
+      const sinceBoundary = nowMs % windowMs;
+      const total         = sampleCountRef.current;
+      const tailSamples   = sinceBoundary > 50 && sinceBoundary < windowMs / 2
+        ? Math.min(Math.round((sinceBoundary / 1000) * sampleRate), total)
+        : 0;
+      if (sinceBoundary > 300 && sinceBoundary < windowMs - 300) {
+        console.debug(`[ft] window rollover ${sinceBoundary} ms after the UTC boundary — carrying ${tailSamples} samples into the next window`);
+      }
+
+      const captured    = sampleBufRef.current.slice(0, total - tailSamples);
       const windowStart = windowStartRef.current!;
-      sampleBufRef.current   = new Float32Array(capacity);
-      sampleCountRef.current = 0;
-      windowStartRef.current = new Date();
+      const nextBuf     = new Float32Array(capacity);
+      if (tailSamples > 0) nextBuf.set(sampleBufRef.current.subarray(total - tailSamples, total));
+      sampleBufRef.current   = nextBuf;
+      sampleCountRef.current = tailSamples;
+      windowStartRef.current = tailSamples > 0 ? new Date(nowMs - sinceBoundary) : new Date();
 
       // Kick off decode concurrently
       dispatchDecode(captured, sampleRate, windowStart);

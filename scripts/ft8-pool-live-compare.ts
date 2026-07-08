@@ -208,13 +208,15 @@ async function setupAppTab(page: Page, poolSize: number) {
   await page.getByRole('button', { name: 'Start Decoding' }).click();
 }
 
-interface DecodeLogMessage { freq: number; dt: number; snr: number; msg: string; sync: number }
+interface DecodeLogMessage { freq: number; dt: number; snr: number; msg: string; sync: number; osd?: number }
 interface DecodeLogEntry { id: number; slot: number; dispatchedAt: number; resolvedAt: number; msgCount: number; messages: DecodeLogMessage[] }
 interface PassResult {
   poolSize: number;
   durationMs: number;
   decodeLog: DecodeLogEntry[];
   finalMessageTexts: string[];
+  /** visible per-window separator rows — carry the admission counters (msg/new/held/dropped) */
+  sepRows: string[];
 }
 
 async function runPass(browser: Browser, poolSize: number): Promise<PassResult> {
@@ -226,9 +228,18 @@ async function runPass(browser: Browser, poolSize: number): Promise<PassResult> 
   sdrPage.on('close', () => console.warn('WebSDR page closed (script-initiated close is expected only at end of pass)'));
   appPage.on('close', () => console.warn('app page closed (script-initiated close is expected only at end of pass)'));
   appPage.on('pageerror', e => console.error('app page error:', e.message));
+  // Surface the capture loop's own timing diagnostics — late window arming
+  // (background-tab timer throttling) directly costs decodes.
+  appPage.on('console', m => {
+    if (m.text().includes('[ft] window')) console.log(`  app: ${m.text()}`);
+  });
 
   await setupWebSDR(sdrPage);
   await setupAppTab(appPage, poolSize);
+  // Keep the APP tab foreground, not the WebSDR: Firefox throttles timers in
+  // background tabs, which arms the 15s capture windows late and eats the
+  // start of every slot. The WebSDR keeps playing audio while backgrounded.
+  await appPage.bringToFront();
 
   // Route: WebSDR tab's output → our null sink (plain pactl — this direction
   // genuinely works). App tab's mic capture ← that sink's monitor, via
@@ -255,11 +266,18 @@ async function runPass(browser: Browser, poolSize: number): Promise<PassResult> 
   const finalMessageTexts = await appPage.evaluate(`
     Array.from(document.querySelectorAll('[class*="truncate"]')).map(el => el.textContent).filter(Boolean)
   `) as string[];
+  // Window separator rows (visible slice of the virtual list) — these carry
+  // the new admission counters ("N msg · +M new · K held · J dropped").
+  const sepRows = await appPage.evaluate(`
+    Array.from(document.querySelectorAll('div'))
+      .filter(el => el.childElementCount <= 8 && el.textContent && /\\d+ msg/.test(el.textContent) && el.textContent.length < 140)
+      .map(el => el.textContent.trim())
+  `) as string[];
 
   await sdrPage.close().catch(() => {});
   await appPage.close().catch(() => {});
 
-  return { poolSize, durationMs, decodeLog, finalMessageTexts };
+  return { poolSize, durationMs, decodeLog, finalMessageTexts, sepRows };
 }
 
 // Groups decodeLog entries into logical windows: all slices of one
@@ -309,6 +327,7 @@ function summarize(pass: PassResult) {
   const { decodeLog } = pass;
   const decodeMs = decodeLog.map(e => e.resolvedAt - e.dispatchedAt);
   const totalMsgs = decodeLog.reduce((s, e) => s + e.msgCount, 0);
+  const osdMsgs = decodeLog.reduce((s, e) => s + e.messages.filter(m => (m.osd ?? -1) >= 0).length, 0);
   const unresolvedHashes = pass.finalMessageTexts.filter(t => t.includes('<...>')).length;
   // Backlog proxy: for FT8 a new window is captured every 15s — if a
   // decode's own wall-clock time exceeds that, the NEXT window's dispatch
@@ -318,6 +337,7 @@ function summarize(pass: PassResult) {
     poolSize: pass.poolSize,
     windows: decodeLog.length,
     totalMessagesDecoded: totalMsgs,
+    osdMessages: osdMsgs,
     avgDecodeMs: decodeMs.length ? Math.round(decodeMs.reduce((a, b) => a + b, 0) / decodeMs.length) : 0,
     maxDecodeMs: decodeMs.length ? Math.round(Math.max(...decodeMs)) : 0,
     windowsOverCadence: overCadence,
@@ -365,6 +385,7 @@ async function main() {
     console.log(`\npool size ${s.poolSize}:`);
     console.log(`  windows decoded:            ${s.windows}`);
     console.log(`  total messages:             ${s.totalMessagesDecoded}`);
+    console.log(`  OSD (low-confidence) msgs:  ${s.osdMessages}`);
     console.log(`  avg decode time:            ${s.avgDecodeMs}ms`);
     console.log(`  max decode time:            ${s.maxDecodeMs}ms`);
     console.log(`  windows over 15s cadence:   ${s.windowsOverCadence}  (backlog risk on single-worker)`);
@@ -372,6 +393,11 @@ async function main() {
     console.log(`  slot usage:                 ${JSON.stringify(s.slotUsage)}`);
     console.log(`  suspicious near-dup clusters (raw, pre-merge-dedup): ${s.suspiciousClusters.length}`);
     for (const c of s.suspiciousClusters) console.log(`    - ${c}`);
+    const pass = results[summaries.indexOf(s)];
+    if (pass.sepRows.length) {
+      console.log(`  window admission counters (visible rows):`);
+      for (const row of pass.sepRows.slice(0, 12)) console.log(`    ${row}`);
+    }
   }
   console.log(`\nfull results written to ${OUT}`);
 }

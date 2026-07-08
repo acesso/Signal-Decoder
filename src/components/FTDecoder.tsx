@@ -6,7 +6,8 @@ import { fmtAbsHz } from '@/lib/formatFreq';
 import AudioAnalysisPanel from './AudioAnalysisPanel';
 import { useFTProcessor } from '@/hooks/useFTProcessor';
 import { FTMode, FTMessage, FT_WINDOW_SECONDS } from '@/lib/ft/decoder';
-import { Contact, mergeContacts, parseFTMsg, parseFTMsgCached, parseADIF, isValidCallsign, gridToLatLon, CONTACT_PALETTE } from '@/lib/ft/parser';
+import { Contact, mergeContacts, parseFTMsg, parseFTMsgCached, parseADIF, isValidCallsign, gridToLatLon, CONTACT_PALETTE, type MergeStats } from '@/lib/ft/parser';
+import { DecodeGate } from '@/lib/ft/gate';
 import FTContactsPanel from './FTContactsPanel';
 import FTWasmPanel from './FTWasmPanel';
 import VirtualList from './VirtualList';
@@ -154,6 +155,8 @@ export type MsgRowData = {
   msg: string;
   time: Date;
   addressedToMe: boolean;
+  /** true when the decode came from the OSD fallback (low confidence) */
+  osd: boolean;
   colorSig: string;
   key: string;
 };
@@ -219,6 +222,14 @@ const MessageRow = memo(function MessageRow({ row, timeStr, myCall, getContact, 
         {formatDT(row.dt)}
       </div>
       <div className="px-2 truncate" style={{ color: msgColor(row.msg, row.snr) }}>
+        {row.osd && (
+          <span
+            className="mr-1 text-[9px] align-middle text-[#e3b341]/70"
+            title="OSD decode — LDPC didn't converge cleanly; this 'best guess' is prone to false positives"
+          >
+             osd
+          </span>
+        )}
         <MsgTextStable msg={row.msg} myCall={myCall} getContact={getContact} onSelect={onSelect} />
       </div>
     </div>
@@ -229,6 +240,7 @@ const MessageRow = memo(function MessageRow({ row, timeStr, myCall, getContact, 
   prev.row.dt === next.row.dt &&
   prev.row.absFreq === next.row.absFreq &&
   prev.row.addressedToMe === next.row.addressedToMe &&
+  prev.row.osd === next.row.osd &&
   prev.row.colorSig === next.row.colorSig &&
   prev.timeStr === next.timeStr &&
   prev.myCall === next.myCall);
@@ -359,6 +371,15 @@ const FTDecoder = forwardRef<DecoderControls, { ftMode: FTMode; myCall?: string;
   // each effect run merges only the slice it hasn't seen yet.
   const mergedCountRef = useRef<Map<number, number>>(new Map());
 
+  // Admission gate for suspicious new callsigns (quarantine + geo checks) —
+  // lives for the session, reset together with the contacts.
+  const gateRef = useRef<DecodeGate | null>(null);
+  if (!gateRef.current) gateRef.current = new DecodeGate();
+
+  // Per-window admission telemetry (windowStart ms → aggregated MergeStats),
+  // rendered as counters on each window's separator row.
+  const [windowStats, setWindowStats] = useState<Map<number, MergeStats>>(new Map());
+
   // Authoritative contacts live in a ref (always current, no data loss);
   // the state copy that drives the heavy consumers — contacts panel sort/stats,
   // Leaflet markers, auto-reply — is published at most once per interval.
@@ -379,6 +400,8 @@ const FTDecoder = forwardRef<DecoderControls, { ftMode: FTMode; myCall?: string;
       frozenVfoRef.current.clear();
       mergedCountRef.current.clear();
       contactsAuthRef.current = new Map();
+      gateRef.current?.reset();
+      setWindowStats(prev => (prev.size ? new Map() : prev));
       return;
     }
 
@@ -398,6 +421,7 @@ const FTDecoder = forwardRef<DecoderControls, { ftMode: FTMode; myCall?: string;
     // Bake absolute freq into ContactMsg so contacts panel never needs VFO.
     let next = contactsAuthRef.current;
     let changed = false;
+    const statDeltas = new Map<number, MergeStats>();
     for (const r of results.slice().reverse()) { // oldest first
       const key = r.windowStart.getTime();
       // Snapshot VFO the first time we see this window
@@ -410,12 +434,35 @@ const FTDecoder = forwardRef<DecoderControls, { ftMode: FTMode; myCall?: string;
         ...msg,
         freq: vfo > 0 ? vfo + msg.freq : msg.freq,
       }));
-      next = mergeContacts(next, r.windowStart, freshMsgs, 0);
+      const { contacts: mergedContacts, stats } = mergeContacts(next, r.windowStart, freshMsgs, 0, gateRef.current!);
+      next = mergedContacts;
+      statDeltas.set(key, stats);
       mergedCountRef.current.set(key, r.messages.length);
       changed = true;
     }
     if (changed) {
       contactsAuthRef.current = next;
+      // Aggregate this run's admission stats into the per-window counters
+      // (mergeContacts runs several times per window as partials stream in).
+      setWindowStats(prev => {
+        const map = new Map(prev);
+        for (const [key, d] of statDeltas) {
+          const s = map.get(key) ?? { newContacts: 0, held: 0, released: 0, expired: 0, gridRejected: 0 };
+          map.set(key, {
+            newContacts:  s.newContacts + d.newContacts,
+            held:         s.held + d.held,
+            released:     s.released + d.released,
+            expired:      s.expired + d.expired,
+            gridRejected: s.gridRejected + d.gridRejected,
+          });
+        }
+        // Evict entries for windows no longer in the results array
+        if (map.size > results.length + 10) {
+          const live = new Set(results.map(r => r.windowStart.getTime()));
+          for (const k of map.keys()) if (!live.has(k)) map.delete(k);
+        }
+        return map;
+      });
       if (publishTimerRef.current === null) {
         publishTimerRef.current = setTimeout(publishContacts, CONTACTS_PUBLISH_MS);
       }
@@ -432,6 +479,8 @@ const FTDecoder = forwardRef<DecoderControls, { ftMode: FTMode; myCall?: string;
     prevResultLenRef.current = 0;
     frozenVfoRef.current.clear();
     mergedCountRef.current.clear();
+    gateRef.current?.reset();
+    setWindowStats(new Map());
     // Restart audio capture to flush the ScriptProcessorNode and AudioContext —
     // same effect as mode-switch; relieves main-thread audio callback buildup.
     if (state.isRecording) {
@@ -512,7 +561,7 @@ const FTDecoder = forwardRef<DecoderControls, { ftMode: FTMode; myCall?: string;
   const totalMsgs = results.reduce((s, r) => s + r.messages.length, 0);
   const hasData   = results.length > 0 || contacts.size > 0;
 
-  type SepRow = { kind: 'sep'; time: Date; mode: FTMode; empty: boolean; decoding: boolean; decodeMs: number; key: string };
+  type SepRow = { kind: 'sep'; time: Date; mode: FTMode; empty: boolean; decoding: boolean; decodeMs: number; msgCount: number; stats?: MergeStats; key: string };
   type TableRow = SepRow | MsgRowData;
 
   const myCallUpper = myCall.toUpperCase();
@@ -538,7 +587,7 @@ const FTDecoder = forwardRef<DecoderControls, { ftMode: FTMode; myCall?: string;
     const frozenVfo = frozenVfoRef.current.get(r.windowStart.getTime()) ?? vfoRef.current;
     const msgs = sortMessages(r.messages);
     return [
-      { kind: 'sep' as const, time: r.windowStart, mode: r.mode, empty: r.messages.length === 0, decoding: !!r.decoding, decodeMs: r.decodeMs, key: `sep-${ri}` },
+      { kind: 'sep' as const, time: r.windowStart, mode: r.mode, empty: r.messages.length === 0, decoding: !!r.decoding, decodeMs: r.decodeMs, msgCount: r.messages.length, stats: windowStats.get(r.windowStart.getTime()), key: `sep-${ri}` },
       ...msgs.map((m) => {
         const parsed = parseFTMsgCached(m.msg);
         const addressedToMe = !!myCallUpper && parsed.callee?.toUpperCase() === myCallUpper;
@@ -554,6 +603,7 @@ const FTDecoder = forwardRef<DecoderControls, { ftMode: FTMode; myCall?: string;
           kind: 'msg' as const,
           absFreq: formatFreq(m.freq, frozenVfo),
           dt: m.dt, snr: m.snr, msg: m.msg,
+          osd: (m.osd ?? -1) >= 0,
           time: r.windowStart, addressedToMe, colorSig,
           // Content-derived key (not array index) so React tracks each message
           // stably across re-sorts instead of reusing a position's old row.
@@ -563,7 +613,7 @@ const FTDecoder = forwardRef<DecoderControls, { ftMode: FTMode; myCall?: string;
     ];
   // frozenVfoRef is a ref — not a dep, but results changing is the only trigger needed
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }), [results, myCallUpper, contacts, sortMessages]);
+  }), [results, myCallUpper, contacts, sortMessages, windowStats]);
 
   const controls: DecoderControls = {
     isRecording: state.isRecording,
@@ -689,6 +739,26 @@ const FTDecoder = forwardRef<DecoderControls, { ftMode: FTMode; myCall?: string;
                   {!row.decoding && row.decodeMs > 0 && (
                     <span className="ml-2 text-[#30363d]" title="decode time">
                       dec {(row.decodeMs / 1000).toFixed(1)}s
+                    </span>
+                  )}
+                  {!row.decoding && row.msgCount > 0 && (
+                    <span className="ml-2" title="decoded messages this window">
+                      {row.msgCount} msg
+                    </span>
+                  )}
+                  {!row.decoding && (row.stats?.newContacts ?? 0) > 0 && (
+                    <span className="ml-2 text-[#2ea043]" title="new validated contacts (senders) this window">
+                      +{row.stats!.newContacts} new
+                    </span>
+                  )}
+                  {!row.decoding && (row.stats?.held ?? 0) > 0 && (
+                    <span className="ml-2 text-[#e3b341]" title="suspicious new callsigns quarantined — admitted only if corroborated within 6 windows">
+                      {row.stats!.held} held
+                    </span>
+                  )}
+                  {!row.decoding && ((row.stats?.expired ?? 0) + (row.stats?.gridRejected ?? 0)) > 0 && (
+                    <span className="ml-2 text-[#f85149]/70" title="dropped: quarantined callsigns never corroborated + geographically implausible grids">
+                      {(row.stats!.expired + row.stats!.gridRejected)} dropped
                     </span>
                   )}
                 </div>
