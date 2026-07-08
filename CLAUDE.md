@@ -2,10 +2,10 @@
 
 ## Dev servers — ports and discipline
 
-The user keeps their own `next dev` running **all the time on port 3000**. **Port 3002 is Claude's** — use it for any test/verification instance.
+The user keeps their own `vite` dev server running **all the time on port 3000** (`npm run dev`). **Port 3002 is Claude's** — use it for any test/verification instance (`npm run dev:test`).
 
-- To stop a server, find the exact listener PID (`ss -tlnp | grep 3002`) and kill only that PID. Never `pkill -f "next dev"` (kills the user's server too) and never `lsof -ti :PORT | xargs kill` (lsof also lists client-connection PIDs — this has killed the user's browser).
-- Never run `npm run build` while any dev server is running — build and dev share `.next/` and the dev server's cache gets corrupted (MODULE_NOT_FOUND webpack errors until restart). Use `npx tsc --noEmit` + the dev server's own HMR compile as the gate instead, or stop servers first.
+- To stop a server, find the exact listener PID (`ss -tlnp | grep 3002`) and kill only that PID. Never `pkill -f vite` (kills the user's server too) and never `lsof -ti :PORT | xargs kill` (lsof also lists client-connection PIDs — this has killed the user's browser).
+- `npm run build` (`tsc -b && vite build`) is safe to run alongside a live dev server — Vite's dev server and its build don't share on-disk state the way Next's `.next/` did, so there's no dev/build cache-corruption class of bug here. If you hit stale-module weirdness in dev, clearing `node_modules/.vite` and restarting the dev server is the Vite-equivalent fix, but this hasn't been needed in practice yet.
 - The app registers a PWA service worker; browsers can serve stale chunks after changes. If the UI looks partially updated, unregister the service worker + clear Cache Storage + hard reload before debugging.
 
 ## FT8/FT4 WASM decoders — rebuild after native changes
@@ -92,4 +92,4 @@ avrdude -c usbasp -p m328p -B 4 -v \
 
 - **CAT protocol unit tests** (pure logic, no hardware, run any time): `npm test -- src/lib/cat/__tests__/protocol.test.ts`. If the firmware change touches a CAT command's format, range, or semantics, update this test file to match — it must reflect actual firmware behavior, not the wire-format spec alone (e.g. a command can *accept* a value the running build never meaningfully distinguishes — check the firmware source, not just the inline comment on the command handler).
 - **CAT hardware test bed against the physical radio** (run after every flash): `npm run test:cat-hardware -- [/dev/ttyACM1] [baud]`. This is a TypeScript script (`scripts/cat-hardware-test.ts`, run via `tsx`) that talks to the real serial port and validates the IF frame, the full batched multi-command poll, and a SET→GET→restore round-trip. Don't rely on the unit tests alone to sign off a firmware change — they validate the JS-side parsing, not that the flashed `.hex` actually behaves as documented. All test bed tooling in this repo is TypeScript — do not write ad hoc Python (or other language) scripts for hardware validation; extend `scripts/cat-hardware-test.ts` instead.
-- **Full app test/build gate** if the change affects `src/hooks/useRadioCAT.ts` or `src/components/RadioCATPanel.tsx` too: `npm test`, `npx tsc --noEmit`, `npm run build`.
+- **Full app test/build gate** if the change affects `src/lib/cat/useRadioCAT.ts` or `src/components/RadioCATPanel.tsx` too: `npm test`, `npx tsc -b --noEmit`, `npm run build`.

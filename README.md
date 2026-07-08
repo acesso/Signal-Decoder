@@ -340,7 +340,8 @@ it, no need to have been recording in advance.
 
 ## Technology Stack
 
-- **Next.js 15**: React framework with App Router
+- **Vite**: Build tool and dev server
+- **SolidJS**: Reactive UI framework
 - **TypeScript**: Type-safe development
 - **Web Audio API**: Real-time audio capture and processing
   - ScriptProcessorNode (Chrome, Firefox, Edge)
@@ -645,7 +646,7 @@ npm run dev
 
 ```bash
 npm run build
-npm start
+npm run preview
 ```
 
 ### FT8/FT4 WASM Decoders

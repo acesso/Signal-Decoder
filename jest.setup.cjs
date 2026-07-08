@@ -1,5 +1,3 @@
-import '@testing-library/jest-dom'
-
 // Mock Web Audio API
 global.AudioContext = jest.fn().mockImplementation(() => ({
   createAnalyser: jest.fn().mockReturnValue({

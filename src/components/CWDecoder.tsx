@@ -1,62 +1,57 @@
-'use client';
+// Port of src/components/CWDecoder.tsx (Next.js app).
+import { createEffect, createMemo, createSignal, For, onCleanup, onMount, Show, type JSX } from 'solid-js'
+import type { DecoderProps, DecoderControls } from '../lib/decoderControls'
+import { fmtAbsHz } from '$decoder-lib/formatFreq'
+import AudioAnalysisPanel from './AudioAnalysisPanel'
+import { createCWProcessor, type TextToken } from '../lib/cw/processor'
+import { loadNumberArray, saveNumberArray } from '$decoder-lib/storage'
 
-import { useEffect, useRef, useCallback, useState, useMemo, forwardRef, useImperativeHandle } from 'react';
-import type { DecoderControls, DecoderProps } from './DecoderControls';
-import { fmtAbsHz } from '@/lib/formatFreq';
-import AudioAnalysisPanel from './AudioAnalysisPanel';
-import { useCWProcessor, TextToken } from '@/hooks/useCWProcessor';
-import { loadNumberArray, saveNumberArray } from '@/lib/storage';
+const DEFAULT_PANEL_WEIGHTS = [1, 1, 0.75]
+const LS_PANEL_WEIGHTS = 'cw_panel_weights'
 
-const DISPLAY_MAX_HZ = 4000;
-const DEFAULT_PANEL_WEIGHTS = [1, 1, 0.75];
-const LS_PANEL_WEIGHTS = 'cw_panel_weights';
-
-// Channel colour palette
 const CH_COLORS = {
   0: { primary: '#79c0ff', dot: '#79c0ff', dash: '#2ea043', recv: '#e3b341', text: '#c9d1d9', flash: '#f0f6fc' },
   1: { primary: '#ffa657', dot: '#ffa657', dash: '#d2a8ff', recv: '#ff7b72', text: '#ffa657', flash: '#ffa657' },
-} as const;
+} as const
 
-// ── Toggle switch ─────────────────────────────────────────────────────────────
-
-function Toggle({ checked, onChange }: { checked: boolean; onChange: () => void }) {
+function Toggle(props: { checked: boolean; onChange: () => void }) {
   return (
     <button
       role="switch"
-      aria-checked={checked}
-      onClick={onChange}
-      className={`relative inline-flex h-5 w-9 shrink-0 items-center rounded-full border transition-colors focus:outline-none ${
-        checked ? 'bg-[#238636] border-[#2ea043]' : 'bg-[#21262d] border-[#30363d]'
+      aria-checked={props.checked}
+      onClick={props.onChange}
+      class={`relative inline-flex h-5 w-9 shrink-0 items-center rounded-full border transition-colors focus:outline-none ${
+        props.checked ? 'border-[#2ea043] bg-[#238636]' : 'border-[#30363d] bg-[#21262d]'
       }`}
     >
-      <span className={`inline-block h-4 w-4 transform rounded-full bg-white shadow-sm transition-transform ${
-        checked ? 'translate-x-4' : 'translate-x-0.5'
-      }`} />
+      <span
+        class={`inline-block h-4 w-4 transform rounded-full bg-white shadow-sm transition-transform ${
+          props.checked ? 'translate-x-4' : 'translate-x-0.5'
+        }`}
+      />
     </button>
-  );
+  )
 }
 
-// ── Morse Visualizer ─────────────────────────────────────────────────────────
+interface MorseElementEntry {
+  id: number
+  type: 'dot' | 'dash'
+}
+interface RecentCharEntry {
+  id: number
+  char: string
+  symbol: string
+}
 
-interface MorseElementEntry { id: number; type: 'dot' | 'dash'; }
-interface RecentCharEntry   { id: number; char: string; symbol: string; }
-
-function MorseVisualizer({
-  elements,
-  flashChar,
-  recentChars,
-  isReceiving,
-  channel = 0,
-  label,
-}: {
-  elements:    MorseElementEntry[];
-  flashChar:   RecentCharEntry | null;
-  recentChars: RecentCharEntry[];
-  isReceiving: boolean;
-  channel?:    0 | 1;
-  label?:      string;
+function MorseVisualizer(props: {
+  elements: MorseElementEntry[]
+  flashChar: RecentCharEntry | null
+  recentChars: RecentCharEntry[]
+  isReceiving: boolean
+  channel?: 0 | 1
+  label?: string
 }) {
-  const c = CH_COLORS[channel];
+  const c = () => CH_COLORS[props.channel ?? 0]
 
   return (
     <div>
@@ -83,434 +78,441 @@ function MorseVisualizer({
         }
       `}</style>
 
-      <div className="flex items-center justify-between mb-1.5">
-        {label
-          ? <h3 className="text-xs font-semibold" style={{ color: c.primary }}>{label}</h3>
-          : <h3 className="text-sm font-medium text-[#8b949e]">Morse Display</h3>
-        }
-        <span className="text-[10px] font-mono text-[#484f58]">
-          {isReceiving ? '⏺ receiving' : elements.length > 0 ? 'building…' : 'monitoring'}
+      <div class="mb-1.5 flex items-center justify-between">
+        {props.label ? (
+          <h3 class="text-xs font-semibold" style={{ color: c().primary }}>
+            {props.label}
+          </h3>
+        ) : (
+          <h3 class="text-sm font-medium text-[#8b949e]">Morse Display</h3>
+        )}
+        <span class="font-mono text-[10px] text-[#484f58]">
+          {props.isReceiving ? '⏺ receiving' : props.elements.length > 0 ? 'building…' : 'monitoring'}
         </span>
       </div>
 
-      <div className="bg-[#0d1117] border border-[#30363d] rounded-lg px-3 py-2.5 space-y-2.5">
-        {/* Elements row */}
-        <div className="flex items-center justify-center gap-2.5 min-h-[24px] flex-wrap">
-          {elements.map((el) =>
-            el.type === 'dot' ? (
-              <div
-                key={el.id}
-                className="w-4 h-4 rounded-full shrink-0"
-                style={{
-                  background: c.dot,
-                  boxShadow: `0 0 8px 2px ${c.dot}80`,
-                  animation: 'cwElementPop 0.2s cubic-bezier(0.34,1.56,0.64,1) forwards',
-                }}
-              />
-            ) : (
-              <div
-                key={el.id}
-                className="w-10 h-4 rounded-full shrink-0"
-                style={{
-                  background: c.dash,
-                  boxShadow: `0 0 8px 2px ${c.dash}80`,
-                  animation: 'cwElementPop 0.2s cubic-bezier(0.34,1.56,0.64,1) forwards',
-                }}
-              />
-            )
-          )}
-          {isReceiving && (
+      <div class="space-y-2.5 rounded-lg border border-[#30363d] bg-[#0d1117] px-3 py-2.5">
+        <div class="flex min-h-[24px] flex-wrap items-center justify-center gap-2.5">
+          <For each={props.elements}>
+            {(el) =>
+              el.type === 'dot' ? (
+                <div
+                  class="h-4 w-4 shrink-0 rounded-full"
+                  style={{
+                    background: c().dot,
+                    'box-shadow': `0 0 8px 2px ${c().dot}80`,
+                    animation: 'cwElementPop 0.2s cubic-bezier(0.34,1.56,0.64,1) forwards',
+                  }}
+                />
+              ) : (
+                <div
+                  class="h-4 w-10 shrink-0 rounded-full"
+                  style={{
+                    background: c().dash,
+                    'box-shadow': `0 0 8px 2px ${c().dash}80`,
+                    animation: 'cwElementPop 0.2s cubic-bezier(0.34,1.56,0.64,1) forwards',
+                  }}
+                />
+              )
+            }
+          </For>
+          <Show when={props.isReceiving}>
             <div
-              className="w-4 h-4 rounded-full shrink-0"
+              class="h-4 w-4 shrink-0 rounded-full"
               style={{
-                background: c.recv,
-                boxShadow: `0 0 10px 3px ${c.recv}80`,
+                background: c().recv,
+                'box-shadow': `0 0 10px 3px ${c().recv}80`,
                 animation: 'cwMarkPulse 0.5s ease-in-out infinite',
               }}
             />
-          )}
-          {elements.length === 0 && !isReceiving && (
-            <span className="text-[#30363d] text-xs font-mono tracking-[0.4em] select-none">· · ·</span>
-          )}
+          </Show>
+          <Show when={props.elements.length === 0 && !props.isReceiving}>
+            <span class="text-xs font-mono tracking-[0.4em] text-[#30363d] select-none">· · ·</span>
+          </Show>
         </div>
 
-        {/* Flash character */}
-        <div className="flex items-center justify-center" style={{ minHeight: 48 }}>
-          {flashChar ? (
+        <div class="flex items-center justify-center" style={{ 'min-height': '48px' }}>
+          {props.flashChar ? (
             <span
-              key={flashChar.id}
-              className={`font-mono font-bold leading-none select-none ${
-                flashChar.char.startsWith('<') ? 'text-xl' :
-                flashChar.char === '?' ? 'text-3xl' :
-                'text-4xl'
+              class={`leading-none font-mono font-bold select-none ${
+                props.flashChar.char.startsWith('<') ? 'text-xl' : props.flashChar.char === '?' ? 'text-3xl' : 'text-4xl'
               }`}
               style={{
-                color: flashChar.char === '?' ? '#da3633' : c.flash,
-                textShadow: flashChar.char === '?'
-                  ? '0 0 16px rgba(218,54,51,0.8)'
-                  : `0 0 18px ${c.flash}88, 0 0 36px ${c.primary}44`,
+                color: props.flashChar.char === '?' ? '#da3633' : c().flash,
+                'text-shadow':
+                  props.flashChar.char === '?' ? '0 0 16px rgba(218,54,51,0.8)' : `0 0 18px ${c().flash}88, 0 0 36px ${c().primary}44`,
                 animation: 'cwCharReveal 1.8s ease-in-out forwards',
               }}
             >
-              {flashChar.char}
+              {props.flashChar.char}
             </span>
           ) : (
-            <div className="w-6 h-px bg-[#21262d]" />
+            <div class="h-px w-6 bg-[#21262d]" />
           )}
         </div>
 
-        {/* Recent chars strip */}
-        {recentChars.length > 0 && (
-          <div className="border-t border-[#21262d] pt-2 flex flex-wrap gap-x-2.5 gap-y-1 justify-center items-end">
-            {recentChars.map((rc, i) => (
-              <div
-                key={rc.id}
-                className="flex flex-col items-center gap-px"
-                style={{
-                  opacity: (i + 1) / recentChars.length * 0.85 + 0.15,
-                  animation: i === recentChars.length - 1
-                    ? 'cwRecentPop 0.25s cubic-bezier(0.34,1.56,0.64,1) forwards'
-                    : 'none',
-                }}
-              >
-                <span
-                  className={`font-mono font-semibold leading-none ${
-                    rc.char.startsWith('<') ? 'text-sm' :
-                    rc.char === '?' ? 'text-base' :
-                    'text-lg'
-                  }`}
-                  style={{ color: rc.char === '?' ? '#da3633' : c.text }}
+        <Show when={props.recentChars.length > 0}>
+          <div class="flex flex-wrap items-end justify-center gap-x-2.5 gap-y-1 border-t border-[#21262d] pt-2">
+            <For each={props.recentChars}>
+              {(rc, i) => (
+                <div
+                  class="flex flex-col items-center gap-px"
+                  style={{
+                    opacity: ((i() + 1) / props.recentChars.length) * 0.85 + 0.15,
+                    animation: i() === props.recentChars.length - 1 ? 'cwRecentPop 0.25s cubic-bezier(0.34,1.56,0.64,1) forwards' : 'none',
+                  }}
                 >
-                  {rc.char}
-                </span>
-                <span className="text-[8px] font-mono text-[#484f58] tracking-wide">
-                  {rc.symbol}
-                </span>
-              </div>
-            ))}
+                  <span
+                    class={`leading-none font-mono font-semibold ${
+                      rc.char.startsWith('<') ? 'text-sm' : rc.char === '?' ? 'text-base' : 'text-lg'
+                    }`}
+                    style={{ color: rc.char === '?' ? '#da3633' : c().text }}
+                  >
+                    {rc.char}
+                  </span>
+                  <span class="font-mono text-[8px] tracking-wide text-[#484f58]">{rc.symbol}</span>
+                </div>
+              )}
+            </For>
           </div>
-        )}
+        </Show>
       </div>
     </div>
-  );
+  )
 }
 
-// ── Main component ────────────────────────────────────────────────────────────
+export default function CWDecoder(props: DecoderProps): JSX.Element {
+  const [toneFreq, setToneFreq] = createSignal(700)
+  const [toneFreq2, setToneFreq2] = createSignal(800)
+  const [squelch, setSquelch] = createSignal(20)
+  const [adaptiveDitLength, setAdaptiveDitLength] = createSignal(false)
+  const [manualWpm, setManualWpm] = createSignal(20)
+  const [dualMode, setDualMode] = createSignal(false)
+  const [filterBandwidth, setFilterBandwidth] = createSignal(90)
 
-const CWDecoder = forwardRef<DecoderControls, DecoderProps>(function CWDecoder({ onStateChange, analyser, vfoFrequency }, ref) {
-  const [toneFreq,          setToneFreq]          = useState(700);
-  const [toneFreq2,         setToneFreq2]         = useState(800);
-  const [squelch,           setSquelch]           = useState(20);
-  const [adaptiveDitLength, setAdaptiveDitLength] = useState(false);
-  const [manualWpm,         setManualWpm]         = useState(20);
-  const [dualMode,          setDualMode]          = useState(false);
-  // Filter bandwidth in Hz — Q is derived per-render so bandwidth stays constant
-  // when the center frequency changes (Q = freq / bandwidth).
-  const [filterBandwidth,   setFilterBandwidth]   = useState(90);
+  const filterQ = createMemo(() => Math.max(1, toneFreq() / filterBandwidth()))
 
-  const toneFreqRef        = useRef(700);
-  const toneFreq2Ref       = useRef(800);
-  const squelchRef         = useRef(20);
-  const dualModeRef        = useRef(false);
-  const filterBandwidthRef = useRef(90);
-  useEffect(() => { toneFreqRef.current        = toneFreq;        }, [toneFreq]);
-  useEffect(() => { toneFreq2Ref.current       = toneFreq2;       }, [toneFreq2]);
-  useEffect(() => { squelchRef.current         = squelch;         }, [squelch]);
-  useEffect(() => { dualModeRef.current        = dualMode;        }, [dualMode]);
-  useEffect(() => { filterBandwidthRef.current = filterBandwidth; }, [filterBandwidth]);
+  const [morseElements, setMorseElements] = createSignal<MorseElementEntry[]>([])
+  const [flashChar, setFlashChar] = createSignal<RecentCharEntry | null>(null)
+  const [recentChars, setRecentChars] = createSignal<RecentCharEntry[]>([])
+  const [morseElements2, setMorseElements2] = createSignal<MorseElementEntry[]>([])
+  const [flashChar2, setFlashChar2] = createSignal<RecentCharEntry | null>(null)
+  const [recentChars2, setRecentChars2] = createSignal<RecentCharEntry[]>([])
 
-  // Q is derived each render; stays stable for spectrum drawing via ref
-  const filterQ    = useMemo(() => Math.max(1, toneFreq / filterBandwidth),  [toneFreq, filterBandwidth]);
-  const filterQRef = useRef(filterQ);
-  useEffect(() => { filterQRef.current = filterQ; }, [filterQ]);
+  let visCounter = 0
+  let flashTimeout: ReturnType<typeof setTimeout> | null = null
+  let flashTimeout2: ReturnType<typeof setTimeout> | null = null
 
-  // Visualizer state — ch1
-  const [morseElements, setMorseElements] = useState<MorseElementEntry[]>([]);
-  const [flashChar,     setFlashChar]     = useState<RecentCharEntry | null>(null);
-  const [recentChars,   setRecentChars]   = useState<RecentCharEntry[]>([]);
-  // Visualizer state — ch2
-  const [morseElements2, setMorseElements2] = useState<MorseElementEntry[]>([]);
-  const [flashChar2,     setFlashChar2]     = useState<RecentCharEntry | null>(null);
-  const [recentChars2,   setRecentChars2]   = useState<RecentCharEntry[]>([]);
+  let containerEl: HTMLDivElement | undefined
+  const [panelWeights, setPanelWeights] = createSignal(loadNumberArray(LS_PANEL_WEIGHTS, DEFAULT_PANEL_WEIGHTS))
+  let dragState: { handle: number; startX: number; startWeights: number[] } | null = null
 
-  const visCounterRef    = useRef(0);
-  const flashTimeoutRef  = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const flashTimeout2Ref = useRef<ReturnType<typeof setTimeout> | null>(null);
+  createEffect(() => saveNumberArray(LS_PANEL_WEIGHTS, panelWeights()))
 
-  // Resizable panels — starts at the SSR-safe default, restored from
-  // localStorage post-mount (see the mode-restore comment in page.tsx for why).
-  const containerRef    = useRef<HTMLDivElement>(null);
-  const [panelWeights, setPanelWeights] = useState(DEFAULT_PANEL_WEIGHTS);
-  const panelWeightsRef = useRef(DEFAULT_PANEL_WEIGHTS);
-  const dragRef = useRef<{ handle: number; startX: number; startWeights: number[] } | null>(null);
-  useEffect(() => { panelWeightsRef.current = panelWeights; }, [panelWeights]);
-  useEffect(() => { setPanelWeights(loadNumberArray(LS_PANEL_WEIGHTS, DEFAULT_PANEL_WEIGHTS)); }, []);
-  useEffect(() => { saveNumberArray(LS_PANEL_WEIGHTS, panelWeights); }, [panelWeights]);
+  function startDrag(e: MouseEvent, handle: number) {
+    e.preventDefault()
+    dragState = { handle, startX: e.clientX, startWeights: [...panelWeights()] }
+  }
 
-  const startDrag = (e: { preventDefault: () => void; clientX: number }, handle: number) => {
-    e.preventDefault();
-    dragRef.current = { handle, startX: e.clientX, startWeights: [...panelWeightsRef.current] };
-  };
-
-  useEffect(() => {
+  onMount(() => {
     const onMove = (e: MouseEvent) => {
-      const drag = dragRef.current;
-      if (!drag || !containerRef.current) return;
-      const containerWidth = containerRef.current.offsetWidth;
-      const dx = e.clientX - drag.startX;
-      const total = drag.startWeights.reduce((a, b) => a + b, 0);
-      const dw = (dx / containerWidth) * total;
-      const w = [...drag.startWeights];
-      w[drag.handle]     = Math.max(0.15, w[drag.handle]     + dw);
-      w[drag.handle + 1] = Math.max(0.15, w[drag.handle + 1] - dw);
-      setPanelWeights([...w]);
-    };
-    const onUp = () => { dragRef.current = null; };
-    window.addEventListener('mousemove', onMove);
-    window.addEventListener('mouseup', onUp);
-    return () => { window.removeEventListener('mousemove', onMove); window.removeEventListener('mouseup', onUp); };
-  }, []);
+      const drag = dragState
+      if (!drag || !containerEl) return
+      const containerWidth = containerEl.offsetWidth
+      const dx = e.clientX - drag.startX
+      const total = drag.startWeights.reduce((a, b) => a + b, 0)
+      const dw = (dx / containerWidth) * total
+      const w = [...drag.startWeights]
+      w[drag.handle] = Math.max(0.15, w[drag.handle] + dw)
+      w[drag.handle + 1] = Math.max(0.15, w[drag.handle + 1] - dw)
+      setPanelWeights(w)
+    }
+    const onUp = () => {
+      dragState = null
+    }
+    window.addEventListener('mousemove', onMove)
+    window.addEventListener('mouseup', onUp)
+    onCleanup(() => {
+      window.removeEventListener('mousemove', onMove)
+      window.removeEventListener('mouseup', onUp)
+    })
+  })
 
-  // Track previous partialSymbol to detect appended elements vs resets
-  const prevSym1Ref = useRef('');
-  const prevSym2Ref = useRef('');
+  let prevSym1 = ''
+  let prevSym2 = ''
 
-  const {
-    state, startRecording, stopRecording, clearText, resetDecoder,
-    onCharRef, onCharRef2,
-    // onElementRef / onElementRef2 intentionally unused — elements are derived
-    // from stats.partialSymbol instead, avoiding React-batch ordering issues.
-  } = useCWProcessor(toneFreq, squelch, adaptiveDitLength, dualMode, toneFreq2, manualWpm, filterQ);
+  const processor = createCWProcessor({
+    toneFreq,
+    squelch,
+    adaptiveDitLength,
+    dualMode,
+    toneFreq2,
+    wpm: manualWpm,
+    filterQ,
+  })
 
-  // ── Element display driven by stats.partialSymbol (source of truth) ──────────
-  // This avoids React-batch ordering bugs that occurred when onElement callbacks
-  // and onCharDecoded clears landed in the same render cycle.
+  createEffect(() => {
+    // Depend on every param so this re-syncs whenever any of them change,
+    // same effect as the original's per-param useEffects collapsed into one.
+    void toneFreq()
+    void squelch()
+    void adaptiveDitLength()
+    void dualMode()
+    void toneFreq2()
+    void manualWpm()
+    void filterQ()
+    processor.syncParams()
+  })
 
-  useEffect(() => {
-    const sym  = state.stats?.partialSymbol ?? '';
-    const prev = prevSym1Ref.current;
-    if (sym === prev) return;
+  createEffect(() => {
+    const sym = processor.state().stats?.partialSymbol ?? ''
+    const prev = prevSym1
+    if (sym === prev) return
 
     if (sym.length > prev.length && sym.startsWith(prev)) {
-      // Symbol grew — append new elements
-      const newEls = sym.slice(prev.length).split('').map(ch => ({
-        id:   visCounterRef.current++,
-        type: (ch === '.' ? 'dot' : 'dash') as 'dot' | 'dash',
-      }));
-      setMorseElements(els => [...els, ...newEls]);
+      const newEls = sym
+        .slice(prev.length)
+        .split('')
+        .map((ch) => ({ id: visCounter++, type: (ch === '.' ? 'dot' : 'dash') as 'dot' | 'dash' }))
+      setMorseElements((els) => [...els, ...newEls])
     } else {
-      // Symbol reset or shortened — rebuild (handles character flush & decoder reset)
-      const newEls = sym.split('').map(ch => ({
-        id:   visCounterRef.current++,
-        type: (ch === '.' ? 'dot' : 'dash') as 'dot' | 'dash',
-      }));
-      setMorseElements(newEls);
+      const newEls = sym.split('').map((ch) => ({ id: visCounter++, type: (ch === '.' ? 'dot' : 'dash') as 'dot' | 'dash' }))
+      setMorseElements(newEls)
     }
+    prevSym1 = sym
+  })
 
-    prevSym1Ref.current = sym;
-  }, [state.stats?.partialSymbol]);
-
-  useEffect(() => {
-    const sym  = state.stats2?.partialSymbol ?? '';
-    const prev = prevSym2Ref.current;
-    if (sym === prev) return;
+  createEffect(() => {
+    const sym = processor.state().stats2?.partialSymbol ?? ''
+    const prev = prevSym2
+    if (sym === prev) return
 
     if (sym.length > prev.length && sym.startsWith(prev)) {
-      const newEls = sym.slice(prev.length).split('').map(ch => ({
-        id:   visCounterRef.current++,
-        type: (ch === '.' ? 'dot' : 'dash') as 'dot' | 'dash',
-      }));
-      setMorseElements2(els => [...els, ...newEls]);
+      const newEls = sym
+        .slice(prev.length)
+        .split('')
+        .map((ch) => ({ id: visCounter++, type: (ch === '.' ? 'dot' : 'dash') as 'dot' | 'dash' }))
+      setMorseElements2((els) => [...els, ...newEls])
     } else {
-      const newEls = sym.split('').map(ch => ({
-        id:   visCounterRef.current++,
-        type: (ch === '.' ? 'dot' : 'dash') as 'dot' | 'dash',
-      }));
-      setMorseElements2(newEls);
+      const newEls = sym.split('').map((ch) => ({ id: visCounter++, type: (ch === '.' ? 'dot' : 'dash') as 'dot' | 'dash' }))
+      setMorseElements2(newEls)
     }
+    prevSym2 = sym
+  })
 
-    prevSym2Ref.current = sym;
-  }, [state.stats2?.partialSymbol]);
+  onMount(() => {
+    processor.setOnChar((char, symbol) => {
+      if (char === ' ') return
+      const id = visCounter++
+      if (flashTimeout) clearTimeout(flashTimeout)
+      const entry: RecentCharEntry = { id, char, symbol }
+      setFlashChar(entry)
+      setRecentChars((prev) => [...prev.slice(-9), entry])
+      flashTimeout = setTimeout(() => setFlashChar(null), 1800)
+    })
+    processor.setOnChar2((char, symbol) => {
+      if (char === ' ') return
+      const id = visCounter++
+      if (flashTimeout2) clearTimeout(flashTimeout2)
+      const entry: RecentCharEntry = { id, char, symbol }
+      setFlashChar2(entry)
+      setRecentChars2((prev) => [...prev.slice(-9), entry])
+      flashTimeout2 = setTimeout(() => setFlashChar2(null), 1800)
+    })
+    onCleanup(() => {
+      processor.setOnChar(null)
+      processor.setOnChar2(null)
+    })
+  })
 
-  // ── onCharRef — flash character + recent strip only ───────────────────────────
-
-  useEffect(() => {
-    onCharRef.current = (char, symbol) => {
-      if (char === ' ') return;
-      const id = visCounterRef.current++;
-      if (flashTimeoutRef.current) clearTimeout(flashTimeoutRef.current);
-      const entry: RecentCharEntry = { id, char, symbol };
-      setFlashChar(entry);
-      setRecentChars(prev => [...prev.slice(-9), entry]);
-      flashTimeoutRef.current = setTimeout(() => setFlashChar(null), 1800);
-    };
-    return () => { onCharRef.current = null; };
-  }, [onCharRef]);
-
-  useEffect(() => {
-    onCharRef2.current = (char, symbol) => {
-      if (char === ' ') return;
-      const id = visCounterRef.current++;
-      if (flashTimeout2Ref.current) clearTimeout(flashTimeout2Ref.current);
-      const entry: RecentCharEntry = { id, char, symbol };
-      setFlashChar2(entry);
-      setRecentChars2(prev => [...prev.slice(-9), entry]);
-      flashTimeout2Ref.current = setTimeout(() => setFlashChar2(null), 1800);
-    };
-    return () => { onCharRef2.current = null; };
-  }, [onCharRef2]);
-
-  // Clear live visualizer state when recording stops
-  useEffect(() => {
-    if (!state.isRecording) {
-      setMorseElements([]); setFlashChar(null);
-      setMorseElements2([]); setFlashChar2(null);
-      prevSym1Ref.current = '';
-      prevSym2Ref.current = '';
-      if (flashTimeoutRef.current)  { clearTimeout(flashTimeoutRef.current);  flashTimeoutRef.current  = null; }
-      if (flashTimeout2Ref.current) { clearTimeout(flashTimeout2Ref.current); flashTimeout2Ref.current = null; }
-    }
-  }, [state.isRecording]);
-
-  const textDivRef = useRef<HTMLDivElement>(null);
-
-  // Auto-scroll text div when new tokens arrive
-  useEffect(() => {
-    const el = textDivRef.current;
-    if (el) el.scrollTop = el.scrollHeight;
-  }, [state.tokens]);
-
-  // ── Handlers ─────────────────────────────────────────────────────────────
-
-  const handleReset = useCallback(() => {
-    resetDecoder();
-    prevSym1Ref.current  = '';
-    prevSym2Ref.current  = '';
-    setMorseElements([]); setFlashChar(null); setRecentChars([]);
-    setMorseElements2([]); setFlashChar2(null); setRecentChars2([]);
-    if (flashTimeoutRef.current)  { clearTimeout(flashTimeoutRef.current);  flashTimeoutRef.current  = null; }
-    if (flashTimeout2Ref.current) { clearTimeout(flashTimeout2Ref.current); flashTimeout2Ref.current = null; }
-  }, [resetDecoder]);
-
-  const handleCopyText = () => {
-    const text = state.tokens.map(t => t.text).join('');
-    if (!text) return;
-    navigator.clipboard.writeText(text).catch(() => {});
-  };
-
-  // ── Derived ───────────────────────────────────────────────────────────────
-
-  const stats  = state.stats;
-  const stats2 = state.stats2;
-
-  const snrColor = stats?.snrDb == null ? 'text-[#8b949e]'
-    : stats.snrDb < 6  ? 'text-[#da3633]'
-    : stats.snrDb < 15 ? 'text-[#e3b341]'
-    : 'text-[#2ea043]';
-
-  const hasText = state.tokens.length > 0;
-  const charCount = useMemo(
-    () => state.tokens.map(t => t.text).join('').replace(/ /g, '').length,
-    [state.tokens],
-  );
-
-  // Coalesce consecutive same-channel tokens to minimise DOM span count
-  const coalescedTokens = useMemo<TextToken[]>(() => {
-    const result: TextToken[] = [];
-    for (const tok of state.tokens) {
-      const last = result[result.length - 1];
-      if (last && last.channel === tok.channel) {
-        result[result.length - 1] = { text: last.text + tok.text, channel: tok.channel };
-      } else {
-        result.push({ text: tok.text, channel: tok.channel });
+  createEffect(() => {
+    if (!processor.state().isRecording) {
+      setMorseElements([])
+      setFlashChar(null)
+      setMorseElements2([])
+      setFlashChar2(null)
+      prevSym1 = ''
+      prevSym2 = ''
+      if (flashTimeout) {
+        clearTimeout(flashTimeout)
+        flashTimeout = null
+      }
+      if (flashTimeout2) {
+        clearTimeout(flashTimeout2)
+        flashTimeout2 = null
       }
     }
-    return result;
-  }, [state.tokens]);
+  })
 
-  const controls: DecoderControls = {
-    isRecording: state.isRecording,
-    isSupported: state.isSupported,
-    error: state.error ?? null,
-    start: startRecording,
-    stop: stopRecording,
-    reset: handleReset,
-  };
-  useImperativeHandle(ref, () => controls, [state.isRecording, state.isSupported, state.error, startRecording, stopRecording, handleReset]); // eslint-disable-line react-hooks/exhaustive-deps
-  const onStateChangeRef = useRef(onStateChange);
-  onStateChangeRef.current = onStateChange;
-  useEffect(() => { onStateChangeRef.current?.(controls); }, [state.isRecording, state.isSupported, state.error]); // eslint-disable-line react-hooks/exhaustive-deps
+  let textDivEl: HTMLDivElement | undefined
+  createEffect(() => {
+    void processor.state().tokens
+    const el = textDivEl
+    if (el) el.scrollTop = el.scrollHeight
+  })
 
-  // ── Render ───────────────────────────────────────────────────────────────
+  function handleReset() {
+    processor.resetDecoder()
+    prevSym1 = ''
+    prevSym2 = ''
+    setMorseElements([])
+    setFlashChar(null)
+    setRecentChars([])
+    setMorseElements2([])
+    setFlashChar2(null)
+    setRecentChars2([])
+    if (flashTimeout) {
+      clearTimeout(flashTimeout)
+      flashTimeout = null
+    }
+    if (flashTimeout2) {
+      clearTimeout(flashTimeout2)
+      flashTimeout2 = null
+    }
+  }
+
+  function handleCopyText() {
+    const text = processor
+      .state()
+      .tokens.map((t) => t.text)
+      .join('')
+    if (!text) return
+    navigator.clipboard.writeText(text).catch(() => {})
+  }
+
+  const snrColor = createMemo(() => {
+    const snr = processor.state().stats?.snrDb
+    if (snr == null) return 'text-[#8b949e]'
+    if (snr < 6) return 'text-[#da3633]'
+    if (snr < 15) return 'text-[#e3b341]'
+    return 'text-[#2ea043]'
+  })
+
+  const hasText = createMemo(() => processor.state().tokens.length > 0)
+  const charCount = createMemo(
+    () =>
+      processor
+        .state()
+        .tokens.map((t) => t.text)
+        .join('')
+        .replace(/ /g, '').length,
+  )
+
+  const coalescedTokens = createMemo<TextToken[]>(() => {
+    const result: TextToken[] = []
+    for (const tok of processor.state().tokens) {
+      const last = result[result.length - 1]
+      if (last && last.channel === tok.channel) {
+        result[result.length - 1] = { text: last.text + tok.text, channel: tok.channel }
+      } else {
+        result.push({ text: tok.text, channel: tok.channel })
+      }
+    }
+    return result
+  })
+
+  function isSupported() {
+    return processor.state().isSupported
+  }
+
+  onMount(() => {
+    if (props.handle) {
+      props.handle.current = {
+        get isRecording() {
+          return processor.state().isRecording
+        },
+        get isSupported() {
+          return isSupported()
+        },
+        get error() {
+          return processor.state().error
+        },
+        start: processor.startRecording,
+        stop: processor.stopRecording,
+        reset: handleReset,
+      }
+    }
+  })
+
+  createEffect(() => {
+    const controls: DecoderControls = {
+      isRecording: processor.state().isRecording,
+      isSupported: isSupported(),
+      error: processor.state().error,
+      start: processor.startRecording,
+      stop: processor.stopRecording,
+      reset: handleReset,
+    }
+    props.onStateChange?.(controls)
+  })
 
   return (
-    <div className="space-y-4 sm:space-y-6">
-
-      {/* ── 3-panel layout ── */}
-      <div ref={containerRef} className="flex flex-col lg:flex-row lg:items-stretch gap-4 lg:gap-0">
-
+    <div class="space-y-4 sm:space-y-6">
+      <div ref={containerEl} class="flex flex-col gap-4 lg:flex-row lg:items-stretch lg:gap-0">
         {/* Panel 1 — CW Output */}
-        <div className="bg-[#161b22] border border-[#30363d] rounded-lg p-3 sm:p-4 flex flex-col min-w-0" style={{ flex: panelWeights[0] }}>
-          <div className="flex items-center justify-between mb-2 sm:mb-3">
-            <h2 className="text-lg sm:text-xl font-semibold">CW Output</h2>
-            <div className="flex items-center gap-3">
-              <div className={`flex items-center gap-2 text-xs font-mono transition-opacity ${dualMode ? 'opacity-100' : 'opacity-0 pointer-events-none'}`}>
-                <span className="flex items-center gap-1"><span className="inline-block w-2 h-2 rounded-full bg-[#79c0ff]" />Ch A</span>
-                <span className="flex items-center gap-1"><span className="inline-block w-2 h-2 rounded-full bg-[#ffa657]" />Ch B</span>
+        <div class="flex min-w-0 flex-col rounded-lg border border-[#30363d] bg-[#161b22] p-3 sm:p-4" style={{ flex: panelWeights()[0] }}>
+          <div class="mb-2 flex items-center justify-between sm:mb-3">
+            <h2 class="text-lg font-semibold sm:text-xl">CW Output</h2>
+            <div class="flex items-center gap-3">
+              <div class={`flex items-center gap-2 font-mono text-xs transition-opacity ${dualMode() ? 'opacity-100' : 'pointer-events-none opacity-0'}`}>
+                <span class="flex items-center gap-1">
+                  <span class="inline-block h-2 w-2 rounded-full bg-[#79c0ff]" />
+                  Ch A
+                </span>
+                <span class="flex items-center gap-1">
+                  <span class="inline-block h-2 w-2 rounded-full bg-[#ffa657]" />
+                  Ch B
+                </span>
               </div>
-              <span className="text-xs text-[#8b949e] font-mono">{charCount} chars</span>
+              <span class="font-mono text-xs text-[#8b949e]">{charCount()} chars</span>
               <button
                 onClick={handleCopyText}
-                disabled={!hasText}
-                className="text-xs px-2 py-0.5 rounded border border-[#30363d] text-[#8b949e] hover:text-[#79c0ff] hover:border-[#79c0ff]/40 disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
+                disabled={!hasText()}
+                class="rounded border border-[#30363d] px-2 py-0.5 text-xs text-[#8b949e] transition-colors hover:border-[#79c0ff]/40 hover:text-[#79c0ff] disabled:cursor-not-allowed disabled:opacity-30"
               >
                 Copy
               </button>
               <button
-                onClick={clearText}
-                disabled={!hasText}
-                className="text-xs px-2 py-0.5 rounded border border-[#30363d] text-[#8b949e] hover:text-[#f85149] hover:border-[#f85149]/40 disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
+                onClick={processor.clearText}
+                disabled={!hasText()}
+                class="rounded border border-[#30363d] px-2 py-0.5 text-xs text-[#8b949e] transition-colors hover:border-[#f85149]/40 hover:text-[#f85149] disabled:cursor-not-allowed disabled:opacity-30"
               >
                 Clear
               </button>
             </div>
           </div>
 
-          {/* Coloured text output */}
           <div
-            ref={textDivRef}
-            className="flex-1 min-h-[200px] w-full bg-[#0d1117] border border-[#30363d] rounded font-mono text-sm p-3 overflow-y-auto focus:outline-none leading-snug whitespace-pre-wrap break-words"
+            ref={textDivEl}
+            class="min-h-[200px] w-full flex-1 overflow-y-auto rounded border border-[#30363d] bg-[#0d1117] p-3 font-mono text-sm leading-snug break-words whitespace-pre-wrap focus:outline-none"
             tabIndex={0}
             aria-label="Decoded CW text"
             aria-live="polite"
           >
-            {coalescedTokens.length === 0 ? (
-              <span className="text-[#30363d]">Decoded CW text will appear here{dualMode ? ' — Ch A blue · Ch B orange' : '…'}</span>
+            {coalescedTokens().length === 0 ? (
+              <span class="text-[#30363d]">Decoded CW text will appear here{dualMode() ? ' — Ch A blue · Ch B orange' : '…'}</span>
             ) : (
-              coalescedTokens.map((tok, i) => (
-                <span key={i} style={{ color: CH_COLORS[tok.channel].text }}>
-                  {tok.text}
-                </span>
-              ))
+              <For each={coalescedTokens()}>{(tok) => <span style={{ color: CH_COLORS[tok.channel].text }}>{tok.text}</span>}</For>
             )}
           </div>
 
-          {/* Morse Visualizer(s) — always rendered, dimmed when not recording */}
-          <div className={`mt-3 sm:mt-4 grid gap-3 transition-opacity ${dualMode ? 'grid-cols-2' : 'grid-cols-1'} ${!state.isRecording ? 'opacity-30' : ''}`}>
+          <div
+            class={`mt-3 grid gap-3 transition-opacity sm:mt-4 ${dualMode() ? 'grid-cols-2' : 'grid-cols-1'} ${!processor.state().isRecording ? 'opacity-30' : ''}`}
+          >
             <MorseVisualizer
-              elements={morseElements}
-              flashChar={flashChar}
-              recentChars={recentChars}
-              isReceiving={stats?.toneDetected ?? false}
+              elements={morseElements()}
+              flashChar={flashChar()}
+              recentChars={recentChars()}
+              isReceiving={processor.state().stats?.toneDetected ?? false}
               channel={0}
-              label={dualMode ? 'Channel A' : undefined}
+              label={dualMode() ? 'Channel A' : undefined}
             />
-            <div className={`transition-opacity ${dualMode ? 'opacity-100' : 'opacity-0 pointer-events-none h-0 overflow-hidden'}`}>
+            <div class={`transition-opacity ${dualMode() ? 'opacity-100' : 'pointer-events-none h-0 overflow-hidden opacity-0'}`}>
               <MorseVisualizer
-                elements={morseElements2}
-                flashChar={flashChar2}
-                recentChars={recentChars2}
-                isReceiving={stats2?.toneDetected ?? false}
+                elements={morseElements2()}
+                flashChar={flashChar2()}
+                recentChars={recentChars2()}
+                isReceiving={processor.state().stats2?.toneDetected ?? false}
                 channel={1}
                 label="Channel B"
               />
@@ -518,247 +520,270 @@ const CWDecoder = forwardRef<DecoderControls, DecoderProps>(function CWDecoder({
           </div>
         </div>
 
-        {/* Drag handle 0↔1 */}
-        <div className="hidden lg:flex w-3 self-stretch cursor-col-resize items-center justify-center group shrink-0" onMouseDown={(e) => startDrag(e, 0)}><div className="w-px h-full bg-[#30363d] group-hover:bg-[#2ea043]/50 transition-colors" /></div>
+        {/* Drag handle 0<->1 */}
+        <div
+          class="group hidden w-3 shrink-0 cursor-col-resize items-center justify-center self-stretch lg:flex"
+          onMouseDown={(e) => startDrag(e, 0)}
+        >
+          <div class="h-full w-px bg-[#30363d] transition-colors group-hover:bg-[#2ea043]/50" />
+        </div>
 
         {/* Panel 2 — Audio Analysis */}
         <AudioAnalysisPanel
-          analyser={analyser ?? null}
-          isRecording={state.isRecording}
+          analyser={props.analyser ?? null}
+          isRecording={processor.state().isRecording}
           storageKeyPrefix="cw"
           markers={[
-            { freq: toneFreq, color: '#79c0ff', label: 'T', bandwidthHz: filterBandwidth },
-            ...(dualMode ? [{ freq: toneFreq2, color: '#ffa657', label: 'T2', bandwidthHz: filterBandwidth }] : []),
+            { freq: toneFreq(), color: '#79c0ff', label: 'T', bandwidthHz: filterBandwidth() },
+            ...(dualMode() ? [{ freq: toneFreq2(), color: '#ffa657', label: 'T2', bandwidthHz: filterBandwidth() }] : []),
           ]}
           onMarkerDrag={(idx, newHz) => {
-            const f = Math.max(50, newHz);
-            if (idx === 0) setToneFreq(f);
-            else setToneFreq2(f);
+            const f = Math.max(50, newHz)
+            if (idx === 0) setToneFreq(f)
+            else setToneFreq2(f)
           }}
-          squelch={squelch}
+          squelch={squelch()}
           onSquelchChange={setSquelch}
-          vfoFrequency={vfoFrequency}
-          className="min-w-0"
-          style={{ flex: panelWeights[1] }}
+          vfoFrequency={props.vfoFrequency}
+          class="min-w-0"
+          style={{ flex: panelWeights()[1] }}
         />
 
-        {/* Drag handle 1↔2 */}
-        <div className="hidden lg:flex w-3 self-stretch cursor-col-resize items-center justify-center group shrink-0" onMouseDown={(e) => startDrag(e, 1)}><div className="w-px h-full bg-[#30363d] group-hover:bg-[#2ea043]/50 transition-colors" /></div>
+        {/* Drag handle 1<->2 */}
+        <div
+          class="group hidden w-3 shrink-0 cursor-col-resize items-center justify-center self-stretch lg:flex"
+          onMouseDown={(e) => startDrag(e, 1)}
+        >
+          <div class="h-full w-px bg-[#30363d] transition-colors group-hover:bg-[#2ea043]/50" />
+        </div>
 
         {/* Panel 3 — Decoder Options */}
-        <div className="bg-[#161b22] border border-[#30363d] rounded-lg p-3 sm:p-4 flex flex-col gap-3 min-w-0" style={{ flex: panelWeights[2] }}>
-          <h2 className="text-lg sm:text-xl font-semibold">Decoder Options</h2>
+        <div
+          class="flex min-w-0 flex-col gap-3 rounded-lg border border-[#30363d] bg-[#161b22] p-3 sm:p-4"
+          style={{ flex: panelWeights()[2] }}
+        >
+          <h2 class="text-lg font-semibold sm:text-xl">Decoder Options</h2>
 
-          {state.error && (
-            <div className="bg-[#da3633]/10 border border-[#f85149]/30 rounded-md p-3 text-[#f85149] text-xs">
-              {state.error}
-            </div>
-          )}
+          <Show when={processor.state().error}>
+            <div class="rounded-md border border-[#f85149]/30 bg-[#da3633]/10 p-3 text-xs text-[#f85149]">{processor.state().error}</div>
+          </Show>
 
-          {/* A/B Mode toggle */}
-          <div className="flex items-center gap-2.5">
-            <Toggle checked={dualMode} onChange={() => setDualMode(v => !v)} />
-            <span className="text-[#c9d1d9] text-sm cursor-default select-none">A/B Mode</span>
+          <div class="flex items-center gap-2.5">
+            <Toggle checked={dualMode()} onChange={() => setDualMode((v) => !v)} />
+            <span class="cursor-default text-sm text-[#c9d1d9] select-none">A/B Mode</span>
           </div>
 
-          {/* Adaptive WPM */}
-          <div className="flex items-center gap-2.5 flex-wrap">
+          <div class="flex flex-wrap items-center gap-2.5">
             <Toggle
-              checked={adaptiveDitLength}
+              checked={adaptiveDitLength()}
               onChange={() => {
-                if (adaptiveDitLength && stats?.adaptiveWpm) setManualWpm(stats.adaptiveWpm);
-                setAdaptiveDitLength(v => !v);
+                if (adaptiveDitLength() && processor.state().stats?.adaptiveWpm) setManualWpm(processor.state().stats!.adaptiveWpm!)
+                setAdaptiveDitLength((v) => !v)
               }}
             />
-            <span className="text-[#c9d1d9] text-sm cursor-default select-none">Adaptive WPM</span>
-            {adaptiveDitLength ? (
-              <div className="flex items-center gap-1.5">
-                <span className="font-mono text-sm text-[#2ea043] tabular-nums min-w-[2.5ch]">
-                  {stats?.adaptiveWpm ?? '—'}
-                </span>
-                <span className="text-xs text-[#484f58]">WPM</span>
+            <span class="cursor-default text-sm text-[#c9d1d9] select-none">Adaptive WPM</span>
+            {adaptiveDitLength() ? (
+              <div class="flex items-center gap-1.5">
+                <span class="min-w-[2.5ch] font-mono text-sm text-[#2ea043] tabular-nums">{processor.state().stats?.adaptiveWpm ?? '—'}</span>
+                <span class="text-xs text-[#484f58]">WPM</span>
               </div>
             ) : (
-              <div className="flex items-center gap-2 flex-wrap">
+              <div class="flex flex-wrap items-center gap-2">
                 <input
                   type="number"
-                  value={manualWpm}
-                  min={3} max={70}
-                  onChange={(e) => {
-                    const v = parseInt(e.target.value);
-                    if (!isNaN(v)) setManualWpm(Math.max(3, Math.min(70, v)));
+                  value={manualWpm()}
+                  min={3}
+                  max={70}
+                  onInput={(e) => {
+                    const v = parseInt(e.currentTarget.value)
+                    if (!isNaN(v)) setManualWpm(Math.max(3, Math.min(70, v)))
                   }}
-                  className="bg-[#0d1117] border border-[#30363d] rounded px-2 py-0.5 w-14 text-[#c9d1d9] font-mono text-sm focus:outline-none focus:border-[#79c0ff] transition-colors"
+                  class="w-14 rounded border border-[#30363d] bg-[#0d1117] px-2 py-0.5 font-mono text-sm text-[#c9d1d9] transition-colors focus:border-[#79c0ff] focus:outline-none"
                 />
-                <span className="text-xs text-[#8b949e]">WPM</span>
-                {stats?.adaptiveWpm != null && (
-                  <span className="text-xs text-[#484f58]">
-                    (suggest&nbsp;
-                    <button className="text-[#2ea043] hover:underline font-mono" onClick={() => setManualWpm(stats.adaptiveWpm!)}>
-                      {stats.adaptiveWpm}
+                <span class="text-xs text-[#8b949e]">WPM</span>
+                <Show when={processor.state().stats?.adaptiveWpm != null}>
+                  <span class="text-xs text-[#484f58]">
+                    (suggest{' '}
+                    <button class="font-mono text-[#2ea043] hover:underline" onClick={() => setManualWpm(processor.state().stats!.adaptiveWpm!)}>
+                      {processor.state().stats?.adaptiveWpm}
                     </button>
                     )
                   </span>
-                )}
+                </Show>
               </div>
             )}
           </div>
 
-          {/* Center frequency Ch A */}
-          <div className="space-y-1">
-            <div className="text-xs text-[#8b949e]">Center Ch A</div>
-            <div className="flex items-center gap-2">
-              {vfoFrequency ? (
-                <span className="bg-[#0d1117] border border-[#30363d] rounded px-2 py-0.5 w-24 text-[#79c0ff] font-mono text-sm block">
-                  {fmtAbsHz(vfoFrequency + toneFreq)}
+          <div class="space-y-1">
+            <div class="text-xs text-[#8b949e]">Center Ch A</div>
+            <div class="flex items-center gap-2">
+              {props.vfoFrequency ? (
+                <span class="block w-24 rounded border border-[#30363d] bg-[#0d1117] px-2 py-0.5 font-mono text-sm text-[#79c0ff]">
+                  {fmtAbsHz(props.vfoFrequency + toneFreq())}
                 </span>
               ) : (
                 <input
                   type="number"
-                  value={toneFreq}
+                  value={toneFreq()}
                   min={50}
-                  onChange={(e) => {
-                    const v = parseInt(e.target.value);
-                    if (!isNaN(v) && v >= 50) setToneFreq(v);
+                  onInput={(e) => {
+                    const v = parseInt(e.currentTarget.value)
+                    if (!isNaN(v) && v >= 50) setToneFreq(v)
                   }}
-                  className="bg-[#0d1117] border border-[#30363d] rounded px-2 py-0.5 w-20 text-[#79c0ff] font-mono text-sm focus:outline-none focus:border-[#79c0ff] transition-colors"
+                  class="w-20 rounded border border-[#30363d] bg-[#0d1117] px-2 py-0.5 font-mono text-sm text-[#79c0ff] transition-colors focus:border-[#79c0ff] focus:outline-none"
                 />
               )}
-              <span className="text-xs text-[#8b949e]">Hz</span>
+              <span class="text-xs text-[#8b949e]">Hz</span>
             </div>
           </div>
 
-          {/* Center frequency Ch B — always visible, greyed when not in dual mode */}
-          <div className={`space-y-1 transition-opacity ${dualMode ? 'opacity-100' : 'opacity-30'}`}>
-            <div className="text-xs text-[#8b949e]">Center Ch B</div>
-            <div className="flex items-center gap-2">
-              {vfoFrequency ? (
-                <span className="bg-[#0d1117] border border-[#30363d] rounded px-2 py-0.5 w-24 text-[#ffa657] font-mono text-sm block">
-                  {fmtAbsHz(vfoFrequency + toneFreq2)}
+          <div class={`space-y-1 transition-opacity ${dualMode() ? 'opacity-100' : 'opacity-30'}`}>
+            <div class="text-xs text-[#8b949e]">Center Ch B</div>
+            <div class="flex items-center gap-2">
+              {props.vfoFrequency ? (
+                <span class="block w-24 rounded border border-[#30363d] bg-[#0d1117] px-2 py-0.5 font-mono text-sm text-[#ffa657]">
+                  {fmtAbsHz(props.vfoFrequency + toneFreq2())}
                 </span>
               ) : (
                 <input
                   type="number"
-                  value={toneFreq2}
+                  value={toneFreq2()}
                   min={50}
-                  disabled={!dualMode}
-                  onChange={(e) => {
-                    const v = parseInt(e.target.value);
-                    if (!isNaN(v) && v >= 50) setToneFreq2(v);
+                  disabled={!dualMode()}
+                  onInput={(e) => {
+                    const v = parseInt(e.currentTarget.value)
+                    if (!isNaN(v) && v >= 50) setToneFreq2(v)
                   }}
-                  className="bg-[#0d1117] border border-[#30363d] rounded px-2 py-0.5 w-20 text-[#ffa657] font-mono text-sm focus:outline-none focus:border-[#ffa657] transition-colors disabled:cursor-not-allowed"
+                  class="w-20 rounded border border-[#30363d] bg-[#0d1117] px-2 py-0.5 font-mono text-sm text-[#ffa657] transition-colors focus:border-[#ffa657] focus:outline-none disabled:cursor-not-allowed"
                 />
               )}
-              <span className="text-xs text-[#8b949e]">Hz</span>
+              <span class="text-xs text-[#8b949e]">Hz</span>
             </div>
           </div>
 
-          {/* Filter bandwidth */}
-          <div className="space-y-1">
-            <div className="text-xs text-[#8b949e]">Bandwidth</div>
-            <div className="flex items-center gap-2">
+          <div class="space-y-1">
+            <div class="text-xs text-[#8b949e]">Bandwidth</div>
+            <div class="flex items-center gap-2">
               <input
                 type="number"
-                value={filterBandwidth}
-                min={30} max={500} step={10}
-                onChange={(e) => {
-                  const v = parseInt(e.target.value);
-                  if (!isNaN(v)) setFilterBandwidth(Math.max(30, Math.min(500, v)));
+                value={filterBandwidth()}
+                min={30}
+                max={500}
+                step={10}
+                onInput={(e) => {
+                  const v = parseInt(e.currentTarget.value)
+                  if (!isNaN(v)) setFilterBandwidth(Math.max(30, Math.min(500, v)))
                 }}
-                className="bg-[#0d1117] border border-[#30363d] rounded px-2 py-0.5 w-20 text-[#c9d1d9] font-mono text-sm focus:outline-none focus:border-[#2ea043] transition-colors"
+                class="w-20 rounded border border-[#30363d] bg-[#0d1117] px-2 py-0.5 font-mono text-sm text-[#c9d1d9] transition-colors focus:border-[#2ea043] focus:outline-none"
               />
-              <span className="text-xs text-[#8b949e]">Hz</span>
+              <span class="text-xs text-[#8b949e]">Hz</span>
             </div>
           </div>
 
-          {/* Status grid — always visible, dimmed when not recording */}
-          <div className={`grid grid-cols-2 gap-2 text-sm mt-auto transition-opacity ${!state.isRecording ? 'opacity-40' : ''}`}>
-            <div className="bg-[#0d1117] border border-[#30363d] rounded-lg p-2.5">
-              <div className="text-[#8b949e] text-[10px] mb-0.5">Speed A</div>
-              <div className="font-mono font-semibold text-xs text-[#79c0ff]">
-                {stats?.wpm ?? '—'} <span className="text-[#8b949e] font-normal">WPM</span>
+          <div class={`mt-auto grid grid-cols-2 gap-2 text-sm transition-opacity ${!processor.state().isRecording ? 'opacity-40' : ''}`}>
+            <div class="rounded-lg border border-[#30363d] bg-[#0d1117] p-2.5">
+              <div class="mb-0.5 text-[10px] text-[#8b949e]">Speed A</div>
+              <div class="font-mono text-xs font-semibold text-[#79c0ff]">
+                {processor.state().stats?.wpm ?? '—'} <span class="font-normal text-[#8b949e]">WPM</span>
               </div>
             </div>
-            <div className={`bg-[#0d1117] border border-[#30363d] rounded-lg p-2.5 transition-opacity ${dualMode ? 'opacity-100' : 'opacity-40'}`}>
-              <div className="text-[#8b949e] text-[10px] mb-0.5">Speed B</div>
-              <div className="font-mono font-semibold text-xs text-[#ffa657]">
-                {stats2?.wpm ?? '—'} <span className="text-[#8b949e] font-normal">WPM</span>
+            <div class={`rounded-lg border border-[#30363d] bg-[#0d1117] p-2.5 transition-opacity ${dualMode() ? 'opacity-100' : 'opacity-40'}`}>
+              <div class="mb-0.5 text-[10px] text-[#8b949e]">Speed B</div>
+              <div class="font-mono text-xs font-semibold text-[#ffa657]">
+                {processor.state().stats2?.wpm ?? '—'} <span class="font-normal text-[#8b949e]">WPM</span>
               </div>
             </div>
-            <div className="bg-[#0d1117] border border-[#30363d] rounded-lg p-2.5">
-              <div className="text-[#8b949e] text-[10px] mb-0.5">Ch A State</div>
-              <div className="font-mono font-semibold text-xs">
-                {stats?.squelched
-                  ? <span className="text-[#e3b341]">Squelched</span>
-                  : stats?.toneDetected
-                    ? <span className="text-[#79c0ff] flex items-center gap-1"><span className="inline-block w-1.5 h-1.5 rounded-full bg-[#79c0ff] animate-pulse shrink-0" />Mark</span>
-                    : <span className="text-[#8b949e]">Space</span>
-                }
+            <div class="rounded-lg border border-[#30363d] bg-[#0d1117] p-2.5">
+              <div class="mb-0.5 text-[10px] text-[#8b949e]">Ch A State</div>
+              <div class="font-mono text-xs font-semibold">
+                {processor.state().stats?.squelched ? (
+                  <span class="text-[#e3b341]">Squelched</span>
+                ) : processor.state().stats?.toneDetected ? (
+                  <span class="flex items-center gap-1 text-[#79c0ff]">
+                    <span class="inline-block h-1.5 w-1.5 shrink-0 animate-pulse rounded-full bg-[#79c0ff]" />
+                    Mark
+                  </span>
+                ) : (
+                  <span class="text-[#8b949e]">Space</span>
+                )}
               </div>
             </div>
-            <div className={`bg-[#0d1117] border border-[#30363d] rounded-lg p-2.5 transition-opacity ${dualMode ? 'opacity-100' : 'opacity-40'}`}>
-              <div className="text-[#8b949e] text-[10px] mb-0.5">Ch B State</div>
-              <div className="font-mono font-semibold text-xs">
-                {stats2?.squelched
-                  ? <span className="text-[#e3b341]">Squelched</span>
-                  : stats2?.toneDetected
-                    ? <span className="text-[#ffa657] flex items-center gap-1"><span className="inline-block w-1.5 h-1.5 rounded-full bg-[#ffa657] animate-pulse shrink-0" />Mark</span>
-                    : <span className="text-[#8b949e]">Space</span>
-                }
+            <div class={`rounded-lg border border-[#30363d] bg-[#0d1117] p-2.5 transition-opacity ${dualMode() ? 'opacity-100' : 'opacity-40'}`}>
+              <div class="mb-0.5 text-[10px] text-[#8b949e]">Ch B State</div>
+              <div class="font-mono text-xs font-semibold">
+                {processor.state().stats2?.squelched ? (
+                  <span class="text-[#e3b341]">Squelched</span>
+                ) : processor.state().stats2?.toneDetected ? (
+                  <span class="flex items-center gap-1 text-[#ffa657]">
+                    <span class="inline-block h-1.5 w-1.5 shrink-0 animate-pulse rounded-full bg-[#ffa657]" />
+                    Mark
+                  </span>
+                ) : (
+                  <span class="text-[#8b949e]">Space</span>
+                )}
               </div>
             </div>
-            <div className="bg-[#0d1117] border border-[#30363d] rounded-lg p-2.5">
-              <div className="text-[#8b949e] text-[10px] mb-0.5">Chars</div>
-              <div className="font-mono font-semibold text-xs">{charCount}</div>
+            <div class="rounded-lg border border-[#30363d] bg-[#0d1117] p-2.5">
+              <div class="mb-0.5 text-[10px] text-[#8b949e]">Chars</div>
+              <div class="font-mono text-xs font-semibold">{charCount()}</div>
             </div>
-            <div className="bg-[#0d1117] border border-[#30363d] rounded-lg p-2.5">
-              <div className="text-[#8b949e] text-[10px] mb-0.5">SNR (Ch A)</div>
-              <div className={`font-mono font-semibold text-xs ${snrColor}`}>
-                {stats?.snrDb != null ? `${stats.snrDb.toFixed(1)} dB` : '-- dB'}
+            <div class="rounded-lg border border-[#30363d] bg-[#0d1117] p-2.5">
+              <div class="mb-0.5 text-[10px] text-[#8b949e]">SNR (Ch A)</div>
+              <div class={`font-mono text-xs font-semibold ${snrColor()}`}>
+                {processor.state().stats?.snrDb != null ? `${processor.state().stats!.snrDb!.toFixed(1)} dB` : '-- dB'}
               </div>
             </div>
           </div>
 
-          {/* Reset */}
           <button
             onClick={handleReset}
-            className="text-xs px-3 py-1.5 rounded border border-[#30363d] text-[#8b949e] hover:text-[#e3b341] hover:border-[#e3b341]/40 transition-colors self-start"
+            class="self-start rounded border border-[#30363d] px-3 py-1.5 text-xs text-[#8b949e] transition-colors hover:border-[#e3b341]/40 hover:text-[#e3b341]"
           >
             Reset Decoder
           </button>
         </div>
       </div>
 
-      {/* ── How to Use ── */}
-      <details className="bg-[#161b22] border border-[#30363d] rounded-lg">
-        <summary className="cursor-pointer p-4 sm:p-6 font-semibold text-lg sm:text-xl hover:bg-[#21262d] rounded-lg transition-colors select-none">
+      {/* How to Use */}
+      <details class="rounded-lg border border-[#30363d] bg-[#161b22]">
+        <summary class="cursor-pointer rounded-lg p-4 text-lg font-semibold transition-colors select-none hover:bg-[#21262d] sm:p-6 sm:text-xl">
           How to Use
         </summary>
-        <div className="px-4 pb-4 sm:px-6 sm:pb-6">
-          <ol className="list-decimal list-inside space-y-2 text-sm sm:text-base text-[#c9d1d9]">
-            <li>Click <strong>Start Decoding</strong> and allow microphone access</li>
+        <div class="px-4 pb-4 sm:px-6 sm:pb-6">
+          <ol class="list-inside list-decimal space-y-2 text-sm text-[#c9d1d9] sm:text-base">
+            <li>
+              Click <strong>Start Decoding</strong> and allow microphone access
+            </li>
             <li>Tune your radio to a CW (Morse code) signal</li>
-            <li>Set the <strong>Center Ch A</strong> frequency to match the CW tone (typically 600–800 Hz)</li>
-            <li>Use <strong>Bandwidth</strong> to widen or narrow the bandpass filter — narrow (50–80 Hz) for clean signals, wider (150–300 Hz) for noisy ones</li>
-            <li>Enable <strong>A/B Mode</strong> to decode two simultaneous CW stations — set each center frequency separately</li>
-            <li>In A/B mode, <span className="text-[#79c0ff]">Ch A text is blue</span> and <span className="text-[#ffa657]">Ch B text is orange</span> in the output panel</li>
+            <li>
+              Set the <strong>Center Ch A</strong> frequency to match the CW tone (typically 600-800 Hz)
+            </li>
+            <li>
+              Use <strong>Bandwidth</strong> to widen or narrow the bandpass filter — narrow (50-80 Hz) for clean signals,
+              wider (150-300 Hz) for noisy ones
+            </li>
+            <li>
+              Enable <strong>A/B Mode</strong> to decode two simultaneous CW stations — set each center frequency separately
+            </li>
+            <li>
+              In A/B mode, <span class="text-[#79c0ff]">Ch A text is blue</span> and{' '}
+              <span class="text-[#ffa657]">Ch B text is orange</span> in the output panel
+            </li>
           </ol>
         </div>
       </details>
 
-      {/* ── Privacy ── */}
-      <details className="bg-[#161b22] border border-[#30363d] rounded-lg">
-        <summary className="cursor-pointer p-4 sm:p-6 font-semibold text-lg sm:text-xl hover:bg-[#21262d] rounded-lg transition-colors select-none">
+      {/* Privacy */}
+      <details class="rounded-lg border border-[#30363d] bg-[#161b22]">
+        <summary class="cursor-pointer rounded-lg p-4 text-lg font-semibold transition-colors select-none hover:bg-[#21262d] sm:p-6 sm:text-xl">
           Privacy
         </summary>
-        <div className="px-4 pb-4 sm:px-6 sm:pb-6 space-y-3 text-sm sm:text-base text-[#c9d1d9]">
+        <div class="space-y-3 px-4 pb-4 text-sm text-[#c9d1d9] sm:px-6 sm:pb-6 sm:text-base">
           <p>This application runs entirely in your browser. No audio data or decoded text is ever transmitted to any server.</p>
           <p>The microphone permission is only used to capture and process the audio signal in real-time for CW decoding using the Web Audio API.</p>
-          <p className="text-xs sm:text-sm text-[#8b949e]">Your privacy is fully protected — we don&apos;t collect, store, or transmit any of your data.</p>
+          <p class="text-xs text-[#8b949e] sm:text-sm">Your privacy is fully protected — we don't collect, store, or transmit any of your data.</p>
         </div>
       </details>
     </div>
-  );
-});
-
-export default CWDecoder;
+  )
+}
