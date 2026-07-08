@@ -1,93 +1,89 @@
-'use client';
+// Port of src/components/SessionCard.tsx (Next.js app). Solid props stay as
+// a props object (not destructured) so field access remains reactive —
+// destructuring would freeze values at first render, same footgun as
+// forgetting a dependency array entry in React but silent here.
+import { createEffect } from 'solid-js'
+import { PASTEL_COLORS, type DecoderSession } from '$decoder-lib/rtty/sessions'
+import type { RTTYConfig } from '$decoder-lib/rtty/decoder'
+import { fmtAbsHz } from '$decoder-lib/formatFreq'
 
-import { useRef, useEffect } from 'react';
-import type { DecoderSession } from '@/lib/rtty/sessions';
-import { PASTEL_COLORS } from '@/lib/rtty/sessions';
-import type { RTTYConfig } from '@/lib/rtty/decoder';
-import { fmtAbsHz } from '@/lib/formatFreq';
-
-const BAUD_RATES = [45, 45.45, 50, 65, 75, 100, 110, 150, 200, 300];
+const BAUD_RATES = [45, 45.45, 50, 65, 75, 100, 110, 150, 200, 300]
+const inputCls =
+  'bg-[#0d1117] border border-[#30363d] rounded px-1 py-0.5 text-[#c9d1d9] text-xs font-mono focus:outline-none focus:border-[#2ea043] transition-colors w-full'
 
 interface Props {
-  session: DecoderSession;
-  isActive: boolean;
-  canRemove: boolean;
-  vfoFrequency?: number;
-  onActivate: (id: string) => void;
-  onRemove: (id: string) => void;
-  onConfigChange: (id: string, patch: Partial<RTTYConfig>) => void;
-  onLabelChange: (id: string, label: string) => void;
-  onColorChange: (id: string, color: string) => void;
+  session: DecoderSession
+  isActive: boolean
+  canRemove: boolean
+  vfoFrequency?: number
+  onActivate: (id: string) => void
+  onRemove: (id: string) => void
+  onConfigChange: (id: string, patch: Partial<RTTYConfig>) => void
+  onLabelChange: (id: string, label: string) => void
+  onColorChange: (id: string, color: string) => void
 }
 
-const inputCls = 'bg-[#0d1117] border border-[#30363d] rounded px-1 py-0.5 text-[#c9d1d9] text-xs font-mono focus:outline-none focus:border-[#2ea043] transition-colors w-full';
+export function SessionCard(props: Props) {
+  const stopProp = (e: MouseEvent) => e.stopPropagation()
 
-export function SessionCard({
-  session,
-  isActive,
-  canRemove,
-  vfoFrequency,
-  onActivate,
-  onRemove,
-  onConfigChange,
-  onLabelChange,
-  onColorChange,
-}: Props) {
-  const { id, label, color, config, preview } = session;
+  let previewOuter: HTMLDivElement | undefined
+  let previewInner: HTMLDivElement | undefined
 
-  const stopProp = (e: React.MouseEvent | React.ChangeEvent<HTMLElement>) =>
-    e.stopPropagation();
-
-  // Translate inner content upward to always expose the bottom lines
-  const previewOuterRef = useRef<HTMLDivElement>(null);
-  const previewInnerRef = useRef<HTMLDivElement>(null);
-
-  useEffect(() => {
-    const outer = previewOuterRef.current;
-    const inner = previewInnerRef.current;
-    if (!outer || !inner) return;
-    const overflow = inner.scrollHeight - outer.clientHeight;
-    inner.style.transform = overflow > 0 ? `translateY(-${overflow}px)` : '';
-  }, [preview]);
+  createEffect(() => {
+    const preview = props.session.preview // reactive dependency
+    const outer = previewOuter
+    const inner = previewInner
+    if (!outer || !inner) return
+    void preview
+    const overflow = inner.scrollHeight - outer.clientHeight
+    inner.style.transform = overflow > 0 ? `translateY(-${overflow}px)` : ''
+  })
 
   return (
     <div
-      onClick={() => !isActive && onActivate(id)}
-      style={{ borderColor: `${color}60` }}
-      className={`border rounded-lg p-3 transition-all overflow-hidden min-w-0 ${
-        isActive
-          ? 'bg-[#161b22] cursor-default'
-          : 'bg-[#0d1117] cursor-pointer hover:brightness-110'
+      onClick={() => !props.isActive && props.onActivate(props.session.id)}
+      style={{ 'border-color': `${props.session.color}60` }}
+      class={`min-w-0 overflow-hidden rounded-lg border p-3 transition-all ${
+        props.isActive ? 'cursor-default bg-[#161b22]' : 'cursor-pointer bg-[#0d1117] hover:brightness-110'
       }`}
     >
       {/* Header row */}
-      <div className="flex items-center justify-between mb-2 gap-2">
-        <div className="flex items-center gap-2 min-w-0">
-          {isActive && (
-            <span className="shrink-0 text-[10px] font-mono uppercase tracking-wide" style={{ color }}>
+      <div class="mb-2 flex items-center justify-between gap-2">
+        <div class="flex min-w-0 items-center gap-2">
+          {props.isActive && (
+            <span class="shrink-0 text-[10px] font-mono tracking-wide uppercase" style={{ color: props.session.color }}>
               ● active
             </span>
           )}
           <input
-            value={label}
-            onChange={(e) => { stopProp(e); onLabelChange(id, e.target.value); }}
+            value={props.session.label}
+            onChange={(e) => {
+              stopProp(e as unknown as MouseEvent)
+              props.onLabelChange(props.session.id, e.currentTarget.value)
+            }}
             onClick={stopProp}
-            className="min-w-0 flex-1 bg-transparent text-sm font-mono text-[#c9d1d9] focus:outline-none border-b border-transparent focus:border-[#30363d] truncate"
+            class="min-w-0 flex-1 truncate border-b border-transparent bg-transparent font-mono text-sm text-[#c9d1d9] focus:border-[#30363d] focus:outline-none"
           />
         </div>
-        <div className="flex items-center gap-1.5 shrink-0">
-          {!isActive && (
+        <div class="flex shrink-0 items-center gap-1.5">
+          {!props.isActive && (
             <button
-              onClick={(e) => { stopProp(e); onActivate(id); }}
-              className="text-xs px-2 py-0.5 rounded border border-[#30363d] text-[#8b949e] hover:text-[#2ea043] hover:border-[#2ea043]/40 transition-colors"
+              onClick={(e) => {
+                stopProp(e)
+                props.onActivate(props.session.id)
+              }}
+              class="rounded border border-[#30363d] px-2 py-0.5 text-xs text-[#8b949e] transition-colors hover:border-[#2ea043]/40 hover:text-[#2ea043]"
             >
               Promote
             </button>
           )}
-          {canRemove && (
+          {props.canRemove && (
             <button
-              onClick={(e) => { stopProp(e); onRemove(id); }}
-              className="text-xs px-2 py-0.5 rounded border border-[#30363d] text-[#8b949e] hover:text-[#f85149] hover:border-[#f85149]/40 transition-colors"
+              onClick={(e) => {
+                stopProp(e)
+                props.onRemove(props.session.id)
+              }}
+              class="rounded border border-[#30363d] px-2 py-0.5 text-xs text-[#8b949e] transition-colors hover:border-[#f85149]/40 hover:text-[#f85149]"
             >
               ✕
             </button>
@@ -95,96 +91,116 @@ export function SessionCard({
         </div>
       </div>
 
-      {/* 2×2 config grid — full labels, label above input */}
-      <div className="grid grid-cols-2 gap-x-2 gap-y-2 mb-2" onClick={stopProp}>
-        <label className="flex flex-col gap-0.5">
-          <span className="text-[10px] text-[#8b949e]">Carrier Shift (Hz)</span>
+      {/* 2x2 config grid */}
+      <div class="mb-2 grid grid-cols-2 gap-x-2 gap-y-2" onClick={stopProp}>
+        <label class="flex flex-col gap-0.5">
+          <span class="text-[10px] text-[#8b949e]">Carrier Shift (Hz)</span>
           <input
             type="number"
-            value={config.carrierShift}
+            value={props.session.config.carrierShift}
             min={1}
-            onChange={(e) => { stopProp(e); onConfigChange(id, { carrierShift: Math.max(1, parseInt(e.target.value) || 450) }); }}
+            onChange={(e) => {
+              stopProp(e as unknown as MouseEvent)
+              props.onConfigChange(props.session.id, {
+                carrierShift: Math.max(1, parseInt(e.currentTarget.value) || 450),
+              })
+            }}
             onClick={stopProp}
-            className={inputCls}
+            class={inputCls}
           />
         </label>
 
-        <label className="flex flex-col gap-0.5">
-          <span className="text-[10px] text-[#8b949e]">Center Freq (Hz)</span>
-          {vfoFrequency ? (
-            <span className={inputCls + ' block'}>
-              {fmtAbsHz(vfoFrequency + config.centerFreq)}
-            </span>
+        <label class="flex flex-col gap-0.5">
+          <span class="text-[10px] text-[#8b949e]">Center Freq (Hz)</span>
+          {props.vfoFrequency ? (
+            <span class={`${inputCls} block`}>{fmtAbsHz(props.vfoFrequency + props.session.config.centerFreq)}</span>
           ) : (
             <input
               type="number"
-              value={config.centerFreq}
-              min={0} max={1500}
-              onChange={(e) => { stopProp(e); onConfigChange(id, { centerFreq: parseInt(e.target.value) || 0 }); }}
+              value={props.session.config.centerFreq}
+              min={0}
+              max={1500}
+              onChange={(e) => {
+                stopProp(e as unknown as MouseEvent)
+                props.onConfigChange(props.session.id, { centerFreq: parseInt(e.currentTarget.value) || 0 })
+              }}
               onClick={stopProp}
-              className={inputCls}
+              class={inputCls}
             />
           )}
         </label>
 
-        <label className="flex flex-col gap-0.5">
-          <span className="text-[10px] text-[#8b949e]">Baud Rate</span>
+        <label class="flex flex-col gap-0.5">
+          <span class="text-[10px] text-[#8b949e]">Baud Rate</span>
           <select
-            value={config.baudRate}
-            onChange={(e) => { stopProp(e); onConfigChange(id, { baudRate: parseFloat(e.target.value) }); }}
+            value={props.session.config.baudRate}
+            onChange={(e) => {
+              stopProp(e as unknown as MouseEvent)
+              props.onConfigChange(props.session.id, { baudRate: parseFloat(e.currentTarget.value) })
+            }}
             onClick={stopProp}
-            className={inputCls}
+            class={inputCls}
           >
-            {BAUD_RATES.map(b => <option key={b} value={b}>{b}</option>)}
+            {BAUD_RATES.map((b) => (
+              <option value={b}>{b}</option>
+            ))}
           </select>
         </label>
 
-        <div className="flex flex-col gap-0.5" onClick={stopProp}>
-          <span className="text-[10px] text-[#8b949e]">Sideband</span>
+        <div class="flex flex-col gap-0.5" onClick={stopProp}>
+          <span class="text-[10px] text-[#8b949e]">Sideband</span>
           <button
-            onClick={(e) => { stopProp(e); onConfigChange(id, { reverseShift: !config.reverseShift }); }}
-            className={`text-xs px-2 py-0.5 rounded border transition-colors ${
-              config.reverseShift
-                ? 'bg-[#f0883e]/10 border-[#f0883e]/50 text-[#f0883e]'
-                : 'bg-[#0d1117] border-[#30363d] text-[#8b949e] hover:border-[#58a6ff]/40 hover:text-[#58a6ff]'
+            onClick={(e) => {
+              stopProp(e)
+              props.onConfigChange(props.session.id, { reverseShift: !props.session.config.reverseShift })
+            }}
+            class={`rounded border px-2 py-0.5 text-xs transition-colors ${
+              props.session.config.reverseShift
+                ? 'border-[#f0883e]/50 bg-[#f0883e]/10 text-[#f0883e]'
+                : 'border-[#30363d] bg-[#0d1117] text-[#8b949e] hover:border-[#58a6ff]/40 hover:text-[#58a6ff]'
             }`}
           >
-            {config.reverseShift ? 'LSB' : 'USB'}
+            {props.session.config.reverseShift ? 'LSB' : 'USB'}
           </button>
         </div>
       </div>
 
       {/* Color palette */}
-      <div className="flex flex-wrap gap-1 mb-2" onClick={stopProp}>
-        {PASTEL_COLORS.map(c => (
+      <div class="mb-2 flex flex-wrap gap-1" onClick={stopProp}>
+        {PASTEL_COLORS.map((c) => (
           <button
-            key={c}
-            onClick={(e) => { stopProp(e); onColorChange(id, c); }}
+            onClick={(e) => {
+              stopProp(e)
+              props.onColorChange(props.session.id, c)
+            }}
             title={c}
             style={{
-              backgroundColor: c,
-              outline: c === color ? `2px solid ${c}` : 'none',
-              outlineOffset: '2px',
-              transform: c === color ? 'scale(1.25)' : 'scale(1)',
+              'background-color': c,
+              outline: c === props.session.color ? `2px solid ${c}` : 'none',
+              'outline-offset': '2px',
+              transform: c === props.session.color ? 'scale(1.25)' : 'scale(1)',
             }}
-            className="w-4 h-4 rounded-full transition-all"
+            class="h-4 w-4 rounded-full transition-all"
           />
         ))}
       </div>
 
       {/* Preview — overflow:hidden + translateY trick to always show the bottom */}
       <div
-        ref={previewOuterRef}
-        className={`font-mono text-xs rounded px-2 py-1.5 overflow-hidden ${isActive ? 'bg-[#0d1117]' : 'bg-[#0a0a0a]'}`}
+        ref={previewOuter}
+        class={`overflow-hidden rounded px-2 py-1.5 font-mono text-xs ${props.isActive ? 'bg-[#0d1117]' : 'bg-[#0a0a0a]'}`}
         style={{ height: '3rem' }}
       >
-        <div ref={previewInnerRef}>
-          {preview
-            ? <span className="whitespace-pre-wrap break-all" style={{ color }}>{preview}</span>
-            : <span className="text-[#30363d]">No output yet…</span>
-          }
+        <div ref={previewInner}>
+          {props.session.preview ? (
+            <span class="break-all whitespace-pre-wrap" style={{ color: props.session.color }}>
+              {props.session.preview}
+            </span>
+          ) : (
+            <span class="text-[#30363d]">No output yet…</span>
+          )}
         </div>
       </div>
     </div>
-  );
+  )
 }

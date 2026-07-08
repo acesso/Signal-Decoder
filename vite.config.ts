@@ -11,9 +11,8 @@ import { VitePWA } from 'vite-plugin-pwa'
 const BASE_PATH = process.env.BASE_PATH || ''
 
 // App version shown in the footer — sourced from the repo-root package.json
-// (the canonical version, same one CI releases from), not this app's own
-// package.json (which stays at Vite's scaffolded 0.0.0).
-const APP_VERSION = JSON.parse(readFileSync(fileURLToPath(new URL('../package.json', import.meta.url)), 'utf-8')).version
+// (the canonical version, same one CI releases from).
+const APP_VERSION = JSON.parse(readFileSync(fileURLToPath(new URL('./package.json', import.meta.url)), 'utf-8')).version
 
 export default defineConfig({
   base: BASE_PATH ? `${BASE_PATH}/` : '/',
@@ -72,11 +71,10 @@ export default defineConfig({
   resolve: {
     alias: {
       // The DSP/decoder core (RTTY/CW/SSTV/FT/MFSK, audio, storage, CAT
-      // protocol) has zero React/Next dependencies — shared verbatim from
-      // the (soon to be replaced) Next.js app's src/lib/ rather than
-      // duplicated here, same approach as the SvelteKit prototype's
-      // $decoder-lib alias.
-      '$decoder-lib': fileURLToPath(new URL('../src/lib', import.meta.url)),
+      // protocol) has zero framework dependencies — lives at src/lib/,
+      // a sibling of this app's own src/ tree, same approach as the
+      // SvelteKit prototype's $decoder-lib alias.
+      '$decoder-lib': fileURLToPath(new URL('./src/lib', import.meta.url)),
     },
   },
 })

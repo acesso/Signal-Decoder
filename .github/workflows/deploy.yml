@@ -1,4 +1,4 @@
-# Builds and deploys the SolidJS app (solid-prototype/) to GitHub Pages.
+# Builds and deploys the SolidJS app to GitHub Pages.
 name: Deploy to Pages
 
 on:
@@ -32,22 +32,19 @@ jobs:
         with:
           node-version-file: ".nvmrc"
           cache: npm
-          cache-dependency-path: solid-prototype/package-lock.json
       - name: Setup Pages
         id: pages
         uses: actions/configure-pages@v5
       - name: Install dependencies
-        working-directory: solid-prototype
         run: npm ci
       - name: Build
-        working-directory: solid-prototype
         run: npm run build
         env:
           BASE_PATH: ${{ steps.pages.outputs.base_path }}
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
         with:
-          path: solid-prototype/dist
+          path: dist
 
   deploy:
     environment:

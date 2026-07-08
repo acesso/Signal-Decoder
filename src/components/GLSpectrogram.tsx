@@ -1,55 +1,57 @@
-'use client';
+// Port of src/components/GLSpectrogram.tsx (Next.js app) — raw WebGL terrain
+// spectrogram. Almost none of the original logic depends on React's render
+// cycle (it's imperative GL code driven by refs); the React wrapper only
+// diffed props into ref updates and exposed an imperative
+// pushRow/render/setSmooth/setRowInterval API via useImperativeHandle.
+//
+// Solid has no useImperativeHandle equivalent — the idiomatic replacement is
+// a caller-supplied mutable object (`handle` prop) that this component fills
+// in via onMount, mirroring what a React ref object looks like from the
+// outside without needing forwardRef.
+import { createEffect, createMemo, createSignal, onCleanup, onMount, type JSX } from 'solid-js'
 
-import { forwardRef, useEffect, useImperativeHandle, useMemo, useRef, useState } from 'react';
+export type GLView = 'terrain'
 
-export type GLView = 'terrain';
-
-export interface GLSpectrogramHandle {
-  pushRow(data: Uint8Array): void;
-  render(): void;
-  setSmooth(alpha: number): void;
-  setRowInterval(ms: number): void;
+export interface SpectroBand {
+  fromHz: number
+  toHz: number
+  color: string
+  line?: boolean
 }
 
-// A frequency range of interest rendered over the spectrogram (decoder filter
-// bands, tone markers). `line: true` renders at full strength (marker line);
-// otherwise it's a translucent band.
-export interface SpectroBand {
-  fromHz: number;
-  toHz: number;
-  color: string;
-  line?: boolean;
+export interface GLSpectrogramHandle {
+  pushRow(data: Uint8Array): void
+  render(): void
+  setSmooth(alpha: number): void
+  setRowInterval(ms: number): void
 }
 
 interface Props {
-  view: GLView;
-  gamma: number;
-  height: number;
-  minHz?: number;          // lower bound of the display window (default 0)
-  maxHz: number;           // upper bound of the display window
-  bands?: SpectroBand[];
-  bandAlpha?: number;      // 0..1 opacity of the band overlays
-  markers?: SpectroBand[]; // screen-space center-line markers (projected to front edge)
-  sqlLevel?: number;       // 0..1 squelch threshold — rendered as a cutting plane
-  sqlAlpha?: number;       // 0..1 opacity of the squelch plane
-  sqlGridSize?: number;    // grid resolution (cols = size*2, rows = size); enables grid mode
-  vfoFrequency?: number;   // radio VFO in Hz — offsets frequency labels to show absolute freq
-  txMarkerHz?: number;     // TX audio frequency in Hz — vertical line overlay
+  handle?: { current: GLSpectrogramHandle | null }
+  view: GLView
+  gamma: number
+  height: number
+  minHz?: number
+  maxHz: number
+  bands?: SpectroBand[]
+  bandAlpha?: number
+  markers?: SpectroBand[]
+  sqlLevel?: number
+  sqlAlpha?: number
+  sqlGridSize?: number
+  vfoFrequency?: number
+  txMarkerHz?: number
 }
 
-// History texture: TEX_W frequency bins × TEX_H rows, written as a ring buffer
-// so scrolling is a sampling offset instead of a per-frame copy
-const TEX_W = 512;
-const TEX_H = 256;
-const BG: [number, number, number] = [0.051, 0.067, 0.09]; // #0d1117
-const SQL_COLOR: [number, number, number] = [0.89, 0.70, 0.25]; // #e3b341
-const MAX_BANDS = 8;
-const HEIGHT_SCALE = 0.55;
+const TEX_W = 512
+const TEX_H = 256
+const BG: [number, number, number] = [0.051, 0.067, 0.09]
+const SQL_COLOR: [number, number, number] = [0.89, 0.7, 0.25]
+const MAX_BANDS = 8
+const HEIGHT_SCALE = 0.55
+const TERRAIN_X = 192
+const TERRAIN_Z = 56
 
-const TERRAIN_X = 192;  // mesh columns (frequency)
-const TERRAIN_Z = 56;   // mesh rows (time) — TERRAIN_X*TERRAIN_Z*6 must stay under Uint16 limit (65535)
-
-// Google's polynomial approximation of the Turbo colormap
 const TURBO_GLSL = `
 vec3 turbo(float t) {
   t = clamp(t, 0.0, 1.0);
@@ -63,10 +65,8 @@ vec3 turbo(float t) {
   vec2 v2 = v4.zw * v4.z;
   return clamp(vec3(dot(v4,kR4)+dot(v2,kR2), dot(v4,kG4)+dot(v2,kG2), dot(v4,kB4)+dot(v2,kB2)), 0.0, 1.0);
 }
-`;
+`
 
-// Tints the surface color inside each band range. vX is the normalized
-// frequency coordinate; loop bound must be a constant in WebGL1 GLSL.
 const BANDS_GLSL = `
 uniform int   uBandCount;
 uniform vec2  uBandRange[${MAX_BANDS}];
@@ -82,11 +82,10 @@ vec3 applyBands(vec3 c, float x) {
   }
   return c;
 }
-`;
+`
 
-// Frequency reference grid: minor/major line steps in normalized x
 const GRID_GLSL = `
-uniform vec2 uGrid; // (minor step, major step)
+uniform vec2 uGrid;
 float gridK(float x, float step, float halfW) {
   float d = abs(fract(x / step + 0.5) - 0.5) * step;
   return 1.0 - smoothstep(halfW * 0.5, halfW, d);
@@ -96,16 +95,11 @@ vec3 applyGrid(vec3 c, float x) {
   float major = gridK(x, uGrid.y, 0.0035);
   return mix(c, vec3(0.55, 0.60, 0.66), minor * 0.10 + major * 0.18);
 }
-`;
-
-// ── SQL grid shaders (terrain mode only) ────────────────────────────────────
-// The plane at the squelch height is replaced by a grid of cells. Each cell
-// is snapped to a centre sample from the ring-buffer texture; if that sample
-// exceeds the raw squelch level the cell lights up in the channel's colour.
+`
 
 const SQL_GRID_VS = `
 precision mediump float;
-attribute vec2 aPos; // x = freq [0,1], y = depth/time [0,1]
+attribute vec2 aPos;
 uniform mat4 uMVP;
 uniform float uY;
 varying float vX;
@@ -115,7 +109,7 @@ void main() {
   vZ = aPos.y;
   gl_Position = uMVP * vec4(aPos.x * 2.0 - 1.0, uY, -aPos.y * 2.0, 1.0);
 }
-`;
+`
 
 const SQL_GRID_FS = `
 precision mediump float;
@@ -137,18 +131,14 @@ vec3 channelCol(float x) {
       return uBandColor[i];
     }
   }
-  return vec3(0.89, 0.70, 0.25); // amber default
+  return vec3(0.89, 0.70, 0.25);
 }
 
 void main() {
-  // Snap to cell centre so every fragment in a cell shares the same sample
   vec2 cc = (floor(vec2(vX, vZ) * uGridCells) + 0.5) / uGridCells;
-
-  // Sample history at cell centre
   float texV = fract(uHead - cc.y * uDepth);
   float raw  = texture2D(uTex, vec2(cc.x, texV)).r;
 
-  // Grid line mask (thin border around each cell)
   vec2  cellFrac = fract(vec2(vX, vZ) * uGridCells);
   float lineW    = 0.055;
   float isLine   = max(step(1.0 - lineW, cellFrac.x), step(1.0 - lineW, cellFrac.y));
@@ -167,19 +157,18 @@ void main() {
   vec3 lineCol = lit ? litCol * 0.22 : vec3(0.11, 0.14, 0.19);
   gl_FragColor = vec4(mix(cellCol, lineCol, isLine), uAlpha);
 }
-`;
+`
 
-// Floor grid lines drawn just below the terrain mesh as GL_LINES
 const FLOOR_VS = `
 precision mediump float;
-attribute vec3 aPos; // world-space xz line endpoint, y fixed in shader
+attribute vec3 aPos;
 uniform mat4 uMVP;
 varying float vFade;
 void main() {
-  vFade = aPos.z; // z carries fade [0=front,1=back]
+  vFade = aPos.z;
   gl_Position = uMVP * vec4(aPos.x, -0.003, aPos.y, 1.0);
 }
-`;
+`
 const FLOOR_FS = `
 precision mediump float;
 varying float vFade;
@@ -187,16 +176,12 @@ void main() {
   float fade = 1.0 - smoothstep(0.4, 1.0, vFade);
   gl_FragColor = vec4(0.50, 0.58, 0.72, 0.75 * fade);
 }
-`;
-
-// ── Shaders ───────────────────────────────────────────────────────────────────
-// Both views sample the same ring-buffer texture: depth d ∈ [0,1] (0 = newest)
-// maps to texture row fract(uHead - d * uDepth).
+`
 
 const TERRAIN_VS = `
 precision mediump float;
-attribute float aHeight; // pre-computed height [0,1] per vertex, updated CPU-side each frame
-attribute vec2 aPos;     // x = freq [0,1], y = depth [0,1] (0 = front/newest)
+attribute float aHeight;
+attribute vec2 aPos;
 uniform float uGamma;
 uniform mat4 uMVP;
 varying float vV;
@@ -210,7 +195,7 @@ void main() {
   vec3 p = vec3(aPos.x * 2.0 - 1.0, v * ${HEIGHT_SCALE}, -aPos.y * 2.0);
   gl_Position = uMVP * vec4(p, 1.0);
 }
-`;
+`
 
 const TERRAIN_FS = `
 precision mediump float;
@@ -224,17 +209,14 @@ void main() {
   vec3 c = turbo(vV);
   c = applyGrid(c, vX);
   c = applyBands(c, vX);
-  c = mix(c, vec3(${BG[0]}, ${BG[1]}, ${BG[2]}), smoothstep(0.45, 1.0, vZ)); // fade into the distance
+  c = mix(c, vec3(${BG[0]}, ${BG[1]}, ${BG[2]}), smoothstep(0.45, 1.0, vZ));
   gl_FragColor = vec4(c, 1.0);
 }
-`;
+`
 
-
-// Squelch threshold: a translucent "sheet of paper" cutting through the terrain
-// at the threshold height (uMode 0), or a thin line on the front ridge (uMode 1)
 const SQL_VS = `
 precision mediump float;
-attribute vec2 aPos; // (x, depth-or-thickness) in [0,1]
+attribute vec2 aPos;
 uniform mat4 uMVP;
 uniform float uY, uMode;
 uniform vec2 uPan;
@@ -249,7 +231,7 @@ void main() {
     gl_Position = vec4((vec2(x, y) + uPan) * uScale, 0.0, 1.0);
   }
 }
-`;
+`
 
 const SQL_FS = `
 precision mediump float;
@@ -257,77 +239,81 @@ uniform float uAlpha;
 void main() {
   gl_FragColor = vec4(${SQL_COLOR[0]}, ${SQL_COLOR[1]}, ${SQL_COLOR[2]}, uAlpha);
 }
-`;
-
-// ── Small GL / matrix helpers ─────────────────────────────────────────────────
+`
 
 function makeProgram(gl: WebGLRenderingContext, vsSrc: string, fsSrc: string): WebGLProgram | null {
   const compile = (type: number, src: string) => {
-    const sh = gl.createShader(type)!;
-    gl.shaderSource(sh, src);
-    gl.compileShader(sh);
+    const sh = gl.createShader(type)!
+    gl.shaderSource(sh, src)
+    gl.compileShader(sh)
     if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) {
-      console.error('GLSpectrogram shader error:', gl.getShaderInfoLog(sh));
-      gl.deleteShader(sh);
-      return null;
+      console.error('GLSpectrogram shader error:', gl.getShaderInfoLog(sh))
+      gl.deleteShader(sh)
+      return null
     }
-    return sh;
-  };
-  const vs = compile(gl.VERTEX_SHADER, vsSrc);
-  const fs = compile(gl.FRAGMENT_SHADER, fsSrc);
-  if (!vs || !fs) return null;
-  const prog = gl.createProgram()!;
-  gl.attachShader(prog, vs);
-  gl.attachShader(prog, fs);
-  gl.linkProgram(prog);
-  gl.deleteShader(vs);
-  gl.deleteShader(fs);
-  if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) {
-    console.error('GLSpectrogram link error:', gl.getProgramInfoLog(prog));
-    gl.deleteProgram(prog);
-    return null;
+    return sh
   }
-  return prog;
+  const vs = compile(gl.VERTEX_SHADER, vsSrc)
+  const fs = compile(gl.FRAGMENT_SHADER, fsSrc)
+  if (!vs || !fs) return null
+  const prog = gl.createProgram()!
+  gl.attachShader(prog, vs)
+  gl.attachShader(prog, fs)
+  gl.linkProgram(prog)
+  gl.deleteShader(vs)
+  gl.deleteShader(fs)
+  if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) {
+    console.error('GLSpectrogram link error:', gl.getProgramInfoLog(prog))
+    gl.deleteProgram(prog)
+    return null
+  }
+  return prog
 }
 
 function hexToRgb(hex: string): [number, number, number] {
-  const h = hex.replace('#', '');
-  return [
-    parseInt(h.slice(0, 2), 16) / 255,
-    parseInt(h.slice(2, 4), 16) / 255,
-    parseInt(h.slice(4, 6), 16) / 255,
-  ];
+  const h = hex.replace('#', '')
+  return [parseInt(h.slice(0, 2), 16) / 255, parseInt(h.slice(2, 4), 16) / 255, parseInt(h.slice(4, 6), 16) / 255]
 }
 
 function mat4Multiply(a: Float32Array, b: Float32Array): Float32Array {
-  const out = new Float32Array(16);
+  const out = new Float32Array(16)
   for (let c = 0; c < 4; c++) {
     for (let r = 0; r < 4; r++) {
-      out[c * 4 + r] =
-        a[r] * b[c * 4] + a[4 + r] * b[c * 4 + 1] + a[8 + r] * b[c * 4 + 2] + a[12 + r] * b[c * 4 + 3];
+      out[c * 4 + r] = a[r] * b[c * 4] + a[4 + r] * b[c * 4 + 1] + a[8 + r] * b[c * 4 + 2] + a[12 + r] * b[c * 4 + 3]
     }
   }
-  return out;
+  return out
 }
 
 function mat4Perspective(fovY: number, aspect: number, near: number, far: number): Float32Array {
-  const f = 1 / Math.tan(fovY / 2);
-  const out = new Float32Array(16);
-  out[0] = f / aspect;
-  out[5] = f;
-  out[10] = (far + near) / (near - far);
-  out[11] = -1;
-  out[14] = (2 * far * near) / (near - far);
-  return out;
+  const f = 1 / Math.tan(fovY / 2)
+  const out = new Float32Array(16)
+  out[0] = f / aspect
+  out[5] = f
+  out[10] = (far + near) / (near - far)
+  out[11] = -1
+  out[14] = (2 * far * near) / (near - far)
+  return out
 }
 
 function mat4LookAt(eye: [number, number, number], center: [number, number, number]): Float32Array {
-  // up is fixed at (0,1,0)
-  let zx = eye[0] - center[0], zy = eye[1] - center[1], zz = eye[2] - center[2];
-  const zl = Math.hypot(zx, zy, zz); zx /= zl; zy /= zl; zz /= zl;
-  let xx = zz, xy = 0, xz = -zx; // (0,1,0) × z
-  const xl = Math.hypot(xx, xy, xz) || 1; xx /= xl; xy /= xl; xz /= xl;
-  const yx = zy * xz - zz * xy, yy = zz * xx - zx * xz, yz = zx * xy - zy * xx;
+  let zx = eye[0] - center[0],
+    zy = eye[1] - center[1],
+    zz = eye[2] - center[2]
+  const zl = Math.hypot(zx, zy, zz)
+  zx /= zl
+  zy /= zl
+  zz /= zl
+  let xx = zz,
+    xy = 0,
+    xz = -zx
+  const xl = Math.hypot(xx, xy, xz) || 1
+  xx /= xl
+  xy /= xl
+  xz /= xl
+  const yx = zy * xz - zz * xy,
+    yy = zz * xx - zx * xz,
+    yz = zx * xy - zy * xx
   return new Float32Array([
     xx, yx, zx, 0,
     xy, yy, zy, 0,
@@ -336,652 +322,646 @@ function mat4LookAt(eye: [number, number, number], center: [number, number, numb
     -(yx * eye[0] + yy * eye[1] + yz * eye[2]),
     -(zx * eye[0] + zy * eye[1] + zz * eye[2]),
     1,
-  ]);
+  ])
 }
 
 function formatHz(hz: number): string {
-  if (hz >= 1000) return `${hz % 1000 === 0 ? hz / 1000 : (hz / 1000).toFixed(1)}k`;
-  return String(hz);
+  if (hz >= 1000) return `${hz % 1000 === 0 ? hz / 1000 : (hz / 1000).toFixed(1)}k`
+  return String(hz)
 }
 
-// Camera defaults — terrain opens at a 45° elevation for a perspective look
-const TERRAIN_CAM = { az: 0, el: Math.PI / 4, dist: 2.6, tx: 0, tz: 0 };
+const TERRAIN_CAM = { az: 0, el: Math.PI / 4, dist: 2.6, tx: 0, tz: 0 }
 
 interface BandUniforms {
-  count: WebGLUniformLocation | null;
-  range: WebGLUniformLocation | null;
-  color: WebGLUniformLocation | null;
-  strength: WebGLUniformLocation | null;
-  alpha: WebGLUniformLocation | null;
+  count: WebGLUniformLocation | null
+  range: WebGLUniformLocation | null
+  color: WebGLUniformLocation | null
+  strength: WebGLUniformLocation | null
+  alpha: WebGLUniformLocation | null
 }
 
-// ── Component ─────────────────────────────────────────────────────────────────
-
-const GLSpectrogram = forwardRef<GLSpectrogramHandle, Props>(function GLSpectrogram(
-  { view, gamma, height, minHz = 0, maxHz, bands, bandAlpha = 0.3, markers, sqlLevel, sqlAlpha = 0.3, sqlGridSize, vfoFrequency = 0, txMarkerHz }, ref,
-) {
-  const canvasRef      = useRef<HTMLCanvasElement>(null);
-  const glRef          = useRef<WebGLRenderingContext | null>(null);
-  const texRef         = useRef<WebGLTexture | null>(null);
-  const headRef        = useRef(0);
-  const rowIntervalRef = useRef(33);
-  const renderRef      = useRef<(() => void) | null>(null);
-  // CPU height grid for terrain: row 0 = newest (front), row TERRAIN_Z-1 = oldest (back)
-  const terrainHeights  = useRef(new Float32Array(TERRAIN_X * TERRAIN_Z));
-  const terrainPrev     = useRef(new Float32Array(TERRAIN_X * TERRAIN_Z)); // snapshot before last push
-  const terrainLerped   = useRef(new Float32Array(TERRAIN_X * TERRAIN_Z)); // interpolated for upload
-  const terrainDirty    = useRef(false);
-  const lastPushTimeRef = useRef(0);
-  const gammaRef   = useRef(gamma);
-  const bandsRef   = useRef<{ ranges: Float32Array; colors: Float32Array; strengths: Float32Array; count: number; alpha: number }>({
+export default function GLSpectrogram(props: Props): JSX.Element {
+  let canvasEl: HTMLCanvasElement | undefined
+  let gl: WebGLRenderingContext | null = null
+  let tex: WebGLTexture | null = null
+  let head = 0
+  let rowInterval = 33
+  let renderFn: (() => void) | null = null
+  const terrainHeights = new Float32Array(TERRAIN_X * TERRAIN_Z)
+  const terrainPrev = new Float32Array(TERRAIN_X * TERRAIN_Z)
+  const terrainLerped = new Float32Array(TERRAIN_X * TERRAIN_Z)
+  let terrainDirty = false
+  let lastPushTime = 0
+  const bandsState = {
     ranges: new Float32Array(MAX_BANDS * 2),
     colors: new Float32Array(MAX_BANDS * 3),
     strengths: new Float32Array(MAX_BANDS),
     count: 0,
-    alpha: bandAlpha,
-  });
-  const sqlRef         = useRef<{ level?: number; alpha: number }>({ level: sqlLevel, alpha: sqlAlpha });
-  const sqlGridSizeRef = useRef<number | undefined>(sqlGridSize);
-  const gridRef    = useRef<[number, number]>([0.1, 0.2]); // normalized (minor, major) steps
-  const minHzRef   = useRef(minHz);
-  const maxHzRef   = useRef(maxHz);
-  const terrainCam = useRef({ ...TERRAIN_CAM });
-  const rowScratch  = useRef(new Uint8Array(TEX_W));
-  const rowSmoothed = useRef(new Float32Array(TEX_W));
-  const smoothAlpha = useRef(0.35);
-  const labelElsRef = useRef<(HTMLSpanElement | null)[]>([]);
-  const markerElsRef = useRef<(HTMLDivElement | null)[]>([]);
-  const markersRef = useRef<SpectroBand[]>([]);
-  const txMarkerElRef = useRef<HTMLDivElement | null>(null);
-  const txMarkerHzRef = useRef(txMarkerHz ?? 0);
-  const [failed, setFailed] = useState(false);
+    alpha: props.bandAlpha ?? 0.3,
+  }
+  const sqlState: { level?: number; alpha: number } = { level: props.sqlLevel, alpha: props.sqlAlpha ?? 0.3 }
+  let sqlGridSizeVal: number | undefined = props.sqlGridSize
+  let gridState: [number, number] = [0.1, 0.2]
+  let minHzVal = props.minHz ?? 0
+  let maxHzVal = props.maxHz
+  let terrainCam = { ...TERRAIN_CAM }
+  const rowScratch = new Uint8Array(TEX_W)
+  const rowSmoothed = new Float32Array(TEX_W)
+  let smoothAlpha = 0.35
+  let labelEls: (HTMLSpanElement | undefined)[] = []
+  let markerEls: (HTMLDivElement | undefined)[] = []
+  let markersVal: SpectroBand[] = []
+  let txMarkerEl: HTMLDivElement | undefined
+  let txMarkerHzVal = props.txMarkerHz ?? 0
+  const [failed, setFailed] = createSignal(false)
+  const failedSetter = setFailed
 
-  useEffect(() => { txMarkerHzRef.current = txMarkerHz ?? 0; renderRef.current?.(); }, [txMarkerHz]);
-
-  // Frequency reference grid: minor lines + labelled major lines
-  const span = maxHz - minHz;
-  const gridMinorHz = span > 2000 ? 250 : 125;
-  const gridMajorHz = span > 2000 ? 1000 : 500;
-  const labels = useMemo(() => {
-    const out: { x: number; text: string }[] = [];
-    const firstMaj = Math.ceil(minHz / gridMajorHz) * gridMajorHz;
-    for (let hz = firstMaj; hz < maxHz; hz += gridMajorHz) {
-      let text: string;
-      if (vfoFrequency > 0) {
-        const absHz  = vfoFrequency + hz;
-        const mhzInt = Math.floor(absHz / 1_000_000);
-        const khzFrac = Math.round((absHz % 1_000_000) / 1000);
-        text = `${mhzInt}.${String(khzFrac).padStart(3, '0')}`;
+  const minHz = createMemo(() => props.minHz ?? 0)
+  const span = createMemo(() => props.maxHz - minHz())
+  const gridMinorHz = createMemo(() => (span() > 2000 ? 250 : 125))
+  const gridMajorHz = createMemo(() => (span() > 2000 ? 1000 : 500))
+  const labels = createMemo(() => {
+    const out: { x: number; text: string }[] = []
+    const mn = minHz()
+    const mx = props.maxHz
+    const majStep = gridMajorHz()
+    const firstMaj = Math.ceil(mn / majStep) * majStep
+    for (let hz = firstMaj; hz < mx; hz += majStep) {
+      let text: string
+      if ((props.vfoFrequency ?? 0) > 0) {
+        const absHz = (props.vfoFrequency ?? 0) + hz
+        const mhzInt = Math.floor(absHz / 1_000_000)
+        const khzFrac = Math.round((absHz % 1_000_000) / 1000)
+        text = `${mhzInt}.${String(khzFrac).padStart(3, '0')}`
       } else {
-        text = formatHz(hz);
+        text = formatHz(hz)
       }
-      out.push({ x: (hz - minHz) / span, text });
+      out.push({ x: (hz - mn) / span(), text })
     }
-    return out;
-  }, [minHz, maxHz, gridMajorHz, span, vfoFrequency]);
-  const labelsRef = useRef(labels);
-  useEffect(() => {
-    labelsRef.current = labels;
-    gridRef.current = [gridMinorHz / span, gridMajorHz / span];
-    minHzRef.current = minHz;
-    maxHzRef.current = maxHz;
-    renderRef.current?.();
-  }, [labels, gridMinorHz, gridMajorHz, span, minHz, maxHz]);
+    return out
+  })
 
-  useEffect(() => {
-    const list = markers ?? [];
-    markersRef.current = list;
-    markerElsRef.current = markerElsRef.current.slice(0, list.length);
-    renderRef.current?.();
-  }, [markers]);
-  useEffect(() => { gammaRef.current = gamma; renderRef.current?.(); }, [gamma]);
-  useEffect(() => {
-    sqlRef.current = { level: sqlLevel, alpha: sqlAlpha };
-    renderRef.current?.();
-  }, [sqlLevel, sqlAlpha]);
-  useEffect(() => {
-    sqlGridSizeRef.current = sqlGridSize;
-    renderRef.current?.();
-  }, [sqlGridSize]);
+  createEffect(() => {
+    txMarkerHzVal = props.txMarkerHz ?? 0
+    renderFn?.()
+  })
 
-  // Pack band props into uniform-ready arrays
-  useEffect(() => {
-    const b = bandsRef.current;
-    const list = (bands ?? []).slice(0, MAX_BANDS);
+  createEffect(() => {
+    gridState = [gridMinorHz() / span(), gridMajorHz() / span()]
+    minHzVal = minHz()
+    maxHzVal = props.maxHz
+    void labels()
+    renderFn?.()
+  })
+
+  createEffect(() => {
+    const list = props.markers ?? []
+    markersVal = list
+    renderFn?.()
+  })
+  createEffect(() => {
+    void props.gamma
+    renderFn?.()
+  })
+  createEffect(() => {
+    sqlState.level = props.sqlLevel
+    sqlState.alpha = props.sqlAlpha ?? 0.3
+    renderFn?.()
+  })
+  createEffect(() => {
+    sqlGridSizeVal = props.sqlGridSize
+    renderFn?.()
+  })
+
+  createEffect(() => {
+    const list = (props.bands ?? []).slice(0, MAX_BANDS)
+    const mn = minHz()
+    const sp = span()
     list.forEach((band, i) => {
-      b.ranges[i * 2]     = Math.max(0, (band.fromHz - minHz) / span);
-      b.ranges[i * 2 + 1] = Math.min(1, (band.toHz - minHz) / span);
-      const [r, g, bl] = hexToRgb(band.color);
-      b.colors[i * 3] = r; b.colors[i * 3 + 1] = g; b.colors[i * 3 + 2] = bl;
-      b.strengths[i] = band.line ? 1.0 : 0.45;
-    });
-    b.count = list.length;
-    b.alpha = bandAlpha;
-    renderRef.current?.();
-  }, [bands, bandAlpha, minHz, maxHz, span]);
+      bandsState.ranges[i * 2] = Math.max(0, (band.fromHz - mn) / sp)
+      bandsState.ranges[i * 2 + 1] = Math.min(1, (band.toHz - mn) / sp)
+      const [r, g, bl] = hexToRgb(band.color)
+      bandsState.colors[i * 3] = r
+      bandsState.colors[i * 3 + 1] = g
+      bandsState.colors[i * 3 + 2] = bl
+      bandsState.strengths[i] = band.line ? 1.0 : 0.45
+    })
+    bandsState.count = list.length
+    bandsState.alpha = props.bandAlpha ?? 0.3
+    renderFn?.()
+  })
 
-  // Context + shared history texture — created once, survives view switches
-  useEffect(() => {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-    const gl = canvas.getContext('webgl', { antialias: true, preserveDrawingBuffer: true });
-    if (!gl) { setFailed(true); return; }
-    glRef.current = gl;
+  onMount(() => {
+    const canvas = canvasEl
+    if (!canvas) return
+    const ctx = canvas.getContext('webgl', { antialias: true, preserveDrawingBuffer: true })
+    if (!ctx) {
+      failedSetter(true)
+      return
+    }
+    gl = ctx
 
-    const tex = gl.createTexture();
-    gl.bindTexture(gl.TEXTURE_2D, tex);
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.LUMINANCE, TEX_W, TEX_H, 0, gl.LUMINANCE, gl.UNSIGNED_BYTE, null);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.REPEAT); // ring-buffer sampling needs wrap
-    texRef.current = tex;
-  }, []);
+    const t = ctx.createTexture()
+    ctx.bindTexture(ctx.TEXTURE_2D, t)
+    ctx.texImage2D(ctx.TEXTURE_2D, 0, ctx.LUMINANCE, TEX_W, TEX_H, 0, ctx.LUMINANCE, ctx.UNSIGNED_BYTE, null)
+    ctx.texParameteri(ctx.TEXTURE_2D, ctx.TEXTURE_MIN_FILTER, ctx.LINEAR)
+    ctx.texParameteri(ctx.TEXTURE_2D, ctx.TEXTURE_MAG_FILTER, ctx.LINEAR)
+    ctx.texParameteri(ctx.TEXTURE_2D, ctx.TEXTURE_WRAP_S, ctx.CLAMP_TO_EDGE)
+    ctx.texParameteri(ctx.TEXTURE_2D, ctx.TEXTURE_WRAP_T, ctx.REPEAT)
+    tex = t
 
-  // Build the programs + geometry for the active view
-  useEffect(() => {
-    const gl = glRef.current;
-    const canvas = canvasRef.current;
-    if (!gl || !canvas || failed) return;
+    if (props.handle) {
+      props.handle.current = {
+        pushRow(data: Uint8Array) {
+          const g = gl
+          if (!g || data.length === 0) return
+          const n = data.length
+          const alpha = smoothAlpha
 
-    const headNorm = () => ((headRef.current - 0.5 + TEX_H) % TEX_H) / TEX_H;
-    const DEPTH = (TEX_H - 1) / TEX_H;
-    const buffers: WebGLBuffer[] = [];
-    const programs: WebGLProgram[] = [];
+          terrainDirty = true
+          lastPushTime = performance.now()
+          terrainPrev.set(terrainHeights)
+          terrainHeights.copyWithin(TERRAIN_X, 0, TERRAIN_X * (TERRAIN_Z - 1))
+
+          for (let i = 0; i < TERRAIN_X; i++) {
+            const f = (i / (TERRAIN_X - 1)) * (n - 1)
+            const i0 = f | 0
+            const i1 = Math.min(i0 + 1, n - 1)
+            const raw = (data[i0] * (1 - (f - i0)) + data[i1] * (f - i0)) / 255
+            rowSmoothed[i] = rowSmoothed[i] * (1 - alpha) + raw * alpha
+            terrainHeights[i] = rowSmoothed[i]
+          }
+
+          for (let i = 0; i < TEX_W; i++) rowScratch[i] = terrainHeights[i] * 255
+          if (tex) {
+            g.bindTexture(g.TEXTURE_2D, tex)
+            g.texSubImage2D(g.TEXTURE_2D, 0, 0, head, TEX_W, 1, g.LUMINANCE, g.UNSIGNED_BYTE, rowScratch)
+            head = (head + 1) % TEX_H
+          }
+        },
+        render() {
+          const tNow = Math.min((performance.now() - lastPushTime) / rowInterval, 1)
+          for (let i = 0; i < terrainLerped.length; i++) {
+            terrainLerped[i] = terrainPrev[i] + (terrainHeights[i] - terrainPrev[i]) * tNow
+          }
+          terrainDirty = true
+          renderFn?.()
+        },
+        setSmooth(alpha: number) {
+          smoothAlpha = alpha
+        },
+        setRowInterval(ms: number) {
+          rowInterval = ms
+        },
+      }
+    }
+  })
+
+  createEffect(() => {
+    const view = props.view
+    const g = gl
+    const canvas = canvasEl
+    if (!g || !canvas) return
+
+    const headNorm = () => ((head - 0.5 + TEX_H) % TEX_H) / TEX_H
+    const DEPTH = (TEX_H - 1) / TEX_H
+    const buffers: WebGLBuffer[] = []
+    const programs: WebGLProgram[] = []
 
     const mkBuffer = (data: Float32Array) => {
-      const buf = gl.createBuffer()!;
-      buffers.push(buf);
-      gl.bindBuffer(gl.ARRAY_BUFFER, buf);
-      gl.bufferData(gl.ARRAY_BUFFER, data, gl.STATIC_DRAW);
-      return buf;
-    };
+      const buf = g.createBuffer()!
+      buffers.push(buf)
+      g.bindBuffer(g.ARRAY_BUFFER, buf)
+      g.bufferData(g.ARRAY_BUFFER, data, g.STATIC_DRAW)
+      return buf
+    }
     const mkProgram = (vs: string, fs: string) => {
-      const p = makeProgram(gl, vs, fs);
-      if (p) programs.push(p);
-      return p;
-    };
+      const p = makeProgram(g, vs, fs)
+      if (p) programs.push(p)
+      return p
+    }
 
     const bandLocs = (p: WebGLProgram): BandUniforms => ({
-      count: gl.getUniformLocation(p, 'uBandCount'),
-      range: gl.getUniformLocation(p, 'uBandRange'),
-      color: gl.getUniformLocation(p, 'uBandColor'),
-      strength: gl.getUniformLocation(p, 'uBandStrength'),
-      alpha: gl.getUniformLocation(p, 'uBandAlpha'),
-    });
+      count: g.getUniformLocation(p, 'uBandCount'),
+      range: g.getUniformLocation(p, 'uBandRange'),
+      color: g.getUniformLocation(p, 'uBandColor'),
+      strength: g.getUniformLocation(p, 'uBandStrength'),
+      alpha: g.getUniformLocation(p, 'uBandAlpha'),
+    })
     const setBandUniforms = (loc: BandUniforms) => {
-      const b = bandsRef.current;
-      gl.uniform1i(loc.count, b.count);
-      gl.uniform2fv(loc.range, b.ranges);
-      gl.uniform3fv(loc.color, b.colors);
-      gl.uniform1fv(loc.strength, b.strengths);
-      gl.uniform1f(loc.alpha, b.alpha);
-    };
+      g.uniform1i(loc.count, bandsState.count)
+      g.uniform2fv(loc.range, bandsState.ranges)
+      g.uniform3fv(loc.color, bandsState.colors)
+      g.uniform1fv(loc.strength, bandsState.strengths)
+      g.uniform1f(loc.alpha, bandsState.alpha)
+    }
 
-    // Shared translucent squelch program (plane on terrain / line on ridge)
-    const sqlProg = mkProgram(SQL_VS, SQL_FS);
-    if (!sqlProg) { setFailed(true); return; }
-    const sqlQuad = mkBuffer(new Float32Array([0, 0, 1, 0, 0, 1, 1, 1]));
+    const sqlProg = mkProgram(SQL_VS, SQL_FS)
+    if (!sqlProg) {
+      failedSetter(true)
+      return
+    }
+    const sqlQuad = mkBuffer(new Float32Array([0, 0, 1, 0, 0, 1, 1, 1]))
     const sqlLoc = {
-      aPos: gl.getAttribLocation(sqlProg, 'aPos'),
-      mvp: gl.getUniformLocation(sqlProg, 'uMVP'),
-      y: gl.getUniformLocation(sqlProg, 'uY'),
-      mode: gl.getUniformLocation(sqlProg, 'uMode'),
-      pan: gl.getUniformLocation(sqlProg, 'uPan'),
-      scale: gl.getUniformLocation(sqlProg, 'uScale'),
-      alpha: gl.getUniformLocation(sqlProg, 'uAlpha'),
-    };
+      aPos: g.getAttribLocation(sqlProg, 'aPos'),
+      mvp: g.getUniformLocation(sqlProg, 'uMVP'),
+      y: g.getUniformLocation(sqlProg, 'uY'),
+      mode: g.getUniformLocation(sqlProg, 'uMode'),
+      pan: g.getUniformLocation(sqlProg, 'uPan'),
+      scale: g.getUniformLocation(sqlProg, 'uScale'),
+      alpha: g.getUniformLocation(sqlProg, 'uAlpha'),
+    }
     const drawSql = (mode: number, y: number, mvp?: Float32Array) => {
-      const sql = sqlRef.current;
-      if (sql.level === undefined || sql.alpha <= 0) return;
-      gl.useProgram(sqlProg);
-      gl.enable(gl.BLEND);
-      gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
-      if (mode === 0) gl.depthMask(false);
-      gl.bindBuffer(gl.ARRAY_BUFFER, sqlQuad);
-      gl.enableVertexAttribArray(sqlLoc.aPos);
-      gl.vertexAttribPointer(sqlLoc.aPos, 2, gl.FLOAT, false, 0, 0);
-      if (mvp) gl.uniformMatrix4fv(sqlLoc.mvp, false, mvp);
-      gl.uniform1f(sqlLoc.y, y);
-      gl.uniform1f(sqlLoc.mode, mode);
-      gl.uniform2f(sqlLoc.pan, 0, 0);
-      gl.uniform1f(sqlLoc.scale, 1);
-      gl.uniform1f(sqlLoc.alpha, sql.alpha);
-      gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
-      gl.disable(gl.BLEND);
-      if (mode === 0) gl.depthMask(true);
-    };
-    const sqlHeight = () => Math.pow(sqlRef.current.level ?? 0, gammaRef.current) * HEIGHT_SCALE;
+      if (sqlState.level === undefined || sqlState.alpha <= 0) return
+      g.useProgram(sqlProg)
+      g.enable(g.BLEND)
+      g.blendFunc(g.SRC_ALPHA, g.ONE_MINUS_SRC_ALPHA)
+      if (mode === 0) g.depthMask(false)
+      g.bindBuffer(g.ARRAY_BUFFER, sqlQuad)
+      g.enableVertexAttribArray(sqlLoc.aPos)
+      g.vertexAttribPointer(sqlLoc.aPos, 2, g.FLOAT, false, 0, 0)
+      if (mvp) g.uniformMatrix4fv(sqlLoc.mvp, false, mvp)
+      g.uniform1f(sqlLoc.y, y)
+      g.uniform1f(sqlLoc.mode, mode)
+      g.uniform2f(sqlLoc.pan, 0, 0)
+      g.uniform1f(sqlLoc.scale, 1)
+      g.uniform1f(sqlLoc.alpha, sqlState.alpha)
+      g.drawArrays(g.TRIANGLE_STRIP, 0, 4)
+      g.disable(g.BLEND)
+      if (mode === 0) g.depthMask(true)
+    }
+    const sqlHeight = () => Math.pow(sqlState.level ?? 0, props.gamma) * HEIGHT_SCALE
 
-    // Position the HTML frequency labels and channel markers using the active projection
     const placeLabels = (project: (xNorm: number) => [number, number] | null) => {
-      const W = canvas.clientWidth, H = canvas.clientHeight;
-      labelsRef.current.forEach((lb, i) => {
-        const el = labelElsRef.current[i];
-        if (!el) return;
-        const pos = project(lb.x);
+      const W = canvas.clientWidth,
+        H = canvas.clientHeight
+      labels().forEach((lb, i) => {
+        const el = labelEls[i]
+        if (!el) return
+        const pos = project(lb.x)
         if (!pos || pos[0] < -20 || pos[0] > W + 20 || pos[1] < 0 || pos[1] > H) {
-          el.style.display = 'none';
-          return;
+          el.style.display = 'none'
+          return
         }
-        el.style.display = 'block';
-        el.style.left = `${pos[0]}px`;
-        el.style.top  = `${Math.min(H - 14, pos[1])}px`;
-      });
-      // Channel center markers: vertical lines anchored to the projected front-edge y position
-      const spanLocal = maxHzRef.current - minHzRef.current;
-      markersRef.current.forEach((mk, i) => {
-        const el = markerElsRef.current[i];
-        if (!el) return;
-        const centerHz = (mk.fromHz + mk.toHz) / 2;
-        const xNorm = (centerHz - minHzRef.current) / spanLocal;
-        const pos = project(xNorm);
-        if (!pos || pos[0] < 0 || pos[0] > W) { el.style.display = 'none'; return; }
-        el.style.display = 'block';
-        el.style.left = `${pos[0]}px`;
-        el.style.top = '0';
-        el.style.bottom = '0';
-      });
-      // TX frequency marker line
-      const txEl = txMarkerElRef.current;
-      const txHz = txMarkerHzRef.current;
+        el.style.display = 'block'
+        el.style.left = `${pos[0]}px`
+        el.style.top = `${Math.min(H - 14, pos[1])}px`
+      })
+      const spanLocal = maxHzVal - minHzVal
+      markersVal.forEach((mk, i) => {
+        const el = markerEls[i]
+        if (!el) return
+        const centerHz = (mk.fromHz + mk.toHz) / 2
+        const xNorm = (centerHz - minHzVal) / spanLocal
+        const pos = project(xNorm)
+        if (!pos || pos[0] < 0 || pos[0] > W) {
+          el.style.display = 'none'
+          return
+        }
+        el.style.display = 'block'
+        el.style.left = `${pos[0]}px`
+        el.style.top = '0'
+        el.style.bottom = '0'
+      })
+      const txEl = txMarkerEl
+      const txHz = txMarkerHzVal
       if (txEl) {
-        if (txHz > 0 && txHz >= minHzRef.current && txHz <= maxHzRef.current) {
-          const xNorm = (txHz - minHzRef.current) / spanLocal;
-          const pos = project(xNorm);
+        if (txHz > 0 && txHz >= minHzVal && txHz <= maxHzVal) {
+          const xNorm = (txHz - minHzVal) / spanLocal
+          const pos = project(xNorm)
           if (pos && pos[0] >= 0 && pos[0] <= W) {
-            txEl.style.display = 'block';
-            txEl.style.left = `${pos[0]}px`;
-            txEl.style.top = '0';
-            txEl.style.bottom = '0';
+            txEl.style.display = 'block'
+            txEl.style.left = `${pos[0]}px`
+            txEl.style.top = '0'
+            txEl.style.bottom = '0'
           } else {
-            txEl.style.display = 'none';
+            txEl.style.display = 'none'
           }
         } else {
-          txEl.style.display = 'none';
+          txEl.style.display = 'none'
         }
       }
-    };
+    }
 
     if (view === 'terrain') {
-      const prog = mkProgram(TERRAIN_VS, TERRAIN_FS);
-      if (!prog) { setFailed(true); return; }
+      const prog = mkProgram(TERRAIN_VS, TERRAIN_FS)
+      if (!prog) {
+        failedSetter(true)
+        return
+      }
 
-      // Static position buffer: (x [0,1], y [0,1]) per vertex — never changes
-      const verts = new Float32Array(TERRAIN_X * TERRAIN_Z * 2);
+      const verts = new Float32Array(TERRAIN_X * TERRAIN_Z * 2)
       for (let j = 0; j < TERRAIN_Z; j++) {
         for (let i = 0; i < TERRAIN_X; i++) {
-          verts[(j * TERRAIN_X + i) * 2]     = i / (TERRAIN_X - 1);
-          verts[(j * TERRAIN_X + i) * 2 + 1] = j / (TERRAIN_Z - 1);
+          verts[(j * TERRAIN_X + i) * 2] = i / (TERRAIN_X - 1)
+          verts[(j * TERRAIN_X + i) * 2 + 1] = j / (TERRAIN_Z - 1)
         }
       }
-      const idx = new Uint16Array((TERRAIN_X - 1) * (TERRAIN_Z - 1) * 6);
-      let k = 0;
+      const idx = new Uint16Array((TERRAIN_X - 1) * (TERRAIN_Z - 1) * 6)
+      let k = 0
       for (let j = 0; j < TERRAIN_Z - 1; j++) {
         for (let i = 0; i < TERRAIN_X - 1; i++) {
-          const a = j * TERRAIN_X + i;
-          idx[k++] = a; idx[k++] = a + 1; idx[k++] = a + TERRAIN_X;
-          idx[k++] = a + 1; idx[k++] = a + TERRAIN_X + 1; idx[k++] = a + TERRAIN_X;
+          const a = j * TERRAIN_X + i
+          idx[k++] = a
+          idx[k++] = a + 1
+          idx[k++] = a + TERRAIN_X
+          idx[k++] = a + 1
+          idx[k++] = a + TERRAIN_X + 1
+          idx[k++] = a + TERRAIN_X
         }
       }
-      const vbuf = mkBuffer(verts);
+      const vbuf = mkBuffer(verts)
 
-      // Dynamic height buffer: one float per vertex, updated CPU-side on each pushRow
-      const hbuf = gl.createBuffer()!;
-      buffers.push(hbuf);
-      gl.bindBuffer(gl.ARRAY_BUFFER, hbuf);
-      gl.bufferData(gl.ARRAY_BUFFER, terrainHeights.current, gl.DYNAMIC_DRAW);
+      const hbuf = g.createBuffer()!
+      buffers.push(hbuf)
+      g.bindBuffer(g.ARRAY_BUFFER, hbuf)
+      g.bufferData(g.ARRAY_BUFFER, terrainHeights, g.DYNAMIC_DRAW)
 
-      const ibuf = gl.createBuffer()!;
-      buffers.push(ibuf);
-      gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ibuf);
-      gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, idx, gl.STATIC_DRAW);
+      const ibuf = g.createBuffer()!
+      buffers.push(ibuf)
+      g.bindBuffer(g.ELEMENT_ARRAY_BUFFER, ibuf)
+      g.bufferData(g.ELEMENT_ARRAY_BUFFER, idx, g.STATIC_DRAW)
 
-      const aPos    = gl.getAttribLocation(prog, 'aPos');
-      const aHeight = gl.getAttribLocation(prog, 'aHeight');
+      const aPos = g.getAttribLocation(prog, 'aPos')
+      const aHeight = g.getAttribLocation(prog, 'aHeight')
       const loc = {
-        gamma: gl.getUniformLocation(prog, 'uGamma'),
-        mvp:   gl.getUniformLocation(prog, 'uMVP'),
-        grid:  gl.getUniformLocation(prog, 'uGrid'),
+        gamma: g.getUniformLocation(prog, 'uGamma'),
+        mvp: g.getUniformLocation(prog, 'uMVP'),
+        grid: g.getUniformLocation(prog, 'uGrid'),
         bands: bandLocs(prog),
-      };
+      }
 
-      // Floor grid lines — rebuilt whenever grid steps change
-      const floorProg = mkProgram(FLOOR_VS, FLOOR_FS);
-      const floorLoc = floorProg ? {
-        aPos: gl.getAttribLocation(floorProg, 'aPos'),
-        mvp:  gl.getUniformLocation(floorProg, 'uMVP'),
-      } : null;
-      const floorBuf = floorProg ? gl.createBuffer()! : null;
-      if (floorBuf) buffers.push(floorBuf);
-      let floorVertCount = 0;
+      const floorProg = mkProgram(FLOOR_VS, FLOOR_FS)
+      const floorLoc = floorProg
+        ? { aPos: g.getAttribLocation(floorProg, 'aPos'), mvp: g.getUniformLocation(floorProg, 'uMVP') }
+        : null
+      const floorBuf = floorProg ? g.createBuffer()! : null
+      if (floorBuf) buffers.push(floorBuf)
+      let floorVertCount = 0
       const buildFloorLines = () => {
-        // Major frequency lines (vertical stripes along Z) + depth lines along X edges
-        const [minorStep, majorStep] = gridRef.current; // normalised [0,1]
-        const verts: number[] = [];
-        // Frequency lines: for each major step, a line from z=0 to z=1
-        const firstMaj = Math.ceil(0 / majorStep) * majorStep;
+        const [minorStep, majorStep] = gridState
+        const vertsArr: number[] = []
+        const firstMaj = Math.ceil(0 / majorStep) * majorStep
         for (let x = firstMaj; x <= 1.0 + 1e-5; x += majorStep) {
-          const wx = x * 2.0 - 1.0;
-          verts.push(wx, 0.0, 0,  wx, -2.0, 1); // (worldX, worldZ, fade)
+          const wx = x * 2.0 - 1.0
+          vertsArr.push(wx, 0.0, 0, wx, -2.0, 1)
         }
-        // Minor frequency lines at half opacity — same structure
-        const firstMin = Math.ceil(0 / minorStep) * minorStep;
+        const firstMin = Math.ceil(0 / minorStep) * minorStep
         for (let x = firstMin; x <= 1.0 + 1e-5; x += minorStep) {
-          // Skip if coincides with a major line
-          const onMajor = Math.abs(x % majorStep) < minorStep * 0.1 || Math.abs(x % majorStep - majorStep) < minorStep * 0.1;
-          if (onMajor) continue;
-          const wx = x * 2.0 - 1.0;
-          verts.push(wx, 0.0, 0,  wx, -2.0, 0.4); // fade encodes minor dimness
+          const onMajor = Math.abs(x % majorStep) < minorStep * 0.1 || Math.abs((x % majorStep) - majorStep) < minorStep * 0.1
+          if (onMajor) continue
+          const wx = x * 2.0 - 1.0
+          vertsArr.push(wx, 0.0, 0, wx, -2.0, 0.4)
         }
-        // Depth lines: front edge (z=0) and a few along depth for perspective
-        const DEPTH_STEPS = 5;
+        const DEPTH_STEPS = 5
         for (let di = 0; di <= DEPTH_STEPS; di++) {
-          const wz = -(di / DEPTH_STEPS) * 2.0;
-          const fade = di / DEPTH_STEPS;
-          verts.push(-1.0, wz, fade,  1.0, wz, fade);
+          const wz = -(di / DEPTH_STEPS) * 2.0
+          const fade = di / DEPTH_STEPS
+          vertsArr.push(-1.0, wz, fade, 1.0, wz, fade)
         }
-        const data = new Float32Array(verts);
-        floorVertCount = data.length / 3;
-        gl.bindBuffer(gl.ARRAY_BUFFER, floorBuf!);
-        gl.bufferData(gl.ARRAY_BUFFER, data, gl.DYNAMIC_DRAW);
-      };
-      buildFloorLines();
+        const data = new Float32Array(vertsArr)
+        floorVertCount = data.length / 3
+        g.bindBuffer(g.ARRAY_BUFFER, floorBuf!)
+        g.bufferData(g.ARRAY_BUFFER, data, g.DYNAMIC_DRAW)
+      }
+      buildFloorLines()
 
       const drawFloor = (mvp: Float32Array) => {
-        if (!floorProg || !floorBuf || !floorLoc || floorVertCount === 0) return;
-        buildFloorLines();
-        gl.useProgram(floorProg);
-        gl.enable(gl.BLEND);
-        gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
-        gl.bindBuffer(gl.ARRAY_BUFFER, floorBuf);
-        gl.enableVertexAttribArray(floorLoc.aPos);
-        gl.vertexAttribPointer(floorLoc.aPos, 3, gl.FLOAT, false, 0, 0);
-        gl.uniformMatrix4fv(floorLoc.mvp, false, mvp);
-        gl.drawArrays(gl.LINES, 0, floorVertCount);
-        gl.disable(gl.BLEND);
-      };
+        if (!floorProg || !floorBuf || !floorLoc || floorVertCount === 0) return
+        buildFloorLines()
+        g.useProgram(floorProg)
+        g.enable(g.BLEND)
+        g.blendFunc(g.SRC_ALPHA, g.ONE_MINUS_SRC_ALPHA)
+        g.bindBuffer(g.ARRAY_BUFFER, floorBuf)
+        g.enableVertexAttribArray(floorLoc.aPos)
+        g.vertexAttribPointer(floorLoc.aPos, 3, g.FLOAT, false, 0, 0)
+        g.uniformMatrix4fv(floorLoc.mvp, false, mvp)
+        g.drawArrays(g.LINES, 0, floorVertCount)
+        g.disable(g.BLEND)
+      }
 
-      // SQL grid program — replaces the solid plane with an animated cell grid
-      const sqlGridProg = mkProgram(SQL_GRID_VS, SQL_GRID_FS);
-      const sqlGridLoc = sqlGridProg ? {
-        aPos:      gl.getAttribLocation(sqlGridProg, 'aPos'),
-        mvp:       gl.getUniformLocation(sqlGridProg, 'uMVP'),
-        y:         gl.getUniformLocation(sqlGridProg, 'uY'),
-        tex:       gl.getUniformLocation(sqlGridProg, 'uTex'),
-        head:      gl.getUniformLocation(sqlGridProg, 'uHead'),
-        depth:     gl.getUniformLocation(sqlGridProg, 'uDepth'),
-        sqlLvl:    gl.getUniformLocation(sqlGridProg, 'uSqlLvl'),
-        alpha:     gl.getUniformLocation(sqlGridProg, 'uAlpha'),
-        gridCells: gl.getUniformLocation(sqlGridProg, 'uGridCells'),
-        bands:     bandLocs(sqlGridProg),
-      } : null;
+      const sqlGridProg = mkProgram(SQL_GRID_VS, SQL_GRID_FS)
+      const sqlGridLoc = sqlGridProg
+        ? {
+            aPos: g.getAttribLocation(sqlGridProg, 'aPos'),
+            mvp: g.getUniformLocation(sqlGridProg, 'uMVP'),
+            y: g.getUniformLocation(sqlGridProg, 'uY'),
+            tex: g.getUniformLocation(sqlGridProg, 'uTex'),
+            head: g.getUniformLocation(sqlGridProg, 'uHead'),
+            depth: g.getUniformLocation(sqlGridProg, 'uDepth'),
+            sqlLvl: g.getUniformLocation(sqlGridProg, 'uSqlLvl'),
+            alpha: g.getUniformLocation(sqlGridProg, 'uAlpha'),
+            gridCells: g.getUniformLocation(sqlGridProg, 'uGridCells'),
+            bands: bandLocs(sqlGridProg),
+          }
+        : null
 
       const drawSqlGrid = (mvp: Float32Array) => {
-        const sql = sqlRef.current;
-        if (sql.level === undefined || sql.alpha <= 0) return;
-        const gs = sqlGridSizeRef.current;
+        if (sqlState.level === undefined || sqlState.alpha <= 0) return
+        const gs = sqlGridSizeVal
         if (!gs || !sqlGridProg || !sqlGridLoc) {
-          drawSql(0, sqlHeight(), mvp); // fallback to solid plane
-          return;
+          drawSql(0, sqlHeight(), mvp)
+          return
         }
-        gl.useProgram(sqlGridProg);
-        gl.enable(gl.BLEND);
-        gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
-        gl.depthMask(false);
-        gl.bindBuffer(gl.ARRAY_BUFFER, sqlQuad);
-        gl.enableVertexAttribArray(sqlGridLoc.aPos);
-        gl.vertexAttribPointer(sqlGridLoc.aPos, 2, gl.FLOAT, false, 0, 0);
-        gl.uniformMatrix4fv(sqlGridLoc.mvp, false, mvp);
-        gl.uniform1f(sqlGridLoc.y, sqlHeight());
-        gl.bindTexture(gl.TEXTURE_2D, texRef.current);
-        gl.uniform1i(sqlGridLoc.tex, 0);
-        gl.uniform1f(sqlGridLoc.head, headNorm());
-        gl.uniform1f(sqlGridLoc.depth, DEPTH);
-        gl.uniform1f(sqlGridLoc.sqlLvl, sql.level);
-        gl.uniform1f(sqlGridLoc.alpha, sql.alpha);
-        gl.uniform2f(sqlGridLoc.gridCells, gs * 2, gs);
-        setBandUniforms(sqlGridLoc.bands);
-        gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
-        gl.disable(gl.BLEND);
-        gl.depthMask(true);
-      };
+        g.useProgram(sqlGridProg)
+        g.enable(g.BLEND)
+        g.blendFunc(g.SRC_ALPHA, g.ONE_MINUS_SRC_ALPHA)
+        g.depthMask(false)
+        g.bindBuffer(g.ARRAY_BUFFER, sqlQuad)
+        g.enableVertexAttribArray(sqlGridLoc.aPos)
+        g.vertexAttribPointer(sqlGridLoc.aPos, 2, g.FLOAT, false, 0, 0)
+        g.uniformMatrix4fv(sqlGridLoc.mvp, false, mvp)
+        g.uniform1f(sqlGridLoc.y, sqlHeight())
+        g.bindTexture(g.TEXTURE_2D, tex)
+        g.uniform1i(sqlGridLoc.tex, 0)
+        g.uniform1f(sqlGridLoc.head, headNorm())
+        g.uniform1f(sqlGridLoc.depth, DEPTH)
+        g.uniform1f(sqlGridLoc.sqlLvl, sqlState.level)
+        g.uniform1f(sqlGridLoc.alpha, sqlState.alpha)
+        g.uniform2f(sqlGridLoc.gridCells, gs * 2, gs)
+        setBandUniforms(sqlGridLoc.bands)
+        g.drawArrays(g.TRIANGLE_STRIP, 0, 4)
+        g.disable(g.BLEND)
+        g.depthMask(true)
+      }
 
-      renderRef.current = () => {
-        const cam = terrainCam.current;
-        gl.viewport(0, 0, canvas.width, canvas.height);
-        gl.enable(gl.DEPTH_TEST);
-        gl.clearColor(BG[0], BG[1], BG[2], 1);
-        gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+      renderFn = () => {
+        const cam = terrainCam
+        g.viewport(0, 0, canvas.width, canvas.height)
+        g.enable(g.DEPTH_TEST)
+        g.clearColor(BG[0], BG[1], BG[2], 1)
+        g.clear(g.COLOR_BUFFER_BIT | g.DEPTH_BUFFER_BIT)
 
-        const target: [number, number, number] = [cam.tx, 0.15, -0.9 + cam.tz];
+        const target: [number, number, number] = [cam.tx, 0.15, -0.9 + cam.tz]
         const eye: [number, number, number] = [
           target[0] + cam.dist * Math.sin(cam.az) * Math.cos(cam.el),
           target[1] + cam.dist * Math.sin(cam.el),
           target[2] + cam.dist * Math.cos(cam.az) * Math.cos(cam.el),
-        ];
-        const proj = mat4Perspective(Math.PI / 3, canvas.width / canvas.height, 0.05, 20);
-        const mvp  = mat4Multiply(proj, mat4LookAt(eye, target));
+        ]
+        const proj = mat4Perspective(Math.PI / 3, canvas.width / canvas.height, 0.05, 20)
+        const mvp = mat4Multiply(proj, mat4LookAt(eye, target))
 
-        drawFloor(mvp);
+        drawFloor(mvp)
 
-        gl.useProgram(prog);
-        // Upload interpolated heights when dirty
-        if (terrainDirty.current) {
-          gl.bindBuffer(gl.ARRAY_BUFFER, hbuf);
-          gl.bufferSubData(gl.ARRAY_BUFFER, 0, terrainLerped.current);
-          terrainDirty.current = false;
+        g.useProgram(prog)
+        if (terrainDirty) {
+          g.bindBuffer(g.ARRAY_BUFFER, hbuf)
+          g.bufferSubData(g.ARRAY_BUFFER, 0, terrainLerped)
+          terrainDirty = false
         } else {
-          gl.bindBuffer(gl.ARRAY_BUFFER, hbuf);
+          g.bindBuffer(g.ARRAY_BUFFER, hbuf)
         }
-        gl.enableVertexAttribArray(aHeight);
-        gl.vertexAttribPointer(aHeight, 1, gl.FLOAT, false, 0, 0);
-        gl.bindBuffer(gl.ARRAY_BUFFER, vbuf);
-        gl.enableVertexAttribArray(aPos);
-        gl.vertexAttribPointer(aPos, 2, gl.FLOAT, false, 0, 0);
-        gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ibuf);
-        gl.uniformMatrix4fv(loc.mvp, false, mvp);
-        gl.uniform1f(loc.gamma, gammaRef.current);
-        gl.uniform2f(loc.grid, gridRef.current[0], gridRef.current[1]);
-        setBandUniforms(loc.bands);
-        gl.drawElements(gl.TRIANGLES, idx.length, gl.UNSIGNED_SHORT, 0);
-        drawSqlGrid(mvp);
-        // Labels track the front edge of the mesh (y=0, z=0)
-        placeLabels(xNorm => {
-          const px = xNorm * 2 - 1;
-          const w = mvp[3] * px + mvp[15];
-          if (w <= 0.01) return null;
-          const sx = ((mvp[0] * px + mvp[12]) / w * 0.5 + 0.5) * canvas.clientWidth;
-          const sy = (1 - ((mvp[1] * px + mvp[13]) / w * 0.5 + 0.5)) * canvas.clientHeight;
-          return [sx, sy + 2];
-        });
-      };
+        g.enableVertexAttribArray(aHeight)
+        g.vertexAttribPointer(aHeight, 1, g.FLOAT, false, 0, 0)
+        g.bindBuffer(g.ARRAY_BUFFER, vbuf)
+        g.enableVertexAttribArray(aPos)
+        g.vertexAttribPointer(aPos, 2, g.FLOAT, false, 0, 0)
+        g.bindBuffer(g.ELEMENT_ARRAY_BUFFER, ibuf)
+        g.uniformMatrix4fv(loc.mvp, false, mvp)
+        g.uniform1f(loc.gamma, props.gamma)
+        g.uniform2f(loc.grid, gridState[0], gridState[1])
+        setBandUniforms(loc.bands)
+        g.drawElements(g.TRIANGLES, idx.length, g.UNSIGNED_SHORT, 0)
+        drawSqlGrid(mvp)
+        placeLabels((xNorm) => {
+          const px = xNorm * 2 - 1
+          const w = mvp[3] * px + mvp[15]
+          if (w <= 0.01) return null
+          const sx = (((mvp[0] * px + mvp[12]) / w) * 0.5 + 0.5) * canvas.clientWidth
+          const sy = (1 - (((mvp[1] * px + mvp[13]) / w) * 0.5 + 0.5)) * canvas.clientHeight
+          return [sx, sy + 2]
+        })
+      }
     }
 
-    renderRef.current?.();
-    return () => {
-      renderRef.current = null;
-      programs.forEach(p => gl.deleteProgram(p));
-      buffers.forEach(b => gl.deleteBuffer(b));
-    };
-  }, [view, failed]);
+    renderFn?.()
+    onCleanup(() => {
+      renderFn = null
+      programs.forEach((p) => g.deleteProgram(p))
+      buffers.forEach((b) => g.deleteBuffer(b))
+    })
+  })
 
-  // Mouse interaction — orbit/pan/zoom for terrain, pan/zoom for ridge.
-  // Double-click resets the camera.
-  useEffect(() => {
-    const canvas = canvasRef.current;
-    if (!canvas || failed) return;
+  onMount(() => {
+    const canvas = canvasEl
+    if (!canvas) return
 
-    let drag: { mode: 'rotate' | 'pan'; x: number; y: number } | null = null;
+    let drag: { mode: 'rotate' | 'pan'; x: number; y: number } | null = null
 
     const onMouseDown = (e: MouseEvent) => {
-      const pan = e.button === 2 || e.button === 1 || e.shiftKey;
-      drag = { mode: pan ? 'pan' : 'rotate', x: e.clientX, y: e.clientY };
-      canvas.style.cursor = 'grabbing';
-      e.preventDefault();
-    };
+      const pan = e.button === 2 || e.button === 1 || e.shiftKey
+      drag = { mode: pan ? 'pan' : 'rotate', x: e.clientX, y: e.clientY }
+      canvas.style.cursor = 'grabbing'
+      e.preventDefault()
+    }
     const onMouseMove = (e: MouseEvent) => {
-      if (!drag) return;
-      const dx = e.clientX - drag.x;
-      const dy = e.clientY - drag.y;
-      drag.x = e.clientX;
-      drag.y = e.clientY;
-      const cam = terrainCam.current;
+      if (!drag) return
+      const dx = e.clientX - drag.x
+      const dy = e.clientY - drag.y
+      drag.x = e.clientX
+      drag.y = e.clientY
+      const cam = terrainCam
       if (drag.mode === 'rotate') {
-        cam.az = Math.max(-1.3, Math.min(1.3, cam.az - dx * 0.008));
-        cam.el = Math.max(0.12, Math.min(1.5, cam.el + dy * 0.008));
+        cam.az = Math.max(-1.3, Math.min(1.3, cam.az - dx * 0.008))
+        cam.el = Math.max(0.12, Math.min(1.5, cam.el + dy * 0.008))
       } else {
-        const s = 0.0022 * cam.dist;
-        cam.tx -= (dx * Math.cos(cam.az) + dy * Math.sin(cam.az)) * s;
-        cam.tz -= (dy * Math.cos(cam.az) - dx * Math.sin(cam.az)) * s;
-        cam.tx = Math.max(-1.5, Math.min(1.5, cam.tx));
-        cam.tz = Math.max(-2.0, Math.min(1.5, cam.tz));
+        const s = 0.0022 * cam.dist
+        cam.tx -= (dx * Math.cos(cam.az) + dy * Math.sin(cam.az)) * s
+        cam.tz -= (dy * Math.cos(cam.az) - dx * Math.sin(cam.az)) * s
+        cam.tx = Math.max(-1.5, Math.min(1.5, cam.tx))
+        cam.tz = Math.max(-2.0, Math.min(1.5, cam.tz))
       }
-      renderRef.current?.();
-    };
-    const onMouseUp = () => { drag = null; canvas.style.cursor = 'grab'; };
+      renderFn?.()
+    }
+    const onMouseUp = () => {
+      drag = null
+      canvas.style.cursor = 'grab'
+    }
     const onWheel = (e: WheelEvent) => {
-      e.preventDefault();
-      const cam = terrainCam.current;
-      cam.dist = Math.max(0.8, Math.min(7, cam.dist * Math.exp(e.deltaY * 0.0012)));
-      renderRef.current?.();
-    };
+      e.preventDefault()
+      const cam = terrainCam
+      cam.dist = Math.max(0.8, Math.min(7, cam.dist * Math.exp(e.deltaY * 0.0012)))
+      renderFn?.()
+    }
     const onDblClick = () => {
-      terrainCam.current = { ...TERRAIN_CAM };
-      renderRef.current?.();
-    };
-    const onContextMenu = (e: MouseEvent) => e.preventDefault();
+      terrainCam = { ...TERRAIN_CAM }
+      renderFn?.()
+    }
+    const onContextMenu = (e: MouseEvent) => e.preventDefault()
 
-    canvas.style.cursor = 'grab';
-    canvas.addEventListener('mousedown', onMouseDown);
-    canvas.addEventListener('wheel', onWheel, { passive: false });
-    canvas.addEventListener('dblclick', onDblClick);
-    canvas.addEventListener('contextmenu', onContextMenu);
-    window.addEventListener('mousemove', onMouseMove);
-    window.addEventListener('mouseup', onMouseUp);
-    return () => {
-      canvas.removeEventListener('mousedown', onMouseDown);
-      canvas.removeEventListener('wheel', onWheel);
-      canvas.removeEventListener('dblclick', onDblClick);
-      canvas.removeEventListener('contextmenu', onContextMenu);
-      window.removeEventListener('mousemove', onMouseMove);
-      window.removeEventListener('mouseup', onMouseUp);
-    };
-  }, [view, failed]);
+    canvas.style.cursor = 'grab'
+    canvas.addEventListener('mousedown', onMouseDown)
+    canvas.addEventListener('wheel', onWheel, { passive: false })
+    canvas.addEventListener('dblclick', onDblClick)
+    canvas.addEventListener('contextmenu', onContextMenu)
+    window.addEventListener('mousemove', onMouseMove)
+    window.addEventListener('mouseup', onMouseUp)
+    onCleanup(() => {
+      canvas.removeEventListener('mousedown', onMouseDown)
+      canvas.removeEventListener('wheel', onWheel)
+      canvas.removeEventListener('dblclick', onDblClick)
+      canvas.removeEventListener('contextmenu', onContextMenu)
+      window.removeEventListener('mousemove', onMouseMove)
+      window.removeEventListener('mouseup', onMouseUp)
+    })
+  })
 
-  // Changing the height attribute clears the drawing buffer — repaint
-  useEffect(() => { renderRef.current?.(); }, [height]);
-
-  useImperativeHandle(ref, () => ({
-    pushRow(data: Uint8Array) {
-      const gl = glRef.current;
-      if (!gl || data.length === 0) return;
-      const smooth = rowSmoothed.current;
-      const heights = terrainHeights.current;
-      const n = data.length;
-      const alpha = smoothAlpha.current;
-
-      terrainDirty.current = true;
-      lastPushTimeRef.current = performance.now();
-      // Snapshot current state before shifting so render() can lerp from it
-      terrainPrev.current.set(heights);
-      // Shift all rows back by one: row 0 = newest, TERRAIN_Z-1 = oldest
-      heights.copyWithin(TERRAIN_X, 0, TERRAIN_X * (TERRAIN_Z - 1));
-
-      // Resample + smooth new FFT into row 0
-      for (let i = 0; i < TERRAIN_X; i++) {
-        const f  = (i / (TERRAIN_X - 1)) * (n - 1);
-        const i0 = f | 0;
-        const i1 = Math.min(i0 + 1, n - 1);
-        const raw = (data[i0] * (1 - (f - i0)) + data[i1] * (f - i0)) / 255;
-        smooth[i] = smooth[i] * (1 - alpha) + raw * alpha;
-        heights[i] = smooth[i];
-      }
-
-      // Also keep the ring-buffer texture updated for ridge/squelch views
-      const out = rowScratch.current;
-      for (let i = 0; i < TEX_W; i++) out[i] = heights[i] * 255;
-      if (texRef.current) {
-        gl.bindTexture(gl.TEXTURE_2D, texRef.current);
-        gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, headRef.current, TEX_W, 1, gl.LUMINANCE, gl.UNSIGNED_BYTE, out);
-        headRef.current = (headRef.current + 1) % TEX_H;
-      }
-    },
-    render() {
-      // Lerp between prev and current heights so the terrain glides smoothly
-      // between row pushes rather than snapping. t goes 0→1 over one row interval.
-      const t = Math.min((performance.now() - lastPushTimeRef.current) / rowIntervalRef.current, 1);
-      const cur  = terrainHeights.current;
-      const prev = terrainPrev.current;
-      const out  = terrainLerped.current;
-      for (let i = 0; i < out.length; i++) out[i] = prev[i] + (cur[i] - prev[i]) * t;
-      terrainDirty.current = true;
-      renderRef.current?.();
-    },
-    setSmooth(alpha: number) {
-      smoothAlpha.current = alpha;
-    },
-    setRowInterval(ms: number) {
-      rowIntervalRef.current = ms;
-    },
-  }), []);
+  createEffect(() => {
+    void props.height
+    renderFn?.()
+  })
 
   return (
     <>
       <canvas
-        ref={canvasRef}
+        ref={canvasEl}
         width={640}
-        height={height}
-        style={{ height }}
-        className="w-full border border-[#30363d] rounded bg-[#0d1117] block select-none"
+        height={props.height}
+        style={{ height: `${props.height}px` }}
+        class="block w-full rounded border border-[#30363d] bg-[#0d1117] select-none"
       />
-      {labels.map((lb, i) => (
+      {labels().map((lb, i) => (
         <span
-          key={i}
-          ref={el => { labelElsRef.current[i] = el; }}
-          className="absolute text-[9px] font-mono text-[#8b949e] pointer-events-none select-none"
-          style={{ display: 'none', transform: 'translateX(-50%)', textShadow: '0 0 4px #0d1117, 0 0 4px #0d1117' }}
+          ref={(el) => (labelEls[i] = el)}
+          class="pointer-events-none absolute font-mono text-[9px] text-[#8b949e] select-none"
+          style={{ display: 'none', transform: 'translateX(-50%)', 'text-shadow': '0 0 4px #0d1117, 0 0 4px #0d1117' }}
         >
           {lb.text}
         </span>
       ))}
-      {(markers ?? []).map((mk, i) => (
+      {(props.markers ?? []).map((mk, i) => (
         <div
-          key={i}
-          ref={el => { markerElsRef.current[i] = el; }}
-          className="absolute pointer-events-none"
+          ref={(el) => (markerEls[i] = el)}
+          class="pointer-events-none absolute"
           style={{
             display: 'none',
             width: '1px',
             transform: 'translateX(-50%)',
             background: mk.color,
             opacity: 0.55,
-            boxShadow: `0 0 3px ${mk.color}`,
+            'box-shadow': `0 0 3px ${mk.color}`,
           }}
         />
       ))}
-      {/* TX frequency marker line */}
       <div
-        ref={txMarkerElRef}
-        className="absolute pointer-events-none"
+        ref={txMarkerEl}
+        class="pointer-events-none absolute"
         style={{
           display: 'none',
           width: '2px',
           transform: 'translateX(-50%)',
           background: 'rgba(88,166,255,0.75)',
-          boxShadow: '0 0 4px rgba(88,166,255,0.5)',
+          'box-shadow': '0 0 4px rgba(88,166,255,0.5)',
         }}
       />
-      <div className="absolute bottom-1.5 right-2 text-[9px] font-mono text-[#484f58] pointer-events-none select-none">
+      <div class="pointer-events-none absolute right-2 bottom-1.5 font-mono text-[9px] text-[#484f58] select-none">
         drag rotate · shift+drag pan · scroll zoom · dblclick reset
       </div>
-      {failed && (
-        <div className="absolute inset-0 flex items-center justify-center text-xs text-[#f85149] font-mono">
+      {failed() && (
+        <div class="absolute inset-0 flex items-center justify-center font-mono text-xs text-[#f85149]">
           WebGL unavailable — switch View back to Classic 2D
         </div>
       )}
     </>
-  );
-});
-
-export default GLSpectrogram;
+  )
+}

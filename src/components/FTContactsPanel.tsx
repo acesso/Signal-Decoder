@@ -1,95 +1,83 @@
-'use client';
-
-import dynamic from 'next/dynamic';
-import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from 'react';
-import { createPortal } from 'react-dom';
+// Port of src/components/FTContactsPanel.tsx (Next.js app). Leaflet map is a
+// plain Solid component here (no dynamic()/ssr:false — this app has no SSR).
+import { createEffect, createMemo, createSignal, For, on, onCleanup, onMount, Show, type JSX } from 'solid-js'
+import { Portal } from 'solid-js/web'
 import {
   Contact, ContactMsg, MSG_TYPE_LABEL, MSG_TYPE_COLOR, generateADIF, parseADIF, gridToLatLon, haversineKm, isConfirmedQSO,
   classifyCallsign,
-} from '@/lib/ft/parser';
-import { callsignCountry } from '@/lib/ft/prefixes';
+} from '$decoder-lib/ft/parser'
+import { callsignCountry } from '$decoder-lib/ft/prefixes'
 
-import { FT_WINDOW_SECONDS, type FTMode } from '@/lib/ft/decoder';
-import { fmtAbsHz } from '@/lib/formatFreq';
-import VirtualList from './VirtualList';
-import { loadNumber, saveNumber, loadBoolean, saveBoolean } from '@/lib/storage';
+import { FT_WINDOW_SECONDS, type FTMode } from '$decoder-lib/ft/decoder'
+import { fmtAbsHz } from '$decoder-lib/formatFreq'
+import VirtualList from './VirtualList'
+import { loadNumber, saveNumber, loadBoolean, saveBoolean } from '$decoder-lib/storage'
+import FTLeafletMap from './FTLeafletMap'
 
-const LS_MAP_HEIGHT       = 'ft_map_height';
-const LS_CONTACTS_SORT_KEY = 'ft_contacts_sort_key';
-const LS_CONTACTS_SORT_REV = 'ft_contacts_sort_rev';
-const CONTACTS_SORT_KEYS = ['date', 'tx', 'rx', 'worked', 'alpha', 'snr-hi', 'snr-lo', 'near', 'far'] as const;
+const LS_MAP_HEIGHT       = 'ft_map_height'
+const LS_CONTACTS_SORT_KEY = 'ft_contacts_sort_key'
+const LS_CONTACTS_SORT_REV = 'ft_contacts_sort_rev'
+const CONTACTS_SORT_KEYS = ['date', 'tx', 'rx', 'worked', 'alpha', 'snr-hi', 'snr-lo', 'near', 'far'] as const
 
 // Virtualized contact list geometry: collapsed cards are fixed-height
 // (summary row 28px + 2px borders + 6px gap); the expanded card is measured
 // live via ResizeObserver, with a fallback used until the first measurement.
-const CARD_GAP_H = 6;
-const COLLAPSED_CARD_H = 30 + CARD_GAP_H;
-const EXPANDED_CARD_FALLBACK_H = 420;
+const CARD_GAP_H = 6
+const COLLAPSED_CARD_H = 30 + CARD_GAP_H
+const EXPANDED_CARD_FALLBACK_H = 420
 
 // Map day/night overlay preference — a UI-only toggle, remembered per browser
 // so it doesn't reset to off every time the page loads.
-const LS_SHOW_TERMINATOR = 'ft_map_show_terminator';
+const LS_SHOW_TERMINATOR = 'ft_map_show_terminator'
 function loadShowTerminator(): boolean {
-  if (typeof window === 'undefined') return false;
-  return localStorage.getItem(LS_SHOW_TERMINATOR) === 'true';
+  return localStorage.getItem(LS_SHOW_TERMINATOR) === 'true'
 }
 function saveShowTerminator(v: boolean) {
-  if (typeof window !== 'undefined') localStorage.setItem(LS_SHOW_TERMINATOR, String(v));
+  localStorage.setItem(LS_SHOW_TERMINATOR, String(v))
 }
 
 // Map tile style preference — dark (default) or light basemap. Remembered
 // per browser like the terminator toggle.
-type MapTileStyle = 'dark' | 'light';
-const LS_MAP_STYLE = 'ft_map_tile_style';
+type MapTileStyle = 'dark' | 'light'
+const LS_MAP_STYLE = 'ft_map_tile_style'
 function loadMapStyle(): MapTileStyle {
-  if (typeof window === 'undefined') return 'dark';
-  return localStorage.getItem(LS_MAP_STYLE) === 'light' ? 'light' : 'dark';
+  return localStorage.getItem(LS_MAP_STYLE) === 'light' ? 'light' : 'dark'
 }
 function saveMapStyle(v: MapTileStyle) {
-  if (typeof window !== 'undefined') localStorage.setItem(LS_MAP_STYLE, v);
+  localStorage.setItem(LS_MAP_STYLE, v)
 }
 
 // Format a stored absolute frequency. Values > 1 MHz are already absolute (VFO
 // was set at decode time); smaller values are raw audio offsets (no VFO then).
 function formatMsgFreq(freq: number): string {
-  if (freq <= 0) return '—';
-  if (freq > 1_000_000) return fmtAbsHz(freq);
-  return `${freq.toFixed(0)} Hz`;
+  if (freq <= 0) return '—'
+  if (freq > 1_000_000) return fmtAbsHz(freq)
+  return `${freq.toFixed(0)} Hz`
 }
 
-// Loaded only in the browser — Leaflet must not run in SSR
-const FTLeafletMap = dynamic(() => import('./FTLeafletMap'), {
-  ssr: false,
-  loading: () => (
-    <div className="h-full flex items-center justify-center text-xs text-[#484f58] font-mono">
-      Loading map…
-    </div>
-  ),
-});
-
 function localHMS(d: Date): string {
-  return d.toLocaleTimeString(undefined, { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
+  return d.toLocaleTimeString(undefined, { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' })
 }
 
 interface LocationParts {
-  flag: string;
-  country: string;
-  grids: string;
+  flag: string
+  country: string
+  grids: string
 }
 
 function locationParts(contact: Contact): LocationParts | null {
-  const pfx     = callsignCountry(contact.callsign);
-  const flag    = pfx?.flag ?? '';
-  const country = pfx?.country ?? '';
+  const pfx     = callsignCountry(contact.callsign)
+  const flag    = pfx?.flag ?? ''
+  const country = pfx?.country ?? ''
   const grids   = contact.grid
     ? contact.grid + (contact.grids.length > 1 ? ` +${contact.grids.length - 1}` : '')
-    : '';
-  if (!flag && !country && !grids) return null;
-  return { flag, country, grids };
+    : ''
+  if (!flag && !country && !grids) return null
+  return { flag, country, grids }
 }
 
 function qrzUrl(callsign: string): string {
-  return `https://www.qrz.com/db/${encodeURIComponent(callsign.split('/')[0])}`;
+  return `https://www.qrz.com/db/${encodeURIComponent(callsign.split('/')[0])}`
 }
 
 // Visible badge shown in the card title next to the callsign: Brazilian
@@ -104,27 +92,27 @@ const BADGE_STYLE = {
   silver: { background: 'rgba(176,186,196,0.15)', color: '#b1bac4', border: '1px solid rgba(176,186,196,0.45)' },
   bronze: { background: 'rgba(205,127,80,0.15)',  color: '#d0885a', border: '1px solid rgba(205,127,80,0.45)' },
   blue:   { background: 'rgba(88,166,255,0.15)',  color: '#58a6ff', border: '1px solid rgba(88,166,255,0.4)' },
-} as const;
+} as const
 
-function callsignBadge(callsign: string): { text: string; title: string; style: CSSProperties } | null {
-  const info = classifyCallsign(callsign);
+function callsignBadge(callsign: string): { text: string; title: string; style: JSX.CSSProperties } | null {
+  const info = classifyCallsign(callsign)
   if (info.brazilLicenseClass) {
     const style = info.brazilLicenseClass === 'A' ? BADGE_STYLE.gold
                 : info.brazilLicenseClass === 'B' ? BADGE_STYLE.silver
-                : BADGE_STYLE.bronze;
-    return { text: `BR-${info.brazilLicenseClass}`, title: `Brazil Class ${info.brazilLicenseClass} license`, style };
+                : BADGE_STYLE.bronze
+    return { text: `BR-${info.brazilLicenseClass}`, title: `Brazil Class ${info.brazilLicenseClass} license`, style }
   }
   if (info.kind === 'compound') {
-    return { text: 'CPD', title: 'Compound/portable callsign (58-bit encoding)', style: BADGE_STYLE.blue };
+    return { text: 'CPD', title: 'Compound/portable callsign (58-bit encoding)', style: BADGE_STYLE.blue }
   }
   if (info.kind === 'nonstandard') {
-    return { text: 'SPEC', title: 'Special/nonstandard-format callsign (58-bit encoding)', style: BADGE_STYLE.blue };
+    return { text: 'SPEC', title: 'Special/nonstandard-format callsign (58-bit encoding)', style: BADGE_STYLE.blue }
   }
-  return null;
+  return null
 }
 
 function formatKm(km: number): string {
-  return `${Math.round(km).toLocaleString('en-US')} km`;
+  return `${Math.round(km).toLocaleString('en-US')} km`
 }
 
 
@@ -132,490 +120,570 @@ function formatKm(km: number): string {
 function conversationWith(contact: Contact, peer: string): ContactMsg[] {
   return contact.msgs
     .filter(m => {
-      const other = m.role === 'tx' ? m.parsed.callee : m.parsed.caller;
-      return other === peer || m.parsed.caller === peer;
+      const other = m.role === 'tx' ? m.parsed.callee : m.parsed.caller
+      return other === peer || m.parsed.caller === peer
     })
-    .sort((a, b) => a.windowStart.getTime() - b.windowStart.getTime());
+    .sort((a, b) => a.windowStart.getTime() - b.windowStart.getTime())
 }
 
 // Partial handshake: the contact transmitted to the peer AND received from the peer
 function isHandshake(contact: Contact, peer: string): boolean {
-  const msgs = conversationWith(contact, peer);
-  const sentToPeer       = msgs.some(m => m.role === 'tx' && m.parsed.callee === peer);
-  const receivedFromPeer = msgs.some(m => m.role === 'rx' && m.parsed.caller === peer);
-  return sentToPeer && receivedFromPeer;
+  const msgs = conversationWith(contact, peer)
+  const sentToPeer       = msgs.some(m => m.role === 'tx' && m.parsed.callee === peer)
+  const receivedFromPeer = msgs.some(m => m.role === 'rx' && m.parsed.caller === peer)
+  return sentToPeer && receivedFromPeer
 }
 
 // Full QSO: handshake confirmed AND a signal report was exchanged AND the
 // conversation ended with a sign-off (RR73 / RRR / 73)
 function isFullQSO(contact: Contact, peer: string): boolean {
-  if (!isHandshake(contact, peer)) return false;
-  const types = conversationWith(contact, peer).map(m => m.parsed.type);
-  const hasReport  = types.includes('report') || types.includes('r_report');
-  const hasSignOff = types.includes('rr73') || types.includes('rrr') || types.includes('tx73');
-  return hasReport && hasSignOff;
+  if (!isHandshake(contact, peer)) return false
+  const types = conversationWith(contact, peer).map(m => m.parsed.type)
+  const hasReport  = types.includes('report') || types.includes('r_report')
+  const hasSignOff = types.includes('rr73') || types.includes('rrr') || types.includes('tx73')
+  return hasReport && hasSignOff
 }
 
 function longestDistances(contact: Contact, contactMap: Map<string, Contact>) {
-  let tx: { km: number; peer: string } | null = null;
-  let rx: { km: number; peer: string } | null = null;
-  if (!contact.latLon) return { tx, rx };
+  let tx: { km: number; peer: string } | null = null
+  let rx: { km: number; peer: string } | null = null
+  if (!contact.latLon) return { tx, rx }
   for (const m of contact.msgs) {
-    const peer    = m.role === 'tx' ? m.parsed.callee : m.parsed.caller;
-    const peerLoc = peer ? contactMap.get(peer)?.latLon : undefined;
-    if (!peer || !peerLoc) continue;
-    const km = haversineKm(contact.latLon, peerLoc);
-    if (m.role === 'tx') { if (!tx || km > tx.km) tx = { km, peer }; }
-    else                 { if (!rx || km > rx.km) rx = { km, peer }; }
+    const peer    = m.role === 'tx' ? m.parsed.callee : m.parsed.caller
+    const peerLoc = peer ? contactMap.get(peer)?.latLon : undefined
+    if (!peer || !peerLoc) continue
+    const km = haversineKm(contact.latLon, peerLoc)
+    if (m.role === 'tx') { if (!tx || km > tx.km) tx = { km, peer } }
+    else                 { if (!rx || km > rx.km) rx = { km, peer } }
   }
-  return { tx, rx };
+  return { tx, rx }
 }
 
 // ── Conversation balloon (portal — renders above all card overflow) ────────────
 
-function ConversationBalloon({
-  contact, peer, contactMap, pos,
-}: {
-  contact: Contact;
-  peer: string;
-  contactMap: Map<string, Contact>;
-  pos: { top: number; left: number };
-}) {
-  const msgs        = conversationWith(contact, peer);
-  const peerContact = contactMap.get(peer);
-  const handshake   = isHandshake(contact, peer);
-  const fullQSO     = isFullQSO(contact, peer);
+function ConversationBalloon(props: {
+  contact: Contact
+  peer: string
+  contactMap: Map<string, Contact>
+  pos: { top: number; left: number }
+}): JSX.Element | null {
+  const msgs        = createMemo(() => conversationWith(props.contact, props.peer))
+  const peerContact  = createMemo(() => props.contactMap.get(props.peer))
+  const handshake    = createMemo(() => isHandshake(props.contact, props.peer))
+  const fullQSO      = createMemo(() => isFullQSO(props.contact, props.peer))
 
-  if (!msgs.length) return null;
-
-  return createPortal(
-    <div
-      className="fixed z-[9999] w-72 bg-[#161b22] border border-[#30363d] rounded-lg shadow-2xl p-2.5 pointer-events-none"
-      style={{ top: pos.top, left: pos.left }}
-    >
-      <div className="flex items-center gap-1.5 mb-1.5 border-b border-[#21262d] pb-1.5">
-        <span className="font-mono font-bold text-[11px]" style={{ color: contact.color }}>
-          {contact.callsign}
-        </span>
-        <span className="text-[#484f58] text-[10px]">↔</span>
-        <span className="font-mono font-bold text-[11px]" style={{ color: peerContact?.color ?? '#8b949e' }}>
-          {peer}
-        </span>
-        {fullQSO ? (
-          <span className="ml-auto text-[10px]" title="Full QSO — report exchanged and signed off">⭐</span>
-        ) : handshake ? (
-          <span className="ml-auto text-[10px]" title="Partial handshake — both sides transmitted">🤝</span>
-        ) : null}
-      </div>
-      <div className="space-y-0.5 max-h-52 overflow-y-auto">
-        {msgs.map((m, i) => {
-          const isTx = m.role === 'tx';
-          return (
-            <div key={i} className="flex items-start gap-1.5 font-mono text-[9px]">
-              <span className="text-[#30363d] shrink-0 w-[44px]">{localHMS(m.windowStart)}</span>
-              <span className="text-[#484f58] shrink-0 w-[60px]" title="Frequency">
-                {formatMsgFreq(m.freq)}
-              </span>
-              <span
-                className="shrink-0 px-1 rounded text-[8px] font-bold"
-                style={{
-                  background: `${MSG_TYPE_COLOR[m.parsed.type]}1a`,
-                  color: MSG_TYPE_COLOR[m.parsed.type],
-                }}
-              >
-                {isTx ? '▶' : '◀'}{MSG_TYPE_LABEL[m.parsed.type]}
-              </span>
-              <span
-                className="truncate"
-                style={{ color: isTx ? contact.color : peerContact?.color ?? '#8b949e', opacity: 0.9 }}
-              >
-                {m.raw}
-              </span>
-            </div>
-          );
-        })}
-      </div>
-    </div>,
-    document.body,
-  );
+  return (
+    <Show when={msgs().length > 0}>
+      <Portal mount={document.body}>
+        <div
+          class="fixed z-[9999] w-72 bg-[#161b22] border border-[#30363d] rounded-lg shadow-2xl p-2.5 pointer-events-none"
+          style={{ top: `${props.pos.top}px`, left: `${props.pos.left}px` }}
+        >
+          <div class="flex items-center gap-1.5 mb-1.5 border-b border-[#21262d] pb-1.5">
+            <span class="font-mono font-bold text-[11px]" style={{ color: props.contact.color }}>
+              {props.contact.callsign}
+            </span>
+            <span class="text-[#484f58] text-[10px]">↔</span>
+            <span class="font-mono font-bold text-[11px]" style={{ color: peerContact()?.color ?? '#8b949e' }}>
+              {props.peer}
+            </span>
+            <Show when={fullQSO()} fallback={
+              <Show when={handshake()}>
+                <span class="ml-auto text-[10px]" title="Partial handshake — both sides transmitted">🤝</span>
+              </Show>
+            }>
+              <span class="ml-auto text-[10px]" title="Full QSO — report exchanged and signed off">⭐</span>
+            </Show>
+          </div>
+          <div class="space-y-0.5 max-h-52 overflow-y-auto">
+            <For each={msgs()}>
+              {(m) => {
+                const isTx = m.role === 'tx'
+                return (
+                  <div class="flex items-start gap-1.5 font-mono text-[9px]">
+                    <span class="text-[#30363d] shrink-0 w-[44px]">{localHMS(m.windowStart)}</span>
+                    <span class="text-[#484f58] shrink-0 w-[60px]" title="Frequency">
+                      {formatMsgFreq(m.freq)}
+                    </span>
+                    <span
+                      class="shrink-0 px-1 rounded text-[8px] font-bold"
+                      style={{
+                        background: `${MSG_TYPE_COLOR[m.parsed.type]}1a`,
+                        color: MSG_TYPE_COLOR[m.parsed.type],
+                      }}
+                    >
+                      {isTx ? '▶' : '◀'}{MSG_TYPE_LABEL[m.parsed.type]}
+                    </span>
+                    <span
+                      class="truncate"
+                      style={{ color: isTx ? props.contact.color : peerContact()?.color ?? '#8b949e', opacity: 0.9 }}
+                    >
+                      {m.raw}
+                    </span>
+                  </div>
+                )
+              }}
+            </For>
+          </div>
+        </div>
+      </Portal>
+    </Show>
+  )
 }
 
 // ── Contact card ──────────────────────────────────────────────────────────────
 
-function ContactCard({
-  contact, expanded, onToggle, onSelect, contactMap, myCall = '', newFraction = 0,
-}: {
-  contact: Contact;
-  expanded: boolean;
-  onToggle: () => void;
-  onSelect: (callsign: string) => void;
-  contactMap: Map<string, Contact>;
-  myCall?: string;
+function PeerChip(props: {
+  peer: string
+  contact: Contact
+  contactMap: Map<string, Contact>
+  onSelect: (callsign: string) => void
+  onPeerEnter: (p: string) => void
+  onPeerLeave: () => void
+  hoveredPeer: string | null
+  balloonPos: { top: number; left: number } | null
+}): JSX.Element {
+  const pc = createMemo(() => props.contactMap.get(props.peer))
+  return (
+    <span class="inline-block">
+      <button
+        onClick={() => props.onSelect(props.peer)}
+        onMouseEnter={() => props.onPeerEnter(props.peer)}
+        onMouseLeave={props.onPeerLeave}
+        class="text-[9px] font-mono font-bold hover:underline"
+        style={{ color: pc()?.color ?? '#8b949e' }}
+      >
+        {props.peer}{pc()?.grid ? ` ${pc()!.grid}` : ''}
+      </button>
+      <Show when={props.hoveredPeer === props.peer && props.balloonPos}>
+        <ConversationBalloon
+          contact={props.contact}
+          peer={props.peer}
+          contactMap={props.contactMap}
+          pos={props.balloonPos!}
+        />
+      </Show>
+    </span>
+  )
+}
+
+function ContactCard(props: {
+  contact: Contact
+  expanded: boolean
+  onToggle: () => void
+  onSelect: (callsign: string) => void
+  contactMap: Map<string, Contact>
+  myCall?: string
   /** 1 = just added, fading to 0 over the decode window; 0 = no highlight. */
-  newFraction?: number;
-}) {
-  const [hoveredPeer, setHoveredPeer] = useState<string | null>(null);
-  const [balloonPos,  setBalloonPos]  = useState<{ top: number; left: number } | null>(null);
-  const hoverTimeout                  = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const cursorRef                     = useRef<{ x: number; y: number }>({ x: 0, y: 0 });
+  newFraction?: number
+}): JSX.Element {
+  const [hoveredPeer, setHoveredPeer] = createSignal<string | null>(null)
+  const [balloonPos,  setBalloonPos]  = createSignal<{ top: number; left: number } | null>(null)
+  let hoverTimeout: ReturnType<typeof setTimeout> | null = null
+  let cursor = { x: 0, y: 0 }
 
   // Track cursor position precisely — read synchronously in hover handler
-  useEffect(() => {
-    const update = (e: MouseEvent) => { cursorRef.current = { x: e.clientX, y: e.clientY }; };
-    window.addEventListener('mousemove', update, { passive: true });
-    return () => window.removeEventListener('mousemove', update);
-  }, []);
+  onMount(() => {
+    const update = (e: MouseEvent) => { cursor = { x: e.clientX, y: e.clientY } }
+    window.addEventListener('mousemove', update, { passive: true })
+    onCleanup(() => window.removeEventListener('mousemove', update))
+  })
 
   const handlePeerEnter = (p: string) => {
-    if (hoverTimeout.current) clearTimeout(hoverTimeout.current);
-    const { x: cx, y: cy } = cursorRef.current;
-    const vh  = window.innerHeight;
-    const vw  = window.innerWidth;
-    const bH  = 280;
-    const bW  = 288; // w-72 = 18rem
-    const top  = cy + 20 + bH > vh ? Math.max(4, cy - bH - 4) : cy + 20;
-    const left = cx + 20 + bW > vw ? Math.max(4, cx - bW - 4) : cx + 20;
-    setBalloonPos({ top, left });
-    setHoveredPeer(p);
-  };
-  const handlePeerLeave = () => {
-    hoverTimeout.current = setTimeout(() => {
-      setHoveredPeer(null);
-      setBalloonPos(null);
-    }, 120);
-  };
-
-  const txMsgs = contact.msgs.filter(m => m.role === 'tx');
-  const rxMsgs = contact.msgs.filter(m => m.role === 'rx');
-
-  const groups: ContactMsg[][] = [];
-  for (const m of contact.msgs) {
-    const last = groups[groups.length - 1];
-    if (last && last[0].raw === m.raw && last[0].role === m.role) last.push(m);
-    else groups.push([m]);
+    if (hoverTimeout) clearTimeout(hoverTimeout)
+    const { x: cx, y: cy } = cursor
+    const vh  = window.innerHeight
+    const vw  = window.innerWidth
+    const bH  = 280
+    const bW  = 288 // w-72 = 18rem
+    const top  = cy + 20 + bH > vh ? Math.max(4, cy - bH - 4) : cy + 20
+    const left = cx + 20 + bW > vw ? Math.max(4, cx - bW - 4) : cx + 20
+    setBalloonPos({ top, left })
+    setHoveredPeer(p)
   }
-  const history = groups.slice(-12);
+  const handlePeerLeave = () => {
+    hoverTimeout = setTimeout(() => {
+      setHoveredPeer(null)
+      setBalloonPos(null)
+    }, 120)
+  }
 
-  const locParts = locationParts(contact);
-  const longest = expanded ? longestDistances(contact, contactMap) : { tx: null, rx: null };
-  const badge = callsignBadge(contact.callsign);
+  const txMsgs = createMemo(() => props.contact.msgs.filter(m => m.role === 'tx'))
+  const rxMsgs = createMemo(() => props.contact.msgs.filter(m => m.role === 'rx'))
+
+  const groups = createMemo(() => {
+    const g: ContactMsg[][] = []
+    for (const m of props.contact.msgs) {
+      const last = g[g.length - 1]
+      if (last && last[0].raw === m.raw && last[0].role === m.role) last.push(m)
+      else g.push([m])
+    }
+    return g
+  })
+  const history = createMemo(() => groups().slice(-12))
+
+  const locParts = createMemo(() => locationParts(props.contact))
+  const longest = createMemo(() => props.expanded ? longestDistances(props.contact, props.contactMap) : { tx: null, rx: null })
+  const badge = createMemo(() => callsignBadge(props.contact.callsign))
 
   // Split peers into groups
-  const receivedFrom = new Set<string>();
-  const repliedTo    = new Set<string>();
-  for (const m of contact.msgs) {
-    const peer = m.role === 'tx' ? m.parsed.callee : m.parsed.caller;
-    if (!peer || peer === contact.callsign) continue;
-    if (m.role === 'tx') repliedTo.add(peer);
-    else receivedFrom.add(peer);
-  }
-  const handshakes = new Set(
-    Array.from(repliedTo).filter(p => receivedFrom.has(p) && isHandshake(contact, p))
-  );
-  const fullQSOs = new Set(
-    Array.from(handshakes).filter(p => isFullQSO(contact, p))
-  );
+  const peerGroups = createMemo(() => {
+    const receivedFrom = new Set<string>()
+    const repliedTo    = new Set<string>()
+    for (const m of props.contact.msgs) {
+      const peer = m.role === 'tx' ? m.parsed.callee : m.parsed.caller
+      if (!peer || peer === props.contact.callsign) continue
+      if (m.role === 'tx') repliedTo.add(peer)
+      else receivedFrom.add(peer)
+    }
+    const handshakes = new Set(
+      Array.from(repliedTo).filter(p => receivedFrom.has(p) && isHandshake(props.contact, p))
+    )
+    const fullQSOs = new Set(
+      Array.from(handshakes).filter(p => isFullQSO(props.contact, p))
+    )
+    return { receivedFrom, repliedTo, handshakes, fullQSOs }
+  })
 
   // QSO status with the local operator
-  const myCallUp   = myCall.toUpperCase();
-  const myQSOFull  = myCallUp ? isFullQSO(contact, myCallUp) : false;
-  const myQSOPart  = myCallUp && !myQSOFull ? isHandshake(contact, myCallUp) : false;
-
-  function PeerChip({ peer }: { peer: string }) {
-    const pc = contactMap.get(peer);
-    return (
-      <span className="inline-block">
-        <button
-          onClick={() => onSelect(peer)}
-          onMouseEnter={() => handlePeerEnter(peer)}
-          onMouseLeave={handlePeerLeave}
-          className="text-[9px] font-mono font-bold hover:underline"
-          style={{ color: pc?.color ?? '#8b949e' }}
-        >
-          {peer}{pc?.grid ? ` ${pc.grid}` : ''}
-        </button>
-        {hoveredPeer === peer && balloonPos && (
-          <ConversationBalloon
-            contact={contact}
-            peer={peer}
-            contactMap={contactMap}
-            pos={balloonPos}
-          />
-        )}
-      </span>
-    );
-  }
+  const myQSOFull = createMemo(() => {
+    const myCallUp = (props.myCall ?? '').toUpperCase()
+    return myCallUp ? isFullQSO(props.contact, myCallUp) : false
+  })
+  const myQSOPart = createMemo(() => {
+    const myCallUp = (props.myCall ?? '').toUpperCase()
+    return myCallUp && !myQSOFull() ? isHandshake(props.contact, myCallUp) : false
+  })
 
   return (
     <div
-      className="mb-1.5 rounded-md border border-[#21262d] transition-shadow duration-500"
+      class="mb-1.5 rounded-md border border-[#21262d] transition-shadow duration-500"
       style={{
-        borderLeftColor: contact.color,
-        borderLeftWidth: '3px',
-        boxShadow: newFraction > 0 ? `0 0 0 1px ${contact.color}${Math.round(newFraction * 55).toString(16).padStart(2, '0')}` : undefined,
+        'border-left-color': props.contact.color,
+        'border-left-width': '3px',
+        'box-shadow': (props.newFraction ?? 0) > 0
+          ? `0 0 0 1px ${props.contact.color}${Math.round((props.newFraction ?? 0) * 55).toString(16).padStart(2, '0')}`
+          : undefined,
       }}
     >
       {/* Summary row */}
       <div
         role="button"
         tabIndex={0}
-        onClick={onToggle}
-        onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onToggle(); } }}
-        className="w-full text-left px-2.5 py-1.5 flex items-center gap-2 hover:bg-[#21262d]/40 transition-colors min-w-0 cursor-pointer"
+        onClick={props.onToggle}
+        onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); props.onToggle() } }}
+        class="w-full text-left px-2.5 py-1.5 flex items-center gap-2 hover:bg-[#21262d]/40 transition-colors min-w-0 cursor-pointer"
       >
         <a
-          href={qrzUrl(contact.callsign)}
+          href={qrzUrl(props.contact.callsign)}
           target="_blank"
           rel="noopener noreferrer"
           onClick={e => e.stopPropagation()}
-          title={`${contact.callsign} on QRZ.com`}
-          className="font-mono font-bold text-xs shrink-0 hover:underline"
-          style={{ color: contact.color }}
+          title={`${props.contact.callsign} on QRZ.com`}
+          class="font-mono font-bold text-xs shrink-0 hover:underline"
+          style={{ color: props.contact.color }}
         >
-          {contact.callsign}
+          {props.contact.callsign}
         </a>
-        {badge && (
+        <Show when={badge()}>
           <span
-            className="shrink-0 text-[9px] font-bold font-mono px-1 py-px rounded"
-            style={badge.style}
-            title={badge.title}
+            class="shrink-0 text-[9px] font-bold font-mono px-1 py-px rounded"
+            style={badge()!.style}
+            title={badge()!.title}
           >
-            {badge.text}
+            {badge()!.text}
           </span>
-        )}
+        </Show>
         {/* QSO badge — only shown when the local operator has exchanged with this station */}
-        {myQSOFull && (
+        <Show when={myQSOFull()}>
           <span
-            className="shrink-0 text-[9px] font-bold font-mono px-1 py-px rounded"
+            class="shrink-0 text-[9px] font-bold font-mono px-1 py-px rounded"
             style={{ background: 'rgba(46,160,67,0.15)', color: '#2ea043', border: '1px solid rgba(46,160,67,0.4)' }}
             title="Full QSO completed with you (signal reports + sign-off exchanged)"
           >
             QSO✓
           </span>
-        )}
-        {myQSOPart && (
+        </Show>
+        <Show when={myQSOPart()}>
           <span
-            className="shrink-0 text-[9px] font-bold font-mono px-1 py-px rounded"
+            class="shrink-0 text-[9px] font-bold font-mono px-1 py-px rounded"
             style={{ background: 'rgba(227,179,65,0.15)', color: '#e3b341', border: '1px solid rgba(227,179,65,0.4)' }}
             title="Partial QSO — exchange started but not fully signed off"
           >
             QSO…
           </span>
-        )}
-        {locParts && (
-          <span className="font-mono text-[10px] text-[#484f58] flex items-center gap-1 truncate min-w-0"
-            title={contact.grids.join(' · ')}>
-            {locParts.flag && (
-              <span title={locParts.country} className="not-italic">{locParts.flag}</span>
-            )}
-            {locParts.grids && <span>({locParts.grids})</span>}
+        </Show>
+        <Show when={locParts()}>
+          <span class="font-mono text-[10px] text-[#484f58] flex items-center gap-1 truncate min-w-0"
+            title={props.contact.grids.join(' · ')}>
+            <Show when={locParts()!.flag}>
+              <span title={locParts()!.country} class="not-italic">{locParts()!.flag}</span>
+            </Show>
+            <Show when={locParts()!.grids}>
+              <span>({locParts()!.grids})</span>
+            </Show>
           </span>
-        )}
-        <span className="flex-1 min-w-0" />
+        </Show>
+        <span class="flex-1 min-w-0" />
         <span
-          className="font-mono text-[11px] font-semibold text-[#2ea043] shrink-0"
+          class="font-mono text-[11px] font-semibold text-[#2ea043] shrink-0"
           title="Messages transmitted by this station"
         >
-          {txMsgs.length}tx
+          {txMsgs().length}tx
         </span>
         <span
-          className="font-mono text-[11px] font-semibold text-[#79c0ff] shrink-0"
+          class="font-mono text-[11px] font-semibold text-[#79c0ff] shrink-0"
           title="Messages addressed to this station"
         >
-          {rxMsgs.length}rx
+          {rxMsgs().length}rx
         </span>
         <span
-          className="font-mono text-[11px] font-semibold text-[#d2a8ff] shrink-0"
-          title={`Worked ${contact.peers.size} station${contact.peers.size === 1 ? '' : 's'}`}
+          class="font-mono text-[11px] font-semibold text-[#d2a8ff] shrink-0"
+          title={`Worked ${props.contact.peers.size} station${props.contact.peers.size === 1 ? '' : 's'}`}
         >
-          {contact.peers.size}w
+          {props.contact.peers.size}w
         </span>
         <svg
           viewBox="0 0 20 20" fill="currentColor"
-          className="shrink-0 text-[#484f58] ml-1 transition-transform duration-150"
-          style={{ width: 10, height: 10, transform: expanded ? 'rotate(180deg)' : 'rotate(0)' }}
+          class="shrink-0 text-[#484f58] ml-1 transition-transform duration-150"
+          style={{ width: '10px', height: '10px', transform: props.expanded ? 'rotate(180deg)' : 'rotate(0)' }}
         >
-          <path fillRule="evenodd" d="M5.293 7.293a1 1 0 011.414 0L10 10.586l3.293-3.293a1 1 0 111.414 1.414l-4 4a1 1 0 01-1.414 0l-4-4a1 1 0 010-1.414z" clipRule="evenodd" />
+          <path fill-rule="evenodd" d="M5.293 7.293a1 1 0 011.414 0L10 10.586l3.293-3.293a1 1 0 111.414 1.414l-4 4a1 1 0 01-1.414 0l-4-4a1 1 0 010-1.414z" clip-rule="evenodd" />
         </svg>
       </div>
 
       {/* Expanded history */}
-      {expanded && (
-        <div className="border-t border-[#21262d] bg-[#0d1117]/70 px-2.5 py-2">
-          {contact.grids.length > 1 && (
-            <div className="mb-1.5 pb-1.5 border-b border-[#21262d] text-[10px] font-mono flex items-center gap-1.5 flex-wrap">
-              <span className="text-[#484f58]">grids:</span>
-              {contact.grids.map(g => (
-                <span key={g} className={g === contact.grid ? 'text-[#c9d1d9] font-bold' : 'text-[#8b949e]'}
-                  title={g === contact.grid ? 'Most recent locator' : undefined}>
-                  {g}
-                </span>
-              ))}
+      <Show when={props.expanded}>
+        <div class="border-t border-[#21262d] bg-[#0d1117]/70 px-2.5 py-2">
+          <Show when={props.contact.grids.length > 1}>
+            <div class="mb-1.5 pb-1.5 border-b border-[#21262d] text-[10px] font-mono flex items-center gap-1.5 flex-wrap">
+              <span class="text-[#484f58]">grids:</span>
+              <For each={props.contact.grids}>
+                {(g) => (
+                  <span class={g === props.contact.grid ? 'text-[#c9d1d9] font-bold' : 'text-[#8b949e]'}
+                    title={g === props.contact.grid ? 'Most recent locator' : undefined}>
+                    {g}
+                  </span>
+                )}
+              </For>
             </div>
-          )}
+          </Show>
 
-          {(longest.tx || longest.rx) && (
-            <div className="mb-1.5 pb-1.5 border-b border-[#21262d] text-[10px] font-mono flex flex-wrap gap-x-3 gap-y-0.5">
-              {longest.tx && (
+          <Show when={longest().tx || longest().rx}>
+            <div class="mb-1.5 pb-1.5 border-b border-[#21262d] text-[10px] font-mono flex flex-wrap gap-x-3 gap-y-0.5">
+              <Show when={longest().tx}>
                 <span title="Longest transmission — distance to the addressed station">
-                  <span className="text-[#2ea043]">longest tx:</span>{' '}
-                  <span className="text-[#c9d1d9]">{formatKm(longest.tx.km)}</span>{' '}
-                  <button onClick={() => onSelect(longest.tx!.peer)}
-                    className="font-bold hover:underline"
-                    style={{ color: contactMap.get(longest.tx.peer)?.color ?? '#8b949e' }}>
-                    → {longest.tx.peer}
+                  <span class="text-[#2ea043]">longest tx:</span>{' '}
+                  <span class="text-[#c9d1d9]">{formatKm(longest().tx!.km)}</span>{' '}
+                  <button onClick={() => props.onSelect(longest().tx!.peer)}
+                    class="font-bold hover:underline"
+                    style={{ color: props.contactMap.get(longest().tx!.peer)?.color ?? '#8b949e' }}>
+                    → {longest().tx!.peer}
                   </button>
                 </span>
-              )}
-              {longest.rx && (
+              </Show>
+              <Show when={longest().rx}>
                 <span title="Longest reception — distance to the transmitting station">
-                  <span className="text-[#79c0ff]">longest rx:</span>{' '}
-                  <span className="text-[#c9d1d9]">{formatKm(longest.rx.km)}</span>{' '}
-                  <button onClick={() => onSelect(longest.rx!.peer)}
-                    className="font-bold hover:underline"
-                    style={{ color: contactMap.get(longest.rx.peer)?.color ?? '#8b949e' }}>
-                    ← {longest.rx.peer}
+                  <span class="text-[#79c0ff]">longest rx:</span>{' '}
+                  <span class="text-[#c9d1d9]">{formatKm(longest().rx!.km)}</span>{' '}
+                  <button onClick={() => props.onSelect(longest().rx!.peer)}
+                    class="font-bold hover:underline"
+                    style={{ color: props.contactMap.get(longest().rx!.peer)?.color ?? '#8b949e' }}>
+                    ← {longest().rx!.peer}
                   </button>
                 </span>
-              )}
+              </Show>
             </div>
-          )}
+          </Show>
 
-          {history.length === 0 ? (
-            <p className="text-[10px] font-mono text-[#484f58]">no messages</p>
-          ) : (
-            <div className="space-y-1">
-              {history.map((group, i) => {
-                const m      = group[group.length - 1];
-                const isTx   = m.role === 'tx';
-                const peerCs = isTx ? m.parsed.callee : m.parsed.caller;
-                const peerColor    = peerCs ? contactMap.get(peerCs)?.color : undefined;
-                const repeatsTitle = group.map(g => `${localHMS(g.windowStart)}  ${g.raw}`).join('\n');
-                const gridLoc  = m.parsed.grid ? gridToLatLon(m.parsed.grid) : null;
-                const otherLoc = isTx
-                  ? (peerCs ? contactMap.get(peerCs)?.latLon : undefined)
-                  : contact.latLon;
-                const km = gridLoc && otherLoc ? haversineKm(gridLoc, otherLoc) : null;
-                return (
-                  <div key={i} className="font-mono text-[10px] flex items-center gap-1.5 min-w-0">
-                    <span className="text-[#30363d] shrink-0 w-[56px]">{localHMS(m.windowStart)}</span>
-                    <span className="text-[#484f58] shrink-0 w-[60px]" title="Frequency">
-                      {formatMsgFreq(m.freq)}
-                    </span>
-                    {isTx ? (
+          <Show when={history().length > 0} fallback={
+            <p class="text-[10px] font-mono text-[#484f58]">no messages</p>
+          }>
+            <div class="space-y-1">
+              <For each={history()}>
+                {(group) => {
+                  const m      = group[group.length - 1]
+                  const isTx   = m.role === 'tx'
+                  const peerCs = isTx ? m.parsed.callee : m.parsed.caller
+                  const peerColor    = peerCs ? props.contactMap.get(peerCs)?.color : undefined
+                  const repeatsTitle = group.map(g => `${localHMS(g.windowStart)}  ${g.raw}`).join('\n')
+                  const gridLoc  = m.parsed.grid ? gridToLatLon(m.parsed.grid) : null
+                  const otherLoc = isTx
+                    ? (peerCs ? props.contactMap.get(peerCs)?.latLon : undefined)
+                    : props.contact.latLon
+                  const km = gridLoc && otherLoc ? haversineKm(gridLoc, otherLoc) : null
+                  return (
+                    <div class="font-mono text-[10px] flex items-center gap-1.5 min-w-0">
+                      <span class="text-[#30363d] shrink-0 w-[56px]">{localHMS(m.windowStart)}</span>
+                      <span class="text-[#484f58] shrink-0 w-[60px]" title="Frequency">
+                        {formatMsgFreq(m.freq)}
+                      </span>
+                      <Show when={isTx} fallback={
+                        <span
+                          class="shrink-0 px-1 py-px rounded text-[8px] font-bold w-[34px] text-center border"
+                          style={{
+                            background: `${MSG_TYPE_COLOR[m.parsed.type]}11`,
+                            color: MSG_TYPE_COLOR[m.parsed.type],
+                            'border-color': `${MSG_TYPE_COLOR[m.parsed.type]}30`,
+                          }}
+                        >
+                          ←{MSG_TYPE_LABEL[m.parsed.type]}
+                        </span>
+                      }>
+                        <span
+                          class="shrink-0 px-1 py-px rounded text-[8px] font-bold w-[34px] text-center"
+                          style={{ background: `${MSG_TYPE_COLOR[m.parsed.type]}1a`, color: MSG_TYPE_COLOR[m.parsed.type] }}
+                        >
+                          {MSG_TYPE_LABEL[m.parsed.type]}
+                        </span>
+                      </Show>
                       <span
-                        className="shrink-0 px-1 py-px rounded text-[8px] font-bold w-[34px] text-center"
-                        style={{ background: `${MSG_TYPE_COLOR[m.parsed.type]}1a`, color: MSG_TYPE_COLOR[m.parsed.type] }}
+                        class="text-[#8b949e] truncate"
+                        title={group.length > 1 ? repeatsTitle : m.raw}
+                        style={{ color: isTx ? props.contact.color : peerColor ?? '#8b949e', opacity: isTx ? 0.85 : 0.55 }}
                       >
-                        {MSG_TYPE_LABEL[m.parsed.type]}
+                        {m.raw}
                       </span>
-                    ) : (
-                      <span
-                        className="shrink-0 px-1 py-px rounded text-[8px] font-bold w-[34px] text-center border"
-                        style={{
-                          background: `${MSG_TYPE_COLOR[m.parsed.type]}11`,
-                          color: MSG_TYPE_COLOR[m.parsed.type],
-                          borderColor: `${MSG_TYPE_COLOR[m.parsed.type]}30`,
-                        }}
-                      >
-                        ←{MSG_TYPE_LABEL[m.parsed.type]}
-                      </span>
-                    )}
-                    <span
-                      className="text-[#8b949e] truncate"
-                      title={group.length > 1 ? repeatsTitle : m.raw}
-                      style={{ color: isTx ? contact.color : peerColor ?? '#8b949e', opacity: isTx ? 0.85 : 0.55 }}
-                    >
-                      {m.raw}
-                    </span>
-                    {km !== null && (
-                      <span className="shrink-0 text-[9px] text-[#484f58]">{formatKm(km)}</span>
-                    )}
-                    {group.length > 1 && (
-                      <span className="shrink-0 px-1 py-px rounded text-[8px] font-bold bg-[#30363d] text-[#8b949e] cursor-help" title={repeatsTitle}>
-                        ×{group.length}
-                      </span>
-                    )}
-                  </div>
-                );
-              })}
+                      <Show when={km !== null}>
+                        <span class="shrink-0 text-[9px] text-[#484f58]">{formatKm(km!)}</span>
+                      </Show>
+                      <Show when={group.length > 1}>
+                        <span class="shrink-0 px-1 py-px rounded text-[8px] font-bold bg-[#30363d] text-[#8b949e] cursor-help" title={repeatsTitle}>
+                          ×{group.length}
+                        </span>
+                      </Show>
+                    </div>
+                  )
+                }}
+              </For>
             </div>
-          )}
+          </Show>
 
           {/* Peers — grouped as Full QSOs / Handshakes / Received from / Replied to */}
-          {contact.peers.size > 0 && (
-            <div className="mt-2 pt-1.5 border-t border-[#21262d] space-y-1.5">
-              {fullQSOs.size > 0 && (
+          <Show when={props.contact.peers.size > 0}>
+            <div class="mt-2 pt-1.5 border-t border-[#21262d] space-y-1.5">
+              <Show when={peerGroups().fullQSOs.size > 0}>
                 <div>
-                  <span className="text-[9px] text-[#e3b341] font-mono font-semibold block mb-0.5">
-                    ⭐ full QSO ({fullQSOs.size})
+                  <span class="text-[9px] text-[#e3b341] font-mono font-semibold block mb-0.5">
+                    ⭐ full QSO ({peerGroups().fullQSOs.size})
                   </span>
-                  <div className="flex flex-wrap gap-x-2 gap-y-0.5 pl-3">
-                    {Array.from(fullQSOs).map(p => <PeerChip key={p} peer={p} />)}
+                  <div class="flex flex-wrap gap-x-2 gap-y-0.5 pl-3">
+                    <For each={Array.from(peerGroups().fullQSOs)}>
+                      {(p) => (
+                        <PeerChip
+                          peer={p}
+                          contact={props.contact}
+                          contactMap={props.contactMap}
+                          onSelect={props.onSelect}
+                          onPeerEnter={handlePeerEnter}
+                          onPeerLeave={handlePeerLeave}
+                          hoveredPeer={hoveredPeer()}
+                          balloonPos={balloonPos()}
+                        />
+                      )}
+                    </For>
                   </div>
                 </div>
-              )}
+              </Show>
 
-              {Array.from(handshakes).some(p => !fullQSOs.has(p)) && (
+              <Show when={Array.from(peerGroups().handshakes).some(p => !peerGroups().fullQSOs.has(p))}>
                 <div>
-                  <span className="text-[9px] text-[#d2a8ff] font-mono font-semibold block mb-0.5">
-                    🤝 handshake ({Array.from(handshakes).filter(p => !fullQSOs.has(p)).length})
+                  <span class="text-[9px] text-[#d2a8ff] font-mono font-semibold block mb-0.5">
+                    🤝 handshake ({Array.from(peerGroups().handshakes).filter(p => !peerGroups().fullQSOs.has(p)).length})
                   </span>
-                  <div className="flex flex-wrap gap-x-2 gap-y-0.5 pl-3">
-                    {Array.from(handshakes).filter(p => !fullQSOs.has(p)).map(p => <PeerChip key={p} peer={p} />)}
+                  <div class="flex flex-wrap gap-x-2 gap-y-0.5 pl-3">
+                    <For each={Array.from(peerGroups().handshakes).filter(p => !peerGroups().fullQSOs.has(p))}>
+                      {(p) => (
+                        <PeerChip
+                          peer={p}
+                          contact={props.contact}
+                          contactMap={props.contactMap}
+                          onSelect={props.onSelect}
+                          onPeerEnter={handlePeerEnter}
+                          onPeerLeave={handlePeerLeave}
+                          hoveredPeer={hoveredPeer()}
+                          balloonPos={balloonPos()}
+                        />
+                      )}
+                    </For>
                   </div>
                 </div>
-              )}
+              </Show>
 
-              {receivedFrom.size > 0 && Array.from(receivedFrom).some(p => !handshakes.has(p)) && (
+              <Show when={peerGroups().receivedFrom.size > 0 && Array.from(peerGroups().receivedFrom).some(p => !peerGroups().handshakes.has(p))}>
                 <div>
-                  <span className="text-[9px] text-[#79c0ff] font-mono font-semibold block mb-0.5">
-                    ← received from ({Array.from(receivedFrom).filter(p => !handshakes.has(p)).length})
+                  <span class="text-[9px] text-[#79c0ff] font-mono font-semibold block mb-0.5">
+                    ← received from ({Array.from(peerGroups().receivedFrom).filter(p => !peerGroups().handshakes.has(p)).length})
                   </span>
-                  <div className="flex flex-wrap gap-x-2 gap-y-0.5 pl-3">
-                    {Array.from(receivedFrom).filter(p => !handshakes.has(p)).map(p => <PeerChip key={p} peer={p} />)}
+                  <div class="flex flex-wrap gap-x-2 gap-y-0.5 pl-3">
+                    <For each={Array.from(peerGroups().receivedFrom).filter(p => !peerGroups().handshakes.has(p))}>
+                      {(p) => (
+                        <PeerChip
+                          peer={p}
+                          contact={props.contact}
+                          contactMap={props.contactMap}
+                          onSelect={props.onSelect}
+                          onPeerEnter={handlePeerEnter}
+                          onPeerLeave={handlePeerLeave}
+                          hoveredPeer={hoveredPeer()}
+                          balloonPos={balloonPos()}
+                        />
+                      )}
+                    </For>
                   </div>
                 </div>
-              )}
+              </Show>
 
-              {repliedTo.size > 0 && Array.from(repliedTo).some(p => !handshakes.has(p)) && (
+              <Show when={peerGroups().repliedTo.size > 0 && Array.from(peerGroups().repliedTo).some(p => !peerGroups().handshakes.has(p))}>
                 <div>
-                  <span className="text-[9px] text-[#2ea043] font-mono font-semibold block mb-0.5">
-                    → replied to ({Array.from(repliedTo).filter(p => !handshakes.has(p)).length})
+                  <span class="text-[9px] text-[#2ea043] font-mono font-semibold block mb-0.5">
+                    → replied to ({Array.from(peerGroups().repliedTo).filter(p => !peerGroups().handshakes.has(p)).length})
                   </span>
-                  <div className="flex flex-wrap gap-x-2 gap-y-0.5 pl-3">
-                    {Array.from(repliedTo).filter(p => !handshakes.has(p)).map(p => <PeerChip key={p} peer={p} />)}
+                  <div class="flex flex-wrap gap-x-2 gap-y-0.5 pl-3">
+                    <For each={Array.from(peerGroups().repliedTo).filter(p => !peerGroups().handshakes.has(p))}>
+                      {(p) => (
+                        <PeerChip
+                          peer={p}
+                          contact={props.contact}
+                          contactMap={props.contactMap}
+                          onSelect={props.onSelect}
+                          onPeerEnter={handlePeerEnter}
+                          onPeerLeave={handlePeerLeave}
+                          hoveredPeer={hoveredPeer()}
+                          balloonPos={balloonPos()}
+                        />
+                      )}
+                    </For>
                   </div>
                 </div>
-              )}
+              </Show>
             </div>
-          )}
+          </Show>
         </div>
-      )}
+      </Show>
     </div>
-  );
+  )
 }
 
 // ── Panel ─────────────────────────────────────────────────────────────────────
 
 interface Props {
-  contacts: Map<string, Contact>;
-  mode: FTMode;
-  myCall?: string;
-  myGrid?: string;
-  vfoHz?: number;
-  onClearContacts: () => void;
-  onImportADIF?: (content: string) => void;
-  focus?: { cs: string; n: number } | null;
+  contacts: Map<string, Contact>
+  mode: FTMode
+  myCall?: string
+  myGrid?: string
+  vfoHz?: number
+  onClearContacts: () => void
+  onImportADIF?: (content: string) => void
+  focus?: { cs: string; n: number } | null
 }
 
-type SortKey = 'date' | 'tx' | 'rx' | 'worked' | 'alpha' | 'snr-hi' | 'snr-lo' | 'near' | 'far';
-type QuickFilter = 'full-qso' | 'handshake' | 'tx-only' | 'rx-only'; // country handled by separate select
+type SortKey = 'date' | 'tx' | 'rx' | 'worked' | 'alpha' | 'snr-hi' | 'snr-lo' | 'near' | 'far'
+type QuickFilter = 'full-qso' | 'handshake' | 'tx-only' | 'rx-only' // country handled by separate select
 
 function loadContactsSortKey(): SortKey {
-  if (typeof window === 'undefined') return 'date';
-  const raw = localStorage.getItem(LS_CONTACTS_SORT_KEY);
-  return (CONTACTS_SORT_KEYS as readonly string[]).includes(raw ?? '') ? (raw as SortKey) : 'date';
+  const raw = localStorage.getItem(LS_CONTACTS_SORT_KEY)
+  return (CONTACTS_SORT_KEYS as readonly string[]).includes(raw ?? '') ? (raw as SortKey) : 'date'
 }
 
 const SORT_OPTIONS: Array<{ key: SortKey; label: string; title: string }> = [
@@ -628,321 +696,314 @@ const SORT_OPTIONS: Array<{ key: SortKey; label: string; title: string }> = [
   { key: 'near',   label: 'Nearest',  title: 'Geographically closest first (requires your grid)' },
   { key: 'far',    label: 'Farthest', title: 'Geographically farthest first (requires your grid)' },
   { key: 'alpha',  label: 'A–Z',      title: 'Alphabetical by callsign' },
-];
+]
 
-export default function FTContactsPanel({ contacts, mode, myCall = '', myGrid = '', vfoHz = 0, onClearContacts, onImportADIF, focus }: Props) {
-  const [expanded,       setExpanded]      = useState<string | null>(null);
-  // Sort prefs start at the SSR-safe default, restored from localStorage
-  // post-mount (see the mode-restore comment in page.tsx for why).
-  const [sortKey,        setSortKey]       = useState<SortKey>('date');
-  const [sortRev,        setSortRev]       = useState(false);
-  useEffect(() => {
-    setSortKey(loadContactsSortKey());
-    setSortRev(loadBoolean(LS_CONTACTS_SORT_REV, false));
-  }, []);
-  useEffect(() => { if (typeof window !== 'undefined') localStorage.setItem(LS_CONTACTS_SORT_KEY, sortKey); }, [sortKey]);
-  useEffect(() => { saveBoolean(LS_CONTACTS_SORT_REV, sortRev); }, [sortRev]);
-  const [query,          setQuery]         = useState('');
-  const [quickFilter,    setQuickFilter]   = useState<QuickFilter | null>(null);
-  const [countryFilter,  setCountryFilter] = useState<string>(''); // country code or ''
-  // Starts at the SSR-safe default, restored from localStorage post-mount.
-  const [mapHeight,     setMapHeight]     = useState(160);
-  useEffect(() => { setMapHeight(loadNumber(LS_MAP_HEIGHT, 160)); }, []);
-  useEffect(() => { saveNumber(LS_MAP_HEIGHT, mapHeight); }, [mapHeight]);
-  // Always starts false (matching what the server renders, since it has no
-  // localStorage) and is synced from storage in an effect below — reading
-  // localStorage directly in the initializer make the client's first render
-  // diverge from the server's whenever a prior visit had it saved as true,
-  // which is a React hydration-mismatch error, not just a cosmetic flash.
-  const [showTerminator, setShowTerminator] = useState(false);
-  useEffect(() => { setShowTerminator(loadShowTerminator()); }, []);
-  const [mapStyle, setMapStyle] = useState<MapTileStyle>('dark');
-  useEffect(() => { setMapStyle(loadMapStyle()); }, []);
-  const panelRef    = useRef<HTMLDivElement>(null);
-  const mapDragRef  = useRef<{ startY: number; startH: number } | null>(null);
+export default function FTContactsPanel(props: Props): JSX.Element {
+  const [expanded,       setExpanded]      = createSignal<string | null>(null)
+  const [sortKey,        setSortKey]       = createSignal<SortKey>(loadContactsSortKey())
+  const [sortRev,        setSortRev]       = createSignal(loadBoolean(LS_CONTACTS_SORT_REV, false))
+  createEffect(() => localStorage.setItem(LS_CONTACTS_SORT_KEY, sortKey()))
+  createEffect(() => saveBoolean(LS_CONTACTS_SORT_REV, sortRev()))
+  const [query,          setQuery]         = createSignal('')
+  const [quickFilter,    setQuickFilter]   = createSignal<QuickFilter | null>(null)
+  const [countryFilter,  setCountryFilter] = createSignal<string>('') // country code or ''
+  const [mapHeight,      setMapHeight]     = createSignal(loadNumber(LS_MAP_HEIGHT, 160))
+  createEffect(() => saveNumber(LS_MAP_HEIGHT, mapHeight()))
+  const [showTerminator, setShowTerminator] = createSignal(loadShowTerminator())
+  const [mapStyle, setMapStyle] = createSignal<MapTileStyle>(loadMapStyle())
+  let panelEl: HTMLDivElement | undefined
+  let mapDrag: { startY: number; startH: number } | null = null
 
   // "New contact" highlight — cards (and map markers) fade in a highlight for
   // one decode window after firstSeen. Ticks only while any contact is still
   // within that window, so the interval goes idle on a quiet band.
-  const windowMs = FT_WINDOW_SECONDS[mode] * 1000;
-  const [highlightTick, setHighlightTick] = useState(0);
-  useEffect(() => {
+  const windowMs = createMemo(() => FT_WINDOW_SECONDS[props.mode] * 1000)
+  const [highlightTick, setHighlightTick] = createSignal(0)
+  createEffect(() => {
+    const contacts = props.contacts
+    const wMs = windowMs()
+    void highlightTick()
     const hasRecent = () => {
-      const now = Date.now();
-      for (const c of contacts.values()) if (now - c.firstSeen.getTime() < windowMs) return true;
-      return false;
-    };
-    if (!hasRecent()) return;
-    const id = setInterval(() => setHighlightTick(t => t + 1), 250);
-    return () => clearInterval(id);
-  }, [contacts, windowMs, highlightTick]);
+      const now = Date.now()
+      for (const c of contacts.values()) if (now - c.firstSeen.getTime() < wMs) return true
+      return false
+    }
+    if (!hasRecent()) return
+    const id = setInterval(() => setHighlightTick(t => t + 1), 250)
+    onCleanup(() => clearInterval(id))
+  })
 
-  useEffect(() => {
+  onMount(() => {
     const onMove = (e: MouseEvent) => {
-      const d = mapDragRef.current;
-      if (!d || !panelRef.current) return;
-      const panelH = panelRef.current.offsetHeight;
-      const maxH   = Math.floor(panelH * 0.5);
-      const newH   = Math.max(80, Math.min(maxH, d.startH + (e.clientY - d.startY)));
-      setMapHeight(newH);
-    };
-    const onUp = () => { mapDragRef.current = null; };
-    window.addEventListener('mousemove', onMove);
-    window.addEventListener('mouseup',   onUp);
-    return () => { window.removeEventListener('mousemove', onMove); window.removeEventListener('mouseup', onUp); };
-  }, []);
+      const d = mapDrag
+      if (!d || !panelEl) return
+      const panelH = panelEl.offsetHeight
+      const maxH   = Math.floor(panelH * 0.5)
+      const newH   = Math.max(80, Math.min(maxH, d.startH + (e.clientY - d.startY)))
+      setMapHeight(newH)
+    }
+    const onUp = () => { mapDrag = null }
+    window.addEventListener('mousemove', onMove)
+    window.addEventListener('mouseup',   onUp)
+    onCleanup(() => { window.removeEventListener('mousemove', onMove); window.removeEventListener('mouseup', onUp) })
+  })
 
-  const select = useCallback((callsign: string) => {
-    if (contacts.has(callsign)) setExpanded(callsign);
-  }, [contacts]);
+  const select = (callsign: string) => {
+    if (props.contacts.has(callsign)) setExpanded(callsign)
+  }
 
   // ── Virtualized list plumbing ────────────────────────────────────────────
   // Collapsed cards have a fixed height; the (single) expanded card is
   // measured live so rows below it are positioned correctly.
-  const [expandedH, setExpandedH] = useState(EXPANDED_CARD_FALLBACK_H);
-  const [heightsVersion, setHeightsVersion] = useState(0);
-  useEffect(() => { setHeightsVersion(v => v + 1); }, [expanded, expandedH]);
+  const [expandedH, setExpandedH] = createSignal(EXPANDED_CARD_FALLBACK_H)
+  const [heightsVersion, setHeightsVersion] = createSignal(0)
+  createEffect(() => { void expanded(); void expandedH(); setHeightsVersion(v => v + 1) })
 
-  const expandedRO = useRef<ResizeObserver | null>(null);
-  const measureExpanded = useCallback((el: HTMLDivElement | null) => {
-    expandedRO.current?.disconnect();
-    if (!el) return;
-    if (!expandedRO.current) {
-      expandedRO.current = new ResizeObserver(entries => {
-        const box = entries[0];
-        const h = (box.borderBoxSize?.[0]?.blockSize ?? box.contentRect.height) + CARD_GAP_H;
-        setExpandedH(prev => (Math.abs(prev - h) > 2 ? h : prev));
-      });
+  let expandedRO: ResizeObserver | null = null
+  const measureExpanded = (el: HTMLDivElement | null) => {
+    expandedRO?.disconnect()
+    if (!el) return
+    if (!expandedRO) {
+      expandedRO = new ResizeObserver(entries => {
+        const box = entries[0]
+        const h = (box.borderBoxSize?.[0]?.blockSize ?? box.contentRect.height) + CARD_GAP_H
+        setExpandedH(prev => (Math.abs(prev - h) > 2 ? h : prev))
+      })
     }
-    expandedRO.current.observe(el);
-  }, []);
-  useEffect(() => () => expandedRO.current?.disconnect(), []);
+    expandedRO.observe(el)
+  }
+  onCleanup(() => expandedRO?.disconnect())
 
   // Scroll the expanded card into view (replaces the old scrollIntoView refs)
-  const [scrollIdx, setScrollIdx] = useState(-1);
-  useEffect(() => {
-    if (expanded) setScrollIdx(filtered.findIndex(c => c.callsign === expanded));
-    else setScrollIdx(-1);
-    // scroll on expansion change only — not when the list reorders under it
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [expanded]);
+  const [scrollIdx, setScrollIdx] = createSignal(-1)
+  // scroll on expansion change only — not when the list reorders under it
+  createEffect(on(expanded, (exp) => {
+    if (exp) setScrollIdx(filtered().findIndex(c => c.callsign === exp))
+    else setScrollIdx(-1)
+  }))
 
-  useEffect(() => {
-    if (focus && contacts.has(focus.cs)) setExpanded(focus.cs);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [focus]);
+  createEffect(on(() => props.focus, (focus) => {
+    if (focus && props.contacts.has(focus.cs)) setExpanded(focus.cs)
+  }))
 
-  const myGridUp = myGrid.toUpperCase();
+  const myGridUp = createMemo(() => (props.myGrid ?? '').toUpperCase())
 
-  const myLatLon: [number, number] | null = useMemo(
-    () => myGridUp ? (gridToLatLon(myGridUp) ?? null) : null,
-    [myGridUp],
-  );
+  const myLatLon = createMemo<[number, number] | null>(
+    () => myGridUp() ? (gridToLatLon(myGridUp()) ?? null) : null,
+  )
 
   // Per-contact derived values — computed once per contacts Map reference, not per render
-  const contactStats = useMemo(() => {
+  const contactStats = createMemo(() => {
     const map = new Map<string, {
-      txCount: number; rxCount: number; maxSnr: number; distKm: number;
-      countryCode: string | undefined;
-    }>();
-    for (const c of contacts.values()) {
-      let txCount = 0, rxCount = 0, snrMax = -99;
+      txCount: number; rxCount: number; maxSnr: number; distKm: number
+      countryCode: string | undefined
+    }>()
+    const myLL = myLatLon()
+    for (const c of props.contacts.values()) {
+      let txCount = 0, rxCount = 0, snrMax = -99
       for (const m of c.msgs) {
-        if (m.role === 'tx') txCount++;
-        else rxCount++;
-        if (m.snr > snrMax) snrMax = m.snr;
+        if (m.role === 'tx') txCount++
+        else rxCount++
+        if (m.snr > snrMax) snrMax = m.snr
       }
-      const dkm = (myLatLon && c.latLon) ? haversineKm(myLatLon, c.latLon) : Infinity;
-      const pfx  = callsignCountry(c.callsign);
-      map.set(c.callsign, { txCount, rxCount, maxSnr: snrMax, distKm: dkm, countryCode: pfx?.countryCode });
+      const dkm = (myLL && c.latLon) ? haversineKm(myLL, c.latLon) : Infinity
+      const pfx  = callsignCountry(c.callsign)
+      map.set(c.callsign, { txCount, rxCount, maxSnr: snrMax, distKm: dkm, countryCode: pfx?.countryCode })
     }
-    return map;
-  }, [contacts, myLatLon]);
+    return map
+  })
 
   // Build the list of unique countries for the country select dropdown
-  const countryOptions = useMemo(() => Array.from(
-    Array.from(contacts.values()).reduce((acc, c) => {
-      const pfx = callsignCountry(c.callsign);
-      const flag    = pfx?.flag;
-      const country = pfx?.country;
-      const code    = pfx?.countryCode;
+  const countryOptions = createMemo(() => Array.from(
+    Array.from(props.contacts.values()).reduce((acc, c) => {
+      const pfx = callsignCountry(c.callsign)
+      const flag    = pfx?.flag
+      const country = pfx?.country
+      const code    = pfx?.countryCode
       if (code && country && flag) {
-        const existing = acc.get(code);
+        const existing = acc.get(code)
         acc.set(code, existing
           ? { ...existing, count: existing.count + 1 }
-          : { code, country, flag, count: 1 });
+          : { code, country, flag, count: 1 })
       }
-      return acc;
+      return acc
     }, new Map<string, { code: string; country: string; flag: string; count: number }>())
-  .values()).sort((a, b) => b.count - a.count || a.country.localeCompare(b.country)),
-  [contacts]);
+    .values()).sort((a, b) => b.count - a.count || a.country.localeCompare(b.country)),
+  )
 
   // Sort contacts — only when contacts, sortKey, sortRev, or stats change
-  const sorted = useMemo(() => Array.from(contacts.values()).sort((a, b) => {
-    const sa = contactStats.get(a.callsign)!;
-    const sb = contactStats.get(b.callsign)!;
-    let cmp: number;
-    if      (sortKey === 'date')   cmp = b.lastSeen.getTime() - a.lastSeen.getTime();
-    else if (sortKey === 'tx')     cmp = sb.txCount - sa.txCount;
-    else if (sortKey === 'rx')     cmp = sb.rxCount - sa.rxCount;
-    else if (sortKey === 'worked') cmp = b.peers.size - a.peers.size;
-    else if (sortKey === 'snr-hi') cmp = sb.maxSnr - sa.maxSnr;
-    else if (sortKey === 'snr-lo') cmp = sa.maxSnr - sb.maxSnr;
-    else if (sortKey === 'near')   cmp = sa.distKm - sb.distKm;
-    else if (sortKey === 'far')    cmp = sb.distKm - sa.distKm;
-    else                           cmp = a.callsign.localeCompare(b.callsign);
-    return sortRev ? -cmp : cmp;
-  }), [contacts, contactStats, sortKey, sortRev]);
+  const sorted = createMemo(() => Array.from(props.contacts.values()).sort((a, b) => {
+    const stats = contactStats()
+    const sa = stats.get(a.callsign)!
+    const sb = stats.get(b.callsign)!
+    const key = sortKey()
+    let cmp: number
+    if      (key === 'date')   cmp = b.lastSeen.getTime() - a.lastSeen.getTime()
+    else if (key === 'tx')     cmp = sb.txCount - sa.txCount
+    else if (key === 'rx')     cmp = sb.rxCount - sa.rxCount
+    else if (key === 'worked') cmp = b.peers.size - a.peers.size
+    else if (key === 'snr-hi') cmp = sb.maxSnr - sa.maxSnr
+    else if (key === 'snr-lo') cmp = sa.maxSnr - sb.maxSnr
+    else if (key === 'near')   cmp = sa.distKm - sb.distKm
+    else if (key === 'far')    cmp = sb.distKm - sa.distKm
+    else                       cmp = a.callsign.localeCompare(b.callsign)
+    return sortRev() ? -cmp : cmp
+  }))
 
   // Stats for filter chip counts — computed once over sorted, not re-run per filter change
-  const filterStats = useMemo(() => {
-    let withLocation = 0, fullQSOCount = 0, handshakeCount = 0, txOnlyCount = 0, rxOnlyCount = 0;
-    for (const c of sorted) {
-      const s = contactStats.get(c.callsign)!;
-      if (c.latLon) withLocation++;
-      if (s.txCount > 0 && s.rxCount === 0) txOnlyCount++;
-      if (s.rxCount > 0 && s.txCount === 0) rxOnlyCount++;
-      const peers = Array.from(c.peers);
-      const hasFull = peers.some(p => isFullQSO(c, p));
-      const hasHand = peers.some(p => isHandshake(c, p) && !isFullQSO(c, p));
-      if (hasFull) fullQSOCount++;
-      if (hasHand) handshakeCount++;
+  const filterStats = createMemo(() => {
+    const stats = contactStats()
+    let withLocation = 0, fullQSOCount = 0, handshakeCount = 0, txOnlyCount = 0, rxOnlyCount = 0
+    for (const c of sorted()) {
+      const s = stats.get(c.callsign)!
+      if (c.latLon) withLocation++
+      if (s.txCount > 0 && s.rxCount === 0) txOnlyCount++
+      if (s.rxCount > 0 && s.txCount === 0) rxOnlyCount++
+      const peers = Array.from(c.peers)
+      const hasFull = peers.some(p => isFullQSO(c, p))
+      const hasHand = peers.some(p => isHandshake(c, p) && !isFullQSO(c, p))
+      if (hasFull) fullQSOCount++
+      if (hasHand) handshakeCount++
     }
-    return { withLocation, fullQSOCount, handshakeCount, txOnlyCount, rxOnlyCount };
-  }, [sorted, contactStats]);
-
-  const { withLocation, fullQSOCount, handshakeCount, txOnlyCount, rxOnlyCount } = filterStats;
+    return { withLocation, fullQSOCount, handshakeCount, txOnlyCount, rxOnlyCount }
+  })
 
   // Apply quick filter + country filter
-  const quickFiltered = useMemo(() => sorted.filter(c => {
-    const s = contactStats.get(c.callsign)!;
-    if (quickFilter === 'full-qso'  && !Array.from(c.peers).some(p => isFullQSO(c, p))) return false;
-    if (quickFilter === 'handshake' && !Array.from(c.peers).some(p => isHandshake(c, p) && !isFullQSO(c, p))) return false;
-    if (quickFilter === 'tx-only'   && !(s.txCount > 0 && s.rxCount === 0)) return false;
-    if (quickFilter === 'rx-only'   && !(s.rxCount > 0 && s.txCount === 0)) return false;
-    if (countryFilter) {
-      const code = callsignCountry(c.callsign)?.countryCode;
-      if (code !== countryFilter) return false;
+  const quickFiltered = createMemo(() => sorted().filter(c => {
+    const stats = contactStats()
+    const s = stats.get(c.callsign)!
+    const qf = quickFilter()
+    const cf = countryFilter()
+    if (qf === 'full-qso'  && !Array.from(c.peers).some(p => isFullQSO(c, p))) return false
+    if (qf === 'handshake' && !Array.from(c.peers).some(p => isHandshake(c, p) && !isFullQSO(c, p))) return false
+    if (qf === 'tx-only'   && !(s.txCount > 0 && s.rxCount === 0)) return false
+    if (qf === 'rx-only'   && !(s.rxCount > 0 && s.txCount === 0)) return false
+    if (cf) {
+      const code = callsignCountry(c.callsign)?.countryCode
+      if (code !== cf) return false
     }
-    return true;
-  }), [sorted, contactStats, quickFilter, countryFilter]);
+    return true
+  }))
 
   // Free-text search on top
-  const q        = query.trim().toLowerCase();
-  const filtered = useMemo(() => q
-    ? quickFiltered.filter(c => {
-        const pfx = callsignCountry(c.callsign);
-        return [c.callsign, ...c.grids, pfx?.country, pfx?.countryCode]
-          .some(s => s?.toLowerCase().includes(q));
-      })
-    : quickFiltered,
-  [q, quickFiltered]);
+  const q = createMemo(() => query().trim().toLowerCase())
+  const filtered = createMemo(() => {
+    const qq = q()
+    return qq
+      ? quickFiltered().filter(c => {
+          const pfx = callsignCountry(c.callsign)
+          return [c.callsign, ...c.grids, pfx?.country, pfx?.countryCode]
+            .some(s => s?.toLowerCase().includes(qq))
+        })
+      : quickFiltered()
+  })
 
-  const hasAnyFilter   = !!quickFilter || !!countryFilter;
+  const hasAnyFilter = createMemo(() => !!quickFilter() || !!countryFilter())
 
-  const importFileRef = useRef<HTMLInputElement>(null);
-  const [importStatus, setImportStatus] = useState<{ count: number; err?: string } | null>(null);
+  let importFileEl: HTMLInputElement | undefined
+  const [importStatus, setImportStatus] = createSignal<{ count: number; err?: string } | null>(null)
 
-  const confirmedQSOCount = myCall
-    ? [...contacts.values()].filter(c => isConfirmedQSO(c, myCall)).length
-    : 0;
+  const confirmedQSOCount = createMemo(() => props.myCall
+    ? [...props.contacts.values()].filter(c => isConfirmedQSO(c, props.myCall!)).length
+    : 0)
 
   function downloadADIF() {
-    const content = generateADIF(contacts, mode, { myCall, myGrid, vfoHz });
-    const blob = new Blob([content], { type: 'text/plain;charset=utf-8' });
-    const url  = URL.createObjectURL(blob);
-    const a    = document.createElement('a');
-    a.href     = url;
-    a.download = `ft-log-${new Date().toISOString().slice(0, 10)}.adi`;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    URL.revokeObjectURL(url);
+    const content = generateADIF(props.contacts, props.mode, { myCall: props.myCall ?? '', myGrid: props.myGrid ?? '', vfoHz: props.vfoHz ?? 0 })
+    const blob = new Blob([content], { type: 'text/plain;charset=utf-8' })
+    const url  = URL.createObjectURL(blob)
+    const a    = document.createElement('a')
+    a.href     = url
+    a.download = `ft-log-${new Date().toISOString().slice(0, 10)}.adi`
+    document.body.appendChild(a)
+    a.click()
+    document.body.removeChild(a)
+    URL.revokeObjectURL(url)
   }
 
-  function handleImportFile(e: React.ChangeEvent<HTMLInputElement>) {
-    const file = e.target.files?.[0];
-    if (!file) return;
-    e.target.value = '';
-    const reader = new FileReader();
+  function handleImportFile(e: Event) {
+    const target = e.currentTarget as HTMLInputElement
+    const file = target.files?.[0]
+    if (!file) return
+    target.value = ''
+    const reader = new FileReader()
     reader.onload = ev => {
-      const content = ev.target?.result as string;
+      const content = ev.target?.result as string
       try {
-        const records = parseADIF(content);
-        if (records.length === 0) { setImportStatus({ count: 0, err: 'No valid QSO records found' }); return; }
-        onImportADIF?.(content);
-        setImportStatus({ count: records.length });
-        setTimeout(() => setImportStatus(null), 4000);
+        const records = parseADIF(content)
+        if (records.length === 0) { setImportStatus({ count: 0, err: 'No valid QSO records found' }); return }
+        props.onImportADIF?.(content)
+        setImportStatus({ count: records.length })
+        setTimeout(() => setImportStatus(null), 4000)
       } catch {
-        setImportStatus({ count: 0, err: 'Failed to parse ADIF file' });
+        setImportStatus({ count: 0, err: 'Failed to parse ADIF file' })
       }
-    };
-    reader.readAsText(file);
+    }
+    reader.readAsText(file)
   }
 
   return (
-    <div ref={panelRef} className="flex flex-col h-full min-h-0">
+    <div ref={panelEl} class="flex flex-col h-full min-h-0">
       {/* Header */}
-      <div className="flex items-center justify-between mb-2 shrink-0 gap-2">
-        <h2 className="text-lg sm:text-xl font-semibold">Contacts</h2>
-        <div className="flex items-center gap-1.5 flex-wrap justify-end">
-          <span className="text-xs font-mono text-[#8b949e]">
-            {q || hasAnyFilter ? `${filtered.length}/${contacts.size} shown` : `${contacts.size} found`}
-            {withLocation > 0 && <span className="text-[#484f58]"> · {withLocation} located</span>}
+      <div class="flex items-center justify-between mb-2 shrink-0 gap-2">
+        <h2 class="text-lg sm:text-xl font-semibold">Contacts</h2>
+        <div class="flex items-center gap-1.5 flex-wrap justify-end">
+          <span class="text-xs font-mono text-[#8b949e]">
+            {q() || hasAnyFilter() ? `${filtered().length}/${props.contacts.size} shown` : `${props.contacts.size} found`}
+            <Show when={filterStats().withLocation > 0}>
+              <span class="text-[#484f58]"> · {filterStats().withLocation} located</span>
+            </Show>
           </span>
-          {importStatus && (
-            <span className={`text-[10px] font-mono ${importStatus.err ? 'text-[#f85149]' : 'text-[#2ea043]'}`}>
-              {importStatus.err ?? `+${importStatus.count} imported`}
+          <Show when={importStatus()}>
+            <span class={`text-[10px] font-mono ${importStatus()!.err ? 'text-[#f85149]' : 'text-[#2ea043]'}`}>
+              {importStatus()!.err ?? `+${importStatus()!.count} imported`}
             </span>
-          )}
+          </Show>
           {/* Hidden file input */}
           <input
-            ref={importFileRef}
+            ref={importFileEl}
             type="file"
             accept=".adi,.adif"
-            className="hidden"
+            class="hidden"
             onChange={handleImportFile}
           />
           <button
-            onClick={() => importFileRef.current?.click()}
-            className="text-xs px-2 py-0.5 rounded border border-[#30363d] text-[#8b949e] hover:text-[#2ea043] hover:border-[#2ea043]/40 transition-colors font-mono"
+            onClick={() => importFileEl?.click()}
+            class="text-xs px-2 py-0.5 rounded border border-[#30363d] text-[#8b949e] hover:text-[#2ea043] hover:border-[#2ea043]/40 transition-colors font-mono"
             title="Import ADIF log (.adi / .adif)"
           >
             import
           </button>
-          {contacts.size > 0 && (
-            <>
-              <button
-                onClick={downloadADIF}
-                disabled={confirmedQSOCount === 0}
-                className="text-xs px-2 py-0.5 rounded border border-[#30363d] text-[#8b949e] hover:text-[#79c0ff] hover:border-[#79c0ff]/40 transition-colors font-mono disabled:opacity-40 disabled:cursor-not-allowed"
-                title={confirmedQSOCount > 0
-                  ? `Download ADIF log — ${confirmedQSOCount} confirmed QSO${confirmedQSOCount !== 1 ? 's' : ''} (SWL entries excluded)`
-                  : 'No confirmed two-way QSOs to export yet'}
-              >
-                export{confirmedQSOCount > 0 ? ` (${confirmedQSOCount})` : ''}
-              </button>
-              <button
-                onClick={onClearContacts}
-                className="text-xs px-2 py-0.5 rounded border border-[#30363d] text-[#8b949e] hover:text-[#f85149] hover:border-[#f85149]/40 transition-colors font-mono"
-              >
-                Clear
-              </button>
-            </>
-          )}
+          <Show when={props.contacts.size > 0}>
+            <button
+              onClick={downloadADIF}
+              disabled={confirmedQSOCount() === 0}
+              class="text-xs px-2 py-0.5 rounded border border-[#30363d] text-[#8b949e] hover:text-[#79c0ff] hover:border-[#79c0ff]/40 transition-colors font-mono disabled:opacity-40 disabled:cursor-not-allowed"
+              title={confirmedQSOCount() > 0
+                ? `Download ADIF log — ${confirmedQSOCount()} confirmed QSO${confirmedQSOCount() !== 1 ? 's' : ''} (SWL entries excluded)`
+                : 'No confirmed two-way QSOs to export yet'}
+            >
+              export{confirmedQSOCount() > 0 ? ` (${confirmedQSOCount()})` : ''}
+            </button>
+            <button
+              onClick={props.onClearContacts}
+              class="text-xs px-2 py-0.5 rounded border border-[#30363d] text-[#8b949e] hover:text-[#f85149] hover:border-[#f85149]/40 transition-colors font-mono"
+            >
+              Clear
+            </button>
+          </Show>
         </div>
       </div>
 
       {/* Map */}
-      <div className="shrink-0 mb-0">
-        <div className="text-[10px] text-[#484f58] font-mono mb-1 flex items-center justify-between">
+      <div class="shrink-0 mb-0">
+        <div class="text-[10px] text-[#484f58] font-mono mb-1 flex items-center justify-between">
           <span>World Map</span>
-          <div className="flex items-center gap-1.5">
+          <div class="flex items-center gap-1.5">
             <button
-              onClick={() => setShowTerminator(v => { saveShowTerminator(!v); return !v; })}
-              title={showTerminator ? 'Hide day/night shading' : 'Show day/night shading'}
-              className={`text-[9px] font-mono px-1.5 py-0.5 rounded border transition-colors ${
-                showTerminator
+              onClick={() => setShowTerminator(v => { saveShowTerminator(!v); return !v })}
+              title={showTerminator() ? 'Hide day/night shading' : 'Show day/night shading'}
+              class={`text-[9px] font-mono px-1.5 py-0.5 rounded border transition-colors ${
+                showTerminator()
                   ? 'border-[#2ea043]/50 text-[#2ea043] bg-[#2ea043]/10'
                   : 'border-[#30363d] text-[#8b949e] hover:text-[#c9d1d9]'
               }`}
@@ -950,210 +1011,213 @@ export default function FTContactsPanel({ contacts, mode, myCall = '', myGrid = 
               🌓 day/night
             </button>
             <button
-              onClick={() => setMapStyle(v => { const next = v === 'dark' ? 'light' : 'dark'; saveMapStyle(next); return next; })}
-              title={mapStyle === 'dark' ? 'Switch to light map' : 'Switch to dark map'}
-              className={`text-[9px] font-mono px-1.5 py-0.5 rounded border transition-colors ${
-                mapStyle === 'light'
+              onClick={() => setMapStyle(v => { const next = v === 'dark' ? 'light' : 'dark'; saveMapStyle(next); return next })}
+              title={mapStyle() === 'dark' ? 'Switch to light map' : 'Switch to dark map'}
+              class={`text-[9px] font-mono px-1.5 py-0.5 rounded border transition-colors ${
+                mapStyle() === 'light'
                   ? 'border-[#2ea043]/50 text-[#2ea043] bg-[#2ea043]/10'
                   : 'border-[#30363d] text-[#8b949e] hover:text-[#c9d1d9]'
               }`}
             >
-              {mapStyle === 'dark' ? '☀️ light map' : '🌑 dark map'}
+              {mapStyle() === 'dark' ? '☀️ light map' : '🌑 dark map'}
             </button>
-            <span className="text-[#30363d]">
-              {withLocation > 0 ? `${withLocation} located` : 'no positions yet'}
+            <span class="text-[#30363d]">
+              {filterStats().withLocation > 0 ? `${filterStats().withLocation} located` : 'no positions yet'}
             </span>
           </div>
         </div>
-        <div className="rounded overflow-hidden border border-[#21262d]" style={{ height: mapHeight }}>
+        <div class="rounded overflow-hidden border border-[#21262d]" style={{ height: `${mapHeight()}px` }}>
           <FTLeafletMap
-            contacts={contacts}
+            contacts={props.contacts}
             onSelect={select}
-            selected={expanded}
-            showTerminator={showTerminator}
-            tileStyle={mapStyle}
-            newWindowMs={windowMs}
-            myCall={myCall}
+            selected={expanded()}
+            showTerminator={showTerminator()}
+            tileStyle={mapStyle()}
+            newWindowMs={windowMs()}
+            myCall={props.myCall}
           />
         </div>
         {/* Drag handle to resize map */}
         <div
-          className="h-2 flex items-center justify-center cursor-ns-resize group mb-1.5"
+          class="h-2 flex items-center justify-center cursor-ns-resize group mb-1.5"
           onMouseDown={e => {
-            e.preventDefault();
-            mapDragRef.current = { startY: e.clientY, startH: mapHeight };
+            e.preventDefault()
+            mapDrag = { startY: e.clientY, startH: mapHeight() }
           }}
         >
-          <div className="w-8 h-0.5 rounded-full bg-[#30363d] group-hover:bg-[#2ea043]/60 transition-colors" />
+          <div class="w-8 h-0.5 rounded-full bg-[#30363d] group-hover:bg-[#2ea043]/60 transition-colors" />
         </div>
       </div>
 
       {/* Search filter */}
-      {contacts.size > 0 && (
-        <div className="mb-1.5 shrink-0 relative">
+      <Show when={props.contacts.size > 0}>
+        <div class="mb-1.5 shrink-0 relative">
           <input
             type="text"
-            value={query}
-            onChange={e => setQuery(e.target.value)}
+            value={query()}
+            onInput={e => setQuery(e.currentTarget.value)}
             placeholder="Search callsign, grid, city, country…"
-            className="w-full bg-[#0d1117] border border-[#30363d] rounded px-2 py-1 text-xs font-mono text-[#c9d1d9] placeholder-[#484f58] focus:outline-none focus:border-[#2ea043] transition-colors"
+            class="w-full bg-[#0d1117] border border-[#30363d] rounded px-2 py-1 text-xs font-mono text-[#c9d1d9] placeholder-[#484f58] focus:outline-none focus:border-[#2ea043] transition-colors"
           />
-          {query && (
+          <Show when={query()}>
             <button
               onClick={() => setQuery('')}
-              className="absolute right-1.5 top-1/2 -translate-y-1/2 text-[#484f58] hover:text-[#c9d1d9] text-xs px-1"
+              class="absolute right-1.5 top-1/2 -translate-y-1/2 text-[#484f58] hover:text-[#c9d1d9] text-xs px-1"
               title="Clear search"
             >
               ✕
             </button>
-          )}
+          </Show>
         </div>
-      )}
+      </Show>
 
       {/* Quick filter chips + country select */}
-      {contacts.size > 0 && (
-        <div className="mb-1.5 shrink-0 flex flex-wrap gap-1 items-center">
-          {fullQSOCount > 0 && (
+      <Show when={props.contacts.size > 0}>
+        <div class="mb-1.5 shrink-0 flex flex-wrap gap-1 items-center">
+          <Show when={filterStats().fullQSOCount > 0}>
             <button
               onClick={() => setQuickFilter(f => f === 'full-qso' ? null : 'full-qso')}
-              className={`text-[9px] font-mono px-1.5 py-0.5 rounded border transition-colors ${
-                quickFilter === 'full-qso'
+              class={`text-[9px] font-mono px-1.5 py-0.5 rounded border transition-colors ${
+                quickFilter() === 'full-qso'
                   ? 'border-[#e3b341]/50 text-[#e3b341] bg-[#e3b341]/10'
                   : 'border-[#30363d] text-[#8b949e] hover:text-[#e3b341] hover:border-[#e3b341]/30'
               }`}
               title="Show contacts with a complete QSO (report exchanged and signed off)"
             >
-              ⭐ full QSO <span className="opacity-60">{fullQSOCount}</span>
+              ⭐ full QSO <span class="opacity-60">{filterStats().fullQSOCount}</span>
             </button>
-          )}
-          {handshakeCount > 0 && (
+          </Show>
+          <Show when={filterStats().handshakeCount > 0}>
             <button
               onClick={() => setQuickFilter(f => f === 'handshake' ? null : 'handshake')}
-              className={`text-[9px] font-mono px-1.5 py-0.5 rounded border transition-colors ${
-                quickFilter === 'handshake'
+              class={`text-[9px] font-mono px-1.5 py-0.5 rounded border transition-colors ${
+                quickFilter() === 'handshake'
                   ? 'border-[#d2a8ff]/50 text-[#d2a8ff] bg-[#d2a8ff]/10'
                   : 'border-[#30363d] text-[#8b949e] hover:text-[#d2a8ff] hover:border-[#d2a8ff]/30'
               }`}
               title="Show contacts with a partial handshake (both sides transmitted, not yet complete)"
             >
-              🤝 handshake <span className="opacity-60">{handshakeCount}</span>
+              🤝 handshake <span class="opacity-60">{filterStats().handshakeCount}</span>
             </button>
-          )}
-          {txOnlyCount > 0 && (
+          </Show>
+          <Show when={filterStats().txOnlyCount > 0}>
             <button
               onClick={() => setQuickFilter(f => f === 'tx-only' ? null : 'tx-only')}
-              className={`text-[9px] font-mono px-1.5 py-0.5 rounded border transition-colors ${
-                quickFilter === 'tx-only'
+              class={`text-[9px] font-mono px-1.5 py-0.5 rounded border transition-colors ${
+                quickFilter() === 'tx-only'
                   ? 'border-[#2ea043]/50 text-[#2ea043] bg-[#2ea043]/10'
                   : 'border-[#30363d] text-[#8b949e] hover:text-[#2ea043] hover:border-[#2ea043]/30'
               }`}
               title="Show stations that transmitted only (no messages addressed to them)"
             >
-              tx only <span className="opacity-60">{txOnlyCount}</span>
+              tx only <span class="opacity-60">{filterStats().txOnlyCount}</span>
             </button>
-          )}
-          {rxOnlyCount > 0 && (
+          </Show>
+          <Show when={filterStats().rxOnlyCount > 0}>
             <button
               onClick={() => setQuickFilter(f => f === 'rx-only' ? null : 'rx-only')}
-              className={`text-[9px] font-mono px-1.5 py-0.5 rounded border transition-colors ${
-                quickFilter === 'rx-only'
+              class={`text-[9px] font-mono px-1.5 py-0.5 rounded border transition-colors ${
+                quickFilter() === 'rx-only'
                   ? 'border-[#79c0ff]/50 text-[#79c0ff] bg-[#79c0ff]/10'
                   : 'border-[#30363d] text-[#8b949e] hover:text-[#79c0ff] hover:border-[#79c0ff]/30'
               }`}
               title="Show stations seen only as addressees (never transmitted)"
             >
-              rx only <span className="opacity-60">{rxOnlyCount}</span>
+              rx only <span class="opacity-60">{filterStats().rxOnlyCount}</span>
             </button>
-          )}
-          {countryOptions.length > 0 && (
+          </Show>
+          <Show when={countryOptions().length > 0}>
             <select
-              value={countryFilter}
-              onChange={e => setCountryFilter(e.target.value)}
+              value={countryFilter()}
+              onChange={e => setCountryFilter(e.currentTarget.value)}
               title="Filter by country"
-              className={`text-[9px] font-mono px-1 py-0.5 rounded border bg-[#0d1117] transition-colors cursor-pointer ${
-                countryFilter
+              class={`text-[9px] font-mono px-1 py-0.5 rounded border bg-[#0d1117] transition-colors cursor-pointer ${
+                countryFilter()
                   ? 'border-[#e3b341]/50 text-[#e3b341]'
                   : 'border-[#30363d] text-[#8b949e]'
               }`}
             >
               <option value="">🌍 All countries</option>
-              {countryOptions.map(({ code, country, flag, count }) => (
-                <option key={code} value={code}>{flag} {country} ({count})</option>
-              ))}
+              <For each={countryOptions()}>
+                {({ code, country, flag, count }) => (
+                  <option value={code}>{flag} {country} ({count})</option>
+                )}
+              </For>
             </select>
-          )}
-          {hasAnyFilter && (
+          </Show>
+          <Show when={hasAnyFilter()}>
             <button
-              onClick={() => { setQuickFilter(null); setCountryFilter(''); }}
-              className="text-[9px] font-mono px-1.5 py-0.5 rounded border border-[#30363d] text-[#484f58] hover:text-[#c9d1d9]"
+              onClick={() => { setQuickFilter(null); setCountryFilter('') }}
+              class="text-[9px] font-mono px-1.5 py-0.5 rounded border border-[#30363d] text-[#484f58] hover:text-[#c9d1d9]"
               title="Clear all filters"
             >
               ✕ clear
             </button>
-          )}
+          </Show>
         </div>
-      )}
+      </Show>
 
       {/* Sort controls */}
-      {contacts.size > 1 && (
-        <div className="flex items-center gap-1 mb-1.5 shrink-0 flex-wrap">
-          <span className="text-[9px] text-[#484f58] font-mono">sort:</span>
-          {SORT_OPTIONS.map(({ key, label, title }) => (
-            <button
-              key={key}
-              onClick={() => {
-                if (sortKey === key) setSortRev(r => !r);
-                else { setSortKey(key); setSortRev(false); }
-              }}
-              title={sortKey === key ? `${title} — click to reverse` : title}
-              className={`text-[9px] font-mono px-1.5 py-0.5 rounded border transition-colors ${
-                sortKey === key
-                  ? 'border-[#2ea043]/50 text-[#2ea043] bg-[#2ea043]/10'
-                  : 'border-[#30363d] text-[#8b949e] hover:text-[#c9d1d9]'
-              }`}
-            >
-              {label}{sortKey === key ? (sortRev ? ' ↑' : ' ↓') : ''}
-            </button>
-          ))}
+      <Show when={props.contacts.size > 1}>
+        <div class="flex items-center gap-1 mb-1.5 shrink-0 flex-wrap">
+          <span class="text-[9px] text-[#484f58] font-mono">sort:</span>
+          <For each={SORT_OPTIONS}>
+            {({ key, label, title }) => (
+              <button
+                onClick={() => {
+                  if (sortKey() === key) setSortRev(r => !r)
+                  else { setSortKey(key); setSortRev(false) }
+                }}
+                title={sortKey() === key ? `${title} — click to reverse` : title}
+                class={`text-[9px] font-mono px-1.5 py-0.5 rounded border transition-colors ${
+                  sortKey() === key
+                    ? 'border-[#2ea043]/50 text-[#2ea043] bg-[#2ea043]/10'
+                    : 'border-[#30363d] text-[#8b949e] hover:text-[#c9d1d9]'
+                }`}
+              >
+                {label}{sortKey() === key ? (sortRev() ? ' ↑' : ' ↓') : ''}
+              </button>
+            )}
+          </For>
         </div>
-      )}
+      </Show>
 
       {/* Contact list — windowed: DOM size is constant however many contacts exist */}
       <VirtualList
-        items={filtered}
-        className="flex-1 overflow-y-auto min-h-0 max-h-[50vh] lg:max-h-none"
+        items={filtered()}
+        class="flex-1 overflow-y-auto min-h-0 max-h-[50vh] lg:max-h-none"
         itemKey={c => c.callsign}
-        itemHeight={c => (c.callsign === expanded ? expandedH : COLLAPSED_CARD_H)}
-        heightsVersion={heightsVersion}
-        scrollToIndex={scrollIdx}
+        itemHeight={c => (c.callsign === expanded() ? expandedH() : COLLAPSED_CARD_H)}
+        heightsVersion={heightsVersion()}
+        scrollToIndex={scrollIdx()}
         overscan={5}
         empty={
-          <div className="flex flex-col items-center justify-center h-28 gap-2">
-            <div className="text-3xl select-none">{q || hasAnyFilter ? '🔍' : '🌍'}</div>
-            <div className="text-xs text-[#484f58] font-mono">
-              {q ? `No contacts match "${query.trim()}"` : hasAnyFilter ? 'No contacts match this filter' : 'No contacts yet'}
+          <div class="flex flex-col items-center justify-center h-28 gap-2">
+            <div class="text-3xl select-none">{q() || hasAnyFilter() ? '🔍' : '🌍'}</div>
+            <div class="text-xs text-[#484f58] font-mono">
+              {q() ? `No contacts match "${query().trim()}"` : hasAnyFilter() ? 'No contacts match this filter' : 'No contacts yet'}
             </div>
           </div>
         }
         renderItem={c => {
-          void highlightTick; // re-render on tick so the fraction below stays current
-          const age = Date.now() - c.firstSeen.getTime();
-          const newFraction = age < windowMs ? 1 - age / windowMs : 0;
+          void highlightTick() // re-render on tick so the fraction below stays current
+          const age = Date.now() - c.firstSeen.getTime()
+          const newFraction = age < windowMs() ? 1 - age / windowMs() : 0
           return (
-            <div ref={c.callsign === expanded ? measureExpanded : undefined} style={{ overflow: c.callsign === expanded ? 'visible' : 'hidden' }}>
+            <div ref={c.callsign === expanded() ? (el) => measureExpanded(el) : undefined} style={{ overflow: c.callsign === expanded() ? 'visible' : 'hidden' }}>
               <ContactCard
                 contact={c}
-                expanded={expanded === c.callsign}
+                expanded={expanded() === c.callsign}
                 onToggle={() => setExpanded(p => p === c.callsign ? null : c.callsign)}
                 onSelect={select}
-                contactMap={contacts}
-                myCall={myCall}
+                contactMap={props.contacts}
+                myCall={props.myCall}
                 newFraction={newFraction}
               />
             </div>
-          );
+          )
         }}
       />
     </div>
-  );
+  )
 }
