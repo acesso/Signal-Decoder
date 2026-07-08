@@ -4,8 +4,21 @@ import { useRef, useEffect, useState, useCallback } from 'react';
 import type React from 'react';
 import GLSpectrogram, { GLSpectrogramHandle, GLView } from './GLSpectrogram';
 import type { MFSKChannel } from '@/lib/mfsk/decoder';
+import { loadNumber, saveNumber, loadString } from '@/lib/storage';
 
 type SpectrogramView = 'legacy' | 'terrain';
+const SPECTROGRAM_VIEWS = ['legacy', 'terrain'] as const;
+
+// Rendering prefs (view mode, gamma, speed, smoothing, band opacity) are
+// shared across every decoder — one waterfall look regardless of mode. The
+// visible Hz range is mode-scoped instead (RTTY/CW/FT/etc. have very
+// different useful ranges), keyed by the caller's storageKeyPrefix prop.
+const LS_SG_VIEW      = 'sg_view_mode';
+const LS_SG_GAMMA     = 'sg_gamma';
+const LS_SG_3D_SPEED  = 'sg_3d_speed';
+const LS_SG_2D_SPEED  = 'sg_2d_speed';
+const LS_SG_3D_SMOOTH = 'sg_3d_smooth';
+const LS_SG_BAND_ALPHA = 'sg_band_alpha';
 
 // ── Canvas helpers (copied from MFSKDecoder) ──────────────────────────────────
 
@@ -193,6 +206,9 @@ export interface AudioAnalysisPanelProps {
   /** Extra CSS classes applied to the root card div (e.g. flex sizing) */
   className?: string;
   style?: React.CSSProperties;
+  /** When set, persists the visible Hz range to localStorage under this
+   *  mode-specific key prefix (e.g. 'rtty', 'cw') — omit to leave it ephemeral. */
+  storageKeyPrefix?: string;
 }
 
 // ── Component ─────────────────────────────────────────────────────────────────
@@ -212,7 +228,13 @@ export default function AudioAnalysisPanel({
   txMarkerHz,
   className,
   style,
+  storageKeyPrefix,
 }: AudioAnalysisPanelProps) {
+  const lsMinHz = storageKeyPrefix ? `${storageKeyPrefix}_sg_display_min_hz` : null;
+  const lsMaxHz = storageKeyPrefix ? `${storageKeyPrefix}_sg_display_max_hz` : null;
+
+  // All display prefs start at their SSR-safe defaults, restored from
+  // localStorage post-mount (see the mode-restore comment in page.tsx for why).
   const [displayMinHz, setDisplayMinHz] = useState(0);
   const [displayMaxHz, setDisplayMaxHz] = useState(defaultMaxHz);
   const [centerFreqInput, setCenterFreqInput] = useState('');
@@ -222,6 +244,26 @@ export default function AudioAnalysisPanel({
   const [sg2dSpeed, setSg2dSpeed] = useState(16);    // 2D canvas: ms between rows, Fast
   const [sg3dSmooth, setSg3dSmooth] = useState(0.35);
   const [bandAlpha, setBandAlpha] = useState(0.3);
+
+  useEffect(() => {
+    setSgView(loadString(LS_SG_VIEW, 'legacy' as SpectrogramView, SPECTROGRAM_VIEWS));
+    setSgGamma(loadNumber(LS_SG_GAMMA, 2.0));
+    setSg3dSpeed(loadNumber(LS_SG_3D_SPEED, 80));
+    setSg2dSpeed(loadNumber(LS_SG_2D_SPEED, 16));
+    setSg3dSmooth(loadNumber(LS_SG_3D_SMOOTH, 0.35));
+    setBandAlpha(loadNumber(LS_SG_BAND_ALPHA, 0.3));
+    if (lsMinHz) setDisplayMinHz(loadNumber(lsMinHz, 0));
+    if (lsMaxHz) setDisplayMaxHz(loadNumber(lsMaxHz, defaultMaxHz));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+  useEffect(() => { saveNumber(LS_SG_GAMMA, sgGamma); }, [sgGamma]);
+  useEffect(() => { saveNumber(LS_SG_3D_SPEED, sg3dSpeed); }, [sg3dSpeed]);
+  useEffect(() => { saveNumber(LS_SG_2D_SPEED, sg2dSpeed); }, [sg2dSpeed]);
+  useEffect(() => { saveNumber(LS_SG_3D_SMOOTH, sg3dSmooth); }, [sg3dSmooth]);
+  useEffect(() => { saveNumber(LS_SG_BAND_ALPHA, bandAlpha); }, [bandAlpha]);
+  useEffect(() => { if (typeof window !== 'undefined') localStorage.setItem(LS_SG_VIEW, sgView); }, [sgView]);
+  useEffect(() => { if (lsMinHz) saveNumber(lsMinHz, displayMinHz); }, [lsMinHz, displayMinHz]);
+  useEffect(() => { if (lsMaxHz) saveNumber(lsMaxHz, displayMaxHz); }, [lsMaxHz, displayMaxHz]);
 
   const specRef        = useRef<HTMLCanvasElement>(null);
   const sgCanvRef      = useRef<HTMLCanvasElement>(null);

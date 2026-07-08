@@ -10,7 +10,16 @@ import { MFSKChannel, MFSKDecoderOptions, DEFAULT_DECODER_OPTIONS } from '@/lib/
 import { bitsToBaudotCode, decodeBaudotCodePoints } from '@/lib/mfsk/baudot';
 import { decodeMFSKVaricode } from '@/lib/mfsk/varicode';
 import { decodeMFSKWithFECIncremental, makeFECCursor, FECCursor } from '@/lib/mfsk/fec';
+import { loadNumberArray, saveNumberArray, loadNumber, saveNumber, loadBoolean, saveBoolean } from '@/lib/storage';
 type Encoding = 'ascii' | 'baudot' | 'varicode';
+
+const DEFAULT_PANEL_WEIGHTS = [1, 1.4, 0.65];
+const LS_PANEL_WEIGHTS      = 'mfsk_panel_weights';
+const LS_SHOW_GRID          = 'mfsk_show_grid';
+const LS_GRID_SIZE          = 'mfsk_grid_size';
+const LS_SHOW_WORD_MARKERS  = 'mfsk_show_word_markers';
+const LS_SHOW_BIT_MARKERS   = 'mfsk_show_bit_markers';
+const LS_SHOW_FRAME_MARKERS = 'mfsk_show_frame_markers';
 
 const CANVAS_H       = 200;
 const AXIS_H         = 25;
@@ -559,8 +568,16 @@ const MFSKDecoder = forwardRef<DecoderControls, DecoderProps>(function MFSKDecod
   const [baudRate,  setBaudRate]  = useState(31.25);
   const [squelch,   setSquelch]   = useState(0);
   const [channelBw, setChannelBw] = useState(80);
+  // Overlay display prefs start at their SSR-safe defaults, restored from
+  // localStorage post-mount (see the mode-restore comment in page.tsx for why).
   const [gridSize,  setGridSize]  = useState(48);
   const [showGrid,       setShowGrid]       = useState(true);
+  useEffect(() => {
+    setGridSize(loadNumber(LS_GRID_SIZE, 48));
+    setShowGrid(loadBoolean(LS_SHOW_GRID, true));
+  }, []);
+  useEffect(() => { saveNumber(LS_GRID_SIZE, gridSize); }, [gridSize]);
+  useEffect(() => { saveBoolean(LS_SHOW_GRID, showGrid); }, [showGrid]);
 
   // ── Decoder options ───────────────────────────────────────────────────────
   const [decoderOpts, setDecoderOpts] = useState<Partial<MFSKDecoderOptions>>({
@@ -580,6 +597,14 @@ const MFSKDecoder = forwardRef<DecoderControls, DecoderProps>(function MFSKDecod
   const [showWordMarkers,  setShowWordMarkers]  = useState(true);
   const [showBitMarkers,   setShowBitMarkers]   = useState(true);
   const [showFrameMarkers, setShowFrameMarkers] = useState(true);
+  useEffect(() => {
+    setShowWordMarkers(loadBoolean(LS_SHOW_WORD_MARKERS, true));
+    setShowBitMarkers(loadBoolean(LS_SHOW_BIT_MARKERS, true));
+    setShowFrameMarkers(loadBoolean(LS_SHOW_FRAME_MARKERS, true));
+  }, []);
+  useEffect(() => { saveBoolean(LS_SHOW_WORD_MARKERS, showWordMarkers); }, [showWordMarkers]);
+  useEffect(() => { saveBoolean(LS_SHOW_BIT_MARKERS, showBitMarkers); }, [showBitMarkers]);
+  useEffect(() => { saveBoolean(LS_SHOW_FRAME_MARKERS, showFrameMarkers); }, [showFrameMarkers]);
 
   // ── Multi-stream decode candidates ───────────────────────────────────────
   // Each offset (Hz) relative to the base frequency produces a candidate stream.
@@ -620,12 +645,15 @@ const MFSKDecoder = forwardRef<DecoderControls, DecoderProps>(function MFSKDecod
   const lastWrdRef = useRef(0);
   const lastRowRef = useRef(-1);
 
-  // Panel resize
+  // Panel resize — starts at the SSR-safe default, restored from
+  // localStorage post-mount.
   const containerRef    = useRef<HTMLDivElement>(null);
-  const [pW, setPW]     = useState([1,1.4,0.65]);
-  const pWRef           = useRef([1,1.4,0.65]);
+  const [pW, setPW]     = useState(DEFAULT_PANEL_WEIGHTS);
+  const pWRef           = useRef(DEFAULT_PANEL_WEIGHTS);
   const pDragRef        = useRef<{h:number;sx:number;sw:number[]}|null>(null);
   useEffect(() => { pWRef.current=pW; }, [pW]);
+  useEffect(() => { setPW(loadNumberArray(LS_PANEL_WEIGHTS, DEFAULT_PANEL_WEIGHTS)); }, []);
+  useEffect(() => { saveNumberArray(LS_PANEL_WEIGHTS, pW); }, [pW]);
   const startDrag = (e:React.MouseEvent, h:number) => {
     e.preventDefault(); pDragRef.current={h,sx:e.clientX,sw:[...pWRef.current]};
   };
@@ -1154,6 +1182,7 @@ const MFSKDecoder = forwardRef<DecoderControls, DecoderProps>(function MFSKDecod
         <AudioAnalysisPanel
           analyser={analyser ?? null}
           isRecording={state.isRecording}
+          storageKeyPrefix="mfsk"
           markers={channels.map(ch => ({ freq: ch.freq, color: ch.color, label: ch.label }))}
           onMarkerDrag={(idx, newHz) => {
             const ch = channels[idx];

@@ -5,8 +5,11 @@ import type { DecoderControls, DecoderProps } from './DecoderControls';
 import { fmtAbsHz } from '@/lib/formatFreq';
 import AudioAnalysisPanel from './AudioAnalysisPanel';
 import { useCWProcessor, TextToken } from '@/hooks/useCWProcessor';
+import { loadNumberArray, saveNumberArray } from '@/lib/storage';
 
 const DISPLAY_MAX_HZ = 4000;
+const DEFAULT_PANEL_WEIGHTS = [1, 1, 0.75];
+const LS_PANEL_WEIGHTS = 'cw_panel_weights';
 
 // Channel colour palette
 const CH_COLORS = {
@@ -234,12 +237,15 @@ const CWDecoder = forwardRef<DecoderControls, DecoderProps>(function CWDecoder({
   const flashTimeoutRef  = useRef<ReturnType<typeof setTimeout> | null>(null);
   const flashTimeout2Ref = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  // Resizable panels
+  // Resizable panels — starts at the SSR-safe default, restored from
+  // localStorage post-mount (see the mode-restore comment in page.tsx for why).
   const containerRef    = useRef<HTMLDivElement>(null);
-  const [panelWeights, setPanelWeights] = useState([1, 1, 0.75]);
-  const panelWeightsRef = useRef([1, 1, 0.75]);
+  const [panelWeights, setPanelWeights] = useState(DEFAULT_PANEL_WEIGHTS);
+  const panelWeightsRef = useRef(DEFAULT_PANEL_WEIGHTS);
   const dragRef = useRef<{ handle: number; startX: number; startWeights: number[] } | null>(null);
   useEffect(() => { panelWeightsRef.current = panelWeights; }, [panelWeights]);
+  useEffect(() => { setPanelWeights(loadNumberArray(LS_PANEL_WEIGHTS, DEFAULT_PANEL_WEIGHTS)); }, []);
+  useEffect(() => { saveNumberArray(LS_PANEL_WEIGHTS, panelWeights); }, [panelWeights]);
 
   const startDrag = (e: { preventDefault: () => void; clientX: number }, handle: number) => {
     e.preventDefault();
@@ -519,6 +525,7 @@ const CWDecoder = forwardRef<DecoderControls, DecoderProps>(function CWDecoder({
         <AudioAnalysisPanel
           analyser={analyser ?? null}
           isRecording={state.isRecording}
+          storageKeyPrefix="cw"
           markers={[
             { freq: toneFreq, color: '#79c0ff', label: 'T', bandwidthHz: filterBandwidth },
             ...(dualMode ? [{ freq: toneFreq2, color: '#ffa657', label: 'T2', bandwidthHz: filterBandwidth }] : []),

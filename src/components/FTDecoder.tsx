@@ -11,6 +11,13 @@ import { DecodeGate } from '@/lib/ft/gate';
 import FTContactsPanel from './FTContactsPanel';
 import FTWasmPanel from './FTWasmPanel';
 import VirtualList from './VirtualList';
+import { loadNumberArray, saveNumberArray, loadBoolean, saveBoolean } from '@/lib/storage';
+
+const DEFAULT_PANEL_WEIGHTS = [0.8, 0.6, 1.2];
+const LS_PANEL_WEIGHTS = 'ft_panel_weights';
+const LS_MSG_SORT_KEY  = 'ft_messages_sort_key';
+const LS_MSG_SORT_REV  = 'ft_messages_sort_rev';
+const MSG_SORT_COLS = ['freq', 'snr', 'dt', 'msg'] as const;
 
 // ── Clock ring (rAF-driven, no setState) ──────────────────────────────────────
 
@@ -173,6 +180,12 @@ const MSG_GRID_COLS = 'grid grid-cols-[78px_92px_54px_46px_minmax(0,1fr)]';
 
 type MsgSortCol = 'freq' | 'snr' | 'dt' | 'msg';
 
+function loadMsgSortKey(): MsgSortCol | null {
+  if (typeof window === 'undefined') return null;
+  const raw = localStorage.getItem(LS_MSG_SORT_KEY);
+  return (MSG_SORT_COLS as readonly string[]).includes(raw ?? '') ? (raw as MsgSortCol) : null;
+}
+
 function SortableHeader({ label, col, sortKey, sortRev, onSort, align, title }: {
   label: string;
   col: MsgSortCol;
@@ -311,8 +324,12 @@ const FTDecoder = forwardRef<DecoderControls, { ftMode: FTMode; myCall?: string;
   // window's messages are re-ordered among themselves, but windows never mix,
   // so a freshly-decoded window always lands in its own natural (newest-first)
   // slot rather than jumping around the list. null = natural decode order.
+  // Starts at the SSR-safe default, restored from localStorage post-mount.
   const [sortKey, setSortKey] = useState<MsgSortCol | null>(null);
   const [sortRev, setSortRev] = useState(false);
+  useEffect(() => { setSortKey(loadMsgSortKey()); setSortRev(loadBoolean(LS_MSG_SORT_REV, false)); }, []);
+  useEffect(() => { if (typeof window !== 'undefined') localStorage.setItem(LS_MSG_SORT_KEY, sortKey ?? ''); }, [sortKey]);
+  useEffect(() => { saveBoolean(LS_MSG_SORT_REV, sortRev); }, [sortRev]);
   const toggleSort = useCallback((key: MsgSortCol) => {
     setSortKey(prev => {
       if (prev !== key) { setSortRev(false); return key; }
@@ -528,11 +545,14 @@ const FTDecoder = forwardRef<DecoderControls, { ftMode: FTMode; myCall?: string;
   }, []);
 
   // ── 2-panel drag ────────────────────────────────────────────────────────────
+  // Starts at the SSR-safe default, restored from localStorage post-mount.
   const containerRef    = useRef<HTMLDivElement>(null);
-  const [panelWeights, setPanelWeights] = useState([0.8, 0.6, 1.2]);
-  const panelWeightsRef = useRef([0.8, 0.6, 1.2]);
+  const [panelWeights, setPanelWeights] = useState(DEFAULT_PANEL_WEIGHTS);
+  const panelWeightsRef = useRef(DEFAULT_PANEL_WEIGHTS);
   const panelDragRef    = useRef<{ divider: number; startX: number; startW: number[] } | null>(null);
   useEffect(() => { panelWeightsRef.current = panelWeights; }, [panelWeights]);
+  useEffect(() => { setPanelWeights(loadNumberArray(LS_PANEL_WEIGHTS, DEFAULT_PANEL_WEIGHTS)); }, []);
+  useEffect(() => { saveNumberArray(LS_PANEL_WEIGHTS, panelWeights); }, [panelWeights]);
 
   const startPanelDrag = (divider: number) => (e: React.MouseEvent) => {
     e.preventDefault();
@@ -798,6 +818,7 @@ const FTDecoder = forwardRef<DecoderControls, { ftMode: FTMode; myCall?: string;
           analyser={analyser ?? null}
           isRecording={state.isRecording}
           vfoFrequency={vfoFrequency}
+          storageKeyPrefix="ft"
           txMarkerHz={txAudioHz > 0 ? txAudioHz : undefined}
           className="min-w-0"
           style={{ flex: panelWeights[1] }}
