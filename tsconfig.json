@@ -38,6 +38,7 @@
   "exclude": [
     "node_modules",
     "playwright.config.ts",
-    "src/e2e"
+    "src/e2e",
+    "solid-prototype"
   ]
 }

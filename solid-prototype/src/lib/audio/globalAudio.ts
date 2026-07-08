@@ -5,6 +5,7 @@
 // the same live signal.
 
 import { createSignal } from 'solid-js'
+import { audioRecorder } from '$decoder-lib/audio/ringRecorder'
 
 export interface GlobalAudioState {
   isRecording: boolean
@@ -73,11 +74,14 @@ function createGlobalAudio() {
       node.connect(silencer)
       silencer.connect(ctx.destination)
 
-      // Ring-buffer tap for the retroactive "Rec" feature — not yet ported
-      // (out of scope for the initial multi-mode pass); a no-op tap keeps
-      // the audio graph shape identical to the Next.js version.
+      // Ring-buffer tap for the retroactive "Rec" feature — continuously
+      // feeds the last N seconds of input audio to audioRecorder so it can
+      // be saved as a WAV after the fact.
       const tap = ctx.createScriptProcessor(4096, 1, 1)
       source.connect(tap)
+      tap.onaudioprocess = (e) => {
+        audioRecorder.write('input', e.inputBuffer.getChannelData(0), ctx.sampleRate)
+      }
       tap.connect(ctx.destination)
       recTap = tap
 
