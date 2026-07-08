@@ -11,7 +11,6 @@
     /* Bundler mode */
     "moduleResolution": "bundler",
     "allowImportingTsExtensions": true,
-    "verbatimModuleSyntax": true,
     "moduleDetection": "force",
     "noEmit": true,
     "jsx": "preserve",
@@ -23,10 +22,14 @@
       "$decoder-lib/*": ["../src/lib/*"]
     },
 
-    /* Linting */
-    "noUnusedLocals": true,
+    /* Linting — noUnusedLocals/erasableSyntaxOnly/verbatimModuleSyntax
+       (create-vite's scaffold defaults) are dropped because $decoder-lib is
+       the pre-existing Next.js app's shared code, written under its own
+       (looser) tsconfig — e.g. it uses real `enum`s, which
+       erasableSyntaxOnly forbids. These flags make sense for source
+       authored fresh in this project, not for code this project merely
+       consumes via a path alias. */
     "noUnusedParameters": true,
-    "erasableSyntaxOnly": true,
     "noFallthroughCasesInSwitch": true
   },
   "include": ["src"]
