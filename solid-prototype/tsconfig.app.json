@@ -4,7 +4,11 @@
     "target": "es2023",
     "module": "esnext",
     "lib": ["ES2023", "DOM"],
-    "types": ["vite/client"],
+    /* "node" is needed because $decoder-lib/ft/decoder.ts references
+       `process.env.NODE_ENV` (guarded by a `typeof window !== 'undefined'`
+       check for runtime safety, but still needs the ambient type at
+       compile time) — no code in this project's own src/ uses Node globals. */
+    "types": ["vite/client", "node"],
     "allowArbitraryExtensions": true,
     "skipLibCheck": true,
 

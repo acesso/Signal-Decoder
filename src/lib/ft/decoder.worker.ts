@@ -49,10 +49,14 @@ export type WorkerResponse =
   | { type: 'resampled'; id: number; samples: Float32Array };
 
 // ── WASM public-asset URL helper ────────────────────────────────────────────
-// Worker chunks are served from /_next/static/chunks/… (or /<basePath>/_next/…
-// on GitHub Pages). Public assets live at origin root (+ optional basePath).
-// We recover basePath by slicing off the /_next/… suffix from the worker URL.
+// Worker chunks are served from a bundler-specific nested path (Next.js:
+// /_next/static/chunks/…, optionally under a GitHub Pages basePath; Vite:
+// /assets/…, under import.meta.env.BASE_URL). Public assets (this app's
+// /wasm/*) live at the site's base path, not next to the worker chunk, so we
+// need to recover that base independently of where the worker itself landed.
 function getPublicBase(): string {
+  const viteBase = (import.meta as unknown as { env?: { BASE_URL?: string } }).env?.BASE_URL;
+  if (viteBase !== undefined) return self.location.origin + viteBase.replace(/\/$/, '');
   const { origin, pathname } = self.location;
   const nextIdx = pathname.indexOf('/_next/');
   return origin + (nextIdx > 0 ? pathname.slice(0, nextIdx) : '');
