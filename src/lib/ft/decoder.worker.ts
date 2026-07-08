@@ -6,12 +6,19 @@
  *   ft8.wasm    — ft8_lib (kgoba): lightweight BP-only decoder. Used for FT4,
  *                 and as FT8 fallback if ft8mon fails to load.
  *
- * Both modules are loaded at worker startup so the first decode window is not
- * blocked. Callsign hash tables live inside each WASM instance and persist
- * across decode windows (matching the old @e04/ft8ts HashCallBook lifetime).
+ * Each engine loads lazily on first use, not both at worker startup — a pool
+ * slot decoding FT4 only ever touches ft8_lib, so it has no reason to pay
+ * ft8mon's load/init cost (and vice versa for a pure-FT8 run that never hits
+ * the ft8mon-failed fallback). With N pool workers this used to mean N×2 WASM
+ * instances resident regardless of which mode was active. Each loader is
+ * still a cached singleton promise, so mode switches or the FT8→ft8_lib
+ * fallback path only pay the load cost once per worker lifetime. Callsign
+ * hash tables live inside each WASM instance and persist across decode
+ * windows for as long as that engine stays loaded (matching the old
+ * @e04/ft8ts HashCallBook lifetime).
  *
  * Decoder params (osd_depth, budget, ...) arrive via 'params' messages and are
- * applied to ft8mon immediately — they take effect on the next decode call.
+ * applied to ft8mon immediately if already loaded, or on its next load.
  */
 
 import type { FTMode, FTDecoderParams } from './decoder';
@@ -116,15 +123,23 @@ function applyParams(mod: FT8MonModule) {
   }
 }
 
+// Each loader announces its own engine as 'ready' the moment IT finishes
+// loading (not both at once) — the main thread's "loading…" indicator should
+// clear as soon as the engine actually needed for the current mode is up,
+// not wait on an engine that mode will never touch.
 function loadFt8Mon(): Promise<FT8MonModule> {
   if (ft8monReady) return ft8monReady;
   ft8monReady = (async () => {
     const mod = await instantiate<FT8MonModule>('ft8mon.js', 'ft8mon.wasm', 'createFT8MonModule');
     mod._ftm_init();
     applyParams(mod);
+    self.postMessage({ type: 'ready', engines: ['ft8mon'] } satisfies WorkerResponse);
     return mod;
   })();
-  ft8monReady.catch(() => { ft8monReady = null; }); // retry on next request
+  ft8monReady.catch(err => {
+    ft8monReady = null; // retry on next request
+    console.error('[ft8 worker] ft8mon load failed:', err);
+  });
   return ft8monReady;
 }
 
@@ -133,22 +148,15 @@ function loadFt8Lib(): Promise<FT8LibModule> {
   ft8libReady = (async () => {
     const mod = await instantiate<FT8LibModule>('ft8.js', 'ft8.wasm', 'createFT8Module');
     mod._ft8_init();
+    self.postMessage({ type: 'ready', engines: ['ft8_lib'] } satisfies WorkerResponse);
     return mod;
   })();
-  ft8libReady.catch(() => { ft8libReady = null; });
+  ft8libReady.catch(err => {
+    ft8libReady = null;
+    console.error('[ft8 worker] ft8_lib load failed:', err);
+  });
   return ft8libReady;
 }
-
-// Pre-load both engines, then tell the main thread which ones are available.
-Promise.allSettled([loadFt8Mon(), loadFt8Lib()]).then(settled => {
-  const engines = ['ft8mon', 'ft8_lib'].filter((_, i) => settled[i].status === 'fulfilled');
-  settled.forEach((s, i) => {
-    if (s.status === 'rejected') {
-      console.error(`[ft8 worker] ${i === 0 ? 'ft8mon' : 'ft8_lib'} load failed:`, s.reason);
-    }
-  });
-  self.postMessage({ type: 'ready', engines } satisfies WorkerResponse);
-});
 
 // ── Decode helpers ───────────────────────────────────────────────────────────
 type Messages = Extract<WorkerResponse, { type: 'result' }>['messages'];

@@ -756,9 +756,14 @@ const FTDecoder = forwardRef<DecoderControls, { ftMode: FTMode; myCall?: string;
                       {row.stats!.held} held
                     </span>
                   )}
-                  {!row.decoding && ((row.stats?.expired ?? 0) + (row.stats?.gridRejected ?? 0)) > 0 && (
-                    <span className="ml-2 text-[#f85149]/70" title="dropped: quarantined callsigns never corroborated + geographically implausible grids">
-                      {(row.stats!.expired + row.stats!.gridRejected)} dropped
+                  {!row.decoding && (row.stats?.expired ?? 0) > 0 && (
+                    <span className="ml-2 text-[#f85149]/70" title="quarantined callsigns dropped — never corroborated by a clean decode or repeat sighting within 6 windows; will never appear as a contact">
+                      {row.stats!.expired} expired
+                    </span>
+                  )}
+                  {!row.decoding && (row.stats?.gridRejected ?? 0) > 0 && (
+                    <span className="ml-2 text-[#f85149]/70" title="grid rejected — reported locator is geographically implausible for the callsign's country (e.g. a wrong-continent decode); the contact's map position was not updated">
+                      {row.stats!.gridRejected} bad grid
                     </span>
                   )}
                 </div>
