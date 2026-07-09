@@ -340,13 +340,18 @@ interface FTTransmitPanelProps {
   onSetPTT?: (tx: boolean) => Promise<void>;
   onStatusChange?: (s: TxStatus) => void;
   onReset?: (clearSentFn: () => void) => void;
+  onBaseFreqHandle?: (setFn: (v: number) => void) => void;
 }
 
 export default function FTTransmitPanel(props: FTTransmitPanelProps): JSX.Element {
   const [myCall, setMyCallState]     = createSignal(loadMyCall())
   const [myGrid, setMyGridState]     = createSignal(loadMyGrid())
   const [baseFreq, setBaseFreqState] = createSignal(loadBaseFreq())
-  const setBaseFreq = (v: number) => { setBaseFreqState(v); saveBaseFreq(v) }
+  const setBaseFreq = (v: number) => {
+    const clamped = Math.max(200, Math.min(3000, Math.round(v)))
+    setBaseFreqState(clamped)
+    saveBaseFreq(clamped)
+  }
   const [editMsg, setEditMsg]        = createSignal('')
   const [editLabel, setEditLabel]    = createSignal('')
   const [callErr, setCallErr]        = createSignal(false)
@@ -373,6 +378,13 @@ export default function FTTransmitPanel(props: FTTransmitPanelProps): JSX.Elemen
   // Register clearSent with parent so the global Reset button can clear TX history
   createEffect(() => {
     props.onReset?.(tx.clearSent)
+  })
+
+  // Expose setBaseFreq to the parent so the Audio Analysis panel's TX marker
+  // (rendered as a sibling under FTDecoder, not a child of this panel) can
+  // drag-adjust it directly.
+  createEffect(() => {
+    props.onBaseFreqHandle?.(setBaseFreq)
   })
 
   // dB <-> linear helpers (slider operates in dB, GainNode needs linear)

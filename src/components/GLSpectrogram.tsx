@@ -9,8 +9,9 @@
 // in via onMount, mirroring what a React ref object looks like from the
 // outside without needing forwardRef.
 import { createEffect, createMemo, createSignal, onCleanup, onMount, type JSX } from 'solid-js'
+import { buildColormapLUT, COLORMAP_LUT_SIZE, type ColormapName } from '$decoder-lib/colormaps'
 
-export type GLView = 'terrain'
+export type GLView = 'terrain' | 'waterfall'
 
 export interface SpectroBand {
   fromHz: number
@@ -41,6 +42,11 @@ interface Props {
   sqlGridSize?: number
   vfoFrequency?: number
   txMarkerHz?: number
+  /** Palette for the terrain/waterfall intensity mapping (default turbo). */
+  colormap?: ColormapName
+  /** Called once if WebGL init or shader compilation fails — lets the host
+   *  swap in a CPU-rendered fallback instead of showing a dead box. */
+  onFailed?: () => void
 }
 
 const TEX_W = 512
@@ -52,18 +58,15 @@ const HEIGHT_SCALE = 0.55
 const TERRAIN_X = 192
 const TERRAIN_Z = 56
 
-const TURBO_GLSL = `
-vec3 turbo(float t) {
-  t = clamp(t, 0.0, 1.0);
-  const vec4 kR4 = vec4(0.13572138, 4.61539260, -42.66032258, 132.13108234);
-  const vec4 kG4 = vec4(0.09140261, 2.19418839, 4.84296658, -14.18503333);
-  const vec4 kB4 = vec4(0.10667330, 12.64194608, -60.58204836, 110.36276771);
-  const vec2 kR2 = vec2(-152.94239396, 59.28637943);
-  const vec2 kG2 = vec2(4.27729857, 2.82956604);
-  const vec2 kB2 = vec2(-89.90310912, 27.34824973);
-  vec4 v4 = vec4(1.0, t, t*t, t*t*t);
-  vec2 v2 = v4.zw * v4.z;
-  return clamp(vec3(dot(v4,kR4)+dot(v2,kR2), dot(v4,kG4)+dot(v2,kG2), dot(v4,kB4)+dot(v2,kB2)), 0.0, 1.0);
+// Palette lookup — samples the 256×1 LUT texture built by
+// $decoder-lib/colormaps (unit 1), shared with the CPU-fallback waterfall so
+// every renderer shows identical colors. Half-texel offsets keep t=0 and t=1
+// from bleeding across the clamped edge texels.
+const CMAP_GLSL = `
+uniform sampler2D uCmapTex;
+vec3 cmap(float t) {
+  float x = clamp(t, 0.0, 1.0) * ${(COLORMAP_LUT_SIZE - 1) / COLORMAP_LUT_SIZE} + ${0.5 / COLORMAP_LUT_SIZE};
+  return texture2D(uCmapTex, vec2(x, 0.5)).rgb;
 }
 `
 
@@ -202,14 +205,48 @@ precision mediump float;
 varying float vV;
 varying float vZ;
 varying float vX;
-${TURBO_GLSL}
+${CMAP_GLSL}
 ${BANDS_GLSL}
 ${GRID_GLSL}
 void main() {
-  vec3 c = turbo(vV);
+  vec3 c = cmap(vV);
   c = applyGrid(c, vX);
   c = applyBands(c, vX);
   c = mix(c, vec3(${BG[0]}, ${BG[1]}, ${BG[2]}), smoothstep(0.45, 1.0, vZ));
+  gl_FragColor = vec4(c, 1.0);
+}
+`
+
+// Top-down scrolling waterfall — a fullscreen quad sampling the same row
+// ring-texture the terrain keeps on the GPU. Replaces the old CPU 2D canvas
+// (getImageData/putImageData full-canvas scroll every row) so waterfall
+// rendering costs the CPU nothing beyond one texSubImage row upload.
+const WATERFALL_VS = `
+precision mediump float;
+attribute vec2 aPos;
+varying vec2 vUV;
+void main() {
+  vUV = aPos;
+  gl_Position = vec4(aPos.x * 2.0 - 1.0, 1.0 - aPos.y * 2.0, 0.0, 1.0);
+}
+`
+
+const WATERFALL_FS = `
+precision mediump float;
+varying vec2 vUV;
+uniform sampler2D uTex;
+uniform float uHead, uDepth, uGamma;
+${CMAP_GLSL}
+${BANDS_GLSL}
+${GRID_GLSL}
+void main() {
+  float texV = fract(uHead - vUV.y * uDepth);
+  float raw  = texture2D(uTex, vec2(vUV.x, texV)).r;
+  float v    = pow(raw, uGamma);
+  vec3 c = cmap(v);
+  c = mix(vec3(${BG[0]}, ${BG[1]}, ${BG[2]}), c, smoothstep(0.0, 0.06, v));
+  c = applyGrid(c, vUV.x);
+  c = applyBands(c, vUV.x);
   gl_FragColor = vec4(c, 1.0);
 }
 `
@@ -344,6 +381,7 @@ export default function GLSpectrogram(props: Props): JSX.Element {
   let canvasEl: HTMLCanvasElement | undefined
   let gl: WebGLRenderingContext | null = null
   let tex: WebGLTexture | null = null
+  let cmapTex: WebGLTexture | null = null
   let head = 0
   let rowInterval = 33
   let renderFn: (() => void) | null = null
@@ -374,7 +412,10 @@ export default function GLSpectrogram(props: Props): JSX.Element {
   let txMarkerEl: HTMLDivElement | undefined
   let txMarkerHzVal = props.txMarkerHz ?? 0
   const [failed, setFailed] = createSignal(false)
-  const failedSetter = setFailed
+  const failedSetter = (v: boolean) => {
+    setFailed(v)
+    if (v) props.onFailed?.()
+  }
 
   const minHz = createMemo(() => props.minHz ?? 0)
   const span = createMemo(() => props.maxHz - minHz())
@@ -399,6 +440,24 @@ export default function GLSpectrogram(props: Props): JSX.Element {
       out.push({ x: (hz - mn) / span(), text })
     }
     return out
+  })
+
+  // Palette LUT lives on texture unit 1 (unit 0 stays the row data texture —
+  // existing samplers rely on its default binding). Always restore the active
+  // unit to 0 so pushRow's bindTexture keeps hitting the data texture.
+  const uploadCmap = () => {
+    const g = gl
+    if (!g || !cmapTex) return
+    const lut = buildColormapLUT(props.colormap ?? 'turbo')
+    g.activeTexture(g.TEXTURE1)
+    g.bindTexture(g.TEXTURE_2D, cmapTex)
+    g.texSubImage2D(g.TEXTURE_2D, 0, 0, 0, COLORMAP_LUT_SIZE, 1, g.RGBA, g.UNSIGNED_BYTE, lut)
+    g.activeTexture(g.TEXTURE0)
+  }
+  createEffect(() => {
+    void props.colormap
+    uploadCmap()
+    renderFn?.()
   })
 
   createEffect(() => {
@@ -470,6 +529,18 @@ export default function GLSpectrogram(props: Props): JSX.Element {
     ctx.texParameteri(ctx.TEXTURE_2D, ctx.TEXTURE_WRAP_T, ctx.REPEAT)
     tex = t
 
+    const ct = ctx.createTexture()
+    ctx.activeTexture(ctx.TEXTURE1)
+    ctx.bindTexture(ctx.TEXTURE_2D, ct)
+    ctx.texImage2D(ctx.TEXTURE_2D, 0, ctx.RGBA, COLORMAP_LUT_SIZE, 1, 0, ctx.RGBA, ctx.UNSIGNED_BYTE, null)
+    ctx.texParameteri(ctx.TEXTURE_2D, ctx.TEXTURE_MIN_FILTER, ctx.LINEAR)
+    ctx.texParameteri(ctx.TEXTURE_2D, ctx.TEXTURE_MAG_FILTER, ctx.LINEAR)
+    ctx.texParameteri(ctx.TEXTURE_2D, ctx.TEXTURE_WRAP_S, ctx.CLAMP_TO_EDGE)
+    ctx.texParameteri(ctx.TEXTURE_2D, ctx.TEXTURE_WRAP_T, ctx.CLAMP_TO_EDGE)
+    ctx.activeTexture(ctx.TEXTURE0)
+    cmapTex = ct
+    uploadCmap()
+
     if (props.handle) {
       props.handle.current = {
         pushRow(data: Uint8Array) {
@@ -492,7 +563,18 @@ export default function GLSpectrogram(props: Props): JSX.Element {
             terrainHeights[i] = rowSmoothed[i]
           }
 
-          for (let i = 0; i < TEX_W; i++) rowScratch[i] = terrainHeights[i] * 255
+          // Ring-texture row: resample the RAW spectrum to the full texture
+          // width. (Previously this copied terrainHeights[0..TEX_W-1] — but a
+          // terrain row is only TERRAIN_X wide, so texture columns beyond it
+          // held stale data from older rows. The waterfall view samples the
+          // whole width, so it needs true full-res rows; unsmoothed keeps it
+          // crisp like the old CPU waterfall.)
+          for (let i = 0; i < TEX_W; i++) {
+            const f = (i / (TEX_W - 1)) * (n - 1)
+            const i0 = f | 0
+            const i1 = Math.min(i0 + 1, n - 1)
+            rowScratch[i] = data[i0] * (1 - (f - i0)) + data[i1] * (f - i0)
+          }
           if (tex) {
             g.bindTexture(g.TEXTURE_2D, tex)
             g.texSubImage2D(g.TEXTURE_2D, 0, 0, head, TEX_W, 1, g.LUMINANCE, g.UNSIGNED_BYTE, rowScratch)
@@ -592,13 +674,15 @@ export default function GLSpectrogram(props: Props): JSX.Element {
     }
     const sqlHeight = () => Math.pow(sqlState.level ?? 0, props.gamma) * HEIGHT_SCALE
 
-    const placeLabels = (project: (xNorm: number) => [number, number] | null) => {
+    const placeLabels = (project: (xNorm: number) => [number, number] | null, hideLabels = false) => {
       const W = canvas.clientWidth,
         H = canvas.clientHeight
       labels().forEach((lb, i) => {
         const el = labelEls[i]
         if (!el) return
-        const pos = project(lb.x)
+        // Waterfall view: labels live in the panel's external HTML ruler
+        // below the box — hide the projected in-canvas ones.
+        const pos = hideLabels ? null : project(lb.x)
         if (!pos || pos[0] < -20 || pos[0] > W + 20 || pos[1] < 0 || pos[1] > H) {
           el.style.display = 'none'
           return
@@ -640,6 +724,48 @@ export default function GLSpectrogram(props: Props): JSX.Element {
         } else {
           txEl.style.display = 'none'
         }
+      }
+    }
+
+    if (view === 'waterfall') {
+      const prog = mkProgram(WATERFALL_VS, WATERFALL_FS)
+      if (!prog) {
+        failedSetter(true)
+        return
+      }
+      const quad = mkBuffer(new Float32Array([0, 0, 1, 0, 0, 1, 1, 1]))
+      const aPos = g.getAttribLocation(prog, 'aPos')
+      const loc = {
+        head: g.getUniformLocation(prog, 'uHead'),
+        depth: g.getUniformLocation(prog, 'uDepth'),
+        gamma: g.getUniformLocation(prog, 'uGamma'),
+        grid: g.getUniformLocation(prog, 'uGrid'),
+        cmapTex: g.getUniformLocation(prog, 'uCmapTex'),
+        bands: bandLocs(prog),
+      }
+
+      renderFn = () => {
+        g.viewport(0, 0, canvas.width, canvas.height)
+        g.disable(g.DEPTH_TEST)
+        g.clearColor(BG[0], BG[1], BG[2], 1)
+        g.clear(g.COLOR_BUFFER_BIT)
+        g.useProgram(prog)
+        g.activeTexture(g.TEXTURE1)
+        g.bindTexture(g.TEXTURE_2D, cmapTex)
+        g.activeTexture(g.TEXTURE0)
+        g.bindTexture(g.TEXTURE_2D, tex)
+        g.uniform1i(loc.cmapTex, 1)
+        g.bindBuffer(g.ARRAY_BUFFER, quad)
+        g.enableVertexAttribArray(aPos)
+        g.vertexAttribPointer(aPos, 2, g.FLOAT, false, 0, 0)
+        g.uniform1f(loc.head, headNorm())
+        g.uniform1f(loc.depth, DEPTH)
+        g.uniform1f(loc.gamma, props.gamma)
+        g.uniform2f(loc.grid, gridState[0], gridState[1])
+        setBandUniforms(loc.bands)
+        g.drawArrays(g.TRIANGLE_STRIP, 0, 4)
+        // Straight linear projection — the waterfall has no camera.
+        placeLabels((xNorm) => [xNorm * canvas.clientWidth, canvas.clientHeight - 14], true)
       }
     }
 
@@ -688,6 +814,7 @@ export default function GLSpectrogram(props: Props): JSX.Element {
         gamma: g.getUniformLocation(prog, 'uGamma'),
         mvp: g.getUniformLocation(prog, 'uMVP'),
         grid: g.getUniformLocation(prog, 'uGrid'),
+        cmapTex: g.getUniformLocation(prog, 'uCmapTex'),
         bands: bandLocs(prog),
       }
 
@@ -817,6 +944,11 @@ export default function GLSpectrogram(props: Props): JSX.Element {
         g.enableVertexAttribArray(aPos)
         g.vertexAttribPointer(aPos, 2, g.FLOAT, false, 0, 0)
         g.bindBuffer(g.ELEMENT_ARRAY_BUFFER, ibuf)
+        g.activeTexture(g.TEXTURE1)
+        g.bindTexture(g.TEXTURE_2D, cmapTex)
+        g.activeTexture(g.TEXTURE0)
+        g.bindTexture(g.TEXTURE_2D, tex) // sqlGrid's sampler reads unit 0
+        g.uniform1i(loc.cmapTex, 1)
         g.uniformMatrix4fv(loc.mvp, false, mvp)
         g.uniform1f(loc.gamma, props.gamma)
         g.uniform2f(loc.grid, gridState[0], gridState[1])
@@ -849,6 +981,7 @@ export default function GLSpectrogram(props: Props): JSX.Element {
     let drag: { mode: 'rotate' | 'pan'; x: number; y: number } | null = null
 
     const onMouseDown = (e: MouseEvent) => {
+      if (props.view !== 'terrain') return
       const pan = e.button === 2 || e.button === 1 || e.shiftKey
       drag = { mode: pan ? 'pan' : 'rotate', x: e.clientX, y: e.clientY }
       canvas.style.cursor = 'grabbing'
@@ -878,18 +1011,24 @@ export default function GLSpectrogram(props: Props): JSX.Element {
       canvas.style.cursor = 'grab'
     }
     const onWheel = (e: WheelEvent) => {
+      if (props.view !== 'terrain') return // waterfall: let the page scroll
       e.preventDefault()
       const cam = terrainCam
       cam.dist = Math.max(0.8, Math.min(7, cam.dist * Math.exp(e.deltaY * 0.0012)))
       renderFn?.()
     }
     const onDblClick = () => {
+      if (props.view !== 'terrain') return
       terrainCam = { ...TERRAIN_CAM }
       renderFn?.()
     }
-    const onContextMenu = (e: MouseEvent) => e.preventDefault()
+    const onContextMenu = (e: MouseEvent) => {
+      if (props.view === 'terrain') e.preventDefault()
+    }
 
-    canvas.style.cursor = 'grab'
+    createEffect(() => {
+      canvas.style.cursor = props.view === 'terrain' ? 'grab' : 'default'
+    })
     canvas.addEventListener('mousedown', onMouseDown)
     canvas.addEventListener('wheel', onWheel, { passive: false })
     canvas.addEventListener('dblclick', onDblClick)
@@ -950,16 +1089,19 @@ export default function GLSpectrogram(props: Props): JSX.Element {
           display: 'none',
           width: '2px',
           transform: 'translateX(-50%)',
-          background: 'rgba(88,166,255,0.75)',
-          'box-shadow': '0 0 4px rgba(88,166,255,0.5)',
+          // Red — stands out against the waterfall's dark-blue quiet floor.
+          background: 'rgba(248,81,73,0.8)',
+          'box-shadow': '0 0 4px rgba(248,81,73,0.5)',
         }}
       />
-      <div class="pointer-events-none absolute right-2 bottom-1.5 font-mono text-[9px] text-[#484f58] select-none">
-        drag rotate · shift+drag pan · scroll zoom · dblclick reset
-      </div>
+      {props.view === 'terrain' && (
+        <div class="pointer-events-none absolute right-2 bottom-1.5 font-mono text-[9px] text-[#484f58] select-none">
+          drag rotate · shift+drag pan · scroll zoom · dblclick reset
+        </div>
+      )}
       {failed() && (
         <div class="absolute inset-0 flex items-center justify-center font-mono text-xs text-[#f85149]">
-          WebGL unavailable — switch View back to Classic 2D
+          WebGL unavailable — using CPU fallback
         </div>
       )}
     </>

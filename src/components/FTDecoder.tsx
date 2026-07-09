@@ -311,6 +311,7 @@ interface Props {
   myGrid?: string
   onContactsChange?: (c: Map<string, Contact>) => void
   txAudioHz?: number
+  onTxAudioHzChange?: (hz: number) => void
   analyser?: AnalyserNode | null
   vfoFrequency?: number
   onStateChange?: (controls: DecoderControls) => void
@@ -898,7 +899,9 @@ export default function FTDecoder(props: Props): JSX.Element {
           isRecording={processor.state().isRecording}
           vfoFrequency={props.vfoFrequency}
           storageKeyPrefix="ft"
-          txMarkerHz={(props.txAudioHz ?? 0) > 0 ? props.txAudioHz : undefined}
+          markers={(props.txAudioHz ?? 0) > 0 ? [{ freq: props.txAudioHz!, color: '#f85149', label: 'TX' }] : undefined}
+          onMarkerDrag={props.onTxAudioHzChange ? (_i, hz) => props.onTxAudioHzChange!(hz) : undefined}
+          markerFieldLabel="TX"
           class="min-w-0"
           style={{ flex: panelWeights()[1] }}
         />

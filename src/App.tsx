@@ -438,7 +438,16 @@ function App(): JSX.Element {
   const [catCollapsed, setCatCollapsed] = createSignal(false)
   function handleBodyScroll() {
     if (!scrollBodyEl) return
-    setCatCollapsed(scrollBodyEl.scrollTop > 24)
+    const y = scrollBodyEl.scrollTop
+    // Hysteresis, not a single threshold: collapsing shrinks the panel, and
+    // the browser's scroll anchoring then pulls scrollTop back across the
+    // same line → expand → collapse → visible flicker. Extra scroll events
+    // from decoders appending content re-poke the loop. Collapse only once
+    // clearly scrolled down, expand only near the top; in between, hold.
+    // (Scroll anchoring itself is disabled on the container — see
+    // [overflow-anchor:none] on the element.)
+    if (y > 96) setCatCollapsed(true)
+    else if (y < 24) setCatCollapsed(false)
   }
 
   // ── Radio CAT — lifted here so VFO frequency flows to all decoders ────────
@@ -477,6 +486,7 @@ function App(): JSX.Element {
     activeHandle().current?.reset()
     clearSent?.()
   }
+  let setTxBaseFreq: ((v: number) => void) | null = null
 
   function handleFTModeChange(m: FTMode) {
     setFTMode(m)
@@ -540,7 +550,11 @@ function App(): JSX.Element {
       </div>
 
       {/* Scrollable body — CAT + TX panel + decoder content */}
-      <div ref={scrollBodyEl} onScroll={handleBodyScroll} class="min-h-0 flex-1 overflow-y-auto px-4 pb-8 sm:px-6 lg:px-8">
+      <div
+        ref={scrollBodyEl}
+        onScroll={handleBodyScroll}
+        class="min-h-0 flex-1 overflow-y-auto px-4 pb-8 sm:px-6 lg:px-8 [overflow-anchor:none]"
+      >
         {/* CAT radio control panel — sticky: stays visible while scrolling,
             collapsing to just its main bar so it doesn't eat too much space. */}
         <div class="sticky top-0 z-10 bg-[#0d1117] pb-3">
@@ -568,6 +582,9 @@ function App(): JSX.Element {
                   onStatusChange={setTxStatus}
                   onReset={(fn) => {
                     clearSent = fn
+                  }}
+                  onBaseFreqHandle={(fn) => {
+                    setTxBaseFreq = fn
                   }}
                 />
               </div>
@@ -599,6 +616,7 @@ function App(): JSX.Element {
             analyser={globalAudio.analyser()}
             vfoFrequency={vfoFrequency()}
             txAudioHz={txAudioHz()}
+            onTxAudioHzChange={(hz) => setTxBaseFreq?.(hz)}
           />
         </div>
       </div>
