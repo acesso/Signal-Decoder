@@ -393,8 +393,12 @@ function TxSummaryChips(props: { s: TxStatus | null }): JSX.Element {
           </span>
         </Show>
         <span class="inline-flex items-center gap-1">
-          <span class="rounded px-1 py-0.5 font-mono text-[9px] font-bold" style={{ color: props.s!.autoCQ ? '#3fb950' : '#484f58', background: props.s!.autoCQ ? 'rgba(46,160,67,0.12)' : 'transparent' }} title="Auto-CQ">
-            CQ
+          <span
+            class="rounded px-1 py-0.5 font-mono text-[9px] font-bold"
+            style={{ color: props.s!.autoCQ ? '#3fb950' : '#484f58', background: props.s!.autoCQ ? 'rgba(46,160,67,0.12)' : 'transparent' }}
+            title={`Auto-CQ · every ${props.s!.autoCQIntervalMin} min`}
+          >
+            CQ {props.s!.autoCQIntervalMin}m
           </span>
           <span
             class="rounded px-1 py-0.5 font-mono text-[9px] font-bold"

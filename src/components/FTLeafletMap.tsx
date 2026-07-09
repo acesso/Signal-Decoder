@@ -9,7 +9,8 @@
 import { createEffect, createSignal, onCleanup, onMount } from 'solid-js'
 import L from 'leaflet'
 import 'leaflet/dist/leaflet.css'
-import { Contact, haversineKm } from '$decoder-lib/ft/parser'
+import { Contact, haversineKm, isConfirmedQSO, isPartialQSO } from '$decoder-lib/ft/parser'
+import { DEFAULT_DECODER_PARAMS } from '$decoder-lib/ft/decoder'
 
 // Map view (center/zoom) persistence. This is a plain client-side SPA (no
 // SSR), so reading localStorage synchronously on mount is always safe here.
@@ -40,6 +41,64 @@ function saveMapView(center: [number, number], zoom: number): void {
 // QSO line colors by direction relative to the hovered station
 const TX_COLOR = '#2ea043' // hovered station transmitting
 const RX_COLOR = '#79c0ff' // hovered station receiving
+
+export type MapColorMode = 'default' | 'age' | 'worked' | 'distance'
+
+const WORKED_FULL_COLOR    = '#2ea043' // confirmed two-way QSO (report exchanged)
+const WORKED_PARTIAL_COLOR = '#d29922' // handshake only, no report yet
+const WORKED_NONE_COLOR    = '#484f58' // heard/decoded, never exchanged with me
+
+// Blend two hex colors — used to fade a pin's color toward the map's dark
+// background as it ages or gets farther away, without touching opacity
+// (which Leaflet's divIcon renders inconsistently across the SVG + halo).
+function mixHex(hex: string, toward: string, t: number): string {
+  const c = Math.max(0, Math.min(1, t))
+  const pa = parseInt(hex.slice(1), 16), pb = parseInt(toward.slice(1), 16)
+  const ra = (pa >> 16) & 255, ga = (pa >> 8) & 255, ba = pa & 255
+  const rb = (pb >> 16) & 255, gb = (pb >> 8) & 255, bb = pb & 255
+  const r = Math.round(ra + (rb - ra) * c)
+  const g = Math.round(ga + (gb - ga) * c)
+  const b = Math.round(ba + (bb - ba) * c)
+  return `#${[r, g, b].map(v => v.toString(16).padStart(2, '0')).join('')}`
+}
+
+const MAP_BG = '#0d1117'
+
+// Effective marker color for the active color mode. `ageMs` = time since
+// last heard; `distanceKm`/`maxDistanceKm` position this contact within the
+// current spread of located contacts (farthest = most dimmed).
+function coloredFor(
+  mode: MapColorMode,
+  contact: Contact,
+  myCall: string,
+  ageMs: number,
+  distanceKm: number | null,
+  maxDistanceKm: number,
+): string {
+  if (mode === 'age') {
+    // Full-color when just heard, fading to the map background over 30 minutes.
+    const DECAY_MS = 30 * 60_000
+    return mixHex(contact.color, MAP_BG, ageMs / DECAY_MS)
+  }
+  if (mode === 'worked') {
+    if (!myCall) return contact.color
+    if (isConfirmedQSO(contact, myCall)) return WORKED_FULL_COLOR
+    if (isPartialQSO(contact, myCall)) return WORKED_PARTIAL_COLOR
+    return WORKED_NONE_COLOR
+  }
+  if (mode === 'distance') {
+    if (distanceKm === null || maxDistanceKm <= 0) return contact.color
+    return mixHex(contact.color, MAP_BG, (distanceKm / maxDistanceKm) * 0.75)
+  }
+  return contact.color
+}
+
+function formatAgeShort(ms: number): string {
+  const mins = Math.round(ms / 60_000)
+  if (mins < 1) return 'just now'
+  if (mins < 60) return `${mins}m`
+  return `${Math.round(mins / 60)}h`
+}
 
 // Bow a straight lat/lon segment into a gentle arc — flat lines read as
 // clutter once a few overlap; a slight curve separates tx/rx pairs visually
@@ -188,6 +247,13 @@ export interface FTLeafletMapProps {
   newWindowMs?: number
   /** The operator's own callsign — its marker gets a distinct gold/star treatment. */
   myCall?: string
+  /** How to color pins: 'default' (per-contact palette color), 'age' (fades
+   *  with time since last heard), 'worked' (full/partial/none QSO status with
+   *  myCall), 'distance' (dims with distance from myCall's own pin). */
+  colorMode?: MapColorMode
+  /** When set, hide contacts whose most recent absolute frequency falls
+   *  outside the decoder's passband around this VFO (Hz). 0/absent = no filter. */
+  vfoFilterHz?: number
 }
 
 const TILE_LAYERS: Record<'dark' | 'light', { url: string }> = {
@@ -218,6 +284,17 @@ export default function FTLeafletMap(props: FTLeafletMapProps) {
   const lineLayers = new Map<string, { line: L.Polyline; head: L.CircleMarker }>()
 
   const [hoverCs, setHoverCs] = createSignal<string | null>(null)
+
+  // Age-based coloring depends on Date.now(), which nothing else here is
+  // reactive to — without a tick, a pin would freeze at whatever shade it had
+  // when last (re)rendered instead of continuing to fade. Only runs the
+  // interval while that mode is actually active.
+  const [ageTick, setAgeTick] = createSignal(0)
+  createEffect(() => {
+    if ((props.colorMode ?? 'default') !== 'age') return
+    const id = setInterval(() => setAgeTick(t => t + 1), 30_000)
+    onCleanup(() => clearInterval(id))
+  })
 
   // ── mount: create the map once ────────────────────────────────────────
   onMount(() => {
@@ -421,10 +498,36 @@ export default function FTLeafletMap(props: FTLeafletMapProps) {
   // ── contact markers: diff against the live marker map ─────────────────
   createEffect(() => {
     if (!map) return
+    ageTick() // re-run periodically while colorMode === 'age' (see effect above)
     const myCallUp = (props.myCall ?? '').trim().toUpperCase()
     const newWindowMs = props.newWindowMs ?? 0
     const selected = props.selected
-    const contactList = Array.from(props.contacts.values()).filter(c => c.latLon)
+    const colorMode = props.colorMode ?? 'default'
+    const vfoHz = props.vfoFilterHz ?? 0
+    let contactList = Array.from(props.contacts.values()).filter(c => c.latLon)
+
+    // VFO filter: keep only contacts whose most recent message's absolute
+    // frequency falls inside the decoder's passband around the live VFO.
+    // Messages store either an absolute Hz (VFO baked in at decode time) or a
+    // bare audio offset (no VFO set then) — only the former can be compared;
+    // a contact with no absolute-frequency messages is excluded when filtering.
+    if (vfoHz > 0) {
+      const lo = vfoHz + DEFAULT_DECODER_PARAMS.minHz
+      const hi = vfoHz + DEFAULT_DECODER_PARAMS.maxHz
+      contactList = contactList.filter(c => {
+        const last = c.msgs.reduce<typeof c.msgs[number] | null>(
+          (latest, m) => (!latest || m.windowStart > latest.windowStart) ? m : latest, null,
+        )
+        if (!last || last.freq <= 1_000_000) return false
+        return last.freq >= lo && last.freq <= hi
+      })
+    }
+
+    const myPos = myCallUp ? props.contacts.get(myCallUp)?.latLon ?? null : null
+    const maxDistanceKm = colorMode === 'distance' && myPos
+      ? contactList.reduce((m, c) => Math.max(m, haversineKm(myPos, c.latLon!)), 0)
+      : 0
+
     const seen = new Set<string>()
 
     for (const c of contactList) {
@@ -435,7 +538,10 @@ export default function FTLeafletMap(props: FTLeafletMapProps) {
       const age = Date.now() - c.firstSeen.getTime()
       const isNew = newWindowMs > 0 && age < newWindowMs
       const isMe  = !!myCallUp && c.callsign.toUpperCase() === myCallUp
-      const icon = makeIcon(c.color, isNew ? newWindowMs - age : null, isMe, c.callsign === selected)
+      const lastHeardMs = Date.now() - c.lastSeen.getTime()
+      const distanceKm = myPos ? haversineKm(myPos, c.latLon!) : null
+      const color = isMe ? c.color : coloredFor(colorMode, c, myCallUp, lastHeardMs, distanceKm, maxDistanceKm)
+      const icon = makeIcon(color, isNew ? newWindowMs - age : null, isMe, c.callsign === selected)
 
       const popupHtml = `
         <div style="font-family:monospace;min-width:110px;">
@@ -448,6 +554,12 @@ export default function FTLeafletMap(props: FTLeafletMapProps) {
             ${txCount > 0 && rxCount > 0 ? '<span> · </span>' : ''}
             ${rxCount > 0 ? `<span>${rxCount} rx</span>` : ''}
           </div>
+          ${colorMode === 'distance' && distanceKm !== null
+            ? `<div style="color:#484f58;font-size:10px;">${Math.round(distanceKm).toLocaleString('en-US')} km</div>`
+            : ''}
+          ${colorMode === 'age'
+            ? `<div style="color:#484f58;font-size:10px;">heard ${formatAgeShort(lastHeardMs)} ago</div>`
+            : ''}
           ${c.peers.size > 0
             ? `<div style="color:#484f58;font-size:10px;">worked: ${Array.from(c.peers).map(p =>
                 `<span style="${props.onSelect ? 'cursor:pointer;' : ''}text-decoration:underline;margin-right:4px;" data-ft-select="${p}">${p}</span>`,

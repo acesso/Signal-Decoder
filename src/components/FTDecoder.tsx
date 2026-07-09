@@ -360,6 +360,10 @@ export default function FTDecoder(props: Props): JSX.Element {
     setContactFocus((prev) => ({ cs, n: (prev?.n ?? 0) + 1 }))
   }
 
+  // Free-text filter over the decoded message table — matches the raw
+  // decoded text (callsigns, grids, reports), not persisted across reloads.
+  const [msgQuery, setMsgQuery] = createSignal('')
+
   let prevResultLen = 0
   // Always-current VFO — readable synchronously without stale closure.
   let vfoVal = props.vfoFrequency ?? 0
@@ -621,9 +625,11 @@ export default function FTDecoder(props: Props): JSX.Element {
     const cs = contacts()
     const myUp = myCallUpper()
     const stats = windowStats()
+    const q = msgQuery().trim().toUpperCase()
     return results.flatMap((r, ri) => {
       const frozen = frozenVfo.get(r.windowStart.getTime()) ?? vfoVal
-      const msgs = sortMessages(r.messages)
+      const msgs = sortMessages(r.messages).filter(m => !q || m.msg.toUpperCase().includes(q))
+      if (q && msgs.length === 0) return []
       return [
         {
           kind: 'sep' as const,
@@ -768,6 +774,28 @@ export default function FTDecoder(props: Props): JSX.Element {
             </div>
           </Show>
 
+          {/* Filter */}
+          <Show when={processor.state().results.length > 0}>
+            <div class="mb-1.5 shrink-0 relative">
+              <input
+                type="text"
+                value={msgQuery()}
+                onInput={e => setMsgQuery(e.currentTarget.value)}
+                placeholder="Filter messages…"
+                class="w-full bg-[#0d1117] border border-[#30363d] rounded px-2 py-1 text-xs font-mono text-[#c9d1d9] placeholder-[#484f58] focus:outline-none focus:border-[#2ea043] transition-colors"
+              />
+              <Show when={msgQuery()}>
+                <button
+                  onClick={() => setMsgQuery('')}
+                  class="absolute right-1.5 top-1/2 -translate-y-1/2 text-[#484f58] hover:text-[#c9d1d9] text-xs px-1"
+                  title="Clear filter"
+                >
+                  ✕
+                </button>
+              </Show>
+            </div>
+          </Show>
+
           {/* column header (outside the scroller — no sticky tricks needed).
               Hz/dB/Δ/Message are sortable — but only WITHIN each decode window;
               windows themselves always stay in newest-first decode order. */}
@@ -793,8 +821,12 @@ export default function FTDecoder(props: Props): JSX.Element {
               <div class="flex h-full items-center justify-center">
                 <div class="space-y-2 text-center text-[#484f58]">
                   <div class="text-4xl">📻</div>
-                  <div>{processor.state().isRecording ? `Waiting for next ${props.ftMode} window…` : `Start decoding to receive ${props.ftMode} signals`}</div>
-                  <Show when={processor.state().isRecording && isSupported()}>
+                  <div>
+                    {msgQuery()
+                      ? `No messages match "${msgQuery().trim()}"`
+                      : processor.state().isRecording ? `Waiting for next ${props.ftMode} window…` : `Start decoding to receive ${props.ftMode} signals`}
+                  </div>
+                  <Show when={!msgQuery() && processor.state().isRecording && isSupported()}>
                     <div class="text-[#30363d]">UTC-synchronized · {windowSec()}s windows</div>
                   </Show>
                 </div>

@@ -1,6 +1,6 @@
 import {
   parseFTMsg, mergeContacts, isValidCallsign, classifyCallsign, gridToLatLon, haversineKm,
-  generateADIF, isConfirmedQSO,
+  generateADIF, isConfirmedQSO, isPartialQSO,
 } from '../parser';
 import { callsignCountry } from '../prefixes';
 
@@ -239,6 +239,33 @@ describe('generateADIF', () => {
   it('marks a completed exchange with the peer as a confirmed QSO', () => {
     const contacts = merge(qsoMsgs);
     expect(isConfirmedQSO(contacts.get(them)!, me)).toBe(true);
+  });
+
+  // Handshake only: THEM calls CQ, ME answers, THEM replies to ME with a grid —
+  // both sides have transmitted directly to each other but no signal report
+  // has been exchanged yet.
+  const handshakeMsgs = [`CQ ${them} FN42`, `${them} ${me} FN31`, `${me} ${them} FN42`];
+
+  it('a handshake with no report is partial, not confirmed, and excluded from export by default', () => {
+    const contacts = merge(handshakeMsgs);
+    expect(isConfirmedQSO(contacts.get(them)!, me)).toBe(false);
+    expect(isPartialQSO(contacts.get(them)!, me)).toBe(true);
+
+    const adif = generateADIF(contacts, 'FT8' as any, { myCall: me, myGrid: 'FN31' });
+    expect(adif).not.toContain(`<CALL:${them.length}>${them}`);
+  });
+
+  it('includes a partial (handshake-only) QSO in export when includePartial is set', () => {
+    const contacts = merge(handshakeMsgs);
+    const adif = generateADIF(contacts, 'FT8' as any, { myCall: me, myGrid: 'FN31', includePartial: true });
+    expect(adif).toContain(`<CALL:${them.length}>${them}`);
+    expect(adif).toContain('partial: handshake only');
+  });
+
+  it('does not mark a confirmed (full) QSO as partial even with includePartial set', () => {
+    const contacts = merge(qsoMsgs);
+    const adif = generateADIF(contacts, 'FT8' as any, { myCall: me, myGrid: 'FN31', includePartial: true });
+    expect(adif).not.toContain('partial: handshake only');
   });
 });
 

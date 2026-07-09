@@ -12,6 +12,23 @@ them into a version section when cutting a release.
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-07-09
+
+### Added
+
+- ADIF export can now optionally include partial QSOs (two-way handshake,
+  no signal report exchanged yet), via an opt-in checkbox next to the
+  existing export button.
+- FT contacts map: pin color modes — as-is (colored), age-decay, worked
+  status (confirmed/partial/none), and distance-from-me — plus an
+  independent VFO-passband filter to hide pins outside the current tuning.
+- Small up/down step buttons restored on the FT8/FT4 transmit panel's Audio
+  Hz and Auto-CQ interval fields (lost in the SolidJS migration when native
+  `<input type="number">` was replaced to fix a Firefox focus-loss bug).
+- Filter input on the Decoded Messages panel to search decoded text live.
+- Collapsed Transmit summary bar now shows the current Auto-CQ interval
+  value on its CQ badge.
+
 ### Fixed
 
 - Dev server now binds to port 3000 as configured, instead of falling back to
