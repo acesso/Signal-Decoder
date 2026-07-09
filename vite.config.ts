@@ -16,6 +16,26 @@ const APP_VERSION = JSON.parse(readFileSync(fileURLToPath(new URL('./package.jso
 
 export default defineConfig({
   base: BASE_PATH ? `${BASE_PATH}/` : '/',
+  server: {
+    port: 3000,
+    strictPort: true,
+    // Dev mode should never be cached by the browser — HMR already handles
+    // live updates, but a stale disk/memory cache on a hard reload (or a
+    // request that HMR didn't catch, e.g. a worker/wasm asset) can still
+    // serve old bytes and make it look like an edit didn't take effect.
+    headers: {
+      'Cache-Control': 'no-store',
+    },
+  },
+  // Force a fresh dependency pre-bundle on every dev server start instead of
+  // reusing node_modules/.vite's cache — that cache is normally a nice speed
+  // win across restarts, but during active development on this app's own
+  // workers/wasm-loading code it has been a source of "I fixed it but it's
+  // still broken" confusion. optimizeDeps.force only affects `vite`/`vite dev`;
+  // `vite build` is unaffected.
+  optimizeDeps: {
+    force: true,
+  },
   plugins: [
     solid(),
     tailwindcss(),

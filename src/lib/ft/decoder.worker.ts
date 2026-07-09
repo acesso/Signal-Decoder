@@ -86,6 +86,25 @@ interface FT8MonModule {
   UTF8ToString: (ptr: number) => string;
 }
 
+// Emscripten's non-modularized JS glue is a classic (non-ESM) UMD-style
+// script — `importScripts()` (the classic-worker way to load it) is
+// disallowed inside a module worker (required here since decoder.worker.ts
+// itself uses `import`). Fetch the glue as text and evaluate it via the
+// indirect `(0, eval)` form instead, which runs in global scope (unlike a
+// direct `eval(...)` call, which would run in this function's local scope
+// and leave the `createFT8MonModule`/`createFT8Module` global unassigned).
+const scriptCache = new Map<string, string>();
+async function loadGlobalScript(url: string): Promise<void> {
+  let src = scriptCache.get(url);
+  if (src === undefined) {
+    const res = await fetch(url);
+    if (!res.ok) throw new Error(`script fetch ${res.status}: ${url}`);
+    src = await res.text();
+    scriptCache.set(url, src);
+  }
+  (0, eval)(src);
+}
+
 // ── Module bootstrap ─────────────────────────────────────────────────────────
 async function instantiate<T>(jsFile: string, wasmFile: string, factoryName: string): Promise<T> {
   const base = getPublicBase();
@@ -94,12 +113,12 @@ async function instantiate<T>(jsFile: string, wasmFile: string, factoryName: str
     return r.arrayBuffer();
   });
 
-  (self as unknown as Record<string, (...a: string[]) => void>).importScripts(`${base}/wasm/${jsFile}`);
+  await loadGlobalScript(`${base}/wasm/${jsFile}`);
 
   const factory = (self as unknown as Record<string, unknown>)[factoryName] as
     (opts: object) => Promise<T>;
   if (typeof factory !== 'function') {
-    throw new Error(`${factoryName} not found after importScripts`);
+    throw new Error(`${factoryName} not found after loading ${jsFile}`);
   }
 
   return factory({ wasmBinary, print: () => {}, printErr: () => {} });

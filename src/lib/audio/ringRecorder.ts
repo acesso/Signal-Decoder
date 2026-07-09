@@ -150,7 +150,7 @@ export class AudioRingRecorder {
   private wavWorker: Worker | null = null;
   private encodeInWorker(samples: Float32Array, sampleRate: number): Promise<ArrayBuffer> {
     if (!this.wavWorker) {
-      this.wavWorker = new Worker(new URL('./wav.worker.ts', import.meta.url));
+      this.wavWorker = new Worker(new URL('./wav.worker.ts', import.meta.url), { type: 'module' });
     }
     const worker = this.wavWorker;
     return new Promise((resolve, reject) => {

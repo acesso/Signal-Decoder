@@ -6,6 +6,7 @@ import { createEffect } from 'solid-js'
 import { PASTEL_COLORS, type DecoderSession } from '$decoder-lib/rtty/sessions'
 import type { RTTYConfig } from '$decoder-lib/rtty/decoder'
 import { fmtAbsHz } from '$decoder-lib/formatFreq'
+import NumberField from './NumberField'
 
 const BAUD_RATES = [45, 45.45, 50, 65, 75, 100, 110, 150, 200, 300]
 const inputCls =
@@ -57,7 +58,7 @@ export function SessionCard(props: Props) {
           )}
           <input
             value={props.session.label}
-            onChange={(e) => {
+            onInput={(e) => {
               stopProp(e as unknown as MouseEvent)
               props.onLabelChange(props.session.id, e.currentTarget.value)
             }}
@@ -95,16 +96,10 @@ export function SessionCard(props: Props) {
       <div class="mb-2 grid grid-cols-2 gap-x-2 gap-y-2" onClick={stopProp}>
         <label class="flex flex-col gap-0.5">
           <span class="text-[10px] text-[#8b949e]">Carrier Shift (Hz)</span>
-          <input
-            type="number"
+          <NumberField
             value={props.session.config.carrierShift}
             min={1}
-            onChange={(e) => {
-              stopProp(e as unknown as MouseEvent)
-              props.onConfigChange(props.session.id, {
-                carrierShift: Math.max(1, parseInt(e.currentTarget.value) || 450),
-              })
-            }}
+            onCommit={(n) => props.onConfigChange(props.session.id, { carrierShift: n })}
             onClick={stopProp}
             class={inputCls}
           />
@@ -115,15 +110,11 @@ export function SessionCard(props: Props) {
           {props.vfoFrequency ? (
             <span class={`${inputCls} block`}>{fmtAbsHz(props.vfoFrequency + props.session.config.centerFreq)}</span>
           ) : (
-            <input
-              type="number"
+            <NumberField
               value={props.session.config.centerFreq}
               min={0}
               max={1500}
-              onChange={(e) => {
-                stopProp(e as unknown as MouseEvent)
-                props.onConfigChange(props.session.id, { centerFreq: parseInt(e.currentTarget.value) || 0 })
-              }}
+              onCommit={(n) => props.onConfigChange(props.session.id, { centerFreq: n })}
               onClick={stopProp}
               class={inputCls}
             />

@@ -12,6 +12,19 @@ them into a version section when cutting a release.
 
 ## [Unreleased]
 
+### Fixed
+
+- Dev server now binds to port 3000 as configured, instead of falling back to
+  Vite's default.
+- Decoder worker crash-loop caused by a missing module worker type, and the
+  resulting `importScripts` incompatibility in FT8/FT4 decoding.
+- RTTY session cards losing focus/resetting mid-keystroke on every edit.
+- Numeric inputs across all decoder modes silently dropping keystrokes in
+  Firefox (a real Firefox focus-loss bug on reactively-bound number inputs).
+- Dev mode no longer caches stale JS/worker/WASM bytes across reloads.
+- Favicon reverted to the app's branded icon (a Vite scaffold default had
+  overwritten it during the SolidJS migration).
+
 ## [0.4.0] - 2026-07-08
 
 ### Added

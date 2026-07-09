@@ -3,6 +3,7 @@ import { createEffect, createMemo, createSignal, For, onCleanup, onMount, Show, 
 import type { DecoderProps, DecoderControls } from '../lib/decoderControls'
 import { fmtAbsHz } from '$decoder-lib/formatFreq'
 import AudioAnalysisPanel from './AudioAnalysisPanel'
+import NumberField from './NumberField'
 import { createCWProcessor, type TextToken } from '../lib/cw/processor'
 import { loadNumberArray, saveNumberArray } from '$decoder-lib/storage'
 
@@ -589,15 +590,11 @@ export default function CWDecoder(props: DecoderProps): JSX.Element {
               </div>
             ) : (
               <div class="flex flex-wrap items-center gap-2">
-                <input
-                  type="number"
+                <NumberField
                   value={manualWpm()}
                   min={3}
                   max={70}
-                  onInput={(e) => {
-                    const v = parseInt(e.currentTarget.value)
-                    if (!isNaN(v)) setManualWpm(Math.max(3, Math.min(70, v)))
-                  }}
+                  onCommit={setManualWpm}
                   class="w-14 rounded border border-[#30363d] bg-[#0d1117] px-2 py-0.5 font-mono text-sm text-[#c9d1d9] transition-colors focus:border-[#79c0ff] focus:outline-none"
                 />
                 <span class="text-xs text-[#8b949e]">WPM</span>
@@ -622,14 +619,13 @@ export default function CWDecoder(props: DecoderProps): JSX.Element {
                   {fmtAbsHz(props.vfoFrequency + toneFreq())}
                 </span>
               ) : (
-                <input
-                  type="number"
+                <NumberField
                   value={toneFreq()}
-                  min={50}
-                  onInput={(e) => {
-                    const v = parseInt(e.currentTarget.value)
-                    if (!isNaN(v) && v >= 50) setToneFreq(v)
+                  parse={(raw) => {
+                    const v = parseInt(raw)
+                    return Number.isFinite(v) && v >= 50 ? v : null
                   }}
+                  onCommit={setToneFreq}
                   class="w-20 rounded border border-[#30363d] bg-[#0d1117] px-2 py-0.5 font-mono text-sm text-[#79c0ff] transition-colors focus:border-[#79c0ff] focus:outline-none"
                 />
               )}
@@ -645,15 +641,14 @@ export default function CWDecoder(props: DecoderProps): JSX.Element {
                   {fmtAbsHz(props.vfoFrequency + toneFreq2())}
                 </span>
               ) : (
-                <input
-                  type="number"
+                <NumberField
                   value={toneFreq2()}
-                  min={50}
-                  disabled={!dualMode()}
-                  onInput={(e) => {
-                    const v = parseInt(e.currentTarget.value)
-                    if (!isNaN(v) && v >= 50) setToneFreq2(v)
+                  parse={(raw) => {
+                    const v = parseInt(raw)
+                    return Number.isFinite(v) && v >= 50 ? v : null
                   }}
+                  disabled={!dualMode()}
+                  onCommit={setToneFreq2}
                   class="w-20 rounded border border-[#30363d] bg-[#0d1117] px-2 py-0.5 font-mono text-sm text-[#ffa657] transition-colors focus:border-[#ffa657] focus:outline-none disabled:cursor-not-allowed"
                 />
               )}
@@ -664,16 +659,11 @@ export default function CWDecoder(props: DecoderProps): JSX.Element {
           <div class="space-y-1">
             <div class="text-xs text-[#8b949e]">Bandwidth</div>
             <div class="flex items-center gap-2">
-              <input
-                type="number"
+              <NumberField
                 value={filterBandwidth()}
                 min={30}
                 max={500}
-                step={10}
-                onInput={(e) => {
-                  const v = parseInt(e.currentTarget.value)
-                  if (!isNaN(v)) setFilterBandwidth(Math.max(30, Math.min(500, v)))
-                }}
+                onCommit={setFilterBandwidth}
                 class="w-20 rounded border border-[#30363d] bg-[#0d1117] px-2 py-0.5 font-mono text-sm text-[#c9d1d9] transition-colors focus:border-[#2ea043] focus:outline-none"
               />
               <span class="text-xs text-[#8b949e]">Hz</span>

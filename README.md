@@ -744,6 +744,8 @@ pactl unload-module <module-id-from-step-1>
 
 Caveats learned the hard way: match streams by their id/app name carefully so you don't re-route another browser's audio; under `xvfb-run` there is no vsync (uncapped rAF makes the waterfall race) and no GPU (llvmpipe software rendering starves the WASM decoder — decode times roughly double), so prefer a real display for decode-quality comparisons.
 
+`scripts/rtty-vs-production.ts` automates this same routing for RTTY, decoding the same live WebSDR audio side-by-side in a local build and the deployed production build (`npx tsx scripts/rtty-vs-production.ts --minutes 5`).
+
 ## How to Use
 
 Select a mode from the top tab bar (RTTY / CW / SSTV / FT / MFSK), then click **Start** and allow microphone access when prompted.
