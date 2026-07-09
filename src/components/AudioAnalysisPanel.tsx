@@ -1,11 +1,16 @@
 // Port of src/components/AudioAnalysisPanel.tsx (Next.js app).
 import { createEffect, createMemo, createSignal, onCleanup, onMount, type JSX } from 'solid-js'
 import GLSpectrogram, { type GLSpectrogramHandle, type SpectroBand } from './GLSpectrogram'
-import { loadNumber, saveNumber, loadString } from '$decoder-lib/storage'
+import { loadNumber, saveNumber, loadString, saveString } from '$decoder-lib/storage'
+import { buildColormapLUT, COLORMAPS, COLORMAP_LABEL, type ColormapName } from '$decoder-lib/colormaps'
 import NumberField from './NumberField'
 
-type SpectrogramView = 'legacy' | 'terrain'
-const SPECTROGRAM_VIEWS = ['legacy', 'terrain'] as const
+// Both views render on the GPU (GLSpectrogram); the old CPU 2D-canvas
+// pipeline survives only as an automatic fallback when WebGL init fails.
+// A previously-stored 'legacy' value fails validation in loadString and
+// falls back to 'waterfall' — its GPU replacement.
+type SpectrogramView = 'waterfall' | 'terrain'
+const SPECTROGRAM_VIEWS = ['waterfall', 'terrain'] as const
 
 const LS_SG_VIEW = 'sg_view_mode'
 const LS_SG_GAMMA = 'sg_gamma'
@@ -14,9 +19,11 @@ const LS_SG_2D_SPEED = 'sg_2d_speed'
 const LS_SG_3D_SMOOTH = 'sg_3d_smooth'
 const LS_SG_BAND_ALPHA = 'sg_band_alpha'
 
+// The ruler used to be painted into a reserved bottom band of this canvas —
+// it's now a separate HTML strip below the canvas (see FreqRuler), so the
+// full canvas height is plot area.
 const CANVAS_H = 200
-const AXIS_H = 25
-const PLOT_H = CANVAS_H - AXIS_H
+const PLOT_H = CANVAS_H
 
 function hexToRgb(hex: string): [number, number, number] {
   const r = parseInt(hex.slice(1, 3), 16)
@@ -26,85 +33,104 @@ function hexToRgb(hex: string): [number, number, number] {
 }
 
 function niceTicks(span: number): { maj: number; min: number } {
-  const targets = [25, 50, 100, 200, 250, 500, 1000, 2000, 2500, 5000]
-  const majStep = targets.find((s) => span / s <= 8) ?? 5000
+  const targets = [25, 50, 100, 200, 250, 500, 1000, 1500, 2000, 2500, 5000]
+  const majStep = targets.find((s) => span / s <= 12) ?? Math.ceil(span / 12 / 1000) * 1000
   return { maj: majStep, min: majStep / 5 }
 }
 
-function drawAxisLabels(
-  ctx: CanvasRenderingContext2D,
-  w: number,
-  pH: number,
-  minF: number,
-  maxF: number,
-  vfoHz = 0,
-  drawGridLines = false,
-) {
+interface FreqTick {
+  x: number // 0..1 fraction across the span
+  isMaj: boolean
+  label: string | null
+}
+
+// Pure tick geometry, shared by the canvas grid-line pass and the HTML ruler
+// rendered outside the plot box (see FreqRuler below).
+function computeTicks(minF: number, maxF: number, vfoHz = 0): FreqTick[] {
   const span = maxF - minF
+  if (span <= 0) return []
   const { maj, min } = niceTicks(span)
-
-  ctx.strokeStyle = '#30363d'
-  ctx.lineWidth = 1
-  ctx.beginPath()
-  ctx.moveTo(0, pH)
-  ctx.lineTo(w, pH)
-  ctx.stroke()
-
+  const out: FreqTick[] = []
   const firstMin = Math.ceil(minF / min) * min
   for (let f = firstMin; f <= maxF + min * 0.5; f += min) {
-    const x = ((f - minF) / span) * w
-    if (x < 0 || x > w) continue
+    const x = (f - minF) / span
+    if (x < 0 || x > 1) continue
     const isMaj = Math.round(f / maj) * maj === Math.round(f)
-
-    if (drawGridLines && isMaj) {
-      ctx.strokeStyle = 'rgba(48,54,61,0.6)'
-      ctx.lineWidth = 0.5
-      ctx.beginPath()
-      ctx.moveTo(x, 0)
-      ctx.lineTo(x, pH)
-      ctx.stroke()
-    }
-
-    const tickH = isMaj ? 7 : 3
-    ctx.strokeStyle = isMaj ? '#8b949e' : '#3d444d'
-    ctx.lineWidth = 1
-    ctx.beginPath()
-    ctx.moveTo(x, pH)
-    ctx.lineTo(x, pH + tickH)
-    ctx.stroke()
-
+    let label: string | null = null
     if (isMaj) {
-      ctx.fillStyle = '#8b949e'
-      ctx.font = '10px monospace'
-      ctx.textAlign = 'center'
       if (vfoHz > 0) {
         const absHz = vfoHz + f
         const mhzInt = Math.floor(absHz / 1_000_000)
         const khzFrac = Math.round((absHz % 1_000_000) / 1000)
-        ctx.fillText(`${mhzInt}.${String(khzFrac).padStart(3, '0')}`, x, pH + 17)
+        label = `${mhzInt}.${String(khzFrac).padStart(3, '0')}`
       } else {
-        ctx.fillText(f >= 1000 ? `${(f / 1000).toFixed(f % 1000 === 0 ? 0 : 1)}k` : `${f}`, x, pH + 17)
+        label = f >= 1000 ? `${(f / 1000).toFixed(f % 1000 === 0 ? 0 : 1)}k` : `${f}`
       }
     }
+    out.push({ x, isMaj, label })
+  }
+  return out
+}
+
+// Faint vertical grid lines at major ticks, drawn INTO the plot canvas itself
+// (used by the waterfall, which benefits from gridlines through the image).
+// The ruler's own tick marks/labels are rendered as HTML outside the canvas
+// by FreqRuler — this function no longer draws them.
+function drawGridLines(ctx: CanvasRenderingContext2D, w: number, pH: number, minF: number, maxF: number) {
+  for (const t of computeTicks(minF, maxF)) {
+    if (!t.isMaj) continue
+    const x = t.x * w
+    ctx.strokeStyle = 'rgba(48,54,61,0.6)'
+    ctx.lineWidth = 0.5
+    ctx.beginPath()
+    ctx.moveTo(x, 0)
+    ctx.lineTo(x, pH)
+    ctx.stroke()
   }
 }
+
+// HTML frequency ruler, rendered as a sibling strip BELOW the spectrum/
+// waterfall canvas instead of painted into it — keeps the full canvas height
+// available for signal data and gives crisper, denser tick labels than the
+// old canvas-drawn axis band.
+function FreqRuler(props: { minHz: number; maxHz: number; vfoHz?: number }): JSX.Element {
+  const ticks = createMemo(() => computeTicks(props.minHz, props.maxHz, props.vfoHz ?? 0))
+  return (
+    <div class="relative h-4 select-none">
+      {ticks().map((t) => (
+        <div
+          class="absolute top-0 flex flex-col items-center"
+          style={{ left: `${t.x * 100}%`, transform: 'translateX(-50%)' }}
+        >
+          <div class={`w-px ${t.isMaj ? 'h-2 bg-[#8b949e]' : 'h-1 bg-[#3d444d]'}`} />
+          {t.label && <span class="font-mono text-[9px] text-[#8b949e] leading-tight">{t.label}</span>}
+        </div>
+      ))}
+    </div>
+  )
+}
+
+// TX marker color — red: clearly visible over the waterfall's dark-blue
+// quiet floor (a blue marker blended right into it).
+const TX_MARKER_COLOR = '#f85149'
 
 function drawTxMarker(ctx: CanvasRenderingContext2D, w: number, h: number, txHz: number, minHz: number, maxHz: number) {
   const span = maxHz - minHz
   if (txHz < minHz || txHz > maxHz) return
   const x = ((txHz - minHz) / span) * w
   ctx.save()
-  ctx.strokeStyle = 'rgba(88,166,255,0.7)'
+  ctx.strokeStyle = TX_MARKER_COLOR
   ctx.lineWidth = 1.5
-  ctx.setLineDash([4, 3])
+  ctx.shadowColor = TX_MARKER_COLOR
+  ctx.shadowBlur = 6
   ctx.beginPath()
   ctx.moveTo(x, 0)
   ctx.lineTo(x, h)
   ctx.stroke()
-  ctx.setLineDash([])
+  ctx.shadowBlur = 0
   ctx.font = '9px monospace'
   ctx.textAlign = x > w * 0.85 ? 'right' : 'left'
-  ctx.fillStyle = 'rgba(88,166,255,0.9)'
+  ctx.fillStyle = TX_MARKER_COLOR
   ctx.fillText(`TX ${txHz}Hz`, x + (x > w * 0.85 ? -4 : 4), 10)
   ctx.restore()
 }
@@ -232,14 +258,18 @@ function drawChannelMarker(
   ctx.lineTo(hi, pH)
   ctx.stroke()
   ctx.setLineDash([])
+  // Solid line with a soft glow — same visual as the GL waterfall's DOM
+  // marker lines, so the marker reads identically across both boxes.
+  ctx.save()
   ctx.lineWidth = 1.5
-  ctx.setLineDash([4, 3])
   ctx.strokeStyle = color
+  ctx.shadowColor = color
+  ctx.shadowBlur = 6
   ctx.beginPath()
   ctx.moveTo(tX, 0)
   ctx.lineTo(tX, pH)
   ctx.stroke()
-  ctx.setLineDash([])
+  ctx.restore()
   ctx.font = '10px monospace'
   ctx.textAlign = 'center'
   ctx.fillStyle = color
@@ -271,6 +301,8 @@ interface Props {
   glBands?: GLBand[]
   vfoFrequency?: number
   txMarkerHz?: number
+  /** Label for the marker readout above the canvas — defaults to "Center". */
+  markerFieldLabel?: string
   class?: string
   style?: JSX.CSSProperties
   storageKeyPrefix?: string
@@ -283,7 +315,16 @@ export default function AudioAnalysisPanel(props: Props): JSX.Element {
 
   const [displayMinHz, setDisplayMinHz] = createSignal(lsMinHz ? loadNumber(lsMinHz, 0) : 0)
   const [displayMaxHz, setDisplayMaxHz] = createSignal(lsMaxHz ? loadNumber(lsMaxHz, defaultMaxHz()) : defaultMaxHz())
-  const [sgView, setSgView] = createSignal<SpectrogramView>(loadString(LS_SG_VIEW, 'legacy', SPECTROGRAM_VIEWS))
+  const [sgView, setSgView] = createSignal<SpectrogramView>(loadString(LS_SG_VIEW, 'waterfall', SPECTROGRAM_VIEWS))
+  // WebGL init/shader failure → swap the spectrogram to the CPU 2D pipeline.
+  const [glFailed, setGlFailed] = createSignal(false)
+  // Palette — persisted PER MODE (unlike view/gamma/speed, which are global):
+  // each decoder gets its own preference via storageKeyPrefix.
+  const lsCmap = props.storageKeyPrefix ? `${props.storageKeyPrefix}_sg_colormap` : 'sg_colormap'
+  const [colormap, setColormap] = createSignal<ColormapName>(loadString(lsCmap, 'turbo', COLORMAPS))
+  createEffect(() => saveString(lsCmap, colormap()))
+  // Same 256-entry table the GL shaders sample — used by the CPU fallback.
+  const cmapLUT = createMemo(() => buildColormapLUT(colormap()))
   const [sgGamma, setSgGamma] = createSignal(loadNumber(LS_SG_GAMMA, 2.0))
   const [sg3dSpeed, setSg3dSpeed] = createSignal(loadNumber(LS_SG_3D_SPEED, 80))
   const [sg2dSpeed, setSg2dSpeed] = createSignal(loadNumber(LS_SG_2D_SPEED, 16))
@@ -306,6 +347,7 @@ export default function AudioAnalysisPanel(props: Props): JSX.Element {
   })
 
   let specEl: HTMLCanvasElement | undefined
+  let specWrapEl: HTMLDivElement | undefined
   let sgCanvEl: HTMLCanvasElement | undefined
   let sgOverlayEl: HTMLCanvasElement | undefined
   const glSg: { current: GLSpectrogramHandle | null } = { current: null }
@@ -315,11 +357,13 @@ export default function AudioAnalysisPanel(props: Props): JSX.Element {
 
   let fftBuf: Uint8Array<ArrayBuffer> | null = null
   let squelchDragging = false
-  let markerDrag: { index: number } | null = null
+  let markerDrag: { index: number; el: HTMLElement } | null = null
 
+  // Row cadence follows the active view's Speed control (2D and 3D each keep
+  // their own preference, as before).
+  const glRowInterval = () => (sgView() === 'terrain' ? sg3dSpeed() : sg2dSpeed())
   createEffect(() => {
-    const sp = sg3dSpeed()
-    glSg.current?.setRowInterval(sp)
+    glSg.current?.setRowInterval(glRowInterval())
   })
   createEffect(() => {
     const sm = sg3dSmooth()
@@ -360,7 +404,36 @@ export default function AudioAnalysisPanel(props: Props): JSX.Element {
     }
     e.preventDefault()
     e.stopPropagation()
-    markerDrag = { index: best }
+    markerDrag = { index: best, el: canvas }
+  }
+
+  // When a mode has both draggable markers (ew cursor) and squelch (ns
+  // cursor), the static class picks the marker cursor everywhere — hovering
+  // the horizontal squelch line must show up/down arrows instead. Uses the
+  // same 8px hit zone as the mousedown handler; clearing the inline style
+  // falls back to the class-based cursor.
+  function handleSpectrumHover(e: MouseEvent) {
+    const canvas = specEl
+    if (!canvas) return
+    const sql = props.squelch ?? 0
+    let nearSql = false
+    if (props.onSquelchChange && sql > 0) {
+      const rect = canvas.getBoundingClientRect()
+      const canvasY = ((e.clientY - rect.top) / rect.height) * CANVAS_H
+      const sqY = PLOT_H * (1 - sql / 100)
+      nearSql = Math.abs(canvasY - sqY) <= 8
+    }
+    canvas.style.cursor = nearSql ? 'ns-resize' : ''
+  }
+
+  // Grip mousedown — used by the DOM grip handles over the spectrum and the
+  // waterfall. `el` is the box whose horizontal extent maps to the displayed
+  // frequency span (the drag's pixel→Hz reference).
+  function startGripDrag(index: number, el: HTMLElement | undefined, e: MouseEvent) {
+    if (!el || !props.onMarkerDrag) return
+    e.preventDefault()
+    e.stopPropagation()
+    markerDrag = { index, el }
   }
 
   onMount(() => {
@@ -379,9 +452,7 @@ export default function AudioAnalysisPanel(props: Props): JSX.Element {
       const drag = markerDrag
       if (!drag || !props.onMarkerDrag) return
       e.preventDefault()
-      const canvas = specEl
-      if (!canvas) return
-      const rect = canvas.getBoundingClientRect()
+      const rect = drag.el.getBoundingClientRect()
       const xRatio = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width))
       const newHz = Math.round(displayMinHz() + xRatio * (displayMaxHz() - displayMinHz()))
       props.onMarkerDrag(drag.index, newHz)
@@ -423,10 +494,7 @@ export default function AudioAnalysisPanel(props: Props): JSX.Element {
       maxHz = displayMaxHz()
     ctx.fillStyle = '#0a0a0a'
     ctx.fillRect(0, 0, canvas.width, CANVAS_H)
-    if (!props.analyser) {
-      drawAxisLabels(ctx, canvas.width, PLOT_H, minHz, maxHz, props.vfoFrequency ?? 0)
-      return null
-    }
+    if (!props.analyser) return null
 
     const bc = props.analyser.frequencyBinCount
     if (!fftBuf || fftBuf.length !== bc) fftBuf = new Uint8Array(bc) as Uint8Array<ArrayBuffer>
@@ -481,7 +549,6 @@ export default function AudioAnalysisPanel(props: Props): JSX.Element {
     if (txMarkerHz > 0) {
       drawTxMarker(ctx, canvas.width, PLOT_H, txMarkerHz, minHz, maxHz)
     }
-    drawAxisLabels(ctx, canvas.width, PLOT_H, minHz, maxHz, props.vfoFrequency ?? 0)
     return vis
   }
 
@@ -489,6 +556,7 @@ export default function AudioAnalysisPanel(props: Props): JSX.Element {
     const ctx = canvas.getContext('2d')
     if (!ctx) return
     const row = ctx.createImageData(canvas.width, 1)
+    const lut = cmapLUT()
     for (let px = 0; px < canvas.width; px++) {
       const bf = (px / canvas.width) * (fd.length - 1),
         b0 = Math.floor(bf),
@@ -496,20 +564,11 @@ export default function AudioAnalysisPanel(props: Props): JSX.Element {
       const v = fd[b0] * (1 - (bf - b0)) + fd[b1] * (bf - b0)
       const g = sgGamma()
       const a = g === 1 ? v : Math.pow(v / 255, g) * 255
-      let r: number, gr: number, bl: number
-      if (a < 128) {
-        r = 0
-        gr = 0
-        bl = Math.round(a * 2)
-      } else {
-        r = Math.round((a - 128) * 2)
-        gr = 0
-        bl = Math.round(255 - (a - 128) * 2)
-      }
+      const li = Math.max(0, Math.min(255, Math.round(a))) * 4
       const i = px * 4
-      row.data[i] = r
-      row.data[i + 1] = gr
-      row.data[i + 2] = bl
+      row.data[i] = lut[li]
+      row.data[i + 1] = lut[li + 1]
+      row.data[i + 2] = lut[li + 2]
       row.data[i + 3] = 255
     }
     ctx.putImageData(ctx.getImageData(0, 0, canvas.width, canvas.height - 1), 0, 1)
@@ -524,19 +583,15 @@ export default function AudioAnalysisPanel(props: Props): JSX.Element {
     ctx.clearRect(0, 0, w, h)
     const minHz = displayMinHz(),
       maxHz = displayMaxHz()
-    const rulerH = 18
-    const rulerY = h - rulerH
-    ctx.fillStyle = 'rgba(10,10,10,0.65)'
-    ctx.fillRect(0, rulerY, w, rulerH)
-    drawAxisLabels(ctx, w, rulerY, minHz, maxHz, props.vfoFrequency ?? 0, true)
+    drawGridLines(ctx, w, h, minHz, maxHz)
     const txMarkerHz = props.txMarkerHz ?? 0
     if (txMarkerHz > 0) {
-      drawTxMarker(ctx, w, h - rulerH, txMarkerHz, minHz, maxHz)
+      drawTxMarker(ctx, w, h, txMarkerHz, minHz, maxHz)
     }
   }
 
   onMount(() => {
-    let sg3dLastTs = 0
+    let glLastTs = 0
     let sg2dLastTs = 0
     let spLastTs = 0
     const tick = (now: number) => {
@@ -547,17 +602,19 @@ export default function AudioAnalysisPanel(props: Props): JSX.Element {
         spLastTs = now
         const fd = drawSpectrum(sp)
         if (fd) {
-          if (sg && now - sg2dLastTs >= sg2dSpeed()) {
-            sg2dLastTs = now
-            drawSpectrogram(sg, fd)
-          }
-          if (now - sg3dLastTs >= sg3dSpeed()) {
-            sg3dLastTs = now
+          if (glFailed()) {
+            // CPU fallback pipeline — only runs when WebGL is unavailable.
+            if (sg && now - sg2dLastTs >= sg2dSpeed()) {
+              sg2dLastTs = now
+              drawSpectrogram(sg, fd)
+            }
+          } else if (now - glLastTs >= glRowInterval()) {
+            glLastTs = now
             glSg.current?.pushRow(fd)
           }
         }
       }
-      if (ov) drawSgOverlay(ov)
+      if (ov && glFailed()) drawSgOverlay(ov)
       glSg.current?.render()
       rafId = requestAnimationFrame(tick)
     }
@@ -593,6 +650,34 @@ export default function AudioAnalysisPanel(props: Props): JSX.Element {
     })
   }
 
+  // Triangular grab handles for the draggable markers — DOM elements rather
+  // than canvas pixels, so they overflow a little above the box edge and give
+  // a wide, obvious mouse target. Rendered over both the spectrum and the 2D
+  // waterfall; `host` is the box whose width maps to the displayed frequency
+  // span during the drag.
+  const MarkerGrips = (p: { host: () => HTMLElement | undefined }) => (
+    <>
+      {props.onMarkerDrag &&
+        (props.markers ?? []).map((m, i) => {
+          const span = displayMaxHz() - displayMinHz()
+          const frac = span > 0 ? (m.freq - displayMinHz()) / span : -1
+          if (frac < 0 || frac > 1) return null
+          return (
+            <div
+              class="absolute z-10 cursor-ew-resize select-none"
+              style={{ left: `${frac * 100}%`, top: '-7px', transform: 'translateX(-50%)' }}
+              title={`Drag to move ${m.label}`}
+              onMouseDown={(e) => startGripDrag(i, p.host(), e)}
+            >
+              <svg width="18" height="15" viewBox="0 0 18 15">
+                <path d="M1 1 L17 1 L9 14 Z" fill={m.color} stroke="rgba(13,17,23,0.7)" stroke-width="1.5" />
+              </svg>
+            </div>
+          )
+        })}
+    </>
+  )
+
   return (
     <div
       class={`flex flex-col rounded-lg border border-[#30363d] bg-[#161b22] p-3 sm:p-4${props.class ? ` ${props.class}` : ''}`}
@@ -605,7 +690,7 @@ export default function AudioAnalysisPanel(props: Props): JSX.Element {
       <div class="shrink-0">
         {(props.markers ?? []).length > 0 && (
           <div class="mb-1.5 flex items-center gap-2 text-xs text-[#8b949e]">
-            <span class="shrink-0">Center</span>
+            <span class="shrink-0">{props.markerFieldLabel ?? 'Center'}</span>
             {props.vfoFrequency ? (
               <span class="w-24 rounded border border-[#30363d] bg-[#0d1117] px-2 py-0.5 font-mono text-xs text-[#c9d1d9]">
                 {(() => {
@@ -632,15 +717,40 @@ export default function AudioAnalysisPanel(props: Props): JSX.Element {
           </div>
         )}
 
-        <canvas
-          ref={specEl}
-          width={640}
-          height={CANVAS_H}
-          class={`block w-full touch-manipulation rounded border border-[#30363d] bg-[#0a0a0a] ${
-            props.onMarkerDrag ? 'cursor-ew-resize' : props.onSquelchChange ? 'cursor-ns-resize' : 'cursor-crosshair'
-          }`}
-          onMouseDown={props.onMarkerDrag || props.onSquelchChange ? handleSpectrumMouseDown : undefined}
-        />
+        <div ref={specWrapEl} class="relative">
+          <canvas
+            ref={specEl}
+            width={640}
+            height={CANVAS_H}
+            class={`block w-full touch-manipulation rounded border border-[#30363d] bg-[#0a0a0a] ${
+              props.onMarkerDrag ? 'cursor-ew-resize' : props.onSquelchChange ? 'cursor-ns-resize' : 'cursor-crosshair'
+            }`}
+            onMouseDown={props.onMarkerDrag || props.onSquelchChange ? handleSpectrumMouseDown : undefined}
+            onMouseMove={props.onSquelchChange ? handleSpectrumHover : undefined}
+          />
+          <MarkerGrips host={() => specWrapEl} />
+          {props.onSquelchChange && (
+            <div
+              class="absolute z-10 cursor-ns-resize select-none"
+              style={{
+                right: '-8px',
+                top: `${(1 - (props.squelch ?? 0) / 100) * 100}%`,
+                transform: 'translateY(-50%)',
+              }}
+              title="Drag to set squelch"
+              onMouseDown={(e) => {
+                e.preventDefault()
+                e.stopPropagation()
+                squelchDragging = true
+              }}
+            >
+              <svg width="15" height="18" viewBox="0 0 15 18">
+                <path d="M14 1 L14 17 L1 9 Z" fill="#e3b341" stroke="rgba(13,17,23,0.7)" stroke-width="1.5" />
+              </svg>
+            </div>
+          )}
+        </div>
+        <FreqRuler minHz={displayMinHz()} maxHz={displayMaxHz()} vfoHz={props.vfoFrequency} />
 
         <div class="mt-1 flex items-center gap-1.5 text-[10px] text-[#8b949e]">
           <span class="shrink-0">View</span>
@@ -711,26 +821,28 @@ export default function AudioAnalysisPanel(props: Props): JSX.Element {
       <div class="mt-3 flex min-h-0 flex-1 flex-col gap-2">
         <h3 class="shrink-0 text-xs font-medium text-[#8b949e]">Spectrogram</h3>
         <div ref={sgContainerEl} class="relative min-h-[100px] flex-1">
-          <div class={`relative ${sgView() === 'legacy' ? 'block' : 'hidden'}`}>
-            <canvas
-              ref={sgCanvEl}
-              width={640}
-              height={sgH()}
-              style={{ height: `${sgH()}px` }}
-              class="block w-full rounded border border-[#30363d] bg-[#0d1117]"
-            />
-            <canvas
-              ref={sgOverlayEl}
-              width={640}
-              height={sgH()}
-              style={{ height: `${sgH()}px` }}
-              class="pointer-events-none absolute inset-0 w-full"
-            />
-          </div>
-          <div class={sgView() !== 'legacy' ? 'block' : 'hidden'}>
+          {glFailed() ? (
+            /* CPU 2D-canvas pipeline — only when WebGL is unavailable */
+            <div class="relative">
+              <canvas
+                ref={sgCanvEl}
+                width={640}
+                height={sgH()}
+                style={{ height: `${sgH()}px` }}
+                class="block w-full rounded border border-[#30363d] bg-[#0d1117]"
+              />
+              <canvas
+                ref={sgOverlayEl}
+                width={640}
+                height={sgH()}
+                style={{ height: `${sgH()}px` }}
+                class="pointer-events-none absolute inset-0 w-full"
+              />
+            </div>
+          ) : (
             <GLSpectrogram
               handle={glSg}
-              view="terrain"
+              view={sgView()}
               gamma={sgGamma()}
               height={sgH()}
               maxHz={displayMaxHz()}
@@ -743,9 +855,17 @@ export default function AudioAnalysisPanel(props: Props): JSX.Element {
               sqlGridSize={props.showGrid ? props.gridSize : undefined}
               vfoFrequency={props.vfoFrequency}
               txMarkerHz={props.txMarkerHz}
+              colormap={colormap()}
+              onFailed={() => setGlFailed(true)}
             />
-          </div>
+          )}
+          {/* Grips over the waterfall — terrain excluded: its markers sit in a
+              rotating 3D projection, so a flat grip row would misalign. */}
+          {(sgView() === 'waterfall' || glFailed()) && <MarkerGrips host={() => sgContainerEl} />}
         </div>
+        {(sgView() === 'waterfall' || glFailed()) && (
+          <FreqRuler minHz={displayMinHz()} maxHz={displayMaxHz()} vfoHz={props.vfoFrequency} />
+        )}
         <div class="flex flex-wrap items-center gap-3 text-xs text-[#8b949e]">
           <label class="flex items-center gap-1.5">
             View
@@ -755,10 +875,22 @@ export default function AudioAnalysisPanel(props: Props): JSX.Element {
               class="cursor-pointer rounded border border-[#30363d] bg-[#0d1117] px-1.5 py-0.5 text-[#c9d1d9] focus:border-[#2ea043] focus:outline-none"
             >
               <option value="terrain">3D Terrain</option>
-              <option value="legacy">Classic 2D</option>
+              <option value="waterfall">2D Waterfall</option>
             </select>
           </label>
-          {sgView() !== 'legacy' && (
+          <label class="flex items-center gap-1.5">
+            Colors
+            <select
+              value={colormap()}
+              onChange={(e) => setColormap(e.currentTarget.value as ColormapName)}
+              class="cursor-pointer rounded border border-[#30363d] bg-[#0d1117] px-1.5 py-0.5 text-[#c9d1d9] focus:border-[#2ea043] focus:outline-none"
+            >
+              {COLORMAPS.map((name) => (
+                <option value={name}>{COLORMAP_LABEL[name]}</option>
+              ))}
+            </select>
+          </label>
+          {!glFailed() && (
             <label class="flex items-center gap-1.5">
               Range
               <input
@@ -784,7 +916,7 @@ export default function AudioAnalysisPanel(props: Props): JSX.Element {
               class="w-14 accent-[#2ea043]"
             />
           </label>
-          {sgView() === 'legacy' ? (
+          {sgView() === 'waterfall' || glFailed() ? (
             <label class="flex items-center gap-1.5">
               Speed
               <select

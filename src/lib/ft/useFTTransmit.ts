@@ -125,6 +125,17 @@ export function saveAutoCQIntervalMin(v: number) {
   if (typeof window !== 'undefined') localStorage.setItem(LS_AUTOCQ_INTERVAL, String(v));
 }
 
+// Restoring auto-CQ=on cannot transmit by itself: the TX engine still starts
+// stopped and must be armed manually each session.
+const LS_AUTOCQ = 'ft_autocq';
+export function loadAutoCQ(): boolean {
+  if (typeof window === 'undefined') return false;
+  return localStorage.getItem(LS_AUTOCQ) === 'true';
+}
+export function saveAutoCQ(v: boolean) {
+  if (typeof window !== 'undefined') localStorage.setItem(LS_AUTOCQ, String(v));
+}
+
 const LS_AUTOREPLY = 'ft_auto_reply';
 export function loadAutoReply(): boolean {
   if (typeof window === 'undefined') return false;
@@ -185,7 +196,7 @@ export function createFTTransmit(
     status: 'idle',
     queue: [],
     sent: [],
-    autoCQ: false,
+    autoCQ: loadAutoCQ(),
     autoCQIntervalMin: loadAutoCQIntervalMin(),
     autoPTT: loadAutoPTT(),
     allowConsecutiveTx: loadAllowConsecutiveTx(),
@@ -197,7 +208,7 @@ export function createFTTransmit(
 
   let isRunning          = false;
   let outputDevice       = loadOutputDevice();
-  let autoCQOn           = false;
+  let autoCQOn           = loadAutoCQ();
   let autoCQIntervalMin  = loadAutoCQIntervalMin();
   let lastAutoCQAtMs     = 0; // epoch ms of the last auto-CQ transmission, 0 = none sent yet this session
   let autoPTTOn          = loadAutoPTT();
@@ -585,6 +596,7 @@ export function createFTTransmit(
 
   function setAutoCQ(v: boolean) {
     autoCQOn = v;
+    saveAutoCQ(v);
     // Reset the cooldown on enable so the first CQ fires on the next eligible
     // window instead of waiting out a stale interval from a previous session.
     if (v) lastAutoCQAtMs = 0;
