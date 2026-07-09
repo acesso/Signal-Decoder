@@ -2,6 +2,7 @@
 import { createEffect, createMemo, createSignal, onCleanup, onMount, type JSX } from 'solid-js'
 import GLSpectrogram, { type GLSpectrogramHandle, type SpectroBand } from './GLSpectrogram'
 import { loadNumber, saveNumber, loadString } from '$decoder-lib/storage'
+import NumberField from './NumberField'
 
 type SpectrogramView = 'legacy' | 'terrain'
 const SPECTROGRAM_VIEWS = ['legacy', 'terrain'] as const
@@ -282,7 +283,6 @@ export default function AudioAnalysisPanel(props: Props): JSX.Element {
 
   const [displayMinHz, setDisplayMinHz] = createSignal(lsMinHz ? loadNumber(lsMinHz, 0) : 0)
   const [displayMaxHz, setDisplayMaxHz] = createSignal(lsMaxHz ? loadNumber(lsMaxHz, defaultMaxHz()) : defaultMaxHz())
-  const [centerFreqInput, setCenterFreqInput] = createSignal('')
   const [sgView, setSgView] = createSignal<SpectrogramView>(loadString(LS_SG_VIEW, 'legacy', SPECTROGRAM_VIEWS))
   const [sgGamma, setSgGamma] = createSignal(loadNumber(LS_SG_GAMMA, 2.0))
   const [sg3dSpeed, setSg3dSpeed] = createSignal(loadNumber(LS_SG_3D_SPEED, 80))
@@ -583,18 +583,14 @@ export default function AudioAnalysisPanel(props: Props): JSX.Element {
     (props.markers ?? []).map((m) => ({ fromHz: m.freq, toHz: m.freq, color: m.color })),
   )
 
-  function applyCenterShift() {
-    if (centerFreqInput() !== '' && props.onMarkerDrag) {
-      const newCenter = parseInt(centerFreqInput())
-      if (!isNaN(newCenter)) {
-        const delta = newCenter - centerFreq()
-        const markers = props.markers ?? []
-        markers.forEach((_, i) => {
-          props.onMarkerDrag!(i, markers[i].freq + delta)
-        })
-      }
-    }
-    setCenterFreqInput('')
+  function applyCenterShift(newCenter: number) {
+    if (!props.onMarkerDrag) return
+    const delta = newCenter - centerFreq()
+    if (delta === 0) return
+    const markers = props.markers ?? []
+    markers.forEach((_, i) => {
+      props.onMarkerDrag!(i, markers[i].freq + delta)
+    })
   }
 
   return (
@@ -620,20 +616,11 @@ export default function AudioAnalysisPanel(props: Props): JSX.Element {
                 })()}
               </span>
             ) : (
-              <input
-                type="number"
+              <NumberField
+                value={centerFreq()}
                 min={50}
                 max={displayMaxHz()}
-                step={1}
-                value={centerFreqInput() !== '' ? centerFreqInput() : centerFreq()}
-                onInput={(e) => setCenterFreqInput(e.currentTarget.value)}
-                onBlur={applyCenterShift}
-                onKeyDown={(e) => {
-                  if (e.key === 'Enter') {
-                    applyCenterShift()
-                    e.currentTarget.blur()
-                  }
-                }}
+                onCommit={applyCenterShift}
                 readOnly={!props.onMarkerDrag}
                 class={`w-20 rounded border border-[#30363d] bg-[#0d1117] px-2 py-0.5 font-mono text-[#c9d1d9] focus:border-[#2ea043] focus:outline-none ${!props.onMarkerDrag ? 'cursor-default opacity-60' : ''}`}
               />

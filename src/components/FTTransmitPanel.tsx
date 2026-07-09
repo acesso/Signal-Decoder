@@ -11,6 +11,7 @@ import {
 import { callsignCountry } from '$decoder-lib/ft/prefixes'
 import { FT_WINDOW_SECONDS, type FTMode } from '$decoder-lib/ft/decoder'
 import { fmtAbsHz } from '$decoder-lib/formatFreq'
+import NumberField from './NumberField'
 
 // rAF-driven countdown: seconds until next window boundary, updated at ~4 Hz
 function useWindowCountdown(windowSec: () => number): () => number {
@@ -621,9 +622,9 @@ export default function FTTransmitPanel(props: FTTransmitPanelProps): JSX.Elemen
         {/* Audio offset */}
         <div class="flex flex-col gap-1">
           <label class="text-[#8b949e] text-[10px] font-semibold tracking-wide">Audio Hz</label>
-          <input type="number" value={baseFreq()}
-            onInput={e => setBaseFreq(Math.max(200, Math.min(3000, Number(e.currentTarget.value))))}
-            min={200} max={3000} step={50}
+          <NumberField value={baseFreq()}
+            min={200} max={3000}
+            onCommit={setBaseFreq}
             class="bg-[#0d1117] border border-[#30363d] rounded px-2 py-1.5 text-sm font-mono text-[#c9d1d9] w-24 focus:outline-none focus:border-[#388bfd]" />
         </div>
 
@@ -680,10 +681,10 @@ export default function FTTransmitPanel(props: FTTransmitPanelProps): JSX.Elemen
             {/* Auto-CQ interval — minimum minutes between unattended CQ transmissions */}
             <div class={`flex items-center gap-1 ${!tx.state().autoCQ ? 'opacity-40' : ''}`}
               title="Minimum time between automatic CQ transmissions">
-              <input type="number" value={tx.state().autoCQIntervalMin}
-                onInput={e => tx.setAutoCQIntervalMin(Number(e.currentTarget.value))}
+              <NumberField value={tx.state().autoCQIntervalMin}
+                onCommit={tx.setAutoCQIntervalMin}
                 disabled={!tx.state().autoCQ}
-                min={1} max={60} step={1}
+                min={1} max={60}
                 class="bg-[#0d1117] border border-[#30363d] rounded px-1.5 py-1 text-xs font-mono text-[#c9d1d9] w-12 focus:outline-none focus:border-[#388bfd] disabled:cursor-not-allowed" />
               <span class="text-[10px] text-[#8b949e] whitespace-nowrap">min</span>
             </div>
