@@ -48,7 +48,20 @@ export default function NumberField(props: Props): JSX.Element {
     if (el && document.activeElement !== el) el.value = String(v)
   })
 
-  return (
+  const clamp = (n: number) => {
+    let v = n
+    if (props.min !== undefined) v = Math.max(props.min, v)
+    if (props.max !== undefined) v = Math.min(props.max, v)
+    return v
+  }
+
+  const step = (dir: 1 | -1) => {
+    if (props.disabled || props.readOnly || !props.step) return
+    const next = clamp(props.value + dir * props.step)
+    props.onCommit(next)
+  }
+
+  const input = (
     <input
       ref={el}
       type="text"
@@ -68,7 +81,33 @@ export default function NumberField(props: Props): JSX.Element {
         if (el) el.value = String(props.value)
         props.onBlurExtra?.()
       }}
-      class={props.class}
+      class={props.step ? `${props.class ?? ''} pr-5` : props.class}
     />
+  )
+
+  // step is opt-in: only fields that pass it get the up/down spin buttons,
+  // so existing call sites (e.g. RadioCATPanel) render exactly as before.
+  if (!props.step) return input
+
+  return (
+    <div class="relative inline-flex">
+      {input}
+      <div class="absolute right-0.5 top-0 bottom-0 flex flex-col justify-center">
+        <button
+          type="button"
+          tabIndex={-1}
+          disabled={props.disabled || props.readOnly}
+          onClick={() => step(1)}
+          class="leading-none text-[8px] px-0.5 text-[#8b949e] hover:text-[#c9d1d9] disabled:opacity-30 disabled:cursor-not-allowed"
+        >▲</button>
+        <button
+          type="button"
+          tabIndex={-1}
+          disabled={props.disabled || props.readOnly}
+          onClick={() => step(-1)}
+          class="leading-none text-[8px] px-0.5 text-[#8b949e] hover:text-[#c9d1d9] disabled:opacity-30 disabled:cursor-not-allowed"
+        >▼</button>
+      </div>
+    </div>
   )
 }
