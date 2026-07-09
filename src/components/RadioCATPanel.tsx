@@ -10,6 +10,7 @@ import {
   type FactoryDefaults,
 } from '../lib/cat/useRadioCAT'
 import CalibrationWizard from './CalibrationWizard'
+import NumberField from './NumberField'
 export { useRadioCAT }
 
 // ── Constants ─────────────────────────────────────────────────────────────────
@@ -295,20 +296,20 @@ function SettingsPanel(props: {
 
         <div class="flex flex-col gap-1.5">
           <label class="text-[10px] font-semibold uppercase tracking-widest text-[#8b949e]">Cmd Timeout (ms)</label>
-          <input
-            type="number" min={50} max={5000} step={50}
+          <NumberField
+            min={50} max={5000}
             value={props.config.timeoutMs}
-            onInput={(e) => props.onConfigChange({ ...props.config, timeoutMs: Math.max(50, Math.min(5000, Number(e.currentTarget.value))) })}
+            onCommit={(n) => props.onConfigChange({ ...props.config, timeoutMs: n })}
             class="bg-[#0d1117] border border-[#30363d] text-[#c9d1d9] text-xs rounded px-2 py-1.5 focus:outline-none focus:border-[#388bfd] font-mono"
           />
         </div>
 
         <div class="flex flex-col gap-1.5">
           <label class="text-[10px] font-semibold uppercase tracking-widest text-[#8b949e]">Query Interval (ms)</label>
-          <input
-            type="number" min={200} max={10000} step={100}
+          <NumberField
+            min={200} max={10000}
             value={props.config.pollIntervalMs}
-            onInput={(e) => props.onConfigChange({ ...props.config, pollIntervalMs: Math.max(200, Math.min(10000, Number(e.currentTarget.value))) })}
+            onCommit={(n) => props.onConfigChange({ ...props.config, pollIntervalMs: n })}
             class="bg-[#0d1117] border border-[#30363d] text-[#c9d1d9] text-xs rounded px-2 py-1.5 focus:outline-none focus:border-[#388bfd] font-mono"
           />
         </div>

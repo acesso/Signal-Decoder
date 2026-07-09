@@ -291,7 +291,7 @@ function rejectAll(reason: string) {
 let readyEngines = new Set<string>();
 
 function attachSlot(slotIndex: number): PoolSlot {
-  const w = new Worker(new URL('./decoder.worker.ts', import.meta.url));
+  const w = new Worker(new URL('./decoder.worker.ts', import.meta.url), { type: 'module' });
   const slot: PoolSlot = { worker: w, inFlight: 0 };
 
   w.onmessage = (e: MessageEvent) => {

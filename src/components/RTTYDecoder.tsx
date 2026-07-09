@@ -1,7 +1,7 @@
 // Port of src/components/RTTYDecoder.tsx (Next.js app) — implements
 // DecoderControls via a caller-owned mutable handle (props.handle.current),
 // filled in via onMount, instead of forwardRef+useImperativeHandle.
-import { createEffect, createMemo, createSignal, onCleanup, onMount, type JSX } from 'solid-js'
+import { createEffect, createMemo, createSignal, For, onCleanup, onMount, type JSX } from 'solid-js'
 import type { RTTYConfig } from '$decoder-lib/rtty/decoder'
 import { loadNumberArray, saveNumberArray } from '$decoder-lib/storage'
 import { createMultiRTTYProcessor } from '../lib/rtty/multiProcessor'
@@ -350,19 +350,30 @@ export default function RTTYDecoder(props: DecoderProps): JSX.Element {
             </div>
           </div>
           <div class="grid grid-cols-2 gap-2">
-            {sessions.state().sessions.map((session) => (
-              <SessionCard
-                session={session}
-                isActive={session.id === sessions.state().activeSessionId}
-                canRemove={sessions.state().sessions.length > 1}
-                vfoFrequency={props.vfoFrequency}
-                onActivate={promoteSession}
-                onRemove={removeSession}
-                onConfigChange={updateSessionConfig}
-                onLabelChange={(id, label) => sessions.dispatch({ type: 'UPDATE_LABEL', id, label })}
-                onColorChange={updateSessionColor}
-              />
-            ))}
+            {/* Keyed by id (stable across edits) rather than by the session
+                object itself — the reducer returns a new object for whichever
+                session was just patched, so keying by object reference (as a
+                plain .map() or a naive <For each={sessions}> effectively
+                does) would unmount/remount that card on every keystroke,
+                dropping focus out of whatever input the user was typing in. */}
+            <For each={sessions.state().sessions.map((s) => s.id)}>
+              {(id) => {
+                const session = createMemo(() => sessions.state().sessions.find((s) => s.id === id)!)
+                return (
+                  <SessionCard
+                    session={session()}
+                    isActive={id === sessions.state().activeSessionId}
+                    canRemove={sessions.state().sessions.length > 1}
+                    vfoFrequency={props.vfoFrequency}
+                    onActivate={promoteSession}
+                    onRemove={removeSession}
+                    onConfigChange={updateSessionConfig}
+                    onLabelChange={(sid, label) => sessions.dispatch({ type: 'UPDATE_LABEL', id: sid, label })}
+                    onColorChange={updateSessionColor}
+                  />
+                )
+              }}
+            </For>
           </div>
         </div>
       </div>

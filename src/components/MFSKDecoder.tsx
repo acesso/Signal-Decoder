@@ -5,6 +5,7 @@ import { createEffect, createMemo, createSignal, For, onCleanup, onMount, Show, 
 import type { DecoderControls, DecoderProps } from '../lib/decoderControls'
 import { fmtAbsHz } from '$decoder-lib/formatFreq'
 import AudioAnalysisPanel from './AudioAnalysisPanel'
+import NumberField from './NumberField'
 import { createMFSKProcessor, type MFSKSymbol, type MFSKWord } from '../lib/mfsk/processor'
 import { MFSKChannel, MFSKDecoderOptions, DEFAULT_DECODER_OPTIONS } from '$decoder-lib/mfsk/decoder'
 import { bitsToBaudotCode, decodeBaudotCodePoints } from '$decoder-lib/mfsk/baudot'
@@ -1196,36 +1197,26 @@ export default function MFSKDecoder(props: DecoderProps): JSX.Element {
             <div class="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-[#8b949e]">
               <label class="flex items-center gap-1.5">
                 Row width
-                <input
-                  type="number"
+                <NumberField
                   value={frameWidth()}
-                  min={1}
-                  max={512}
-                  step={wordWidth() > 0 ? wordWidth() : 1}
-                  onInput={(e) => {
-                    const v = parseFloat(e.currentTarget.value)
-                    if (!isNaN(v) && v > 0) {
-                      const step = wordWidth() > 0 ? wordWidth() : 1
-                      const snapped = Math.max(step, Math.round(v / step) * step)
-                      setFrameWidth(Math.min(512, snapped))
-                    }
+                  parse={(raw) => {
+                    const v = parseFloat(raw)
+                    if (!Number.isFinite(v) || v <= 0) return null
+                    const step = wordWidth() > 0 ? wordWidth() : 1
+                    return Math.min(512, Math.max(step, Math.round(v / step) * step))
                   }}
+                  onCommit={setFrameWidth}
                   class="w-14 rounded border border-[#30363d] bg-[#0d1117] px-1.5 py-0.5 font-mono text-[#c9d1d9] focus:border-[#2ea043] focus:outline-none"
                 />
                 cols
               </label>
               <label class="flex items-center gap-1.5">
                 Frame
-                <input
-                  type="number"
+                <NumberField
                   value={frameHeight()}
                   min={2}
                   max={128}
-                  step={2}
-                  onInput={(e) => {
-                    const v = parseInt(e.currentTarget.value)
-                    if (!isNaN(v)) setFrameHeight(Math.max(2, Math.min(128, v)))
-                  }}
+                  onCommit={setFrameHeight}
                   class="w-12 rounded border border-[#30363d] bg-[#0d1117] px-1.5 py-0.5 font-mono text-[#c9d1d9] focus:border-[#2ea043] focus:outline-none"
                 />
                 rows
@@ -1235,32 +1226,22 @@ export default function MFSKDecoder(props: DecoderProps): JSX.Element {
             <div class="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs">
               <label class="flex items-center gap-1.5 text-[#8b949e]">
                 Word
-                <input
-                  type="number"
+                <NumberField
                   value={wordWidth()}
                   min={2}
                   max={64}
-                  step={0.5}
-                  onInput={(e) => {
-                    const v = parseFloat(e.currentTarget.value)
-                    if (!isNaN(v)) setWordWidth(Math.max(2, Math.min(64, v)))
-                  }}
+                  onCommit={setWordWidth}
                   class="w-20 rounded border border-[#30363d] bg-[#0d1117] px-2 py-0.5 font-mono text-[#c9d1d9] focus:border-[#2ea043] focus:outline-none"
                 />
                 cols
               </label>
               <label class={`flex items-center gap-1.5 ${isSyncMode() ? 'text-[#39d353]' : 'text-[#56d364]'}`}>
                 Start
-                <input
-                  type="number"
+                <NumberField
                   value={startBits()}
                   min={0}
                   max={8}
-                  step={1}
-                  onInput={(e) => {
-                    const v = parseFloat(e.currentTarget.value)
-                    if (!isNaN(v)) setStartBits(Math.max(0, Math.min(8, v)))
-                  }}
+                  onCommit={setStartBits}
                   class={`w-16 rounded border px-2 py-0.5 font-mono focus:outline-none ${
                     isSyncMode()
                       ? 'border-[#39d353] text-[#39d353] shadow-[0_0_0_1px_rgba(57,211,83,0.25)] focus:border-[#39d353]'
@@ -1273,16 +1254,11 @@ export default function MFSKDecoder(props: DecoderProps): JSX.Element {
               </label>
               <label class="flex items-center gap-1.5 text-[#ff7b72]">
                 Stop
-                <input
-                  type="number"
+                <NumberField
                   value={stopBits()}
                   min={0}
                   max={8}
-                  step={0.5}
-                  onInput={(e) => {
-                    const v = parseFloat(e.currentTarget.value)
-                    if (!isNaN(v)) setStopBits(Math.max(0, Math.min(8, v)))
-                  }}
+                  onCommit={setStopBits}
                   class="w-16 rounded border border-[#30363d] bg-[#0d1117] px-2 py-0.5 font-mono text-[#ff7b72] focus:border-[#ff7b72] focus:outline-none"
                 />
               </label>
@@ -1514,32 +1490,24 @@ export default function MFSKDecoder(props: DecoderProps): JSX.Element {
           <div class="mb-3 shrink-0 space-y-2 border-b border-[#30363d] pb-3">
             <div class="flex items-center gap-2 text-xs">
               <span class="w-16 shrink-0 text-[#8b949e]">Baud rate</span>
-              <input
-                type="number"
+              <NumberField
                 value={baudRate()}
-                min={0.1}
-                max={10000}
-                step={0.1}
-                onInput={(e) => {
-                  const v = parseFloat(e.currentTarget.value)
-                  if (!isNaN(v) && v > 0) setBaudRate(v)
+                parse={(raw) => {
+                  const v = parseFloat(raw)
+                  return Number.isFinite(v) && v > 0 ? v : null
                 }}
+                onCommit={setBaudRate}
                 class="min-w-0 flex-1 rounded border border-[#30363d] bg-[#0d1117] px-2 py-1 font-mono text-[#c9d1d9] focus:border-[#2ea043] focus:outline-none"
               />
               <span class="shrink-0 text-[#484f58]">Bd</span>
             </div>
             <div class="flex items-center gap-2 text-xs">
               <span class="w-16 shrink-0 text-[#8b949e]">Band width</span>
-              <input
-                type="number"
+              <NumberField
                 value={channelBw()}
                 min={5}
                 max={1000}
-                step={5}
-                onInput={(e) => {
-                  const v = parseFloat(e.currentTarget.value)
-                  if (!isNaN(v)) setChannelBw(Math.max(5, Math.min(1000, v)))
-                }}
+                onCommit={setChannelBw}
                 class="min-w-0 flex-1 rounded border border-[#30363d] bg-[#0d1117] px-2 py-1 font-mono text-[#c9d1d9] focus:border-[#2ea043] focus:outline-none"
               />
               <span class="shrink-0 text-[#484f58]">Hz</span>
@@ -1611,15 +1579,11 @@ export default function MFSKDecoder(props: DecoderProps): JSX.Element {
               </div>
               <div class="flex items-center gap-2 text-xs">
                 <span class="w-16 shrink-0 text-[#8b949e]">Char bits</span>
-                <input
-                  type="number"
+                <NumberField
                   value={decoderOpts().charBits ?? 8}
                   min={5}
                   max={8}
-                  onInput={(e) => {
-                    const v = parseInt(e.currentTarget.value)
-                    if (!isNaN(v)) setDecoderOpts((o) => ({ ...o, charBits: Math.max(5, Math.min(8, v)) }))
-                  }}
+                  onCommit={(n) => setDecoderOpts((o) => ({ ...o, charBits: n }))}
                   class="w-16 rounded border border-[#30363d] bg-[#0d1117] px-2 py-0.5 font-mono text-[#c9d1d9] focus:border-[#2ea043] focus:outline-none"
                 />
                 <span class="text-[#484f58]">bits</span>
@@ -1660,16 +1624,13 @@ export default function MFSKDecoder(props: DecoderProps): JSX.Element {
               <Show when={fec() === 'k7r12'}>
                 <div class="flex items-center gap-2 text-xs">
                   <span class="w-16 shrink-0 text-[#8b949e]">IL depth</span>
-                  <input
-                    type="number"
+                  <NumberField
                     value={interleaverDepth()}
-                    min={1}
-                    max={100}
-                    step={1}
-                    onInput={(e) => {
-                      const v = parseInt(e.currentTarget.value)
-                      if (!isNaN(v) && v > 0) setInterleaverDepth(v)
+                    parse={(raw) => {
+                      const v = parseInt(raw)
+                      return Number.isFinite(v) && v > 0 ? Math.min(100, v) : null
                     }}
+                    onCommit={setInterleaverDepth}
                     class="w-16 rounded border border-[#30363d] bg-[#0d1117] px-2 py-0.5 font-mono text-[#c9d1d9] focus:border-[#2ea043] focus:outline-none"
                   />
                   <span class="text-[10px] text-[#484f58]">symbols</span>
