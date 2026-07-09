@@ -324,6 +324,7 @@ export interface TxStatus {
   pendingReplies: number; // contacts that have messaged us but we haven't replied yet
   autoReply: boolean;
   autoCQ: boolean;
+  autoCQIntervalMin: number;
   autoPTT: boolean;
   allowConsecutiveTx: boolean;
   windowSec: number;
@@ -449,7 +450,8 @@ export default function FTTransmitPanel(props: FTTransmitPanelProps): JSX.Elemen
     }
     props.onStatusChange({
       status: tx.state().status, isRunning: isRunning(), queueLen: tx.state().queue.length, pendingReplies, autoReply: autoReply(),
-      autoCQ: tx.state().autoCQ, autoPTT: tx.state().autoPTT, allowConsecutiveTx: tx.state().allowConsecutiveTx,
+      autoCQ: tx.state().autoCQ, autoCQIntervalMin: tx.state().autoCQIntervalMin,
+      autoPTT: tx.state().autoPTT, allowConsecutiveTx: tx.state().allowConsecutiveTx,
       windowSec: FT_WINDOW_SECONDS[props.mode] ?? 15, txAudioHz: baseFreq(),
     })
   })
@@ -623,7 +625,7 @@ export default function FTTransmitPanel(props: FTTransmitPanelProps): JSX.Elemen
         <div class="flex flex-col gap-1">
           <label class="text-[#8b949e] text-[10px] font-semibold tracking-wide">Audio Hz</label>
           <NumberField value={baseFreq()}
-            min={200} max={3000}
+            min={200} max={3000} step={50}
             onCommit={setBaseFreq}
             class="bg-[#0d1117] border border-[#30363d] rounded px-2 py-1.5 text-sm font-mono text-[#c9d1d9] w-24 focus:outline-none focus:border-[#388bfd]" />
         </div>
@@ -684,7 +686,7 @@ export default function FTTransmitPanel(props: FTTransmitPanelProps): JSX.Elemen
               <NumberField value={tx.state().autoCQIntervalMin}
                 onCommit={tx.setAutoCQIntervalMin}
                 disabled={!tx.state().autoCQ}
-                min={1} max={60}
+                min={1} max={60} step={1}
                 class="bg-[#0d1117] border border-[#30363d] rounded px-1.5 py-1 text-xs font-mono text-[#c9d1d9] w-12 focus:outline-none focus:border-[#388bfd] disabled:cursor-not-allowed" />
               <span class="text-[10px] text-[#8b949e] whitespace-nowrap">min</span>
             </div>

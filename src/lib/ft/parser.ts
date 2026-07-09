@@ -604,6 +604,9 @@ export interface ADIFOptions {
   // Contacts store their audio offset; the absolute freq = vfoHz + audioOffsetHz.
   // If 0 / absent, FREQ and BAND are omitted.
   vfoHz?: number;
+  // Also export partial QSOs (two-way handshake with no report exchanged yet).
+  // Off by default — only confirmed (full) QSOs are exported.
+  includePartial?: boolean;
 }
 
 const REPORT_TYPES: ReadonlySet<MsgType> = new Set(['report', 'r_report']);
@@ -633,6 +636,21 @@ function segmentQSOs(msgs: ContactMsg[]): ContactMsg[][] {
   return segments;
 }
 
+// Returns true if both sides transmitted to each other within the segment —
+// the basic two-way handshake, with or without a signal report.
+// NOTE: `msgs` belongs to the PEER's contact record (c), not mine — role='tx'
+// means the peer transmitted, role='rx' means the peer was addressed (i.e. I
+// transmitted to them).
+function segmentIsHandshake(msgs: ContactMsg[], me: string): { iSent: ContactMsg[]; theySent: ContactMsg[] } | null {
+  // Messages they transmitted (peer is caller, role='tx' on the peer's contact entry)
+  const theySent = msgs.filter(m => m.role === 'tx' && m.parsed.callee?.toUpperCase() === me);
+  // Messages I transmitted to them (peer is callee, role='rx' on the peer's contact entry
+  // because the peer was addressed while I was the caller)
+  const iSent    = msgs.filter(m => m.role === 'rx' && m.parsed.caller?.toUpperCase() === me);
+  if (iSent.length === 0 || theySent.length === 0) return null;
+  return { iSent, theySent };
+}
+
 // Returns true if the segment/contact's messages constitute a confirmed two-way QSO.
 // Rules:
 //   1. Both sides must have transmitted to each other (basic handshake).
@@ -640,30 +658,35 @@ function segmentQSOs(msgs: ContactMsg[]): ContactMsg[][] {
 //      - They sent me a report (they reported my signal), OR
 //      - I sent them a report (I reported their signal).
 //   This covers all standard FT8 QSO flows regardless of who called CQ.
-// Without myCall we cannot determine participation, so all contacts pass through.
-// NOTE: `msgs` belongs to the PEER's contact record (c), not mine — role='tx'
-// means the peer transmitted, role='rx' means the peer was addressed (i.e. I
-// transmitted to them).
 function segmentIsConfirmed(msgs: ContactMsg[], me: string): boolean {
-  // Messages they transmitted (peer is caller, role='tx' on the peer's contact entry)
-  const theySent = msgs.filter(m => m.role === 'tx' && m.parsed.callee?.toUpperCase() === me);
-  // Messages I transmitted to them (peer is callee, role='rx' on the peer's contact entry
-  // because the peer was addressed while I was the caller)
-  const iSent    = msgs.filter(m => m.role === 'rx' && m.parsed.caller?.toUpperCase() === me);
-  if (iSent.length === 0 || theySent.length === 0) return false;
-  const iSentReport    = iSent.some(m => REPORT_TYPES.has(m.parsed.type));
-  const theySentReport = theySent.some(m => REPORT_TYPES.has(m.parsed.type));
+  const hs = segmentIsHandshake(msgs, me);
+  if (!hs) return false;
+  const iSentReport    = hs.iSent.some(m => REPORT_TYPES.has(m.parsed.type));
+  const theySentReport = hs.theySent.some(m => REPORT_TYPES.has(m.parsed.type));
   return iSentReport || theySentReport;
 }
 
+// Without myCall we cannot determine participation, so all contacts pass through.
 export function isConfirmedQSO(c: Contact, myCall: string): boolean {
   if (!myCall) return true;
   return segmentIsConfirmed(c.msgs, myCall.toUpperCase());
 }
 
-function confirmedSegments(c: Contact, me: string): ContactMsg[][] {
+// A partial QSO: the two-way handshake happened but no signal report was
+// exchanged yet (e.g. only CQ + answer). Excludes segments that already
+// qualify as a confirmed (full) QSO.
+export function isPartialQSO(c: Contact, myCall: string): boolean {
+  if (!myCall) return false;
+  const me = myCall.toUpperCase();
+  return segmentQSOs(c.msgs).some(seg => segmentIsHandshake(seg, me) && !segmentIsConfirmed(seg, me));
+}
+
+function confirmedSegments(c: Contact, me: string, includePartial: boolean): ContactMsg[][] {
   if (!me) return [c.msgs];
-  return segmentQSOs(c.msgs).filter(seg => segmentIsConfirmed(seg, me));
+  return segmentQSOs(c.msgs).filter(seg => {
+    if (segmentIsConfirmed(seg, me)) return true;
+    return includePartial && segmentIsHandshake(seg, me) !== null;
+  });
 }
 
 export function generateADIF(
@@ -671,7 +694,7 @@ export function generateADIF(
   ftMode: FTMode,
   opts: ADIFOptions = {},
 ): string {
-  const { myCall, myGrid, vfoHz = 0 } = opts;
+  const { myCall, myGrid, vfoHz = 0, includePartial = false } = opts;
   const now       = new Date();
   const timestamp = `${adifDate(now)} ${adifTime(now)}`;
 
@@ -695,11 +718,12 @@ export function generateADIF(
     // Each confirmed QSO segment with this callsign becomes a separate ADIF record.
     // NOTE: `seg` messages belong to the PEER's contact record (c) — role='tx'
     // means the peer transmitted, role='rx' means the peer was addressed (I transmitted).
-    for (const seg of confirmedSegments(c, me)) {
+    for (const seg of confirmedSegments(c, me, includePartial)) {
       // Messages I transmitted to them: role='rx' on their contact (they were addressed), I am the caller
       const iSentMsgs    = seg.filter(m => m.role === 'rx' && m.parsed.caller?.toUpperCase() === me);
       // Messages they transmitted to me: role='tx' on their contact (they are caller), callee=me
       const theySentMsgs = seg.filter(m => m.role === 'tx' && m.parsed.callee?.toUpperCase() === me);
+      const isPartial     = !segmentIsConfirmed(seg, me);
 
       // RST_RCVD = best SNR on signals I received from them (their tx, stored as my rx)
       const bestSnrRcvd = theySentMsgs.reduce((best, m) => m.snr > best ? m.snr : best, -99);
@@ -740,7 +764,8 @@ export function generateADIF(
         fields.push(['RST_SENT', `${bestSnrSent >= 0 ? '+' : ''}${bestSnrSent}`]);
       if (myCall)     fields.push(['STATION_CALLSIGN', me]);
       if (myGrid)     fields.push(['MY_GRIDSQUARE',    myGrid.toUpperCase()]);
-      fields.push(['COMMENT', `FT8 QSO: ${iSentMsgs.length} sent, ${theySentMsgs.length} rcvd`]);
+      const partialNote = isPartial ? ' (partial: handshake only, no report exchanged)' : '';
+      fields.push(['COMMENT', `FT8 QSO: ${iSentMsgs.length} sent, ${theySentMsgs.length} rcvd${partialNote}`]);
 
       lines.push(fields.map(([k, v]) => af(k, v)).join(' ') + ' <EOR>');
     }

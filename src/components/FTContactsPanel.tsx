@@ -4,7 +4,7 @@ import { createEffect, createMemo, createSignal, For, on, onCleanup, onMount, Sh
 import { Portal } from 'solid-js/web'
 import {
   Contact, ContactMsg, MSG_TYPE_LABEL, MSG_TYPE_COLOR, generateADIF, parseADIF, gridToLatLon, haversineKm, isConfirmedQSO,
-  classifyCallsign,
+  isPartialQSO, classifyCallsign,
 } from '$decoder-lib/ft/parser'
 import { callsignCountry } from '$decoder-lib/ft/prefixes'
 
@@ -17,6 +17,7 @@ import FTLeafletMap from './FTLeafletMap'
 const LS_MAP_HEIGHT       = 'ft_map_height'
 const LS_CONTACTS_SORT_KEY = 'ft_contacts_sort_key'
 const LS_CONTACTS_SORT_REV = 'ft_contacts_sort_rev'
+const LS_ADIF_INCLUDE_PARTIAL = 'ft_adif_include_partial'
 const CONTACTS_SORT_KEYS = ['date', 'tx', 'rx', 'worked', 'alpha', 'snr-hi', 'snr-lo', 'near', 'far'] as const
 
 // Virtualized contact list geometry: collapsed cards are fixed-height
@@ -45,6 +46,27 @@ function loadMapStyle(): MapTileStyle {
 }
 function saveMapStyle(v: MapTileStyle) {
   localStorage.setItem(LS_MAP_STYLE, v)
+}
+
+// Map pin color mode — mutually exclusive, remembered per browser.
+const MAP_COLOR_MODES = ['default', 'age', 'worked', 'distance'] as const
+type MapColorModeStored = typeof MAP_COLOR_MODES[number]
+const LS_MAP_COLOR_MODE = 'ft_map_color_mode'
+function loadMapColorMode(): MapColorModeStored {
+  const v = localStorage.getItem(LS_MAP_COLOR_MODE)
+  return (MAP_COLOR_MODES as readonly string[]).includes(v ?? '') ? (v as MapColorModeStored) : 'default'
+}
+function saveMapColorMode(v: MapColorModeStored) {
+  localStorage.setItem(LS_MAP_COLOR_MODE, v)
+}
+
+// Map VFO filter — independent of color mode, remembered per browser.
+const LS_MAP_VFO_FILTER = 'ft_map_vfo_filter'
+function loadMapVfoFilter(): boolean {
+  return localStorage.getItem(LS_MAP_VFO_FILTER) === 'true'
+}
+function saveMapVfoFilter(v: boolean) {
+  localStorage.setItem(LS_MAP_VFO_FILTER, String(v))
 }
 
 // Format a stored absolute frequency. Values > 1 MHz are already absolute (VFO
@@ -711,6 +733,8 @@ export default function FTContactsPanel(props: Props): JSX.Element {
   createEffect(() => saveNumber(LS_MAP_HEIGHT, mapHeight()))
   const [showTerminator, setShowTerminator] = createSignal(loadShowTerminator())
   const [mapStyle, setMapStyle] = createSignal<MapTileStyle>(loadMapStyle())
+  const [mapColorMode, setMapColorMode] = createSignal<MapColorModeStored>(loadMapColorMode())
+  const [mapVfoFilter, setMapVfoFilter] = createSignal(loadMapVfoFilter())
   let panelEl: HTMLDivElement | undefined
   let mapDrag: { startY: number; startH: number } | null = null
 
@@ -902,13 +926,24 @@ export default function FTContactsPanel(props: Props): JSX.Element {
 
   let importFileEl: HTMLInputElement | undefined
   const [importStatus, setImportStatus] = createSignal<{ count: number; err?: string } | null>(null)
+  const [includePartial, setIncludePartial] = createSignal(loadBoolean(LS_ADIF_INCLUDE_PARTIAL, false))
+  createEffect(() => saveBoolean(LS_ADIF_INCLUDE_PARTIAL, includePartial()))
 
   const confirmedQSOCount = createMemo(() => props.myCall
     ? [...props.contacts.values()].filter(c => isConfirmedQSO(c, props.myCall!)).length
     : 0)
 
+  const partialQSOCount = createMemo(() => props.myCall
+    ? [...props.contacts.values()].filter(c => isPartialQSO(c, props.myCall!)).length
+    : 0)
+
+  const exportQSOCount = createMemo(() => confirmedQSOCount() + (includePartial() ? partialQSOCount() : 0))
+
   function downloadADIF() {
-    const content = generateADIF(props.contacts, props.mode, { myCall: props.myCall ?? '', myGrid: props.myGrid ?? '', vfoHz: props.vfoHz ?? 0 })
+    const content = generateADIF(props.contacts, props.mode, {
+      myCall: props.myCall ?? '', myGrid: props.myGrid ?? '', vfoHz: props.vfoHz ?? 0,
+      includePartial: includePartial(),
+    })
     const blob = new Blob([content], { type: 'text/plain;charset=utf-8' })
     const url  = URL.createObjectURL(blob)
     const a    = document.createElement('a')
@@ -974,15 +1009,27 @@ export default function FTContactsPanel(props: Props): JSX.Element {
             import
           </button>
           <Show when={props.contacts.size > 0}>
+            <label
+              class="flex items-center gap-1 text-[10px] text-[#8b949e] font-mono cursor-pointer select-none"
+              title="Also export partial QSOs — two-way handshake with no signal report exchanged yet"
+            >
+              <input
+                type="checkbox"
+                checked={includePartial()}
+                onChange={e => setIncludePartial(e.currentTarget.checked)}
+                class="accent-[#79c0ff]"
+              />
+              +partial{partialQSOCount() > 0 ? ` (${partialQSOCount()})` : ''}
+            </label>
             <button
               onClick={downloadADIF}
-              disabled={confirmedQSOCount() === 0}
+              disabled={exportQSOCount() === 0}
               class="text-xs px-2 py-0.5 rounded border border-[#30363d] text-[#8b949e] hover:text-[#79c0ff] hover:border-[#79c0ff]/40 transition-colors font-mono disabled:opacity-40 disabled:cursor-not-allowed"
-              title={confirmedQSOCount() > 0
-                ? `Download ADIF log — ${confirmedQSOCount()} confirmed QSO${confirmedQSOCount() !== 1 ? 's' : ''} (SWL entries excluded)`
+              title={exportQSOCount() > 0
+                ? `Download ADIF log — ${exportQSOCount()} QSO${exportQSOCount() !== 1 ? 's' : ''} (SWL entries excluded)`
                 : 'No confirmed two-way QSOs to export yet'}
             >
-              export{confirmedQSOCount() > 0 ? ` (${confirmedQSOCount()})` : ''}
+              export{exportQSOCount() > 0 ? ` (${exportQSOCount()})` : ''}
             </button>
             <button
               onClick={props.onClearContacts}
@@ -996,8 +1043,7 @@ export default function FTContactsPanel(props: Props): JSX.Element {
 
       {/* Map */}
       <div class="shrink-0 mb-0">
-        <div class="text-[10px] text-[#484f58] font-mono mb-1 flex items-center justify-between">
-          <span>World Map</span>
+        <div class="text-[10px] text-[#484f58] font-mono mb-1 flex items-center justify-end">
           <div class="flex items-center gap-1.5">
             <button
               onClick={() => setShowTerminator(v => { saveShowTerminator(!v); return !v })}
@@ -1026,6 +1072,45 @@ export default function FTContactsPanel(props: Props): JSX.Element {
             </span>
           </div>
         </div>
+        <div class="text-[10px] font-mono mb-1 flex items-center gap-1.5 flex-wrap">
+          <For each={[
+            { key: 'default' as const,  label: 'colored' },
+            { key: 'age' as const,      label: 'age' },
+            { key: 'worked' as const,   label: 'worked' },
+            { key: 'distance' as const, label: 'distance' },
+          ]}>
+            {opt => (
+              <button
+                onClick={() => setMapColorMode(v => { const next = v === opt.key ? 'default' : opt.key; saveMapColorMode(next); return next })}
+                title={{
+                  default:  'Pin color: each contact keeps its own palette color',
+                  age:      'Pin color: fades toward the background the longer since last heard',
+                  worked:   'Pin color: green = confirmed QSO, amber = handshake only, gray = never worked (needs My Callsign set)',
+                  distance: 'Pin color: dims with distance from my own station (needs My Callsign set + located)',
+                }[opt.key]}
+                class={`px-1.5 py-0.5 rounded border transition-colors ${
+                  mapColorMode() === opt.key
+                    ? 'border-[#2ea043]/50 text-[#2ea043] bg-[#2ea043]/10'
+                    : 'border-[#30363d] text-[#8b949e] hover:text-[#c9d1d9]'
+                }`}
+              >
+                {opt.label}
+              </button>
+            )}
+          </For>
+          <label
+            class="flex items-center gap-1 text-[#8b949e] cursor-pointer select-none ml-1"
+            title="Hide pins whose last-heard frequency falls outside the current VFO passband"
+          >
+            <input
+              type="checkbox"
+              checked={mapVfoFilter()}
+              onChange={e => { setMapVfoFilter(e.currentTarget.checked); saveMapVfoFilter(e.currentTarget.checked) }}
+              class="accent-[#79c0ff]"
+            />
+            VFO only
+          </label>
+        </div>
         <div class="rounded overflow-hidden border border-[#21262d]" style={{ height: `${mapHeight()}px` }}>
           <FTLeafletMap
             contacts={props.contacts}
@@ -1035,6 +1120,8 @@ export default function FTContactsPanel(props: Props): JSX.Element {
             tileStyle={mapStyle()}
             newWindowMs={windowMs()}
             myCall={props.myCall}
+            colorMode={mapColorMode()}
+            vfoFilterHz={mapVfoFilter() ? (props.vfoHz ?? 0) : 0}
           />
         </div>
         {/* Drag handle to resize map */}
