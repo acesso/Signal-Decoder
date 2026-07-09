@@ -152,7 +152,9 @@ export default function RTTYDecoder(props: DecoderProps): JSX.Element {
   )
   const halfBW = createMemo(() => activeConfig().baudRate / 2)
   const spectrumMarkers = createMemo(() => [
-    { freq: markFreq(), color: '#58a6ff', label: 'M', bandwidthHz: halfBW() * 2 },
+    // Red, not blue — a blue marker disappears into the waterfall's dark-blue
+    // quiet floor.
+    { freq: markFreq(), color: '#f85149', label: 'M', bandwidthHz: halfBW() * 2 },
     { freq: spaceFreq(), color: '#f0883e', label: 'S', bandwidthHz: halfBW() * 2 },
   ])
 

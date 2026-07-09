@@ -60,6 +60,7 @@ No installation, no downloads, no setup - just open and decode!
   - Schmitt trigger sync detection
   - Bidirectional exponential moving average filtering
 - **Live Display**: Progressive rendering with real-time spectrum visualization
+- **GPU Spectrogram**: WebGL 2D waterfall and 3D terrain views with six color palettes (stored per mode), draggable frequency/squelch markers, and a VFO-aware frequency ruler
 - **Save Output**: Export decoded images as PNG or text sessions
 - **Retroactive Audio Capture**: A ring buffer keeps the last 30 s–5 min
   (configurable via the ⚙ menu in the top bar) of input and TX output audio

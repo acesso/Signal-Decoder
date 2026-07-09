@@ -535,7 +535,7 @@ export default function CWDecoder(props: DecoderProps): JSX.Element {
           isRecording={processor.state().isRecording}
           storageKeyPrefix="cw"
           markers={[
-            { freq: toneFreq(), color: '#79c0ff', label: 'T', bandwidthHz: filterBandwidth() },
+            { freq: toneFreq(), color: '#f85149', label: 'T', bandwidthHz: filterBandwidth() },
             ...(dualMode() ? [{ freq: toneFreq2(), color: '#ffa657', label: 'T2', bandwidthHz: filterBandwidth() }] : []),
           ]}
           onMarkerDrag={(idx, newHz) => {

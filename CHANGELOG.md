@@ -12,6 +12,37 @@ them into a version section when cutting a release.
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-07-09
+
+### Added
+
+- Spectrogram color themes — Turbo, Viridis, Inferno, Jet, Grayscale, Green —
+  selectable per decoder mode and remembered per browser.
+- FT8/FT4 TX audio marker on the Audio Analysis panel is now draggable and
+  stays in sync with the transmit panel's Audio Hz field.
+- Triangular grab handles on draggable frequency markers, on both the
+  spectrum and the 2D waterfall, plus a side handle on the squelch line.
+- Auto-CQ on/off state persists across sessions (the interval minutes
+  already did).
+
+### Changed
+
+- 2D waterfall now renders on the GPU via WebGL (the CPU canvas remains as
+  automatic fallback), freeing the main thread for decoding.
+- Frequency ruler moved outside the spectrum/waterfall boxes with denser
+  ticks; still shows absolute dial frequency when a radio VFO is connected.
+- Marker lines are red instead of blue, which blended into the waterfall's
+  quiet floor.
+
+### Fixed
+
+- Radio CAT panel no longer flickers between collapsed/expanded while
+  scrolling as decoders append content.
+- Hovering the squelch line now shows a vertical-drag cursor instead of the
+  marker-drag cursor (CW/MFSK).
+- Waterfall history texture no longer contains stale columns beyond the
+  terrain mesh width.
+
 ## [0.5.0] - 2026-07-09
 
 ### Added
