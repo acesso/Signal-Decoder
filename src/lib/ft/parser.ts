@@ -94,6 +94,23 @@ function isRecognizedShape(w: string): boolean {
   return matchedPrefix(w) !== null || compoundPrefix(w) !== null;
 }
 
+// The operator's actual callsign inside a compound/portable form — the slash
+// part that matches a callsign shape (9A/S55X/P → S55X, YS3/PY8WW → PY8WW,
+// K1ABC/4 → K1ABC). Prefix-only parts (9A, YS3, PJ4) and portable
+// designators (/P, /QRP, /4) have no letter suffix after the digit, so they
+// never match a callsign shape; if both sides somehow match, the longer one
+// wins. Used for external lookups (QRZ), where only the base call resolves.
+export function baseCallsign(cs: string): string {
+  const parts = cs.split('/').filter(Boolean);
+  if (parts.length <= 1) return cs;
+  const last = parts[parts.length - 1];
+  if (PORTABLE_SUFFIXES.has(last) || /^[0-9]$/.test(last)) parts.pop();
+  if (parts.length === 1) return parts[0];
+  const shaped = parts.filter((p) => matchedPrefix(p) !== null);
+  const pool = shaped.length > 0 ? shaped : parts;
+  return pool.reduce((a, b) => (b.length > a.length ? b : a));
+}
+
 // "RR73" is lexically a valid Maidenhead square but is reserved as a QSO
 // sign-off message and must never be read as a locator (same as WSJT-X)
 const GRID_EXACT = /^(?!RR73)[A-R]{2}[0-9]{2}$/;
@@ -781,20 +798,112 @@ export function isPartialQSO(c: Contact, myCall: string): boolean {
   return segmentQSOs(c.msgs).some(seg => segmentIsHandshake(seg, me) && !segmentIsConfirmed(seg, me));
 }
 
-function confirmedSegments(c: Contact, me: string, includePartial: boolean): ContactMsg[][] {
-  if (!me) return [c.msgs];
-  return segmentQSOs(c.msgs).filter(seg => {
-    if (segmentIsConfirmed(seg, me)) return true;
-    return includePartial && segmentIsHandshake(seg, me) !== null;
-  });
+/** One QSO exchange, snapshotted as a self-contained record. Contact message
+ *  lists rotate (60 per contact) and whole contacts get evicted at
+ *  MAX_CONTACTS, so QSOs must be extracted into records the moment they are
+ *  decoded and kept in a separate store (see qsoLog.ts) — deriving them from
+ *  live contacts at export time silently loses exchanges whose messages have
+ *  already rotated out. */
+export interface QSORecord {
+  callsign: string;
+  grid?: string;
+  /** First / last exchange-message time (ms epoch). QSO_DATE/TIME_ON come
+   *  from startMs; endMs lets re-captures of the same QSO be recognized by
+   *  time overlap even after its earliest messages rotate out. */
+  startMs: number;
+  endMs: number;
+  /** Absolute Hz when known (VFO already folded in at capture), 0 = unknown. */
+  freqHz: number;
+  /** Best SNR received from them; -99 when nothing was heard (SWL edge). */
+  rstRcvd: number;
+  /** Report I sent them, when one went out. */
+  rstSent?: number;
+  sentCount: number;
+  rcvdCount: number;
+  /** true = report exchanged (full QSO); false = handshake only (partial). */
+  confirmed: boolean;
+  mode: FTMode;
+  /** Verbatim COMMENT override (preserves comments on imported records). */
+  comment?: string;
 }
 
-export function generateADIF(
-  contacts: Map<string, Contact>,
+// NOTE: `c.msgs` belong to the PEER's contact record — role='tx' means the
+// peer transmitted, role='rx' means the peer was addressed (I transmitted).
+export function extractQSORecords(
+  c: Contact,
+  myCall: string,
   ftMode: FTMode,
-  opts: ADIFOptions = {},
+  vfoHz = 0,
+  includePartial = true,
+): QSORecord[] {
+  const me = myCall.toUpperCase();
+  // Skip the entry keyed by our own callsign — mergeContacts tracks every
+  // caller/callee it sees, including us, so a "contact" for myCall is not a
+  // real QSO partner. Without this guard a completed exchange produces an
+  // ADIF record with CALL === STATION_CALLSIGN (a bogus self-worked QSO).
+  if (me && c.callsign.toUpperCase() === me) return [];
+  // Without myCall participation can't be determined, so the whole history
+  // passes through as a single unconditional record.
+  const segments = me
+    ? segmentQSOs(c.msgs).filter(
+        seg => segmentIsConfirmed(seg, me) || (includePartial && segmentIsHandshake(seg, me) !== null),
+      )
+    : [c.msgs];
+
+  const out: QSORecord[] = [];
+  for (const seg of segments) {
+    // Messages I transmitted to them: role='rx' on their contact (they were addressed), I am the caller
+    const iSentMsgs    = seg.filter(m => m.role === 'rx' && m.parsed.caller?.toUpperCase() === me);
+    // Messages they transmitted to me: role='tx' on their contact (they are caller), callee=me
+    const theySentMsgs = seg.filter(m => m.role === 'tx' && m.parsed.callee?.toUpperCase() === me);
+    const confirmed    = me ? segmentIsConfirmed(seg, me) : true;
+
+    // RST_RCVD = best SNR on signals I received from them (their tx, stored as my rx)
+    const bestSnrRcvd = theySentMsgs.reduce((best, m) => m.snr > best ? m.snr : best, -99);
+    // RST_SENT = the report value I sent them (in my tx messages of type report/r_report)
+    const reportedSnr = iSentMsgs
+      .filter(m => REPORT_TYPES.has(m.parsed.type))
+      .map(m => m.parsed.report)
+      .filter((v): v is number => v !== undefined);
+    const bestSnrSent = reportedSnr.length > 0
+      ? reportedSnr.reduce((a, b) => a > b ? a : b)
+      : undefined;
+
+    // QSO start/end = first/last exchange message in this segment
+    const allExchange = [...iSentMsgs, ...theySentMsgs].sort(
+      (a, b) => a.windowStart.getTime() - b.windowStart.getTime(),
+    );
+    const qsoStart = allExchange[0]?.windowStart ?? c.firstSeen;
+    const qsoEnd   = allExchange[allExchange.length - 1]?.windowStart ?? qsoStart;
+
+    const firstMsg = allExchange[0];
+    const absHz = firstMsg
+      ? (firstMsg.freq > 1_000_000 ? firstMsg.freq : (vfoHz > 0 ? vfoHz + firstMsg.freq : 0))
+      : (vfoHz > 0 ? vfoHz : 0);
+
+    out.push({
+      callsign: c.callsign,
+      grid: c.grid,
+      startMs: qsoStart.getTime(),
+      endMs: qsoEnd.getTime(),
+      freqHz: absHz,
+      rstRcvd: bestSnrRcvd,
+      rstSent: bestSnrSent,
+      sentCount: iSentMsgs.length,
+      rcvdCount: theySentMsgs.length,
+      confirmed,
+      mode: ftMode,
+    });
+  }
+  return out;
+}
+
+export function generateADIFFromRecords(
+  records: QSORecord[],
+  opts: Pick<ADIFOptions, 'myCall' | 'myGrid'> = {},
 ): string {
-  const { myCall, myGrid, vfoHz = 0, includePartial = false } = opts;
+  const { myCall, myGrid } = opts;
+  const me        = (myCall ?? '').toUpperCase();
   const now       = new Date();
   const timestamp = `${adifDate(now)} ${adifTime(now)}`;
 
@@ -807,71 +916,47 @@ export function generateADIF(
     '',
   ];
 
-  const me = (myCall ?? '').toUpperCase();
+  for (const r of [...records].sort((a, b) => a.startMs - b.startMs)) {
+    const qsoStart = new Date(r.startMs);
+    const freqMhz  = r.freqHz > 0 ? r.freqHz / 1_000_000 : 0;
+    const band     = freqMhz > 0 ? freqMhzToBand(freqMhz) : undefined;
 
-  for (const c of contacts.values()) {
-    // Skip the entry keyed by our own callsign — mergeContacts tracks every
-    // caller/callee it sees, including us, so a "contact" for myCall is not a
-    // real QSO partner. Without this guard a completed exchange produces an
-    // ADIF record with CALL === STATION_CALLSIGN (a bogus self-worked QSO).
-    if (me && c.callsign.toUpperCase() === me) continue;
-    // Each confirmed QSO segment with this callsign becomes a separate ADIF record.
-    // NOTE: `seg` messages belong to the PEER's contact record (c) — role='tx'
-    // means the peer transmitted, role='rx' means the peer was addressed (I transmitted).
-    for (const seg of confirmedSegments(c, me, includePartial)) {
-      // Messages I transmitted to them: role='rx' on their contact (they were addressed), I am the caller
-      const iSentMsgs    = seg.filter(m => m.role === 'rx' && m.parsed.caller?.toUpperCase() === me);
-      // Messages they transmitted to me: role='tx' on their contact (they are caller), callee=me
-      const theySentMsgs = seg.filter(m => m.role === 'tx' && m.parsed.callee?.toUpperCase() === me);
-      const isPartial     = !segmentIsConfirmed(seg, me);
+    const fields: [string, string][] = [
+      ['CALL',     r.callsign],
+      ...adifMode(r.mode),
+      ['QSO_DATE', adifDate(qsoStart)],
+      ['TIME_ON',  adifTime(qsoStart)],
+    ];
 
-      // RST_RCVD = best SNR on signals I received from them (their tx, stored as my rx)
-      const bestSnrRcvd = theySentMsgs.reduce((best, m) => m.snr > best ? m.snr : best, -99);
-      // RST_SENT = the report value I sent them (in my tx messages of type report/r_report)
-      const reportedSnr = iSentMsgs
-        .filter(m => REPORT_TYPES.has(m.parsed.type))
-        .map(m => m.parsed.report)
-        .filter((v): v is number => v !== undefined);
-      const bestSnrSent = reportedSnr.length > 0
-        ? reportedSnr.reduce((a, b) => a > b ? a : b)
-        : undefined;
+    if (band)        fields.push(['BAND',       band]);
+    if (freqMhz > 0) fields.push(['FREQ',       freqMhz.toFixed(6)]);
+    if (r.grid)      fields.push(['GRIDSQUARE', r.grid]);
+    fields.push(['RST_RCVD', `${r.rstRcvd >= 0 ? '+' : ''}${r.rstRcvd}`]);
+    if (r.rstSent !== undefined)
+      fields.push(['RST_SENT', `${r.rstSent >= 0 ? '+' : ''}${r.rstSent}`]);
+    if (myCall) fields.push(['STATION_CALLSIGN', me]);
+    if (myGrid) fields.push(['MY_GRIDSQUARE',    myGrid.toUpperCase()]);
+    const partialNote = r.confirmed ? '' : ' (partial: handshake only, no report exchanged)';
+    fields.push(['COMMENT', r.comment ?? `${r.mode} QSO: ${r.sentCount} sent, ${r.rcvdCount} rcvd${partialNote}`]);
 
-      // QSO start = first exchange message in this segment
-      const allExchange = [...iSentMsgs, ...theySentMsgs].sort(
-        (a, b) => a.windowStart.getTime() - b.windowStart.getTime(),
-      );
-      const qsoStart = allExchange[0]?.windowStart ?? c.firstSeen;
-
-      const firstMsg = allExchange[0];
-      const absHz = firstMsg
-        ? (firstMsg.freq > 1_000_000 ? firstMsg.freq : (vfoHz > 0 ? vfoHz + firstMsg.freq : 0))
-        : (vfoHz > 0 ? vfoHz : 0);
-      const freqMhz = absHz > 0 ? absHz / 1_000_000 : 0;
-      const band    = freqMhz > 0 ? freqMhzToBand(freqMhz) : undefined;
-
-      const fields: [string, string][] = [
-        ['CALL',     c.callsign],
-        ...adifMode(ftMode),
-        ['QSO_DATE', adifDate(qsoStart)],
-        ['TIME_ON',  adifTime(qsoStart)],
-      ];
-
-      if (band)       fields.push(['BAND',           band]);
-      if (freqMhz > 0) fields.push(['FREQ',          freqMhz.toFixed(6)]);
-      if (c.grid)     fields.push(['GRIDSQUARE',      c.grid]);
-      fields.push(['RST_RCVD', `${bestSnrRcvd >= 0 ? '+' : ''}${bestSnrRcvd}`]);
-      if (bestSnrSent !== undefined)
-        fields.push(['RST_SENT', `${bestSnrSent >= 0 ? '+' : ''}${bestSnrSent}`]);
-      if (myCall)     fields.push(['STATION_CALLSIGN', me]);
-      if (myGrid)     fields.push(['MY_GRIDSQUARE',    myGrid.toUpperCase()]);
-      const partialNote = isPartial ? ' (partial: handshake only, no report exchanged)' : '';
-      fields.push(['COMMENT', `FT8 QSO: ${iSentMsgs.length} sent, ${theySentMsgs.length} rcvd${partialNote}`]);
-
-      lines.push(fields.map(([k, v]) => af(k, v)).join(' ') + ' <EOR>');
-    }
+    lines.push(fields.map(([k, v]) => af(k, v)).join(' ') + ' <EOR>');
   }
 
   return lines.join('\n') + '\n';
+}
+
+export function generateADIF(
+  contacts: Map<string, Contact>,
+  ftMode: FTMode,
+  opts: ADIFOptions = {},
+): string {
+  const { myCall, myGrid, vfoHz = 0, includePartial = false } = opts;
+  const me = (myCall ?? '').toUpperCase();
+  const records: QSORecord[] = [];
+  for (const c of contacts.values()) {
+    records.push(...extractQSORecords(c, me, ftMode, vfoHz, includePartial));
+  }
+  return generateADIFFromRecords(records, { myCall, myGrid });
 }
 
 // ── ADIF import ───────────────────────────────────────────────────────────────
@@ -881,8 +966,10 @@ export interface ADIFRecord {
   qsoDate?: string;   // YYYYMMDD
   timeOn?: string;    // HHMMSS
   mode?: string;
+  submode?: string;
   gridsquare?: string;
   rstRcvd?: string;
+  freq?: string;      // MHz
   comment?: string;
 }
 
@@ -910,8 +997,10 @@ export function parseADIF(content: string): ADIFRecord[] {
       qsoDate:     parseADIFValue(raw, 'QSO_DATE'),
       timeOn:      parseADIFValue(raw, 'TIME_ON'),
       mode:        parseADIFValue(raw, 'MODE'),
+      submode:     parseADIFValue(raw, 'SUBMODE'),
       gridsquare:  parseADIFValue(raw, 'GRIDSQUARE'),
       rstRcvd:     parseADIFValue(raw, 'RST_RCVD'),
+      freq:        parseADIFValue(raw, 'FREQ'),
       comment:     parseADIFValue(raw, 'COMMENT'),
     });
   }

@@ -293,7 +293,7 @@ Callsigns are extracted from decoded messages and tracked as contacts with full 
 - **QSO history**: Per-contact message log with seconds-precision UTC timestamps, message-type badges, and TX/RX direction; runs of repeated messages collapse into one row with a `×N` counter (hover to see every occurrence)
 - **Cross-linking**: Callsigns are clickable everywhere they appear (worked list, map popups) and jump to the expanded contact
 - **Sorting**: By last activity, TX count, or callsign — click the active sort again to reverse
-- **ADIF export**: Download the session log as a standard `.adi` file for import into any logger
+- **ADIF export**: Download the QSO log as a standard `.adi` file for import into any logger. QSOs are captured into a persistent log the moment they are decoded, so they survive contact-list rotation and page reloads; the Clear button empties both the contacts and this log
 
 ## Audio Ring Buffer (Rec)
 

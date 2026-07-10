@@ -1,6 +1,7 @@
 import {
   parseFTMsg, mergeContacts, isValidCallsign, classifyCallsign, gridToLatLon, haversineKm,
   generateADIF, isConfirmedQSO, isPartialQSO, buildFTMessage, needsHashedExchange, qsyAudioOffsetHz,
+  baseCallsign, extractQSORecords, generateADIFFromRecords,
   type TxMsgType,
 } from '../parser';
 import { encodeFT8 } from '@e04/ft8ts';
@@ -313,6 +314,99 @@ describe('generateADIF', () => {
     const contacts = merge(qsoMsgs);
     const adif = generateADIF(contacts, 'FT8' as any, { myCall: me, myGrid: 'FN31', includePartial: true });
     expect(adif).not.toContain('partial: handshake only');
+  });
+});
+
+describe('baseCallsign — operator base call inside compound/portable forms', () => {
+  it('plain calls pass through unchanged', () => {
+    expect(baseCallsign('PU7FTW')).toBe('PU7FTW');
+    expect(baseCallsign('K1ABC')).toBe('K1ABC');
+  });
+
+  it('prefix/call forms return the call, not the leading prefix', () => {
+    expect(baseCallsign('YS3/PY8WW')).toBe('PY8WW');
+    expect(baseCallsign('PJ4/K1ABC')).toBe('K1ABC');
+  });
+
+  it('call/suffix portable forms drop the designator or region digit', () => {
+    expect(baseCallsign('K1ABC/4')).toBe('K1ABC');
+    expect(baseCallsign('K1ABC/P')).toBe('K1ABC');
+    expect(baseCallsign('K1ABC/QRP')).toBe('K1ABC');
+  });
+
+  it('doubly-compound prefix/call/designator returns the middle call', () => {
+    expect(baseCallsign('9A/S55X/P')).toBe('S55X');
+  });
+});
+
+describe('QSO log records — capture at decode time, export after rotation', () => {
+  const t  = new Date('2026-06-12T12:00:00Z');
+  const me   = 'K1ABC';
+  const them = 'W9XYZ';
+  const qsoMsgs = [
+    `CQ ${them} FN42`,
+    `${them} ${me} FN31`,
+    `${me} ${them} -10`,
+    `${them} ${me} R-05`,
+    `${me} ${them} RR73`,
+  ];
+
+  it('extracts a confirmed record with report, counts, and exchange time span', () => {
+    const { contacts } = mergeContacts(new Map(), t, qsoMsgs.map(msg => ({ msg, freq: 21_075_500, snr: -7 })), 0);
+    const recs = extractQSORecords(contacts.get(them)!, me, 'FT8' as any);
+    expect(recs).toHaveLength(1);
+    const r = recs[0];
+    expect(r.callsign).toBe(them);
+    expect(r.confirmed).toBe(true);
+    expect(r.rstSent).toBe(-5);    // the R-05 I sent them
+    expect(r.rstRcvd).toBe(-7);    // best SNR I heard them at
+    expect(r.sentCount).toBe(2);   // my answer + R-05
+    expect(r.rcvdCount).toBe(2);   // their -10 report + RR73 (their CQ is not addressed to me)
+    expect(r.startMs).toBe(t.getTime());
+    expect(r.freqHz).toBe(21_075_500);
+  });
+
+  it('a record captured before message rotation still exports after the QSO rotates out of the contact', () => {
+    let contacts = mergeContacts(new Map(), t, qsoMsgs.map(msg => ({ msg, freq: 1500, snr: -10 })), 0).contacts;
+    // Capture at decode time — what FTDecoder feeds the persistent QSO log.
+    const recs = extractQSORecords(contacts.get(them)!, me, 'FT8' as any);
+    expect(recs).toHaveLength(1);
+
+    // The peer keeps CQing: 60 further messages push the whole exchange out
+    // of the contact's 60-message ring.
+    const later = new Date(t.getTime() + 60_000);
+    const cqSpam = Array.from({ length: 60 }, () => ({ msg: `CQ ${them} FN42`, freq: 1500, snr: -10 }));
+    contacts = mergeContacts(contacts, later, cqSpam, 0).contacts;
+
+    // Deriving from live contacts now silently loses the QSO — the old export bug.
+    expect(isConfirmedQSO(contacts.get(them)!, me)).toBe(false);
+    const fromContacts = generateADIF(contacts, 'FT8' as any, { myCall: me });
+    expect(fromContacts).not.toContain(`<CALL:${them.length}>${them}`);
+
+    // The captured record is rotation-proof.
+    const fromLog = generateADIFFromRecords(recs, { myCall: me, myGrid: 'FN31' });
+    expect(fromLog).toContain(`<CALL:${them.length}>${them}`);
+    expect(fromLog).toContain('<RST_SENT:2>-5');
+    expect(fromLog).toContain(`<STATION_CALLSIGN:${me.length}>${me}`);
+    expect(fromLog).not.toContain('partial: handshake only');
+  });
+
+  it('a handshake-only exchange yields an unconfirmed (partial) record', () => {
+    const handshake = [`CQ ${them} FN42`, `${them} ${me} FN31`, `${me} ${them} FN42`];
+    const { contacts } = mergeContacts(new Map(), t, handshake.map(msg => ({ msg, freq: 1500, snr: -10 })), 0);
+    const recs = extractQSORecords(contacts.get(them)!, me, 'FT8' as any);
+    expect(recs).toHaveLength(1);
+    expect(recs[0].confirmed).toBe(false);
+  });
+
+  it('a station merely heard (no exchange with me) yields no record', () => {
+    const { contacts } = mergeContacts(new Map(), t, [{ msg: `CQ ${them} FN42`, freq: 1500, snr: -10 }], 0);
+    expect(extractQSORecords(contacts.get(them)!, me, 'FT8' as any)).toHaveLength(0);
+  });
+
+  it('never yields a record for my own contact entry', () => {
+    const { contacts } = mergeContacts(new Map(), t, qsoMsgs.map(msg => ({ msg, freq: 1500, snr: -10 })), 0);
+    expect(extractQSORecords(contacts.get(me)!, me, 'FT8' as any)).toHaveLength(0);
   });
 });
 
