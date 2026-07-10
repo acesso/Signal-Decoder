@@ -119,6 +119,42 @@ const BADGE_STYLE = {
   blue:   { background: 'rgba(88,166,255,0.15)',  color: '#58a6ff', border: '1px solid rgba(88,166,255,0.4)' },
 } as const
 
+// Conventional meanings of the slash designators hams append to a call.
+const DESIGNATOR_MEANING: Record<string, string> = {
+  P:   'portable (/P)',
+  M:   'mobile (/M)',
+  MM:  'maritime mobile (/MM)',
+  AM:  'aeronautical mobile (/AM)',
+  QRP: 'low power (/QRP)',
+  R:   'rover (/R)',
+}
+
+// Human-readable breakdown of a compound/portable callsign for the badge
+// tooltip: the operator's base call (with home country), the host-country
+// prefix they are operating from, and any portable/mobile designator.
+// 9A/S55X/P → "S55X (Slovenia), operating from Croatia (9A), portable (/P)".
+function compoundBreakdown(callsign: string): string {
+  const base = baseCallsign(callsign)
+  const home = callsignCountry(base)
+  const bits: string[] = [home ? `${base} (${home.country})` : base]
+  const parts = callsign.toUpperCase().split('/').filter(Boolean)
+  const baseIdx = parts.indexOf(base.toUpperCase())
+  parts.forEach((p, i) => {
+    if (i === baseIdx) return
+    // Designators only ever TRAIL the base call — a leading "M/" is
+    // England's prefix, not "mobile".
+    if (i > baseIdx && DESIGNATOR_MEANING[p]) {
+      bits.push(DESIGNATOR_MEANING[p])
+    } else if (i > baseIdx && /^[0-9]$/.test(p)) {
+      bits.push(`call area ${p}`)
+    } else {
+      const host = callsignCountry(p)
+      bits.push(host ? `operating from ${host.country} (${p})` : `unrecognized part /${p}`)
+    }
+  })
+  return bits.join(', ')
+}
+
 function callsignBadge(callsign: string): { text: string; title: string; style: JSX.CSSProperties } | null {
   const info = classifyCallsign(callsign)
   if (info.brazilLicenseClass) {
@@ -128,10 +164,19 @@ function callsignBadge(callsign: string): { text: string; title: string; style: 
     return { text: `BR-${info.brazilLicenseClass}`, title: `Brazil Class ${info.brazilLicenseClass} license`, style }
   }
   if (info.kind === 'compound') {
-    return { text: 'CPD', title: 'Compound/portable callsign (58-bit encoding)', style: BADGE_STYLE.blue }
+    return {
+      text: 'CPD',
+      title: `Compound/portable callsign (58-bit encoding) — ${compoundBreakdown(callsign)}`,
+      style: BADGE_STYLE.blue,
+    }
   }
   if (info.kind === 'nonstandard') {
-    return { text: 'SPEC', title: 'Special/nonstandard-format callsign (58-bit encoding)', style: BADGE_STYLE.blue }
+    const home = callsignCountry(callsign)
+    return {
+      text: 'SPEC',
+      title: `Special/nonstandard-format callsign (58-bit encoding)${home ? ` — ${home.country}` : ''}`,
+      style: BADGE_STYLE.blue,
+    }
   }
   return null
 }
@@ -1041,8 +1086,8 @@ export default function FTContactsPanel(props: Props): JSX.Element {
               onClick={downloadADIF}
               disabled={exportQSOCount() === 0}
               class="text-xs px-2 py-0.5 rounded border border-[#30363d] text-[#8b949e] hover:text-[#79c0ff] hover:border-[#79c0ff]/40 transition-colors font-mono disabled:opacity-40 disabled:cursor-not-allowed"
-              title={exportQSOCount() > 0
-                ? `Download ADIF log — ${exportQSOCount()} QSO${exportQSOCount() !== 1 ? 's' : ''} (SWL entries excluded)`
+              title={confirmedQSOCount() + partialQSOCount() > 0
+                ? `Download ADIF log — saved QSO log holds ${confirmedQSOCount()} confirmed + ${partialQSOCount()} partial; exporting ${exportQSOCount()} (${includePartial() ? 'incl. partial' : 'confirmed only'}, SWL entries excluded)`
                 : 'No confirmed two-way QSOs to export yet'}
             >
               export{exportQSOCount() > 0 ? ` (${exportQSOCount()})` : ''}

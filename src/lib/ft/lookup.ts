@@ -2,6 +2,8 @@
 // lookup (hamdb.org). These run independently of message parsing: results are
 // cached and surfaced to the UI whenever they arrive, never blocking decode.
 
+import { baseCallsign } from './parser';
+
 export interface GeoInfo {
   country?: string;     // full country name in English
   countryCode?: string; // ISO-3166 alpha-2, uppercase
@@ -108,7 +110,9 @@ async function fetchOperator(call: string): Promise<OperatorInfo | null> {
 }
 
 export function lookupOperator(callsign: string): Promise<OperatorInfo | null> {
-  const base   = callsign.split('/')[0].toUpperCase(); // strip portable suffix
+  // The registry only knows the operator's base call — for compound/portable
+  // forms (9A/S55X/P, YS3/PY8WW) query that, not the leading prefix.
+  const base   = baseCallsign(callsign.toUpperCase());
   const cached = opCache.get(base);
   if (cached !== undefined) return Promise.resolve(cached);
   const pending = opPending.get(base);

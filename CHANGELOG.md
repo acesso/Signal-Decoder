@@ -12,6 +12,29 @@ them into a version section when cutting a release.
 
 ## [Unreleased]
 
+## [0.7.2] - 2026-07-10
+
+### Added
+
+- Suggested-messages filter chips: VFO only (same passband rule as the map's
+  pin filter), Latest (heard in the last 5 minutes), and ✨ special
+  (compound/special-event callsigns).
+- Compound-callsign badge tooltips now explain each part — base call with
+  home country, host-country prefix, and portable/mobile designator meaning.
+- The Audio Analysis marker field is an editable Tx input in kHz with Hz
+  precision when a radio is connected (was a read-only MHz display rounded
+  to whole kHz).
+- The ADIF export tooltip shows the saved QSO log's confirmed/partial
+  breakdown.
+
+### Fixed
+
+- Plain two-word answers involving compound/nonstandard callsigns
+  (e.g. "W5C/H PU7FTW") were rejected as fragments and never reached the
+  contact cards — they are the complete grid-less type-4 message form.
+- The hamdb.org operator lookup queried the leading prefix of compound
+  callsigns (YS3 for YS3/PY8WW), returning the wrong or no operator.
+
 ## [0.7.1] - 2026-07-10
 
 ### Fixed
