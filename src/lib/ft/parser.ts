@@ -236,11 +236,17 @@ export function parseFTMsg(raw: string): ParsedFTMsg {
     return { type: 'answer', caller: words[0], grid: words[1], raw, clean: isValidCallsign(words[0]) };
   }
 
-  // Two-word hashed answer "<THEIR> MINE" (type 4 — carries no grid). Only
-  // trusted when a bracketed call was actually present: a plain two-word
-  // "CALLEE CALLER" is more likely a garbled three-word capture and stays
-  // rejected (see the fragment tests).
-  if (words.length === 2 && hadHashedCall && isCallsignish(words[0]) && isCallsignish(words[1])) {
+  // Two-word hashed answer "<THEIR> MINE" (type 4 — carries no grid).
+  // Trusted when a bracketed call was present, OR when either callsign's
+  // shape REQUIRES the hashed exchange (compound/nonstandard, e.g.
+  // "W5C/H PU7FTW" — decoders render the resolved hash without brackets):
+  // such exchanges genuinely have no grid to lose, so two words is the
+  // complete message. A plain two-word pair of STANDARD calls is more
+  // likely a garbled three-word capture and stays rejected (see the
+  // fragment tests).
+  const hashShape = (w: string) => !isPlaceholder(w) && needsHashedExchange(w);
+  if (words.length === 2 && isCallsignish(words[0]) && isCallsignish(words[1]) &&
+      (hadHashedCall || hashShape(words[0]) || hashShape(words[1]))) {
     return {
       type: 'answer', caller: words[1], callee: words[0], raw,
       clean: isValidCallsign(words[0]) || isValidCallsign(words[1]),

@@ -6,11 +6,11 @@ import {
 } from '../lib/ft/useFTTransmit'
 import {
   buildFTMessage, nextTxMsgType, parseFTMsg, isValidCallsign, needsHashedExchange, qsyAudioOffsetHz,
-  type Contact, type MsgType,
+  classifyCallsign, type Contact, type MsgType,
   MSG_TYPE_COLOR, MSG_TYPE_LABEL, gridToLatLon, haversineKm,
 } from '$decoder-lib/ft/parser'
 import { callsignCountry } from '$decoder-lib/ft/prefixes'
-import { FT_WINDOW_SECONDS, type FTMode } from '$decoder-lib/ft/decoder'
+import { FT_WINDOW_SECONDS, DEFAULT_DECODER_PARAMS, type FTMode } from '$decoder-lib/ft/decoder'
 import { fmtAbsHz } from '$decoder-lib/formatFreq'
 import NumberField from './NumberField'
 
@@ -199,6 +199,10 @@ interface Suggestion {
   // for sorting
   maxSnr: number;
   latLon?: [number, number];
+  // for filter chips: last-heard time and last message's frequency (absolute
+  // Hz when a VFO was connected at decode time, bare audio offset otherwise)
+  lastSeenMs: number;
+  lastFreqHz?: number;
 }
 
 // Priority: stations actively in QSO with us rank above stations we merely heard.
@@ -218,6 +222,7 @@ function buildSuggestions(myCall: string, myGrid: string, contacts: Map<string, 
     repliedToMe: false,
     thread: [],
     maxSnr: -99,
+    lastSeenMs: 0,
   })
 
   const candidates = [...contacts.values()]
@@ -296,6 +301,10 @@ function buildSuggestions(myCall: string, myGrid: string, contacts: Map<string, 
       thread,
       maxSnr: c.msgs.reduce((best, m) => m.snr > best ? m.snr : best, -99),
       latLon: c.latLon,
+      lastSeenMs: c.lastSeen.getTime(),
+      lastFreqHz: c.msgs.reduce<Contact['msgs'][number] | null>(
+        (latest, m) => (!latest || m.windowStart > latest.windowStart) ? m : latest, null,
+      )?.freq,
     })
   }
 
@@ -550,6 +559,11 @@ export default function FTTransmitPanel(props: FTTransmitPanelProps): JSX.Elemen
   const [sugCountryFilter, setSugCountryFilter] = createSignal('')
   const [sugMyOnly,        setSugMyOnly]        = createSignal(false)
   const [sugCQOnly,        setSugCQOnly]        = createSignal(false)
+  const [sugVfoOnly,       setSugVfoOnly]       = createSignal(false)
+  const [sugLatestOnly,    setSugLatestOnly]    = createSignal(false)
+  const [sugSpecialOnly,   setSugSpecialOnly]   = createSignal(false)
+
+  const SUG_LATEST_WINDOW_MS = 5 * 60_000
 
   const DISPLAY_LIMIT = 8
 
@@ -585,10 +599,22 @@ export default function FTTransmitPanel(props: FTTransmitPanelProps): JSX.Elemen
   const cqSug = createMemo(() => allSuggestions()[0])
   const contactSugs = createMemo(() => allSuggestions().slice(1))
   const suggestions = createMemo(() => {
+    const vfo = props.vfoFrequency ?? 0
+    const latestCutoff = Date.now() - SUG_LATEST_WINDOW_MS
     const filteredSugs = contactSugs().filter(s => {
       if (sugMyOnly() && s.thread.length === 0) return false
       if (sugCountryFilter() && s.countryCode !== sugCountryFilter()) return false
       if (sugCQOnly() && !s.isCQ) return false
+      // Same rule as the map's VFO-only pin filter: keep stations whose
+      // last-heard absolute frequency falls in the passband around the live
+      // VFO; audio-offset-only entries (no VFO at decode time) are excluded.
+      if (sugVfoOnly() && vfo > 0) {
+        if (!s.lastFreqHz || s.lastFreqHz <= 1_000_000) return false
+        if (s.lastFreqHz < vfo + DEFAULT_DECODER_PARAMS.minHz ||
+            s.lastFreqHz > vfo + DEFAULT_DECODER_PARAMS.maxHz) return false
+      }
+      if (sugLatestOnly() && s.lastSeenMs < latestCutoff) return false
+      if (sugSpecialOnly() && !(s.callsign && classifyCallsign(s.callsign).kind !== 'standard')) return false
       return true
     })
     const sortedSugs = [...filteredSugs].sort((a, b) => {
@@ -889,6 +915,46 @@ export default function FTTransmitPanel(props: FTTransmitPanelProps): JSX.Elemen
                     CQ only
                   </button>
                 </Show>
+                {/* VFO passband filter — same rule as the map's VFO-only pins */}
+                <Show when={(props.vfoFrequency ?? 0) > 0}>
+                  <button
+                    onClick={() => setSugVfoOnly(v => !v)}
+                    title="Show only stations whose last-heard frequency falls inside the current VFO passband"
+                    class={`text-[9px] font-mono px-1.5 py-0.5 rounded border transition-colors ${
+                      sugVfoOnly()
+                        ? 'border-[#79c0ff]/50 text-[#79c0ff] bg-[#79c0ff]/10'
+                        : 'border-[#30363d] text-[#484f58] hover:text-[#8b949e]'
+                    }`}
+                  >
+                    VFO only
+                  </button>
+                </Show>
+                {/* Recent-activity filter */}
+                <button
+                  onClick={() => setSugLatestOnly(v => !v)}
+                  title="Show only stations heard in the last 5 minutes"
+                  class={`text-[9px] font-mono px-1.5 py-0.5 rounded border transition-colors ${
+                    sugLatestOnly()
+                      ? 'border-[#d2a8ff]/50 text-[#d2a8ff] bg-[#d2a8ff]/10'
+                      : 'border-[#30363d] text-[#484f58] hover:text-[#8b949e]'
+                  }`}
+                >
+                  Latest
+                </button>
+                {/* Special/compound callsign filter */}
+                <Show when={contactSugs().some(s => s.callsign && classifyCallsign(s.callsign).kind !== 'standard')}>
+                  <button
+                    onClick={() => setSugSpecialOnly(v => !v)}
+                    title="Show only compound/special-event callsigns (nonstandard encoding)"
+                    class={`text-[9px] font-mono px-1.5 py-0.5 rounded border transition-colors ${
+                      sugSpecialOnly()
+                        ? 'border-[#f0883e]/50 text-[#f0883e] bg-[#f0883e]/10'
+                        : 'border-[#30363d] text-[#484f58] hover:text-[#8b949e]'
+                    }`}
+                  >
+                    ✨ special
+                  </button>
+                </Show>
                 {/* Country select */}
                 <Show when={sugCountryOptions().length > 1}>
                   <select
@@ -909,9 +975,12 @@ export default function FTTransmitPanel(props: FTTransmitPanelProps): JSX.Elemen
                     </For>
                   </select>
                 </Show>
-                <Show when={sugSort() !== 'default' || sugCountryFilter() || sugMyOnly() || sugCQOnly()}>
+                <Show when={sugSort() !== 'default' || sugCountryFilter() || sugMyOnly() || sugCQOnly() || sugVfoOnly() || sugLatestOnly() || sugSpecialOnly()}>
                   <button
-                    onClick={() => { setSugSort('default'); setSugCountryFilter(''); setSugMyOnly(false); setSugCQOnly(false) }}
+                    onClick={() => {
+                      setSugSort('default'); setSugCountryFilter(''); setSugMyOnly(false); setSugCQOnly(false)
+                      setSugVfoOnly(false); setSugLatestOnly(false); setSugSpecialOnly(false)
+                    }}
                     class="text-[9px] font-mono px-1 py-0.5 rounded border border-[#30363d] text-[#484f58] hover:text-[#8b949e]"
                     title="Reset sort and filters"
                   >

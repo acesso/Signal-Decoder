@@ -944,7 +944,7 @@ export default function FTDecoder(props: Props): JSX.Element {
           storageKeyPrefix="ft"
           markers={(props.txAudioHz ?? 0) > 0 ? [{ freq: props.txAudioHz!, color: '#f85149', label: 'TX' }] : undefined}
           onMarkerDrag={props.onTxAudioHzChange ? (_i, hz) => props.onTxAudioHzChange!(hz) : undefined}
-          markerFieldLabel="TX"
+          markerFieldLabel="Tx"
           class="min-w-0"
           style={{ flex: panelWeights()[1] }}
         />
