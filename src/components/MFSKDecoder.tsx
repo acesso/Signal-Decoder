@@ -9,11 +9,12 @@ import NumberField from './NumberField'
 import { createMFSKProcessor, type MFSKSymbol, type MFSKWord } from '../lib/mfsk/processor'
 import { MFSKChannel, MFSKDecoderOptions, DEFAULT_DECODER_OPTIONS } from '$decoder-lib/mfsk/decoder'
 import { bitsToBaudotCode, decodeBaudotCodePoints } from '$decoder-lib/mfsk/baudot'
+import { decodeCCIR476FromBits } from '$decoder-lib/mfsk/ccir476'
 import { decodeMFSKVaricode } from '$decoder-lib/mfsk/varicode'
 import { decodeMFSKWithFECIncremental, makeFECCursor, type FECCursor } from '$decoder-lib/mfsk/fec'
 import { loadNumberArray, saveNumberArray, loadNumber, saveNumber, loadBoolean, saveBoolean } from '$decoder-lib/storage'
 
-type Encoding = 'ascii' | 'baudot' | 'varicode'
+type Encoding = 'ascii' | 'baudot' | 'varicode' | 'ccir476'
 
 const DEFAULT_PANEL_WEIGHTS = [1, 1.4, 0.65]
 const LS_PANEL_WEIGHTS = 'mfsk_panel_weights'
@@ -100,6 +101,32 @@ const PRESETS: Record<string, PresetDef> = {
     label: 'RTTY 50 Bd — 850 Hz shift', baudRate: 50, channelBw: 350,
     channels: [{ freq: 1020, color: DEFAULT_TONE_COLOR, label: 'Mk' }, { freq: 1870, color: DEFAULT_TONE_COLOR, label: 'Sp' }],
     decoderOpts: RTTY_OPTS, ...RTTY_FRAME,
+  },
+  'rtty-75-850': {
+    label: 'RTTY 75 Bd — 850 Hz shift', baudRate: 75, channelBw: 350,
+    channels: [{ freq: 1020, color: DEFAULT_TONE_COLOR, label: 'Mk' }, { freq: 1870, color: DEFAULT_TONE_COLOR, label: 'Sp' }],
+    decoderOpts: RTTY_OPTS, ...RTTY_FRAME,
+  },
+
+  // ── 2-tone FSK utility catches ────────────────────────────────────────────
+  // Famous non-amateur 2-tone FSK signals with correct on-air parameters.
+  navtex: {
+    label: 'NAVTEX / SITOR-B — 100 Bd, 170 Hz (CCIR476)', baudRate: 100, channelBw: 120,
+    channels: [{ freq: 1415, color: DEFAULT_TONE_COLOR, label: 'Mk' }, { freq: 1585, color: DEFAULT_TONE_COLOR, label: 'Sp' }],
+    decoderOpts: { bitOrder: 'lsb', oversampleFactor: 2, syncMode: 'free', charBits: 8, stopBitSymbols: 1 },
+    encoding: 'ccir476', fec: 'none', interleaverDepth: 0,
+    // 7-bit grid: one CCIR476 code word per row — the 4-mark/3-space constant
+    // ratio is easy to spot visually when tuned correctly.
+    frameWidth: 7, wordWidth: 7, startBits: 0, stopBits: 0,
+  },
+  // Bell 202's HDLC/NRZI framing isn't implemented, so it stays a raw-bit
+  // analysis preset; tones and baud are correct for identification.
+  afsk1200: {
+    label: 'Bell 202 / AFSK 1200 — packet, APRS (raw bits)', baudRate: 1200, channelBw: 600,
+    channels: [{ freq: 1200, color: DEFAULT_TONE_COLOR, label: 'Mk' }, { freq: 2200, color: DEFAULT_TONE_COLOR, label: 'Sp' }],
+    decoderOpts: { bitOrder: 'lsb', oversampleFactor: 2, syncMode: 'free', charBits: 8, stopBitSymbols: 1 },
+    encoding: 'ascii', fec: 'none', interleaverDepth: 0,
+    frameWidth: 8, wordWidth: 8, startBits: 0, stopBits: 0,
   },
 
   // ── fldigi MFSK (varicode, K=7 R=1/2 FEC) ────────────────────────────────
@@ -579,16 +606,6 @@ function ToneRow(props: {
   pwrRef: (el: HTMLDivElement | null) => void
 }) {
   const [expanded, setExpanded] = createSignal(false)
-  const [freqInput, setFreqInput] = createSignal(String(props.ch.freq))
-
-  // keep freqInput in sync when channel changes externally (e.g. drag)
-  createEffect(() => setFreqInput(String(props.ch.freq)))
-
-  const commitFreq = () => {
-    const v = parseFloat(freqInput())
-    if (!isNaN(v)) props.onFreqChange(Math.max(50, Math.min(props.maxHz, v)))
-    else setFreqInput(String(props.ch.freq))
-  }
 
   return (
     <div class="rounded border border-[#30363d]" style={{ 'border-left-color': props.ch.color, 'border-left-width': '3px' }}>
@@ -650,18 +667,19 @@ function ToneRow(props: {
           </div>
           <div class="flex items-center gap-2">
             <label class="w-8 shrink-0 text-[10px] text-[#484f58]">Freq</label>
+            {/* Shared NumberField: commits every valid keystroke and its ▲▼
+                step buttons apply immediately — the old number input only
+                committed on blur/Enter, so the native spinner arrows appeared
+                to do nothing. */}
             <Show
               when={props.vfoFrequency}
               fallback={
-                <input
-                  type="number"
-                  value={freqInput()}
+                <NumberField
+                  value={props.ch.freq}
                   min={50}
                   max={props.maxHz}
-                  step={1}
-                  onInput={(e) => setFreqInput(e.currentTarget.value)}
-                  onBlur={commitFreq}
-                  onKeyDown={(e) => { if (e.key === 'Enter') commitFreq() }}
+                  step={5}
+                  onCommit={(f) => props.onFreqChange(Math.round(f))}
                   class="min-w-0 flex-1 rounded border border-[#30363d] bg-[#161b22] px-1.5 py-0.5 font-mono text-[10px] focus:border-[#2ea043] focus:outline-none"
                   style={{ color: props.ch.color }}
                 />
@@ -889,7 +907,16 @@ export default function MFSKDecoder(props: DecoderProps): JSX.Element {
       } else {
         // Non-FEC paths: full re-decode (no Viterbi in-flight issue)
         let text = ''
-        if (isSyncMode) {
+        if (enc === 'ccir476') {
+          // SITOR-B/NAVTEX: the lib self-aligns bit phase, polarity, and
+          // DX/RX slot parity over the whole stream — feed it raw symbol bits.
+          const bits: number[] = []
+          for (const s of syms) {
+            if (s.squelched) continue
+            for (let b = 0; b < bps; b++) bits.push(s.bits[b] ? 1 : 0)
+          }
+          text = decodeCCIR476FromBits(bits)
+        } else if (isSyncMode) {
           text = enc === 'baudot'
             ? decodeBaudotFromWords(words, opts.bitOrder === 'lsb')
             : words
@@ -1048,6 +1075,38 @@ export default function MFSKDecoder(props: DecoderProps): JSX.Element {
     setChannels((p) => p.map((c) => (c.id === id ? { ...c, color } : c)))
   }
 
+  // ── Tone-group geometry ───────────────────────────────────────────────────
+  // Center = midpoint of the outermost tones; spacing = average gap (exact
+  // for evenly spaced sets). Setting the center rigidly shifts the group;
+  // setting the spacing re-lays the tones out evenly around the current
+  // center, preserving their frequency order.
+
+  const toneCenter = createMemo(() => {
+    const fs = channels().map((c) => c.freq)
+    if (fs.length === 0) return 0
+    return Math.round((Math.min(...fs) + Math.max(...fs)) / 2)
+  })
+  const toneSpacing = createMemo(() => {
+    const fs = channels().map((c) => c.freq)
+    if (fs.length < 2) return 0
+    return Math.round((Math.max(...fs) - Math.min(...fs)) / (fs.length - 1))
+  })
+  function applyToneCenter(newCenter: number) {
+    const fs = channels().map((c) => c.freq)
+    if (fs.length === 0) return
+    let delta = Math.round(newCenter) - toneCenter()
+    delta = Math.max(50 - Math.min(...fs), Math.min(3000 - Math.max(...fs), delta))
+    if (delta !== 0) setChannels((p) => p.map((c) => ({ ...c, freq: c.freq + delta })))
+  }
+  function applyToneSpacing(spacing: number) {
+    const n = channels().length
+    if (n < 2) return
+    const s = Math.max(1, Math.round(spacing))
+    const lo = Math.max(50, Math.round(toneCenter() - ((n - 1) / 2) * s))
+    const bySortedIndex = new Map([...channels()].sort((a, b) => a.freq - b.freq).map((c, i) => [c.id, Math.min(3000, lo + i * s)]))
+    setChannels((p) => p.map((c) => ({ ...c, freq: bySortedIndex.get(c.id)! })))
+  }
+
   // ── Preset apply ──────────────────────────────────────────────────────────
 
   function applyPreset(key: string) {
@@ -1170,10 +1229,12 @@ export default function MFSKDecoder(props: DecoderProps): JSX.Element {
                     ? 'border-[#d2a8ff]/40 bg-[#d2a8ff]/10 text-[#d2a8ff]'
                     : encoding() === 'varicode'
                       ? 'border-[#79c0ff]/40 bg-[#79c0ff]/10 text-[#79c0ff]'
-                      : 'border-[#484f58]/60 text-[#484f58]'
+                      : encoding() === 'ccir476'
+                        ? 'border-[#f0883e]/40 bg-[#f0883e]/10 text-[#f0883e]'
+                        : 'border-[#484f58]/60 text-[#484f58]'
                 }`}
               >
-                {encoding() === 'baudot' ? 'Baudot ITA2' : encoding() === 'varicode' ? 'Varicode' : 'ASCII'}
+                {encoding() === 'baudot' ? 'Baudot ITA2' : encoding() === 'varicode' ? 'Varicode' : encoding() === 'ccir476' ? 'CCIR476 SITOR' : 'ASCII'}
               </span>
               <Show when={decoderOpts().useGrayCode ?? false}>
                 <span class="rounded border border-[#56d364]/40 bg-[#56d364]/10 px-1.5 py-0.5 font-mono text-[#56d364]">Gray</span>
@@ -1366,11 +1427,13 @@ export default function MFSKDecoder(props: DecoderProps): JSX.Element {
             <div class="mb-1 flex items-center justify-between">
               <span class="text-xs font-semibold text-[#8b949e]">
                 Decoded ·{' '}
-                {isSyncMode()
-                  ? (encoding() === 'baudot' ? 'Baudot ITA2' : 'ASCII') + ' sync'
-                  : encoding() === 'varicode'
-                    ? 'Varicode (IZ8BLY)'
-                    : 'ASCII free'}
+                {encoding() === 'ccir476'
+                  ? 'CCIR476 SITOR-B'
+                  : isSyncMode()
+                    ? (encoding() === 'baudot' ? 'Baudot ITA2' : 'ASCII') + ' sync'
+                    : encoding() === 'varicode'
+                      ? 'Varicode (IZ8BLY)'
+                      : 'ASCII free'}
               </span>
               <div class="flex items-center gap-1.5">
                 <button
@@ -1419,9 +1482,15 @@ export default function MFSKDecoder(props: DecoderProps): JSX.Element {
           isRecording={processor.state().isRecording}
           storageKeyPrefix="mfsk"
           markers={channels().map((ch) => ({ freq: ch.freq, color: ch.color, label: ch.label }))}
-          onMarkerDrag={(idx, newHz) => {
+          onMarkerDrag={(idx, newHz, shiftKey) => {
             const ch = channels()[idx]
             if (!ch) return
+            if (shiftKey) {
+              // Shift+drag: move just this tone, leave the rest of the group.
+              const f = Math.max(50, Math.min(24000, Math.round(newHz)))
+              if (f !== ch.freq) setChannels((p) => p.map((c) => (c.id === ch.id ? { ...c, freq: f } : c)))
+              return
+            }
             let delta = Math.round(newHz) - ch.freq
             // Clamp delta so no channel escapes [50, 24000] — preserves spacing
             const minFreq = Math.min(...channels().map((c) => c.freq))
@@ -1464,7 +1533,12 @@ export default function MFSKDecoder(props: DecoderProps): JSX.Element {
             >
               <option value="">— load preset —</option>
               <optgroup label="── RTTY ──">
-                <For each={['rtty-45-170', 'rtty-50-170', 'rtty-75-170', 'rtty-50-450', 'rtty-50-850']}>
+                <For each={['rtty-45-170', 'rtty-50-170', 'rtty-75-170', 'rtty-50-450', 'rtty-50-850', 'rtty-75-850']}>
+                  {(k) => <option value={k}>{PRESETS[k].label}</option>}
+                </For>
+              </optgroup>
+              <optgroup label="── 2-tone FSK utility ──">
+                <For each={['navtex', 'afsk1200']}>
                   {(k) => <option value={k}>{PRESETS[k].label}</option>}
                 </For>
               </optgroup>
@@ -1602,7 +1676,12 @@ export default function MFSKDecoder(props: DecoderProps): JSX.Element {
             <div class="flex items-center gap-2 text-xs">
               <span class="w-16 shrink-0 text-[#8b949e]">Encoding</span>
               <SegBtn
-                options={[{ label: 'ASCII', value: 'ascii' }, { label: 'Varicode', value: 'varicode' }, { label: 'Baudot', value: 'baudot' }]}
+                options={[
+                  { label: 'ASCII', value: 'ascii' },
+                  { label: 'Varicode', value: 'varicode' },
+                  { label: 'Baudot', value: 'baudot' },
+                  { label: 'CCIR476', value: 'ccir476' },
+                ]}
                 value={encoding()}
                 onChange={(v) => setEncoding(v as Encoding)}
               />
@@ -1653,6 +1732,36 @@ export default function MFSKDecoder(props: DecoderProps): JSX.Element {
               Add
             </button>
           </div>
+
+          {/* Group geometry — move/space the whole tone set at once */}
+          <Show when={channels().length > 0}>
+            <div class="mb-1 flex shrink-0 items-center gap-1.5 text-[10px] text-[#8b949e]">
+              <span class="shrink-0">Center</span>
+              <NumberField
+                value={toneCenter()}
+                min={50}
+                max={3000}
+                step={10}
+                onCommit={applyToneCenter}
+                title="Center of the tone group — shifts all tones together"
+                class="w-14 rounded border border-[#30363d] bg-[#0d1117] px-1.5 py-0.5 font-mono text-[#c9d1d9] focus:border-[#2ea043] focus:outline-none"
+              />
+              <span class="shrink-0 text-[#484f58]">Hz</span>
+              <span class="ml-1 shrink-0">Spacing</span>
+              <NumberField
+                value={toneSpacing()}
+                min={1}
+                max={1000}
+                step={5}
+                onCommit={applyToneSpacing}
+                disabled={channels().length < 2}
+                title="Gap between adjacent tones — re-lays the group out evenly around the center"
+                class="w-12 rounded border border-[#30363d] bg-[#0d1117] px-1.5 py-0.5 font-mono text-[#c9d1d9] focus:border-[#2ea043] focus:outline-none disabled:opacity-40"
+              />
+              <span class="shrink-0 text-[#484f58]">Hz</span>
+            </div>
+            <p class="mb-1.5 shrink-0 text-[9px] text-[#484f58]">marker drag moves all tones · shift+drag moves one</p>
+          </Show>
 
           <div class="flex-1 space-y-0.5 overflow-y-auto pr-0.5">
             <Show when={channels().length === 0}>
