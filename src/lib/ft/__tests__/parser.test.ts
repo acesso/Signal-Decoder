@@ -1,7 +1,9 @@
 import {
   parseFTMsg, mergeContacts, isValidCallsign, classifyCallsign, gridToLatLon, haversineKm,
-  generateADIF, isConfirmedQSO, isPartialQSO,
+  generateADIF, isConfirmedQSO, isPartialQSO, buildFTMessage, needsHashedExchange, qsyAudioOffsetHz,
+  type TxMsgType,
 } from '../parser';
+import { encodeFT8 } from '@e04/ft8ts';
 import { callsignCountry } from '../prefixes';
 
 describe('parseFTMsg', () => {
@@ -10,9 +12,17 @@ describe('parseFTMsg', () => {
     expect(p).toMatchObject({ type: 'cq', caller: 'PU7FTW', grid: 'HI72', clean: true });
   });
 
-  it('parses directed CQ', () => {
+  it('parses directed CQ and captures the tag', () => {
     const p = parseFTMsg('CQ DX K1ABC FN42');
-    expect(p).toMatchObject({ type: 'cq', caller: 'K1ABC', grid: 'FN42', clean: true });
+    expect(p).toMatchObject({ type: 'cq', caller: 'K1ABC', grid: 'FN42', cqTag: 'DX', clean: true });
+    expect(parseFTMsg('CQ POTA K1ABC FN42')).toMatchObject({ type: 'cq', caller: 'K1ABC', cqTag: 'POTA', clean: true });
+    expect(parseFTMsg('CQ SOTA K1ABC')).toMatchObject({ type: 'cq', caller: 'K1ABC', cqTag: 'SOTA', clean: true });
+    expect(parseFTMsg('CQ K1ABC FN42').cqTag).toBeUndefined();
+  });
+
+  it('parses a numeric QSY CQ ("CQ nnn CALL GRID")', () => {
+    const p = parseFTMsg('CQ 573 K1ABC FN42');
+    expect(p).toMatchObject({ type: 'cq', caller: 'K1ABC', grid: 'FN42', cqTag: '573', clean: true });
   });
 
   it('parses bare CQ without grid', () => {
@@ -83,6 +93,29 @@ describe('parseFTMsg', () => {
     const p = parseFTMsg('CQ YW18FIFA FK68');
     expect(p).toMatchObject({ type: 'cq', caller: 'YW18FIFA', clean: true });
   });
+
+  it('accepts a doubly-compound portable CQ (the 9A/S55X/P case)', () => {
+    const p = parseFTMsg('CQ 9A/S55X/P');
+    expect(p).toMatchObject({ type: 'cq', caller: '9A/S55X/P', clean: true });
+  });
+
+  // Hashed-call exchanges (protocol types 1/4 for nonstandard calls) — the
+  // decoder shows the hashed call in <angle brackets> once resolved.
+  it('parses a hashed two-word answer "<THEIR> MINE"', () => {
+    const p = parseFTMsg('<YS3/PY8WW> PU7FTW');
+    expect(p).toMatchObject({ type: 'answer', caller: 'PU7FTW', callee: 'YS3/PY8WW', clean: true });
+  });
+
+  it('parses hashed report and sign-off forms', () => {
+    expect(parseFTMsg('<YS3/PY8WW> PU7FTW R-08')).toMatchObject({ type: 'r_report', caller: 'PU7FTW', callee: 'YS3/PY8WW', report: -8, clean: true });
+    expect(parseFTMsg('YS3/PY8WW <PU7FTW> RR73')).toMatchObject({ type: 'rr73', caller: 'PU7FTW', callee: 'YS3/PY8WW', clean: true });
+  });
+
+  it('still rejects plain two-word pairs and keeps <...> placeholders invalid', () => {
+    // No bracket marker → treat as a likely garbled 3-word capture, as before
+    expect(parseFTMsg('K1ABC W9XYZ').clean).toBe(false);
+    expect(parseFTMsg('<...> PU7FTW').clean).toBe(false);
+  });
 });
 
 describe('isValidCallsign — ITU prefix + shape', () => {
@@ -100,6 +133,15 @@ describe('isValidCallsign — ITU prefix + shape', () => {
   it('accepts compound/portable form when either side is a real callsign', () => {
     expect(isValidCallsign('PJ4/K1ABC')).toBe(true);
     expect(isValidCallsign('K1ABC/PJ4')).toBe(true);
+  });
+
+  it('accepts doubly-compound PREFIX/CALL/SUFFIX portable calls', () => {
+    expect(isValidCallsign('9A/S55X/P')).toBe(true);   // Slovenian op portable in Croatia
+    expect(isValidCallsign('EA8/K1ABC/M')).toBe(true);
+    expect(isValidCallsign('PJ4/K1ABC/7')).toBe(true); // region-digit suffix
+    // Unknown trailing part / no valid call anywhere → still rejected
+    expect(isValidCallsign('9A/S55X/XYZQ')).toBe(false);
+    expect(isValidCallsign('A/B/P')).toBe(false);
   });
 
   it('accepts special-event callsigns with a longer suffix', () => {
@@ -193,6 +235,11 @@ describe('mergeContacts', () => {
     const c = contacts.get('PU7FTW')!;
     expect(c.grid).toBe('HI72');
     expect(c.latLon).toBeDefined();
+  });
+
+  it('accumulates directed-CQ tags on the caller contact', () => {
+    const contacts = merge(['CQ POTA K1ABC FN42', 'CQ DX K1ABC FN42', 'CQ POTA K1ABC FN42']);
+    expect(contacts.get('K1ABC')!.cqTags).toEqual(['POTA', 'DX']);
   });
 
   it('accumulates multiple grids, latest becoming primary', () => {
@@ -302,5 +349,90 @@ describe('distance helpers', () => {
 
   it('is zero for identical points', () => {
     expect(haversineKm([10, 20], [10, 20])).toBe(0);
+  });
+});
+
+describe('qsyAudioOffsetHz — numeric directed-CQ (QSY) requests', () => {
+  const VFO = 14_074_000; // dial 14.074 MHz
+
+  it('reads nnn as the requested dial kHz when reachable from the VFO passband', () => {
+    expect(qsyAudioOffsetHz('076', VFO)).toBe(2000); // 14.076 = VFO + 2000 Hz audio
+    expect(qsyAudioOffsetHz('075', VFO)).toBe(1000);
+  });
+
+  it('never asks for a rig retune — unreachable dial requests return null', () => {
+    expect(qsyAudioOffsetHz('080', VFO)).toBeNull(); // 6 kHz up: outside the passband
+    expect(qsyAudioOffsetHz('074', VFO)).toBeNull(); // 0 Hz offset: below the passband floor
+  });
+
+  it('falls back to literal audio Hz when the kHz reading is impossible', () => {
+    expect(qsyAudioOffsetHz('573', VFO)).toBe(573); // 14.573 is nonsense → 573 Hz audio
+    expect(qsyAudioOffsetHz('573', 0)).toBe(573);   // no CAT/VFO: literal audio Hz
+    expect(qsyAudioOffsetHz('080', 0)).toBeNull();  // 80 Hz below passband → unusable
+  });
+
+  it('ignores non-numeric or absent tags', () => {
+    expect(qsyAudioOffsetHz('DX', VFO)).toBeNull();
+    expect(qsyAudioOffsetHz(undefined, VFO)).toBeNull();
+  });
+});
+
+describe('buildFTMessage — hashed exchange for nonstandard calls', () => {
+  it('classifies which calls need the hashed forms', () => {
+    expect(needsHashedExchange('K1ABC')).toBe(false);
+    expect(needsHashedExchange('K1ABC/P')).toBe(false); // /P rides type 2 natively
+    expect(needsHashedExchange('K1ABC/R')).toBe(false);
+    expect(needsHashedExchange('YS3/PY8WW')).toBe(true);
+    expect(needsHashedExchange('PJ4/K1ABC')).toBe(true);
+    expect(needsHashedExchange('YW18FIFA')).toBe(true);
+    expect(needsHashedExchange('')).toBe(false);
+  });
+
+  it('builds WSJT-X-style hashed forms when their call is compound', () => {
+    const my = 'PU7FTW', their = 'YS3/PY8WW';
+    expect(buildFTMessage('answer', my, their, undefined, 'HI22')).toBe('<YS3/PY8WW> PU7FTW'); // grid dropped
+    expect(buildFTMessage('report', my, their, -8)).toBe('<YS3/PY8WW> PU7FTW -08');
+    expect(buildFTMessage('r_report', my, their, -8)).toBe('<YS3/PY8WW> PU7FTW R-08');
+    expect(buildFTMessage('rr73', my, their)).toBe('YS3/PY8WW <PU7FTW> RR73');
+    expect(buildFTMessage('tx73', my, their)).toBe('YS3/PY8WW <PU7FTW> 73');
+  });
+
+  it('keeps standard forms untouched for standard calls', () => {
+    expect(buildFTMessage('answer', 'W9XYZ', 'K1ABC', undefined, 'FN42')).toBe('K1ABC W9XYZ FN42');
+    expect(buildFTMessage('rr73', 'W9XYZ', 'K1ABC')).toBe('K1ABC W9XYZ RR73');
+  });
+
+  it('drops the grid from a compound-call CQ', () => {
+    expect(buildFTMessage('cq', 'YS3/PY8WW', '', undefined, 'HI22')).toBe('CQ YS3/PY8WW');
+  });
+
+  // The point of it all: every generated hashed form must actually pack into
+  // a 77-bit FT8 payload. This drives the real encoder end to end.
+  it('every hashed form round-trips through the FT8 encoder', () => {
+    const types: TxMsgType[] = ['cq', 'answer', 'report', 'r_report', 'rr73', 'tx73'];
+    for (const t of types) {
+      const msg = buildFTMessage(t, 'PU7FTW', 'YS3/PY8WW', -8, 'HI22');
+      expect(() => encodeFT8(msg, { sampleRate: 12000, baseFrequency: 1500 })).not.toThrow();
+    }
+    // My call compound, theirs standard — the other direction
+    for (const t of types) {
+      const msg = buildFTMessage(t, 'YS3/PY8WW', 'PU7FTW', -8, 'HI22');
+      expect(() => encodeFT8(msg, { sampleRate: 12000, baseFrequency: 1500 })).not.toThrow();
+    }
+  });
+
+  it('replies to a doubly-compound portable call with encodable hashed forms', () => {
+    expect(needsHashedExchange('9A/S55X/P')).toBe(true);
+    const answer = buildFTMessage('answer', 'PU7FTW', '9A/S55X/P', undefined, 'HI22');
+    expect(answer).toBe('<9A/S55X/P> PU7FTW');
+    expect(() => encodeFT8(answer, { sampleRate: 12000, baseFrequency: 1500 })).not.toThrow();
+  });
+
+  it('documents the protocol trap: compound call + grid silently truncates to free text', () => {
+    // Unbracketed compound calls fit no structured type, so the packer falls
+    // back to free text and silently truncates to 13 chars ("YS3/PY8WW PU7")
+    // — it does NOT throw. This is why the hashed forms above exist and why
+    // the transmit panel refuses to enqueue this shape.
+    expect(() => encodeFT8('YS3/PY8WW PU7FTW HI22', { sampleRate: 12000, baseFrequency: 1500 })).not.toThrow();
   });
 });

@@ -701,7 +701,7 @@ interface Props {
 }
 
 type SortKey = 'date' | 'tx' | 'rx' | 'worked' | 'alpha' | 'snr-hi' | 'snr-lo' | 'near' | 'far'
-type QuickFilter = 'full-qso' | 'handshake' | 'tx-only' | 'rx-only' // country handled by separate select
+type QuickFilter = 'full-qso' | 'handshake' | 'tx-only' | 'rx-only' | 'special-call' // country/CQ-tag handled separately
 
 function loadContactsSortKey(): SortKey {
   const raw = localStorage.getItem(LS_CONTACTS_SORT_KEY)
@@ -729,6 +729,7 @@ export default function FTContactsPanel(props: Props): JSX.Element {
   const [query,          setQuery]         = createSignal('')
   const [quickFilter,    setQuickFilter]   = createSignal<QuickFilter | null>(null)
   const [countryFilter,  setCountryFilter] = createSignal<string>('') // country code or ''
+  const [cqTagFilter,    setCqTagFilter]   = createSignal<string>('') // directed-CQ tag or ''
   const [mapHeight,      setMapHeight]     = createSignal(loadNumber(LS_MAP_HEIGHT, 160))
   createEffect(() => saveNumber(LS_MAP_HEIGHT, mapHeight()))
   const [showTerminator, setShowTerminator] = createSignal(loadShowTerminator())
@@ -877,31 +878,44 @@ export default function FTContactsPanel(props: Props): JSX.Element {
   // Stats for filter chip counts — computed once over sorted, not re-run per filter change
   const filterStats = createMemo(() => {
     const stats = contactStats()
-    let withLocation = 0, fullQSOCount = 0, handshakeCount = 0, txOnlyCount = 0, rxOnlyCount = 0
+    let withLocation = 0, fullQSOCount = 0, handshakeCount = 0, txOnlyCount = 0, rxOnlyCount = 0, specialCount = 0
     for (const c of sorted()) {
       const s = stats.get(c.callsign)!
       if (c.latLon) withLocation++
       if (s.txCount > 0 && s.rxCount === 0) txOnlyCount++
       if (s.rxCount > 0 && s.txCount === 0) rxOnlyCount++
+      if (classifyCallsign(c.callsign).kind !== 'standard') specialCount++
       const peers = Array.from(c.peers)
       const hasFull = peers.some(p => isFullQSO(c, p))
       const hasHand = peers.some(p => isHandshake(c, p) && !isFullQSO(c, p))
       if (hasFull) fullQSOCount++
       if (hasHand) handshakeCount++
     }
-    return { withLocation, fullQSOCount, handshakeCount, txOnlyCount, rxOnlyCount }
+    return { withLocation, fullQSOCount, handshakeCount, txOnlyCount, rxOnlyCount, specialCount }
   })
 
-  // Apply quick filter + country filter
+  // Directed-CQ tags seen across contacts (DX, POTA, …), most frequent first.
+  const cqTagOptions = createMemo(() => {
+    const counts = new Map<string, number>()
+    for (const c of props.contacts.values()) {
+      for (const t of c.cqTags ?? []) counts.set(t, (counts.get(t) ?? 0) + 1)
+    }
+    return [...counts.entries()].sort((a, b) => b[1] - a[1]).slice(0, 8)
+  })
+
+  // Apply quick filter + country filter + CQ-tag filter
   const quickFiltered = createMemo(() => sorted().filter(c => {
     const stats = contactStats()
     const s = stats.get(c.callsign)!
     const qf = quickFilter()
     const cf = countryFilter()
+    const tf = cqTagFilter()
     if (qf === 'full-qso'  && !Array.from(c.peers).some(p => isFullQSO(c, p))) return false
     if (qf === 'handshake' && !Array.from(c.peers).some(p => isHandshake(c, p) && !isFullQSO(c, p))) return false
     if (qf === 'tx-only'   && !(s.txCount > 0 && s.rxCount === 0)) return false
     if (qf === 'rx-only'   && !(s.rxCount > 0 && s.txCount === 0)) return false
+    if (qf === 'special-call' && classifyCallsign(c.callsign).kind === 'standard') return false
+    if (tf && !(c.cqTags ?? []).includes(tf)) return false
     if (cf) {
       const code = callsignCountry(c.callsign)?.countryCode
       if (code !== cf) return false
@@ -922,7 +936,7 @@ export default function FTContactsPanel(props: Props): JSX.Element {
       : quickFiltered()
   })
 
-  const hasAnyFilter = createMemo(() => !!quickFilter() || !!countryFilter())
+  const hasAnyFilter = createMemo(() => !!quickFilter() || !!countryFilter() || !!cqTagFilter())
 
   let importFileEl: HTMLInputElement | undefined
   const [importStatus, setImportStatus] = createSignal<{ count: number; err?: string } | null>(null)
@@ -1213,6 +1227,34 @@ export default function FTContactsPanel(props: Props): JSX.Element {
               rx only <span class="opacity-60">{filterStats().rxOnlyCount}</span>
             </button>
           </Show>
+          <Show when={filterStats().specialCount > 0}>
+            <button
+              onClick={() => setQuickFilter(f => f === 'special-call' ? null : 'special-call')}
+              class={`text-[9px] font-mono px-1.5 py-0.5 rounded border transition-colors ${
+                quickFilter() === 'special-call'
+                  ? 'border-[#f0883e]/50 text-[#f0883e] bg-[#f0883e]/10'
+                  : 'border-[#30363d] text-[#8b949e] hover:text-[#f0883e] hover:border-[#f0883e]/30'
+              }`}
+              title="Show compound/portable and special-event callsigns (58-bit encoding)"
+            >
+              ✨ special calls <span class="opacity-60">{filterStats().specialCount}</span>
+            </button>
+          </Show>
+          <For each={cqTagOptions()}>
+            {([tag, count]) => (
+              <button
+                onClick={() => setCqTagFilter(t => t === tag ? '' : tag)}
+                class={`text-[9px] font-mono px-1.5 py-0.5 rounded border transition-colors ${
+                  cqTagFilter() === tag
+                    ? 'border-[#56d364]/50 text-[#56d364] bg-[#56d364]/10'
+                    : 'border-[#30363d] text-[#8b949e] hover:text-[#56d364] hover:border-[#56d364]/30'
+                }`}
+                title={`Show stations that called CQ ${tag}`}
+              >
+                CQ {tag} <span class="opacity-60">{count}</span>
+              </button>
+            )}
+          </For>
           <Show when={countryOptions().length > 0}>
             <select
               value={countryFilter()}
@@ -1234,7 +1276,7 @@ export default function FTContactsPanel(props: Props): JSX.Element {
           </Show>
           <Show when={hasAnyFilter()}>
             <button
-              onClick={() => { setQuickFilter(null); setCountryFilter('') }}
+              onClick={() => { setQuickFilter(null); setCountryFilter(''); setCqTagFilter('') }}
               class="text-[9px] font-mono px-1.5 py-0.5 rounded border border-[#30363d] text-[#484f58] hover:text-[#c9d1d9]"
               title="Clear all filters"
             >

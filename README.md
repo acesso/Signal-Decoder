@@ -50,7 +50,7 @@ No installation, no downloads, no setup - just open and decode!
 - **CW Decoding**: Morse code decoder with automatic speed detection and dual-channel A/B mode
 - **SSTV Decoding**: 15 modes — Robot36/72, Scottie S1/S2/DX, Martin M1/M2, PD50/90/120/160/180/240/290, Wraase SC2-180
 - **FT8/FT4 Decoding**: UTC-synchronized window decoding with QSO contact tracking, world map, and ADIF export
-- **MFSK Decoding**: All fldigi MFSK modes (MFSK4 through MFSK128) with K=7 R=1/2 FEC and IZ8BLY varicode
+- **MFSK Decoding**: All fldigi MFSK modes (MFSK4 through MFSK128) with K=7 R=1/2 FEC and IZ8BLY varicode, plus RTTY, NAVTEX/SITOR-B (CCIR476), and 2-tone FSK presets
 - **Mode Auto-Detection**: Automatically identifies the incoming signal type
 - **Session Gallery**: Review and save decoded sessions
 - **Real-time Audio Processing**: Captures microphone input using Web Audio API (auto-detects 44.1 kHz or 48 kHz)

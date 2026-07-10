@@ -12,6 +12,43 @@ them into a version section when cutting a release.
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-07-10
+
+### Added
+
+- NAVTEX / SITOR-B decoding: new CCIR476 character decoder (self-aligning on
+  bit phase and polarity, DX/RX error recovery) available as an MFSK encoding
+  option, with a ready-made NAVTEX preset.
+- MFSK 2-tone utility presets: RTTY 75 Bd / 850 Hz, NAVTEX 100 Bd / 170 Hz,
+  and Bell 202 / AFSK 1200 (raw bits).
+- MFSK tone-group Center and Spacing controls; shift+drag on a marker moves a
+  single tone instead of the whole group.
+- FT8/FT4 hashed `<bracket>` message forms for compound and nonstandard
+  callsigns, generated and parsed automatically (WSJT-X compatible).
+- Directed-CQ tags (DX, POTA, …) and numeric QSY CQs are parsed and kept per
+  contact; the contacts panel gained "special calls" and per-CQ-tag filter
+  chips.
+- QSY requests ("CQ 573") are honored as a per-conversation pinned TX
+  frequency — the global Audio Hz setting never moves.
+
+### Fixed
+
+- Queued TX messages now re-encode when Audio Hz or mode changes instead of
+  transmitting at the frequency captured when they were queued.
+- MFSK per-tone frequency input only committed on blur, making its step
+  arrows appear dead; replaced with the shared stepper field.
+- Custom TX message input rejected valid structured messages longer than 13
+  chars, and unpackable messages would silently truncate to 13-char free
+  text on air; both are now caught with a helpful hint.
+- Doubly-compound portable callsigns (e.g. 9A/S55X/P) were dropped by the
+  contact validator and never reached the contact list or reply suggestions.
+
+### Changed
+
+- Reply suggestions for hashed (compound-call) conversations render with a
+  dashed amber border, and QSY/pinned-frequency chips show where each entry
+  will transmit.
+
 ## [0.6.0] - 2026-07-09
 
 ### Added
