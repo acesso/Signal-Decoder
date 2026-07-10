@@ -112,8 +112,23 @@ describe('parseFTMsg', () => {
     expect(parseFTMsg('YS3/PY8WW <PU7FTW> RR73')).toMatchObject({ type: 'rr73', caller: 'PU7FTW', callee: 'YS3/PY8WW', clean: true });
   });
 
-  it('still rejects plain two-word pairs and keeps <...> placeholders invalid', () => {
-    // No bracket marker → treat as a likely garbled 3-word capture, as before
+  it('parses a plain two-word answer when either call requires the hashed exchange', () => {
+    // Type-4 exchanges carry no grid, and decoders render the resolved hash
+    // WITHOUT brackets — so for compound/nonstandard calls two words IS the
+    // complete message, not a fragment.
+    expect(parseFTMsg('W5C/H PU7FTW')).toMatchObject({ type: 'answer', caller: 'PU7FTW', callee: 'W5C/H', clean: true });
+    expect(parseFTMsg('ZY32MMDC PU7FTW')).toMatchObject({ type: 'answer', caller: 'PU7FTW', callee: 'ZY32MMDC', clean: true });
+    expect(parseFTMsg('PU7FTW YS3/PY8WW')).toMatchObject({ type: 'answer', caller: 'YS3/PY8WW', callee: 'PU7FTW', clean: true });
+  });
+
+  it('a standard-base /P or /R portable does not unlock the two-word form (it rides types 1/2)', () => {
+    expect(parseFTMsg('K1ABC/P W9XYZ').clean).toBe(false);
+    expect(parseFTMsg('K1ABC/R W9XYZ').clean).toBe(false);
+  });
+
+  it('still rejects plain two-word pairs of standard calls and keeps <...> placeholders invalid', () => {
+    // No bracket marker and no hash-requiring shape → treat as a likely
+    // garbled 3-word capture, as before
     expect(parseFTMsg('K1ABC W9XYZ').clean).toBe(false);
     expect(parseFTMsg('<...> PU7FTW').clean).toBe(false);
   });
@@ -249,6 +264,15 @@ describe('mergeContacts', () => {
     expect(c.grids).toEqual(['HI72', 'HI73']);
     expect(c.grid).toBe('HI72'); // most recent report
     expect(c.latLon).toEqual(gridToLatLon('HI72'));
+  });
+
+  it('tracks plain two-word type-4 answers on both contact cards (compound peer)', () => {
+    const contacts = merge(['CQ PU7FTW HI22', 'W5C/H PU7FTW']);
+    const caller = contacts.get('PU7FTW')!;
+    expect(caller.msgs.some(m => m.raw === 'W5C/H PU7FTW' && m.role === 'tx')).toBe(true);
+    const callee = contacts.get('W5C/H')!;
+    expect(callee).toBeDefined();
+    expect(callee.msgs.some(m => m.raw === 'W5C/H PU7FTW' && m.role === 'rx')).toBe(true);
   });
 });
 

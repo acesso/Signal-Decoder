@@ -694,14 +694,18 @@ export default function AudioAnalysisPanel(props: Props): JSX.Element {
           <div class="mb-1.5 flex items-center gap-2 text-xs text-[#8b949e]">
             <span class="shrink-0">{props.markerFieldLabel ?? 'Center'}</span>
             {props.vfoFrequency ? (
-              <span class="w-24 rounded border border-[#30363d] bg-[#0d1117] px-2 py-0.5 font-mono text-xs text-[#c9d1d9]">
-                {(() => {
-                  const absHz = props.vfoFrequency! + centerFreq()
-                  const mhzInt = Math.floor(absHz / 1_000_000)
-                  const khzFrac = Math.round((absHz % 1_000_000) / 1000)
-                  return `${mhzInt}.${String(khzFrac).padStart(3, '0')}`
-                })()}
-              </span>
+              // Absolute dial+audio frequency, editable, in kHz down to Hz
+              // precision (21075.5 = 21,075,500 Hz) — commits back as an
+              // audio-offset shift of the markers.
+              <NumberField
+                value={Math.round(props.vfoFrequency + centerFreq()) / 1000}
+                min={(props.vfoFrequency + 50) / 1000}
+                max={(props.vfoFrequency + displayMaxHz()) / 1000}
+                step={0.01}
+                onCommit={(khz) => applyCenterShift(Math.round(khz * 1000) - props.vfoFrequency!)}
+                readOnly={!props.onMarkerDrag}
+                class={`w-28 rounded border border-[#30363d] bg-[#0d1117] px-2 py-0.5 font-mono text-xs text-[#c9d1d9] focus:border-[#2ea043] focus:outline-none ${!props.onMarkerDrag ? 'cursor-default opacity-60' : ''}`}
+              />
             ) : (
               <NumberField
                 value={centerFreq()}
@@ -712,7 +716,7 @@ export default function AudioAnalysisPanel(props: Props): JSX.Element {
                 class={`w-20 rounded border border-[#30363d] bg-[#0d1117] px-2 py-0.5 font-mono text-[#c9d1d9] focus:border-[#2ea043] focus:outline-none ${!props.onMarkerDrag ? 'cursor-default opacity-60' : ''}`}
               />
             )}
-            <span class="shrink-0 text-[#484f58]">{props.vfoFrequency ? 'MHz' : 'Hz'}</span>
+            <span class="shrink-0 text-[#484f58]">{props.vfoFrequency ? 'kHz' : 'Hz'}</span>
             <span class="ml-auto text-[10px] text-[#484f58]">
               {(props.markers ?? []).length} marker{(props.markers ?? []).length !== 1 ? 's' : ''}
             </span>
