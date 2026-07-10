@@ -11,6 +11,9 @@ export interface ParsedFTMsg {
   callee?: string;  // the addressed station (first callsign)
   grid?: string;    // Maidenhead grid — always belongs to the caller
   report?: number;  // signal report in dB
+  /** Directed-CQ tag (DX, POTA, SOTA, IOTA, NA, TEST, …) or a 3-digit QSY
+   *  frequency ("CQ 573 K1ABC" = answer 573 Hz above the band base). */
+  cqTag?: string;
   raw: string;
   clean: boolean;   // every word classified as a known FT token — safe to track
 }
@@ -60,14 +63,25 @@ function matchedPrefix(w: string): string | null {
   return standardPrefix(w) ?? nonstandardPrefix(w);
 }
 
+// Portable/mobile designators that may trail a call as a final slash part.
+const PORTABLE_SUFFIXES = new Set(['P', 'R', 'M', 'MM', 'AM', 'QRP']);
+
 // Compound/portable form (HOME/PORTABLE, e.g. PJ4/K1ABC or K1ABC/PJ4) — valid
 // if EITHER side alone is a standard- or nonstandard-shape callsign; the
 // other side is often just a bare prefix or region tag, not a full callsign.
+// Doubly-compound PREFIX/CALL/SUFFIX (e.g. 9A/S55X/P, a Slovenian station
+// portable in Croatia) is accepted when the trailing part is a recognized
+// portable/mobile designator or a single region digit.
 // Returns the matched prefix from whichever side matched, preferring the
 // side most likely to be the operator's actual identity (the non-prefix-only
 // side), which for ITU-prefix purposes is whichever side matched at all.
 function compoundPrefix(w: string): string | null {
   const parts = w.split('/');
+  if (parts.length === 3) {
+    const last = parts[2];
+    if (!PORTABLE_SUFFIXES.has(last) && !/^[0-9]$/.test(last)) return null;
+    parts.pop();
+  }
   if (parts.length !== 2) return null;
   for (const p of parts) {
     const prefix = matchedPrefix(p);
@@ -163,15 +177,31 @@ export function parseFTMsgCached(raw: string): ParsedFTMsg {
 // regexes so partially-captured messages still yield their usable parts —
 // e.g. "<...> PU7FTW HI72" must still record PU7FTW's locator.
 export function parseFTMsg(raw: string): ParsedFTMsg {
-  const words = raw.trim().toUpperCase().split(/\s+/).filter(Boolean);
+  // Hashed-call messages (protocol types 1/4 with a nonstandard call) show
+  // the hashed call in <angle brackets> once the decoder resolves it, e.g.
+  // "<YS3/PY8WW> PU7FTW RR73" — treat a bracketed call as the call itself.
+  // The unresolved-hash placeholder "<...>" stays as-is (invalid, by design).
+  let hadHashedCall = false;
+  const words = raw.trim().toUpperCase().split(/\s+/).filter(Boolean).map((w) => {
+    if (w.length > 2 && w.startsWith('<') && w.endsWith('>') && w !== '<...>') {
+      hadHashedCall = true;
+      return w.slice(1, -1);
+    }
+    return w;
+  });
 
   // CQ form: CQ [DIR] CALLER [GRID]
   if (words[0] === 'CQ') {
     let i = 1;
-    // Directed-CQ tag (DX, NA, POTA, …) — letters only, not a callsign or grid
-    // (a letters-only word can never match a callsign shape, which requires a
-    // digit, so only the grid check is actually needed here)
-    if (words[i] && /^[A-Z]{1,4}$/.test(words[i]) && !GRID_EXACT.test(words[i])) i++;
+    let cqTag: string | undefined;
+    // Directed-CQ tag: 1-4 letters (DX, NA, POTA, SOTA, IOTA, TEST, …) — a
+    // letters-only word can never match a callsign shape, which requires a
+    // digit, so only the grid check is needed there — or a 3-digit QSY
+    // frequency ("CQ 573 K1ABC FN42"), which the protocol packs as CQ_nnn.
+    if (words[i] && ((/^[A-Z]{1,4}$/.test(words[i]) && !GRID_EXACT.test(words[i])) || /^[0-9]{3}$/.test(words[i]))) {
+      cqTag = words[i];
+      i++;
+    }
     const caller = words[i] ?? raw;
     const grid   = words[i + 1] && GRID_EXACT.test(words[i + 1]) ? words[i + 1] : undefined;
     // isValidCallsign (not just isCallsignish) — a CQ's caller populates the
@@ -179,7 +209,7 @@ export function parseFTMsg(raw: string): ParsedFTMsg {
     // just shape-plausibility.
     const clean  = words.length <= i + 2 && isValidCallsign(caller) &&
                    (words[i + 1] === undefined || grid !== undefined);
-    return { type: 'cq', caller, grid, raw, clean };
+    return { type: 'cq', caller, grid, raw, clean, cqTag };
   }
 
   // Partial-capture fragment "CALLER GRID" (e.g. a CQ with the CQ word lost,
@@ -187,6 +217,17 @@ export function parseFTMsg(raw: string): ParsedFTMsg {
   // so the location info is still usable
   if (words.length === 2 && isCallsignish(words[0]) && GRID_EXACT.test(words[1])) {
     return { type: 'answer', caller: words[0], grid: words[1], raw, clean: isValidCallsign(words[0]) };
+  }
+
+  // Two-word hashed answer "<THEIR> MINE" (type 4 — carries no grid). Only
+  // trusted when a bracketed call was actually present: a plain two-word
+  // "CALLEE CALLER" is more likely a garbled three-word capture and stays
+  // rejected (see the fragment tests).
+  if (words.length === 2 && hadHashedCall && isCallsignish(words[0]) && isCallsignish(words[1])) {
+    return {
+      type: 'answer', caller: words[1], callee: words[0], raw,
+      clean: isValidCallsign(words[0]) || isValidCallsign(words[1]),
+    };
   }
 
   // Standard form: CALLEE CALLER PAYLOAD — the SECOND callsign is the
@@ -253,6 +294,8 @@ export interface Contact {
   color: string;
   msgs: ContactMsg[];
   peers: Set<string>;
+  /** Directed-CQ tags this station has called with (DX, POTA, …), unique. */
+  cqTags?: string[];
   firstSeen: Date;
   lastSeen: Date;
 }
@@ -407,6 +450,15 @@ export function mergeContacts(
         } else if (parsed.grid && !gridOk) {
           stats.gridRejected++;
         }
+        // Remember what the station CQs for (DX, POTA, …) — feeds the
+        // contacts panel's directed-CQ filter chips.
+        if (parsed.type === 'cq' && parsed.cqTag) {
+          caller.cqTags ??= [];
+          if (!caller.cqTags.includes(parsed.cqTag)) {
+            caller.cqTags.push(parsed.cqTag);
+            if (caller.cqTags.length > 6) caller.cqTags.splice(0, caller.cqTags.length - 6);
+          }
+        }
         if (calleeValid) {
           caller.peers.add(parsed.callee!);
           if (caller.peers.size > 50) {
@@ -485,6 +537,17 @@ export const MSG_TYPE_COLOR: Record<MsgType, string> = {
 
 export type TxMsgType = 'cq' | 'answer' | 'report' | 'r_report' | 'rr73' | 'tx73';
 
+// True when a callsign cannot ride in a standard 28-bit callsign field —
+// compound (PJ4/K1ABC) or nonstandard shape (YW18FIFA) — EXCEPT a standard
+// base with a /P or /R suffix, which message types 1/2 carry natively. Such
+// calls need the hashed <angle bracket> message forms below.
+export function needsHashedExchange(call: string): boolean {
+  if (!call) return false;
+  if (classifyCallsign(call).kind === 'standard') return false;
+  const m = call.toUpperCase().match(/^(.+)\/[RP]$/);
+  return !(m && classifyCallsign(m[1]).kind === 'standard');
+}
+
 export function buildFTMessage(
   type: TxMsgType,
   myCall: string,
@@ -495,6 +558,23 @@ export function buildFTMessage(
   const rpt = reportDb !== undefined
     ? (reportDb >= 0 ? `+${String(reportDb).padStart(2, '0')}` : `-${String(Math.abs(reportDb)).padStart(2, '0')}`)
     : '+00';
+
+  // Hashed exchange, mirroring WSJT-X: when either call can't fit a standard
+  // 28-bit field the protocol cannot carry a grid at all, the answer hashes
+  // their call and spells mine in full (type 4), reports ride type 1 with the
+  // hash in a callsign field, and sign-offs flip to spell THEIR call in full —
+  // each side gets its call confirmed over the air at least once.
+  if (needsHashedExchange(myCall) || needsHashedExchange(theirCall)) {
+    switch (type) {
+      case 'cq':       return `CQ ${myCall}`;
+      case 'answer':   return `<${theirCall}> ${myCall}`;
+      case 'report':   return `<${theirCall}> ${myCall} ${rpt}`;
+      case 'r_report': return `<${theirCall}> ${myCall} R${rpt}`;
+      case 'rr73':     return `${theirCall} <${myCall}> RR73`;
+      case 'tx73':     return `${theirCall} <${myCall}> 73`;
+    }
+  }
+
   switch (type) {
     case 'cq':       return myGrid ? `CQ ${myCall} ${myGrid}` : `CQ ${myCall}`;
     case 'answer':   return myGrid ? `${theirCall} ${myCall} ${myGrid}` : `${theirCall} ${myCall}`;
@@ -503,6 +583,26 @@ export function buildFTMessage(
     case 'rr73':     return `${theirCall} ${myCall} RR73`;
     case 'tx73':     return `${theirCall} ${myCall} 73`;
   }
+}
+
+// Audio-Hz interpretation of a numeric directed-CQ tag ("CQ 573 K1ABC" — the
+// caller asks to be answered on a specific frequency). Protocol semantics:
+// nnn is the kHz part of the requested dial frequency; from a fixed VFO
+// that's an audio offset of (MHz base + nnn·1000 − vfo) Hz, honorable WITHOUT
+// touching the rig whenever it lands inside the audio passband. When that
+// reading is impossible (no VFO connected, or outside the passband) fall back
+// to reading nnn as a literal audio offset when plausible. Returns null when
+// the request can't be honored from the current VFO — never retune the rig.
+export function qsyAudioOffsetHz(cqTag: string | undefined, vfoHz: number): number | null {
+  if (!cqTag || !/^[0-9]{3}$/.test(cqTag)) return null;
+  const nnn = parseInt(cqTag, 10);
+  if (vfoHz > 0) {
+    const target = Math.floor(vfoHz / 1_000_000) * 1_000_000 + nnn * 1000;
+    const offset = target - vfoHz;
+    if (offset >= 200 && offset <= 3000) return offset;
+  }
+  if (nnn >= 200 && nnn <= 999) return nnn;
+  return null;
 }
 
 // Derive the natural next message type given the last message we sent and the

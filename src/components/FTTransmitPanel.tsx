@@ -5,7 +5,8 @@ import {
   loadAutoReply, saveAutoReply, loadBaseFreq, saveBaseFreq,
 } from '../lib/ft/useFTTransmit'
 import {
-  buildFTMessage, nextTxMsgType, parseFTMsg, isValidCallsign, type Contact, type MsgType,
+  buildFTMessage, nextTxMsgType, parseFTMsg, isValidCallsign, needsHashedExchange, qsyAudioOffsetHz,
+  type Contact, type MsgType,
   MSG_TYPE_COLOR, MSG_TYPE_LABEL, gridToLatLon, haversineKm,
 } from '$decoder-lib/ft/parser'
 import { callsignCountry } from '$decoder-lib/ft/prefixes'
@@ -187,6 +188,9 @@ interface Suggestion {
   callsign?: string;
   color?: string;
   isCQ?: boolean; // contact's last heard message was a CQ
+  /** They CQ'd with a numeric QSY request we can honor — the TX Audio Hz to
+   *  switch to when this suggestion is queued (never a rig retune). */
+  qsyHz?: number;
   countryCode?: string;
   // true when the contact has directly addressed our callsign — warrants highlight
   repliedToMe: boolean;
@@ -204,7 +208,7 @@ function contactPriority(c: Contact, myCall: string): number {
   return repliedToUs ? 1 : 0
 }
 
-function buildSuggestions(myCall: string, myGrid: string, contacts: Map<string, Contact>): Suggestion[] {
+function buildSuggestions(myCall: string, myGrid: string, contacts: Map<string, Contact>, vfoHz = 0): Suggestion[] {
   const sugs: Suggestion[] = []
 
   sugs.push({
@@ -272,7 +276,13 @@ function buildSuggestions(myCall: string, myGrid: string, contacts: Map<string, 
     }
 
     const pfx = callsignCountry(c.callsign)
-    const lastTxParsedType = theirMsgs[theirMsgs.length - 1]?.parsed.type
+    const lastTxParsed = theirMsgs[theirMsgs.length - 1]?.parsed
+    // Honor a numeric QSY request when answering their CQ: move OUR TX audio
+    // to where they said they're listening (pure Audio Hz — the VFO already
+    // covers the whole passband, so the rig is never touched).
+    const qsyHz = nextTxType === 'answer' && lastTxParsed?.type === 'cq'
+      ? qsyAudioOffsetHz(lastTxParsed.cqTag, vfoHz) ?? undefined
+      : undefined
     sugs.push({
       type: nextTxType as MsgType,
       message,
@@ -280,7 +290,8 @@ function buildSuggestions(myCall: string, myGrid: string, contacts: Map<string, 
       callsign: c.callsign,
       color: c.color,
       countryCode: pfx?.countryCode,
-      isCQ: lastTxParsedType === 'cq',
+      isCQ: lastTxParsed?.type === 'cq',
+      qsyHz,
       repliedToMe,
       thread,
       maxSnr: c.msgs.reduce((best, m) => m.snr > best ? m.snr : best, -99),
@@ -439,6 +450,10 @@ export default function FTTransmitPanel(props: FTTransmitPanelProps): JSX.Elemen
   // Track the last-processed message fingerprint per callsign:
   // callsign -> "lastTheirMsgCount|lastOurMsgCount" so we re-fire when new messages arrive
   const autoReplied = new Map<string, string>()
+  // Per-conversation TX audio pins (callsign → Hz), honoring QSY requests.
+  // The global Audio Hz is never moved — only the messages belonging to the
+  // pinned conversation encode at the requested frequency.
+  const convAudioHz = new Map<string, number>()
 
   const setAutoReply = (v: boolean) => {
     setAutoReplyState(v)
@@ -521,7 +536,11 @@ export default function FTTransmitPanel(props: FTTransmitPanelProps): JSX.Elemen
       }
 
       autoReplied.set(callsign, fingerprint)
-      tx.enqueueFirst({ id: uid(), message, label: `Auto → ${contact.callsign} (${labelMap[nextType] ?? nextType})` })
+      // Keep honoring a conversation's pinned QSY frequency across the exchange
+      tx.enqueueFirst({
+        id: uid(), message, label: `Auto → ${contact.callsign} (${labelMap[nextType] ?? nextType})`,
+        audioHz: convAudioHz.get(callsign),
+      })
     }
   })
 
@@ -538,7 +557,7 @@ export default function FTTransmitPanel(props: FTTransmitPanelProps): JSX.Elemen
   const myGridUp = createMemo(() => myGrid().toUpperCase())
 
   const allSuggestions = createMemo(
-    () => buildSuggestions(myCallUp(), myGridUp(), props.contacts),
+    () => buildSuggestions(myCallUp(), myGridUp(), props.contacts, props.vfoFrequency ?? 0),
   )
 
   const myLatLon = createMemo(
@@ -585,12 +604,34 @@ export default function FTTransmitPanel(props: FTTransmitPanelProps): JSX.Elemen
   const addSuggestion = (sug: Suggestion) => {
     if (!canOperate()) return
     if (tx.state().queue.some(e => e.message === sug.message)) return
-    tx.enqueue({ id: uid(), message: sug.message, label: sug.label })
+    const cs = sug.callsign?.toUpperCase()
+    if (sug.qsyHz !== undefined && cs) convAudioHz.set(cs, sug.qsyHz)
+    const pinned = sug.qsyHz ?? (cs ? convAudioHz.get(cs) : undefined)
+    tx.enqueue({ id: uid(), message: sug.message, label: sug.label, audioHz: pinned })
   }
+
+  const [customErr, setCustomErr] = createSignal('')
 
   const addCustom = () => {
     const msg = editMsg().trim().toUpperCase()
     if (!msg) return
+    // The encoder silently truncates anything it can't pack as a structured
+    // message to 13-char free text — refuse the known traps here instead of
+    // transmitting a mangled message.
+    const words = msg.split(/\s+/)
+    if (words[0] !== 'CQ') {
+      for (const w of words.slice(0, 2)) {
+        if (!w.startsWith('<') && isValidCallsign(w) && needsHashedExchange(w)) {
+          setCustomErr(`${w} doesn't fit a standard field — hash it: <${w}> (grids can't be sent alongside it)`)
+          return
+        }
+      }
+    }
+    if (msg.length > 13 && !parseFTMsg(msg).clean) {
+      setCustomErr('Not a standard FT8 form — free text is limited to 13 chars')
+      return
+    }
+    setCustomErr('')
     if (tx.state().queue.some(e => e.message === msg)) return
     tx.enqueue({ id: uid(), message: msg, label: editLabel().trim() || msg })
     setEditMsg(''); setEditLabel('')
@@ -884,13 +925,17 @@ export default function FTTransmitPanel(props: FTTransmitPanelProps): JSX.Elemen
           <div class="space-y-2">
             <For each={suggestions()}>
               {(sug) => {
-                const borderColor = sug.repliedToMe ? (sug.color ?? '#f0e68c') : '#30363d'
-                const hoverBorder = sug.repliedToMe ? (sug.color ?? '#f0e68c') : '#388bfd'
+                // Hashed (compound/special-call) conversations get a dashed
+                // amber border — these exchange with <bracket> messages and
+                // carry no grid, so they read differently on air.
+                const isHashed = !!sug.callsign && needsHashedExchange(sug.callsign)
+                const borderColor = sug.repliedToMe ? (sug.color ?? '#f0e68c') : isHashed ? 'rgba(240,136,62,0.55)' : '#30363d'
+                const hoverBorder = sug.repliedToMe ? (sug.color ?? '#f0e68c') : isHashed ? '#f0883e' : '#388bfd'
                 let wrapEl: HTMLDivElement | undefined
                 return (
                   <div ref={wrapEl}
                     class="rounded overflow-hidden"
-                    style={{ border: `1px solid ${borderColor}` }}>
+                    style={{ border: `1px ${isHashed ? 'dashed' : 'solid'} ${borderColor}` }}>
                     {/* Thread — only shown when there's exchange history */}
                     <Show when={sug.thread.length > 0}>
                       <div class="bg-[#0d1117] px-3 pt-2 pb-1 space-y-0.5 border-b" style={{ 'border-color': borderColor }}>
@@ -934,6 +979,25 @@ export default function FTTransmitPanel(props: FTTransmitPanelProps): JSX.Elemen
                             <span class="text-[10px]" title="They replied to you" style={{ color: sug.color }}>▶</span>
                           </Show>
                           <span class="text-[#8b949e] text-[10px] font-semibold uppercase">{sug.label}</span>
+                          <Show when={sug.qsyHz !== undefined}>
+                            <span
+                              class="text-[9px] font-mono px-1 py-px rounded border border-[#e3b341]/40 bg-[#e3b341]/10 text-[#e3b341]"
+                              title={`They asked to be answered at ${sug.qsyHz} Hz — this conversation's messages transmit there; your Audio Hz setting stays put (rig untouched)`}
+                            >
+                              QSY {sug.qsyHz}Hz
+                            </span>
+                          </Show>
+                          <Show when={(() => {
+                            const cs = sug.callsign?.toUpperCase()
+                            return sug.qsyHz === undefined && cs !== undefined && convAudioHz.has(cs)
+                          })()}>
+                            <span
+                              class="text-[9px] font-mono px-1 py-px rounded border border-[#e3b341]/30 bg-[#e3b341]/5 text-[#e3b341]/80"
+                              title="This conversation is pinned to the frequency they QSY'd to"
+                            >
+                              @{convAudioHz.get(sug.callsign!.toUpperCase())}Hz
+                            </span>
+                          </Show>
                           <Show when={sug.callsign}>
                             <span class="flex items-center gap-1 text-[10px] font-mono font-bold" style={{ color: sug.color }}>
                               {(() => {
@@ -961,9 +1025,9 @@ export default function FTTransmitPanel(props: FTTransmitPanelProps): JSX.Elemen
           <div class="border-t border-[#21262d] pt-3 space-y-2">
             <div class="text-[#8b949e] text-[10px] font-semibold uppercase tracking-wide">Custom Message</div>
             <div class="flex gap-2">
-              <input value={editMsg()} onInput={e => setEditMsg(e.currentTarget.value.toUpperCase())}
+              <input value={editMsg()} onInput={e => { setEditMsg(e.currentTarget.value.toUpperCase()); setCustomErr('') }}
                 onKeyDown={e => e.key === 'Enter' && addCustom()}
-                placeholder="CQ PU7FWT GG54" maxLength={13}
+                placeholder="CQ PU7FWT GG54" maxLength={40}
                 class="flex-1 bg-[#0d1117] border border-[#30363d] rounded px-2 py-1.5 text-xs font-mono text-[#c9d1d9] focus:outline-none focus:border-[#388bfd]" />
               <input value={editLabel()} onInput={e => setEditLabel(e.currentTarget.value)}
                 placeholder="Label (opt)"
@@ -974,7 +1038,12 @@ export default function FTTransmitPanel(props: FTTransmitPanelProps): JSX.Elemen
                 Queue
               </button>
             </div>
-            <p class="text-[#484f58] text-[10px]">Max 13 chars · FT8/FT4 message format</p>
+            <Show when={customErr()}>
+              <p class="text-[#f85149] text-[10px]">{customErr()}</p>
+            </Show>
+            <p class="text-[#484f58] text-[10px]">
+              Standard FT8/FT4 forms, any length · free text ≤ 13 chars · compound calls use {'<'}brackets{'>'}: {'<'}YS3/PY8WW{'>'} PU7FTW
+            </p>
           </div>
         </div>
 
@@ -1047,6 +1116,11 @@ export default function FTTransmitPanel(props: FTTransmitPanelProps): JSX.Elemen
                         <div class="font-mono text-xs text-[#c9d1d9] truncate">{entry.message}</div>
                         <div class="text-[#484f58] text-[10px] truncate">
                           {isError() ? <span class="text-[#f85149]">{entry.encodeError}</span> : entry.label}
+                          <Show when={entry.audioHz !== undefined}>
+                            <span class="ml-1 text-[#e3b341]" title="Pinned TX frequency for this conversation (QSY) — global Audio Hz unaffected">
+                              @{entry.audioHz}Hz
+                            </span>
+                          </Show>
                         </div>
                       </div>
                       <div class="flex items-center gap-1.5 shrink-0">

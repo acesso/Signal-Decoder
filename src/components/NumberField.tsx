@@ -28,6 +28,7 @@ interface Props {
   readOnly?: boolean
   disabled?: boolean
   title?: string
+  style?: JSX.CSSProperties
   onClick?: (e: MouseEvent) => void
 }
 
@@ -70,6 +71,7 @@ export default function NumberField(props: Props): JSX.Element {
       readOnly={props.readOnly}
       disabled={props.disabled}
       title={props.title}
+      style={props.style}
       onClick={props.onClick}
       onInput={(e) => {
         const parsed = (props.parse ?? ((raw: string) => defaultParse(raw, props.min, props.max)))(e.currentTarget.value)

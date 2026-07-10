@@ -12,6 +12,10 @@ export interface TxQueueEntry {
   id: string;
   message: string;
   label: string;
+  /** Pinned TX audio frequency for THIS entry (honors a station's QSY
+   *  request per conversation) — overrides the panel's global Audio Hz,
+   *  which stays untouched. */
+  audioHz?: number;
   // Populated as soon as the entry is enqueued — loop never waits for encoding
   samples: Float32Array | null;
   encodeStatus: 'pending' | 'ready' | 'error';
@@ -239,7 +243,7 @@ export function createFTTransmit(
 
   function startEncode(entry: TxQueueEntry) {
     const ENC_RATE = 12000;
-    encodeAsync(entry.message, getMode(), ENC_RATE, getBaseFrequency())
+    encodeAsync(entry.message, getMode(), ENC_RATE, entry.audioHz ?? getBaseFrequency())
       .then(samples => {
         setState(prev => {
           const q = prev.queue.map(e =>
@@ -377,6 +381,7 @@ export function createFTTransmit(
       let txMessage = '';
       let txLabel   = '';
       let txId      = '';
+      let txAudioHz = getBaseFrequency();
 
       if (useAutoCQ) {
         samples   = autoCQSamples;
@@ -391,7 +396,7 @@ export function createFTTransmit(
           const sent: SentEntry = {
             id: live.id, message: live.message, label: live.label,
             windowStart: new Date(),
-            vfoHz: getVfoFrequency(), audioHz: getBaseFrequency(),
+            vfoHz: getVfoFrequency(), audioHz: live.audioHz ?? getBaseFrequency(),
             error: live.encodeError,
           };
           setState(prev => ({
@@ -417,6 +422,7 @@ export function createFTTransmit(
         txMessage = finalEntry.message;
         txLabel   = finalEntry.label;
         txId      = finalEntry.id;
+        txAudioHz = finalEntry.audioHz ?? getBaseFrequency();
       }
 
       if (!samples) continue;
@@ -475,7 +481,7 @@ export function createFTTransmit(
 
       const sent: SentEntry = {
         id: txId, message: txMessage, label: txLabel, windowStart,
-        vfoHz: getVfoFrequency(), audioHz: getBaseFrequency(),
+        vfoHz: getVfoFrequency(), audioHz: txAudioHz,
       };
       setState(prev => ({
         ...prev, status: 'waiting',
@@ -500,10 +506,32 @@ export function createFTTransmit(
   function syncParams() {
     const mode = getMode();
     const freq = getBaseFrequency();
-    if (mode !== lastSyncedMode || freq !== lastSyncedFreq) {
+    const modeChanged = mode !== lastSyncedMode;
+    const freqChanged = freq !== lastSyncedFreq;
+    if (modeChanged || freqChanged) {
       lastSyncedMode = mode;
       lastSyncedFreq = freq;
       if (autoCQMessage) rebuildAutoCQCache(autoCQMessage);
+      // Queued entries were encoded with the params captured at enqueue time —
+      // a later Audio Hz (or mode) change must re-encode them, or they'd still
+      // transmit on the old frequency. Entries with a pinned per-conversation
+      // audioHz don't follow the global Audio Hz, so a freq-only change leaves
+      // them alone; a mode change invalidates everything. Mark stale entries
+      // pending first so the TX loop can't send old samples mid-re-encode;
+      // the encode worker is FIFO, so a re-encode's result always lands after
+      // any in-flight first encode for the same entry.
+      const stale = queue.filter(e => modeChanged || e.audioHz === undefined);
+      if (stale.length > 0) {
+        const staleIds = new Set(stale.map(e => e.id));
+        setState(prev => {
+          const q = prev.queue.map(e =>
+            staleIds.has(e.id) ? { ...e, samples: null, encodeStatus: 'pending' as const } : e
+          );
+          queue = q;
+          return { ...prev, queue: q };
+        });
+        for (const e of queue) if (staleIds.has(e.id)) startEncode(e);
+      }
     }
   }
 

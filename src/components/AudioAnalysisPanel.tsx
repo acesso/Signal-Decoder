@@ -292,7 +292,9 @@ interface Props {
   analyser: AnalyserNode | null
   isRecording: boolean
   markers?: AudioMarker[]
-  onMarkerDrag?: (index: number, newFreq: number) => void
+  /** shiftKey reflects the modifier during the drag — lets a mode offer an
+   *  alternate drag behavior (e.g. MFSK: move one tone instead of the group). */
+  onMarkerDrag?: (index: number, newFreq: number, shiftKey?: boolean) => void
   squelch?: number
   onSquelchChange?: (v: number) => void
   showGrid?: boolean
@@ -455,7 +457,7 @@ export default function AudioAnalysisPanel(props: Props): JSX.Element {
       const rect = drag.el.getBoundingClientRect()
       const xRatio = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width))
       const newHz = Math.round(displayMinHz() + xRatio * (displayMaxHz() - displayMinHz()))
-      props.onMarkerDrag(drag.index, newHz)
+      props.onMarkerDrag(drag.index, newHz, e.shiftKey)
     }
     const onUp = () => {
       markerDrag = null
