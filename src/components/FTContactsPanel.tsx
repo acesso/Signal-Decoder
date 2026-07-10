@@ -3,9 +3,10 @@
 import { createEffect, createMemo, createSignal, For, on, onCleanup, onMount, Show, type JSX } from 'solid-js'
 import { Portal } from 'solid-js/web'
 import {
-  Contact, ContactMsg, MSG_TYPE_LABEL, MSG_TYPE_COLOR, generateADIF, parseADIF, gridToLatLon, haversineKm, isConfirmedQSO,
-  isPartialQSO, classifyCallsign,
+  Contact, ContactMsg, MSG_TYPE_LABEL, MSG_TYPE_COLOR, generateADIFFromRecords, parseADIF, gridToLatLon, haversineKm,
+  classifyCallsign, baseCallsign,
 } from '$decoder-lib/ft/parser'
+import { qsoLogRecords } from '$decoder-lib/ft/qsoLog'
 import { callsignCountry } from '$decoder-lib/ft/prefixes'
 
 import { FT_WINDOW_SECONDS, type FTMode } from '$decoder-lib/ft/decoder'
@@ -99,7 +100,9 @@ function locationParts(contact: Contact): LocationParts | null {
 }
 
 function qrzUrl(callsign: string): string {
-  return `https://www.qrz.com/db/${encodeURIComponent(callsign.split('/')[0])}`
+  // QRZ only resolves the operator's base call — for compound/portable forms
+  // (9A/S55X/P, YS3/PY8WW) link the base callsign, not the leading prefix.
+  return `https://www.qrz.com/db/${encodeURIComponent(baseCallsign(callsign))}`
 }
 
 // Visible badge shown in the card title next to the callsign: Brazilian
@@ -943,20 +946,19 @@ export default function FTContactsPanel(props: Props): JSX.Element {
   const [includePartial, setIncludePartial] = createSignal(loadBoolean(LS_ADIF_INCLUDE_PARTIAL, false))
   createEffect(() => saveBoolean(LS_ADIF_INCLUDE_PARTIAL, includePartial()))
 
-  const confirmedQSOCount = createMemo(() => props.myCall
-    ? [...props.contacts.values()].filter(c => isConfirmedQSO(c, props.myCall!)).length
-    : 0)
+  // Export reads the persistent QSO log (see qsoLog.ts), not live contacts —
+  // contact messages rotate, so QSOs decoded hours ago may no longer be
+  // derivable from them at export time.
+  const confirmedQSOCount = createMemo(() => qsoLogRecords().filter(r => r.confirmed).length)
 
-  const partialQSOCount = createMemo(() => props.myCall
-    ? [...props.contacts.values()].filter(c => isPartialQSO(c, props.myCall!)).length
-    : 0)
+  const partialQSOCount = createMemo(() => qsoLogRecords().filter(r => !r.confirmed).length)
 
   const exportQSOCount = createMemo(() => confirmedQSOCount() + (includePartial() ? partialQSOCount() : 0))
 
   function downloadADIF() {
-    const content = generateADIF(props.contacts, props.mode, {
-      myCall: props.myCall ?? '', myGrid: props.myGrid ?? '', vfoHz: props.vfoHz ?? 0,
-      includePartial: includePartial(),
+    const records = qsoLogRecords().filter(r => r.confirmed || includePartial())
+    const content = generateADIFFromRecords(records, {
+      myCall: props.myCall ?? '', myGrid: props.myGrid ?? '',
     })
     const blob = new Blob([content], { type: 'text/plain;charset=utf-8' })
     const url  = URL.createObjectURL(blob)
@@ -1022,7 +1024,7 @@ export default function FTContactsPanel(props: Props): JSX.Element {
           >
             import
           </button>
-          <Show when={props.contacts.size > 0}>
+          <Show when={props.contacts.size > 0 || qsoLogRecords().length > 0}>
             <label
               class="flex items-center gap-1 text-[10px] text-[#8b949e] font-mono cursor-pointer select-none"
               title="Also export partial QSOs — two-way handshake with no signal report exchanged yet"
@@ -1048,6 +1050,7 @@ export default function FTContactsPanel(props: Props): JSX.Element {
             <button
               onClick={props.onClearContacts}
               class="text-xs px-2 py-0.5 rounded border border-[#30363d] text-[#8b949e] hover:text-[#f85149] hover:border-[#f85149]/40 transition-colors font-mono"
+              title="Clear all contacts AND the saved QSO log that ADIF export reads from"
             >
               Clear
             </button>

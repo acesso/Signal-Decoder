@@ -13,7 +13,10 @@ import {
   gridToLatLon,
   CONTACT_PALETTE,
   type MergeStats,
+  type QSORecord,
+  extractQSORecords,
 } from '$decoder-lib/ft/parser'
+import { qsoLogUpsert, qsoLogClear } from '$decoder-lib/ft/qsoLog'
 import { DecodeGate } from '$decoder-lib/ft/gate'
 import FTContactsPanel from './FTContactsPanel'
 import FTWasmPanel from './FTWasmPanel'
@@ -454,6 +457,8 @@ export default function FTDecoder(props: Props): JSX.Element {
     let next = contactsAuth
     let changed = false
     const statDeltas = new Map<number, MergeStats>()
+    const myUp = (props.myCall ?? '').trim().toUpperCase()
+    const qsoTouched = new Set<string>()
     for (const r of results.slice().reverse()) {
       const key = r.windowStart.getTime()
       if (!frozenVfo.has(key)) frozenVfo.set(key, currentVfo)
@@ -470,6 +475,26 @@ export default function FTDecoder(props: Props): JSX.Element {
       statDeltas.set(key, stats)
       mergedCount.set(key, r.messages.length)
       changed = true
+
+      // Peers exchanging with me in this batch — their QSO segments get
+      // snapshotted into the persistent QSO log below, before rotation
+      // (60-msg cap / contact eviction) can flush the exchange.
+      if (myUp) {
+        for (const fm of freshMsgs) {
+          const p = parseFTMsgCached(fm.msg)
+          if (!p.clean) continue
+          if (p.caller?.toUpperCase() === myUp && p.callee) qsoTouched.add(p.callee)
+          else if (p.callee?.toUpperCase() === myUp && p.caller) qsoTouched.add(p.caller)
+        }
+      }
+    }
+    if (qsoTouched.size > 0) {
+      const recs: QSORecord[] = []
+      for (const cs of qsoTouched) {
+        const c = next.get(cs)
+        if (c) recs.push(...extractQSORecords(c, myUp, props.ftMode, currentVfo))
+      }
+      qsoLogUpsert(recs)
     }
     if (changed) {
       contactsAuth = next
@@ -523,10 +548,10 @@ export default function FTDecoder(props: Props): JSX.Element {
   function handleImportADIF(content: string) {
     const records = parseADIF(content)
     if (!records.length) return
+    const importedRecs: QSORecord[] = []
     setContacts((prev) => {
       const next = new Map(prev)
       for (const r of records) {
-        if (next.has(r.call)) continue
         const ts =
           r.qsoDate && r.timeOn
             ? new Date(
@@ -538,6 +563,23 @@ export default function FTDecoder(props: Props): JSX.Element {
                 parseInt(r.timeOn.slice(4, 6)),
               )
             : new Date()
+        // Imported QSOs go straight into the persistent QSO log so they
+        // survive contact rotation and round-trip through export.
+        const rstRcvd = parseInt(r.rstRcvd ?? '', 10)
+        importedRecs.push({
+          callsign: r.call,
+          grid: r.gridsquare?.toUpperCase(),
+          startMs: ts.getTime(),
+          endMs: ts.getTime(),
+          freqHz: r.freq ? Math.round(parseFloat(r.freq) * 1_000_000) || 0 : 0,
+          rstRcvd: Number.isNaN(rstRcvd) ? -99 : rstRcvd,
+          sentCount: 0,
+          rcvdCount: 0,
+          confirmed: !r.comment?.includes('partial:'),
+          mode: r.mode === 'FT8' ? 'FT8' : r.mode === 'FT4' || r.submode === 'FT4' ? 'FT4' : props.ftMode,
+          comment: r.comment,
+        })
+        if (next.has(r.call)) continue
         const idx = next.size % CONTACT_PALETTE.length
         const c: Contact = {
           callsign: r.call,
@@ -555,6 +597,7 @@ export default function FTDecoder(props: Props): JSX.Element {
       props.onContactsChange?.(next)
       return next
     })
+    qsoLogUpsert(importedRecs)
   }
 
   // ── 2-panel drag ────────────────────────────────────────────────────────
@@ -919,7 +962,14 @@ export default function FTDecoder(props: Props): JSX.Element {
             myCall={props.myCall ?? ''}
             myGrid={props.myGrid ?? ''}
             vfoHz={props.vfoFrequency ?? 0}
-            onClearContacts={() => setContacts(new Map())}
+            onClearContacts={() => {
+              // Clear the authoritative holder too, or the next decode's
+              // publish would resurrect every cleared contact from it.
+              contactsAuth = new Map()
+              setContacts(new Map())
+              props.onContactsChange?.(contactsAuth)
+              qsoLogClear()
+            }}
             onImportADIF={handleImportADIF}
             focus={contactFocus()}
           />

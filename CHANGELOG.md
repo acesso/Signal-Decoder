@@ -12,6 +12,22 @@ them into a version section when cutting a release.
 
 ## [Unreleased]
 
+## [0.7.1] - 2026-07-10
+
+### Fixed
+
+- QRZ profile links for compound callsigns pointed at the leading prefix
+  (e.g. 9A for 9A/S55X/P); they now link the operator's base call (S55X).
+- ADIF export derived QSOs from live contact messages, which rotate (60 per
+  contact) — a busy peer's CQ loop alone could silently flush an exchange
+  before export; QSOs are now snapshotted into a persistent log the moment
+  they are decoded and export reads that log, so entries survive message
+  rotation, contact eviction, and page reloads.
+- ADIF imports now enter the persistent QSO log and round-trip through
+  later exports.
+- The contacts Clear button no longer lets the next decode resurrect the
+  cleared contacts; it also empties the saved QSO log.
+
 ## [0.7.0] - 2026-07-10
 
 ### Added
