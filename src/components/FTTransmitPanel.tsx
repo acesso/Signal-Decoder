@@ -212,6 +212,17 @@ function contactPriority(c: Contact, myCall: string): number {
   return repliedToUs ? 1 : 0
 }
 
+// When this station was last actually HEARD (its own transmissions only).
+// c.lastSeen also updates when the station is merely ADDRESSED by someone
+// else, which keeps long-gone stations looking "fresh" for as long as others
+// keep calling them.
+function lastHeardMs(c: Contact): number {
+  for (let i = c.msgs.length - 1; i >= 0; i--) {
+    if (c.msgs[i].role === 'tx') return c.msgs[i].windowStart.getTime()
+  }
+  return 0
+}
+
 function buildSuggestions(myCall: string, myGrid: string, contacts: Map<string, Contact>, vfoHz = 0): Suggestion[] {
   const sugs: Suggestion[] = []
 
@@ -230,13 +241,17 @@ function buildSuggestions(myCall: string, myGrid: string, contacts: Map<string, 
     .sort((a, b) => {
       const pd = contactPriority(b, myCall) - contactPriority(a, myCall)
       if (pd !== 0) return pd
-      return b.lastSeen.getTime() - a.lastSeen.getTime()
+      return lastHeardMs(b) - lastHeardMs(a)
     })
 
   const myCallUp = myCall.toUpperCase()
 
   for (const c of candidates) {
     const theirMsgs  = c.msgs.filter(m => m.role === 'tx')
+    // Never actually heard this station (it only ever appeared as someone
+    // else's addressee) — we can't answer what we can't hear, and its
+    // SNR/recency/frequency would all be another station's.
+    if (theirMsgs.length === 0) continue
     const replieToUs = theirMsgs.filter(m => m.parsed.callee?.toUpperCase() === myCallUp)
     const ourMsgs    = c.msgs.filter(m => m.role === 'rx' && m.parsed.caller?.toUpperCase() === myCallUp)
 
@@ -281,7 +296,10 @@ function buildSuggestions(myCall: string, myGrid: string, contacts: Map<string, 
     }
 
     const pfx = callsignCountry(c.callsign)
-    const lastTxParsed = theirMsgs[theirMsgs.length - 1]?.parsed
+    // Latest of their transmissions by timestamp — gate replays can append
+    // released messages out of push order.
+    const lastHeard = theirMsgs.reduce((latest, m) => m.windowStart > latest.windowStart ? m : latest, theirMsgs[0])
+    const lastTxParsed = lastHeard.parsed
     // Honor a numeric QSY request when answering their CQ: move OUR TX audio
     // to where they said they're listening (pure Audio Hz — the VFO already
     // covers the whole passband, so the rig is never touched).
@@ -299,12 +317,12 @@ function buildSuggestions(myCall: string, myGrid: string, contacts: Map<string, 
       qsyHz,
       repliedToMe,
       thread,
-      maxSnr: c.msgs.reduce((best, m) => m.snr > best ? m.snr : best, -99),
+      // Their own transmissions only — an rx-role message's SNR/time/freq
+      // belongs to whoever SENT it, not to this station.
+      maxSnr: theirMsgs.reduce((best, m) => m.snr > best ? m.snr : best, -99),
       latLon: c.latLon,
-      lastSeenMs: c.lastSeen.getTime(),
-      lastFreqHz: c.msgs.reduce<Contact['msgs'][number] | null>(
-        (latest, m) => (!latest || m.windowStart > latest.windowStart) ? m : latest, null,
-      )?.freq,
+      lastSeenMs: lastHeard.windowStart.getTime(),
+      lastFreqHz: lastHeard.freq,
     })
   }
 

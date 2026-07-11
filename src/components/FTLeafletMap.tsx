@@ -506,17 +506,20 @@ export default function FTLeafletMap(props: FTLeafletMapProps) {
     const vfoHz = props.vfoFilterHz ?? 0
     let contactList = Array.from(props.contacts.values()).filter(c => c.latLon)
 
-    // VFO filter: keep only contacts whose most recent message's absolute
-    // frequency falls inside the decoder's passband around the live VFO.
+    // VFO filter: keep only contacts whose most recently HEARD transmission's
+    // absolute frequency falls inside the decoder's passband around the live
+    // VFO. Only the station's own (tx-role) messages count — an rx-role
+    // message's frequency is where the SENDER transmitted, not this station.
     // Messages store either an absolute Hz (VFO baked in at decode time) or a
     // bare audio offset (no VFO set then) — only the former can be compared;
-    // a contact with no absolute-frequency messages is excluded when filtering.
+    // a contact with no absolute-frequency transmissions is excluded when
+    // filtering.
     if (vfoHz > 0) {
       const lo = vfoHz + DEFAULT_DECODER_PARAMS.minHz
       const hi = vfoHz + DEFAULT_DECODER_PARAMS.maxHz
       contactList = contactList.filter(c => {
         const last = c.msgs.reduce<typeof c.msgs[number] | null>(
-          (latest, m) => (!latest || m.windowStart > latest.windowStart) ? m : latest, null,
+          (latest, m) => m.role === 'tx' && (!latest || m.windowStart > latest.windowStart) ? m : latest, null,
         )
         if (!last || last.freq <= 1_000_000) return false
         return last.freq >= lo && last.freq <= hi

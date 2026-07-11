@@ -12,6 +12,22 @@ them into a version section when cutting a release.
 
 ## [Unreleased]
 
+## [0.7.3] - 2026-07-10
+
+### Fixed
+
+- Suggested-messages stats were polluted by OTHER stations' messages: the
+  Strongest sort used SNR inherited from whoever called the station, Latest
+  kept long-gone stations fresh while others called them, VFO-only compared
+  the caller's frequency, and never-heard stations (only seen as someone
+  else's addressee) were suggested at all — every stat now derives solely
+  from the station's own transmissions.
+- The map's VFO-only pin filter had the same flaw and now also uses the
+  station's own last transmission frequency.
+- The 2D waterfall stayed blank after switching to 3D Terrain and back —
+  stale WebGL vertex-attribute state from the terrain mesh made every
+  subsequent waterfall draw call fail silently.
+
 ## [0.7.2] - 2026-07-10
 
 ### Added
