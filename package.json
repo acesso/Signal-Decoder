@@ -1,6 +1,6 @@
 {
   "name": "sstv-decoder",
-  "version": "0.7.2",
+  "version": "0.7.3",
   "description": "Free web-based SSTV decoder for amateur radio. Decode Robot36, Robot72, Scottie, and PD mode signals in real-time from your browser. Perfect for ham radio, ISS SSTV events, and satellite image reception.",
   "keywords": [
     "sstv",

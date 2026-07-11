@@ -605,6 +605,14 @@ export default function GLSpectrogram(props: Props): JSX.Element {
     const canvas = canvasEl
     if (!g || !canvas) return
 
+    // The previous view's program may have left extra vertex attrib arrays
+    // enabled (terrain uses two: aPos + aHeight). Their buffers are deleted
+    // on view cleanup, and any draw call made while a stale enabled array
+    // has no buffer is an INVALID_OPERATION — the new view then renders
+    // nothing (2D waterfall going blank after a round-trip to 3D Terrain).
+    const maxAttribs = g.getParameter(g.MAX_VERTEX_ATTRIBS) as number
+    for (let i = 0; i < maxAttribs; i++) g.disableVertexAttribArray(i)
+
     const headNorm = () => ((head - 0.5 + TEX_H) % TEX_H) / TEX_H
     const DEPTH = (TEX_H - 1) / TEX_H
     const buffers: WebGLBuffer[] = []
