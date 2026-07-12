@@ -1003,7 +1003,7 @@ export default function FTContactsPanel(props: Props): JSX.Element {
   function downloadADIF() {
     const records = qsoLogRecords().filter(r => r.confirmed || includePartial())
     const content = generateADIFFromRecords(records, {
-      myCall: props.myCall ?? '', myGrid: props.myGrid ?? '',
+      myCall: props.myCall ?? '', myGrid: props.myGrid ?? '', vfoHz: props.vfoHz ?? 0,
     })
     const blob = new Blob([content], { type: 'text/plain;charset=utf-8' })
     const url  = URL.createObjectURL(blob)

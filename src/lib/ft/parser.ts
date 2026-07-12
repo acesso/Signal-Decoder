@@ -860,6 +860,9 @@ export interface QSORecord {
   endMs: number;
   /** Absolute Hz when known (VFO already folded in at capture), 0 = unknown. */
   freqHz: number;
+  /** Audio offset (Hz) when no VFO was connected at capture — lets export
+   *  fall back to the export-time VFO to derive FREQ/BAND. */
+  audioHz?: number;
   /** Best SNR received from them; -99 when nothing was heard (SWL edge). */
   rstRcvd: number;
   /** Report I sent them, when one went out. */
@@ -926,6 +929,9 @@ export function extractQSORecords(
     const absHz = firstMsg
       ? (firstMsg.freq > 1_000_000 ? firstMsg.freq : (vfoHz > 0 ? vfoHz + firstMsg.freq : 0))
       : (vfoHz > 0 ? vfoHz : 0);
+    // No VFO connected at capture: keep the bare audio offset so export can
+    // still derive an absolute frequency from the export-time VFO.
+    const audioHz = absHz === 0 && firstMsg && firstMsg.freq <= 1_000_000 ? firstMsg.freq : undefined;
 
     out.push({
       callsign: c.callsign,
@@ -933,7 +939,8 @@ export function extractQSORecords(
       startMs: qsoStart.getTime(),
       endMs: qsoEnd.getTime(),
       freqHz: absHz,
-      rstRcvd: bestSnrRcvd,
+      audioHz,
+      rstRcvd: Math.round(bestSnrRcvd),
       rstSent: bestSnrSent,
       sentCount: iSentMsgs.length,
       rcvdCount: theySentMsgs.length,
@@ -946,9 +953,9 @@ export function extractQSORecords(
 
 export function generateADIFFromRecords(
   records: QSORecord[],
-  opts: Pick<ADIFOptions, 'myCall' | 'myGrid'> = {},
+  opts: Pick<ADIFOptions, 'myCall' | 'myGrid' | 'vfoHz'> = {},
 ): string {
-  const { myCall, myGrid } = opts;
+  const { myCall, myGrid, vfoHz = 0 } = opts;
   const me        = (myCall ?? '').toUpperCase();
   const now       = new Date();
   const timestamp = `${adifDate(now)} ${adifTime(now)}`;
@@ -964,7 +971,11 @@ export function generateADIFFromRecords(
 
   for (const r of [...records].sort((a, b) => a.startMs - b.startMs)) {
     const qsoStart = new Date(r.startMs);
-    const freqMhz  = r.freqHz > 0 ? r.freqHz / 1_000_000 : 0;
+    // Absolute frequency from capture; else fall back to folding the
+    // record's audio offset into the export-time VFO (legacy behavior for
+    // QSOs decoded before the radio was connected).
+    const absHz    = r.freqHz > 0 ? r.freqHz : (vfoHz > 0 && r.audioHz ? vfoHz + r.audioHz : 0);
+    const freqMhz  = absHz > 0 ? absHz / 1_000_000 : 0;
     const band     = freqMhz > 0 ? freqMhzToBand(freqMhz) : undefined;
 
     const fields: [string, string][] = [
@@ -977,9 +988,14 @@ export function generateADIFFromRecords(
     if (band)        fields.push(['BAND',       band]);
     if (freqMhz > 0) fields.push(['FREQ',       freqMhz.toFixed(6)]);
     if (r.grid)      fields.push(['GRIDSQUARE', r.grid]);
-    fields.push(['RST_RCVD', `${r.rstRcvd >= 0 ? '+' : ''}${r.rstRcvd}`]);
-    if (r.rstSent !== undefined)
-      fields.push(['RST_SENT', `${r.rstSent >= 0 ? '+' : ''}${r.rstSent}`]);
+    // Round at format time too — records logged before rounding was added
+    // at capture hold raw decoder floats (-8.161644894026992).
+    const rstRcvd = Math.round(r.rstRcvd);
+    fields.push(['RST_RCVD', `${rstRcvd >= 0 ? '+' : ''}${rstRcvd}`]);
+    if (r.rstSent !== undefined) {
+      const rstSent = Math.round(r.rstSent);
+      fields.push(['RST_SENT', `${rstSent >= 0 ? '+' : ''}${rstSent}`]);
+    }
     if (myCall) fields.push(['STATION_CALLSIGN', me]);
     if (myGrid) fields.push(['MY_GRIDSQUARE',    myGrid.toUpperCase()]);
     const partialNote = r.confirmed ? '' : ' (partial: handshake only, no report exchanged)';
@@ -1002,7 +1018,7 @@ export function generateADIF(
   for (const c of contacts.values()) {
     records.push(...extractQSORecords(c, me, ftMode, vfoHz, includePartial));
   }
-  return generateADIFFromRecords(records, { myCall, myGrid });
+  return generateADIFFromRecords(records, { myCall, myGrid, vfoHz });
 }
 
 // ── ADIF import ───────────────────────────────────────────────────────────────
