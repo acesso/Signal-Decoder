@@ -629,31 +629,71 @@ export function qsyAudioOffsetHz(cqTag: string | undefined, vfoHz: number): numb
 }
 
 // Derive the natural next message type given the last message we sent and the
-// last message received from that station.
-// Rules follow the standard FT8 QSO flow:
-//   CQ → (they answer) → report → (they r_report) → rr73 → tx73
+// last message received from that station, following WSJT-X auto-sequencing:
+//   CQ → (they answer) → report → (they r_report) → rr73 → (they tx73) done
 //   (we answer their CQ) → answer → (they report) → r_report → (they rr73) → tx73
-// RR73 / r_report / tx73 are all treated as equivalent closing messages.
-// We always close with RR73 — it confirms receipt AND signs off in one transmission.
-const CLOSING: ReadonlySet<MsgType> = new Set(['r_report', 'rrr', 'rr73', 'tx73']);
-
+// Crucially this includes RETRIES: the peer repeating an earlier message
+// means our last transmission was lost on their end — the right move is to
+// re-send that transmission, not to advance the sequence or go silent.
+// Callers must only act on the result when the peer's message is the NEWER
+// of the two (it's our turn); 'cq' means the exchange needs nothing from us.
+// A received 73 is never answered — replying to a sign-off would 73-ping-pong
+// between two auto-sequencers.
 export function nextTxMsgType(lastSent: MsgType | null, lastRx: MsgType | null): TxMsgType {
   if (!lastSent) return 'cq';
 
-  // We sent CQ — reply with report once they answer (or retry report)
-  if (lastSent === 'cq') return lastRx === 'answer' ? 'report' : 'report';
+  // We CQ'd (or never addressed them): grid answer → report; a direct
+  // report (tail-ender skipping the grid) → R+report; R+report (our report
+  // reached them but our log rotated) → RR73; RR73/RRR → confirm with 73.
+  if (lastSent === 'cq') {
+    if (lastRx === 'report')                        return 'r_report';
+    if (lastRx === 'r_report')                      return 'rr73';
+    if (lastRx === 'rr73' || lastRx === 'rrr')      return 'tx73';
+    if (lastRx === 'tx73')                          return 'cq';
+    return 'report';
+  }
 
-  // We answered their CQ — reply with r_report once they report to us (or retry answer)
-  if (lastSent === 'answer') return (lastRx === 'report' || lastRx === 'r_report') ? 'r_report' : 'answer';
+  // We answered their CQ: they report → R+report; they close → 73 back;
+  // anything else (incl. their repeated CQ) → keep answering.
+  if (lastSent === 'answer') {
+    if (lastRx === 'report' || lastRx === 'r_report') return 'r_report';
+    if (lastRx === 'rr73' || lastRx === 'rrr')        return 'tx73';
+    if (lastRx === 'tx73')                            return 'cq';
+    return 'answer';
+  }
 
-  // We sent a report — close with RR73 (they confirmed with r_report/rrr or we retry)
-  if (lastSent === 'report') return 'rr73';
+  // We sent a report: rogered (R+report/RRR) → RR73; they closed → 73;
+  // a repeated grid answer means they missed our report → re-send it.
+  if (lastSent === 'report') {
+    if (lastRx === 'r_report' || lastRx === 'rrr') return 'rr73';
+    if (lastRx === 'rr73')                         return 'tx73';
+    if (lastRx === 'tx73')                         return 'cq';
+    return 'report';
+  }
 
-  // We sent r_report — close with RR73 unless already done
-  if (lastSent === 'r_report') return CLOSING.has(lastRx!) ? 'cq' : 'rr73';
+  // We sent R+report: RR73/RRR → 73 back; their 73 → done; a repeated
+  // report means they missed our R+report → re-send it.
+  if (lastSent === 'r_report') {
+    if (lastRx === 'rr73' || lastRx === 'rrr') return 'tx73';
+    if (lastRx === 'tx73')                     return 'cq';
+    return 'r_report';
+  }
 
-  // We sent RR73 or any other closing — QSO complete
-  if (CLOSING.has(lastSent)) return 'cq';
+  // We sent RR73/RRR: their 73 (or anything new like a fresh CQ) → done;
+  // a repeated R+report/report means they missed it → re-send RR73;
+  // their RR73 crossing ours → 73.
+  if (lastSent === 'rr73' || lastSent === 'rrr') {
+    if (lastRx === 'r_report' || lastRx === 'report' || lastRx === 'rrr') return 'rr73';
+    if (lastRx === 'rr73')                                                return 'tx73';
+    return 'cq';
+  }
+
+  // We sent 73: only a repeated RR73/RRR (they missed our 73) warrants
+  // re-sending it — never reply to their 73.
+  if (lastSent === 'tx73') {
+    if (lastRx === 'rr73' || lastRx === 'rrr') return 'tx73';
+    return 'cq';
+  }
 
   return 'cq';
 }

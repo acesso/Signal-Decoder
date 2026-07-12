@@ -525,22 +525,35 @@ export default function FTTransmitPanel(props: FTTransmitPanelProps): JSX.Elemen
       )
       if (theirMsgsToUs.length === 0) continue
 
+      // Latest by timestamp — the quarantine gate can replay released
+      // messages out of push order.
+      const lastTheirMsg = theirMsgsToUs.reduce(
+        (latest, m) => m.windowStart > latest.windowStart ? m : latest, theirMsgsToUs[0],
+      )
+      const lastTheirType = lastTheirMsg.parsed.type
+
       // What we've already sent them — read from the TX sent log, not from decoded
       // contacts (our own transmissions are never decoded back by the receiver).
       // state.sent is newest-first, so filter then take index 0 for the most recent.
       const sentToThem = tx.state().sent.filter(e =>
         parseFTMsg(e.message).callee?.toUpperCase() === callsign
       )
+      const lastSentMsg = sentToThem.length ? sentToThem[0] : null
 
-      // Fingerprint: re-fire whenever either side has a new message
-      const fingerprint = `${theirMsgsToUs.length}|${sentToThem.length}`
+      // Fingerprint: re-fire whenever either side has a NEW latest message.
+      // Never counts — the contact's 60-message ring rotates, so counts can
+      // stay constant (one old dropped, one new added) across a new arrival.
+      const fingerprint = `${lastTheirMsg.windowStart.getTime()}|${lastTheirType}|${lastSentMsg?.windowStart.getTime() ?? 0}`
       if (autoReplied.get(callsign) === fingerprint) continue
 
-      const lastTheirMsg  = theirMsgsToUs[theirMsgsToUs.length - 1]
-      const lastTheirType = lastTheirMsg.parsed.type
+      // Turn-taking: only transmit when THEY spoke last. If our own message
+      // is the newer one we're waiting on their reply — acting again here
+      // would answer our own transmission and double-send every exchange.
+      if (lastSentMsg && lastSentMsg.windowStart.getTime() >= lastTheirMsg.windowStart.getTime()) {
+        autoReplied.set(callsign, fingerprint)
+        continue
+      }
 
-      // sent is newest-first — index 0 is the most recently sent message
-      const lastSentMsg  = sentToThem.length ? sentToThem[0] : null
       const lastSentType = lastSentMsg ? parseFTMsg(lastSentMsg.message).type : null
 
       // For the very first reply to a station, treat as if we just sent CQ
@@ -554,12 +567,23 @@ export default function FTTransmitPanel(props: FTTransmitPanelProps): JSX.Elemen
       const bestSnr = theirMsgsToUs.reduce((best, m) => m.snr > best ? m.snr : best, -99)
       const message = buildFTMessage(nextType, myCallUp, callsign, Math.round(bestSnr), myGridUp)
 
-      // Don't enqueue if this exact message is already queued or already sent
+      // Already queued → pending, nothing to add. NOTE: a matching entry in
+      // the SENT log deliberately does NOT block — the peer repeating their
+      // message means our earlier transmission was lost, and the correct
+      // move is to re-send the exact same message (retry).
       if (tx.state().queue.some(e => e.message === message)) { autoReplied.set(callsign, fingerprint); continue }
-      if (tx.state().sent.some(e => e.message === message))  { autoReplied.set(callsign, fingerprint); continue }
 
       const labelMap: Record<string, string> = {
         answer: 'Answer', report: 'Report', r_report: 'R+Report', rr73: 'RR73', tx73: '73',
+      }
+
+      // The conversation moved on — drop any queued auto-reply to this
+      // station that this message supersedes (e.g. a queued report when
+      // they've already rogered), so the stale step never transmits.
+      for (const e of tx.state().queue) {
+        if (e.label.startsWith('Auto → ') && parseFTMsg(e.message).callee?.toUpperCase() === callsign) {
+          tx.dequeue(e.id)
+        }
       }
 
       autoReplied.set(callsign, fingerprint)
