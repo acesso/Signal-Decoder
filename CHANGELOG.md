@@ -12,6 +12,19 @@ them into a version section when cutting a release.
 
 ## [Unreleased]
 
+## [0.7.5] - 2026-07-12
+
+### Fixed
+
+- ADIF RST fields exported the raw decoder SNR float (-8.161644894026992);
+  now rounded at capture and at export (covers records already logged).
+- ADIF entries for QSOs decoded with no radio connected lost FREQ/BAND
+  entirely; such records now keep their audio offset and export folds it
+  into the export-time VFO, as the pre-log export did.
+- package.json still carried the upstream sstv-decoder fork's identity;
+  name, description, keywords, author, repository, homepage, and bugs now
+  describe this project.
+
 ## [0.7.4] - 2026-07-10
 
 ### Fixed

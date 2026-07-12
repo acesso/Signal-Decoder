@@ -63,6 +63,7 @@ function mergeQSO(ex: QSORecord, rec: QSORecord): QSORecord {
     startMs:   Math.min(ex.startMs, rec.startMs),
     endMs:     Math.max(ex.endMs, rec.endMs),
     freqHz:    ex.freqHz > 0 ? ex.freqHz : rec.freqHz,
+    audioHz:   ex.audioHz ?? rec.audioHz,
     grid:      rec.grid ?? ex.grid,
     rstRcvd:   Math.max(ex.rstRcvd, rec.rstRcvd),
     rstSent:   rec.rstSent !== undefined && (ex.rstSent === undefined || rec.rstSent > ex.rstSent)
@@ -76,6 +77,7 @@ function mergeQSO(ex: QSORecord, rec: QSORecord): QSORecord {
 
 function recEqual(a: QSORecord, b: QSORecord): boolean {
   return a.startMs === b.startMs && a.endMs === b.endMs && a.freqHz === b.freqHz &&
+    a.audioHz === b.audioHz &&
     a.grid === b.grid && a.rstRcvd === b.rstRcvd && a.rstSent === b.rstSent &&
     a.sentCount === b.sentCount && a.rcvdCount === b.rcvdCount &&
     a.confirmed === b.confirmed && a.comment === b.comment;

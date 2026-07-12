@@ -415,6 +415,34 @@ describe('QSO log records — capture at decode time, export after rotation', ()
     expect(fromLog).not.toContain('partial: handshake only');
   });
 
+  it('rounds raw decoder SNR floats in RST fields', () => {
+    const { contacts } = mergeContacts(new Map(), t, qsoMsgs.map(msg => ({ msg, freq: 21_075_500, snr: -8.161644894026992 })), 0);
+    const recs = extractQSORecords(contacts.get(them)!, me, 'FT8' as any);
+    expect(recs[0].rstRcvd).toBe(-8);
+    const adif = generateADIFFromRecords(recs, { myCall: me });
+    expect(adif).toContain('<RST_RCVD:2>-8');
+    expect(adif).not.toContain('161644894026992');
+    // Records logged before capture-time rounding hold floats — the
+    // formatter must round those too.
+    const legacy = generateADIFFromRecords([{ ...recs[0], rstRcvd: -8.161644894026992 }], { myCall: me });
+    expect(legacy).toContain('<RST_RCVD:2>-8');
+  });
+
+  it('falls back to the export-time VFO for records captured without one (audio offset only)', () => {
+    // Decoded with no radio connected: message freqs are bare audio offsets.
+    const { contacts } = mergeContacts(new Map(), t, qsoMsgs.map(msg => ({ msg, freq: 1500, snr: -10 })), 0);
+    const recs = extractQSORecords(contacts.get(them)!, me, 'FT8' as any, 0);
+    expect(recs[0].freqHz).toBe(0);
+    expect(recs[0].audioHz).toBe(1500);
+
+    // No VFO at export either → FREQ/BAND omitted.
+    expect(generateADIFFromRecords(recs, { myCall: me })).not.toContain('<FREQ:');
+    // Radio connected at export → offset folds into the current dial.
+    const adif = generateADIFFromRecords(recs, { myCall: me, vfoHz: 21_074_000 });
+    expect(adif).toContain('<FREQ:9>21.075500');
+    expect(adif).toContain('<BAND:3>15m');
+  });
+
   it('a handshake-only exchange yields an unconfirmed (partial) record', () => {
     const handshake = [`CQ ${them} FN42`, `${them} ${me} FN31`, `${me} ${them} FN42`];
     const { contacts } = mergeContacts(new Map(), t, handshake.map(msg => ({ msg, freq: 1500, snr: -10 })), 0);

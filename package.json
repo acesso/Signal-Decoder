@@ -1,37 +1,37 @@
 {
-  "name": "sstv-decoder",
-  "version": "0.7.4",
-  "description": "Free web-based SSTV decoder for amateur radio. Decode Robot36, Robot72, Scottie, and PD mode signals in real-time from your browser. Perfect for ham radio, ISS SSTV events, and satellite image reception.",
+  "name": "signal-decoder",
+  "version": "0.7.5",
+  "description": "Free web-based signal decoder for amateur radio. Decode FT8/FT4 (with QSO tracking, world map, ADIF log, and CAT transmit), RTTY, CW, SSTV, NAVTEX/SITOR-B, and MFSK signals in real-time from your browser.",
   "keywords": [
+    "ft8",
+    "ft4",
+    "rtty",
+    "cw",
+    "morse-code",
     "sstv",
-    "sstv-decoder",
-    "slow-scan-television",
+    "mfsk",
+    "navtex",
     "amateur-radio",
     "ham-radio",
-    "robot36",
-    "robot72",
-    "scottie",
-    "pd120",
-    "iss-sstv",
+    "cat-control",
+    "adif",
     "web-audio",
-    "fm-demodulation",
     "dsp",
     "pwa",
     "offline-first",
-    "radio-decoder",
-    "satellite-images"
+    "radio-decoder"
   ],
   "author": {
-    "name": "smolgroot",
-    "url": "https://github.com/smolgroot"
+    "name": "acesso",
+    "url": "https://github.com/acesso"
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/smolgroot/sstv-decoder.git"
+    "url": "https://github.com/acesso/Signal-Decoder.git"
   },
-  "homepage": "https://sstv-decoder.vercel.app",
+  "homepage": "https://acesso.github.io/Signal-Decoder/",
   "bugs": {
-    "url": "https://github.com/smolgroot/sstv-decoder/issues"
+    "url": "https://github.com/acesso/Signal-Decoder/issues"
   },
   "license": "0BSD",
   "private": true,
