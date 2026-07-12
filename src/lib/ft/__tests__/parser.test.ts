@@ -1,7 +1,7 @@
 import {
   parseFTMsg, mergeContacts, isValidCallsign, classifyCallsign, gridToLatLon, haversineKm,
   generateADIF, isConfirmedQSO, isPartialQSO, buildFTMessage, needsHashedExchange, qsyAudioOffsetHz,
-  baseCallsign, extractQSORecords, generateADIFFromRecords,
+  baseCallsign, extractQSORecords, generateADIFFromRecords, nextTxMsgType,
   type TxMsgType,
 } from '../parser';
 import { encodeFT8 } from '@e04/ft8ts';
@@ -431,6 +431,50 @@ describe('QSO log records — capture at decode time, export after rotation', ()
   it('never yields a record for my own contact entry', () => {
     const { contacts } = mergeContacts(new Map(), t, qsoMsgs.map(msg => ({ msg, freq: 1500, snr: -10 })), 0);
     expect(extractQSORecords(contacts.get(me)!, me, 'FT8' as any)).toHaveLength(0);
+  });
+});
+
+describe('nextTxMsgType — QSO auto-sequencing incl. retries', () => {
+  it('advances the flow where I called CQ', () => {
+    expect(nextTxMsgType('cq', 'answer')).toBe('report');       // they answered with grid
+    expect(nextTxMsgType('report', 'r_report')).toBe('rr73');   // they rogered my report
+    expect(nextTxMsgType('rr73', 'tx73')).toBe('cq');           // their 73 — done
+  });
+
+  it('advances the flow where I answered their CQ', () => {
+    expect(nextTxMsgType(null, null)).toBe('cq');
+    expect(nextTxMsgType('answer', 'report')).toBe('r_report'); // they sent me a report
+    expect(nextTxMsgType('r_report', 'rr73')).toBe('tx73');     // confirm their RR73 with 73
+  });
+
+  it('answers a direct (tail-end) report with R+report even with no prior exchange', () => {
+    expect(nextTxMsgType('cq', 'report')).toBe('r_report');
+  });
+
+  it('re-sends the lost transmission when the peer repeats an earlier message', () => {
+    expect(nextTxMsgType('answer', 'cq')).toBe('answer');         // they re-CQ'd, keep calling
+    expect(nextTxMsgType('report', 'answer')).toBe('report');     // they missed my report
+    expect(nextTxMsgType('r_report', 'report')).toBe('r_report'); // they missed my R+report
+    expect(nextTxMsgType('rr73', 'r_report')).toBe('rr73');       // they missed my RR73
+    expect(nextTxMsgType('tx73', 'rr73')).toBe('tx73');           // they missed my 73
+  });
+
+  it('never advances past what the peer has confirmed', () => {
+    // No RR73 before any roger of my report — the old table sent RR73
+    // unconditionally after a report.
+    expect(nextTxMsgType('report', 'cq')).toBe('report');
+    expect(nextTxMsgType('report', 'other')).toBe('report');
+  });
+
+  it('never replies to a received 73 (no sign-off ping-pong)', () => {
+    expect(nextTxMsgType('tx73', 'tx73')).toBe('cq');
+    expect(nextTxMsgType('cq', 'tx73')).toBe('cq');
+    expect(nextTxMsgType('r_report', 'tx73')).toBe('cq');
+  });
+
+  it('QSO is over once they move on (fresh CQ after my RR73)', () => {
+    expect(nextTxMsgType('rr73', 'cq')).toBe('cq');
+    expect(nextTxMsgType('rr73', 'answer')).toBe('cq');
   });
 });
 

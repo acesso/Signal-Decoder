@@ -312,13 +312,16 @@ export function createFTTransmit(
   }
 
   // ── Sent log helpers ──────────────────────────────────────────────────────
-  // Drop the new entry if it is identical to the most-recent one (same message
-  // and no error) — prevents the log from filling with repeated auto-CQ rows.
+  // Collapse a repeat of the most-recent message (same text, no error) into
+  // one row — prevents the log from filling with repeated auto-CQ rows — but
+  // REPLACE it so windowStart reflects the latest transmission: auto-reply
+  // decides whose turn it is by comparing this timestamp against the peer's
+  // last message, and a stale one would misread a retry as already answered.
   // Cap at 50 entries total.
 
   function dedupeAndCapSent(entry: SentEntry, prev: SentEntry[]): SentEntry[] {
     if (!entry.error && prev.length > 0 && prev[0].message === entry.message) {
-      return prev; // suppress consecutive duplicate
+      return [entry, ...prev.slice(1)]; // refresh the row in place
     }
     return [entry, ...prev].slice(0, 50);
   }

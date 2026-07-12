@@ -12,6 +12,22 @@ them into a version section when cutting a release.
 
 ## [Unreleased]
 
+## [0.7.4] - 2026-07-10
+
+### Fixed
+
+- Auto-reply stopped evaluating busy stations entirely: its change detector
+  used message counts, which stay constant once the contact's 60-message
+  ring rotates (one old message dropped per new arrival).
+- The QSO sequencer could not retry — after our RR73 it went silent forever,
+  so a peer repeating their R-report (our RR73 lost to fading) killed the
+  exchange; it now re-sends the lost transmission like WSJT-X, answers
+  tail-end direct reports with R+report, confirms a received RR73 with 73,
+  and never replies to a received 73.
+- Auto-reply now acts only when the peer's message is newer than our last
+  transmission to them (true tx/rx turn order), and drops superseded queued
+  auto-reply steps when the conversation advances past them.
+
 ## [0.7.3] - 2026-07-10
 
 ### Fixed
