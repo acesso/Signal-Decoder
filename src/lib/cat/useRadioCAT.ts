@@ -80,10 +80,12 @@ export interface RadioState {
    *  extension controls on this instead of hardcoding a version anywhere. */
   firmwareVersion: string | null;
   /** CAT auto-report state (AI; — menu "CAT auto rep", firmware ≥4.02a).
-   *  null until the first poll answers; false on older firmware (always AI0;).
-   *  While true the app stops long-polling — the radio pushes changes itself
-   *  and only SM/AI stay polled. Deliberately NOT user-controllable from the
-   *  UI: it's a radio menu option, the app just discovers and follows it. */
+   *  Discovered ONCE at connect (like firmwareVersion); false on older
+   *  firmware (always AI0;). While true, polling stops entirely — the radio
+   *  pushes settings changes and throttled S-meter telemetry itself; toggles
+   *  at the rig arrive as unsolicited AIn; announces. Deliberately NOT
+   *  user-controllable from the UI: it's a radio menu option, the app just
+   *  discovers and follows it. */
   autoReport: boolean | null;
 }
 
@@ -190,7 +192,10 @@ export interface RadioCATControls {
 // Query filter: FW;    → FWn;      (0=Full 1=3000 2=2400 3=1800 4=500 5=200 6=100 7=50 Hz)
 // Set filter:   FWn;   → FWn;      (n in 0..7)
 // Query S-meter: SM;   → SMn;      (signed dBm, read-only — no SM SET. During TX
-//                                   replies an empty "SM;": no RX signal to measure)
+//                                   replies an empty "SM;": no RX signal to measure.
+//                                   With auto-report on, the firmware also PUSHES
+//                                   SMn; on change, ≤1 frame/300ms — the app's
+//                                   S-meter stays live without any polling.)
 // Query TX drive: DR;  → DRn;      (0..8, linear)
 // Set TX drive:   DRn; → DRn;
 // Query backlight: BL; → BLn;      (0=off, 1=on. Physical effect confirmed after
@@ -228,14 +233,17 @@ export interface RadioCATControls {
 // Query auto-report: AI; → AIn;    (0=off 1=on — menu "CAT auto rep", firmware
 // Set auto-report: AI0;/AI1; → echo ≥4.02a. When on, the radio pushes the
 //                                   standard GET reply frame for any setting
-//                                   changed at the rig itself, and the app
-//                                   drops from the full long poll to a light
-//                                   SM;AI; poll. Older firmware always answers
-//                                   AI0; — that's the capability discovery, so
-//                                   the app keeps long-polling: retro-compatible.
+//                                   changed at the rig itself PLUS throttled
+//                                   S-meter telemetry (≤1 frame/300ms, on
+//                                   change), and the app stops polling
+//                                   entirely. Queried ONCE at connect time —
+//                                   older firmware always answers AI0; and the
+//                                   app keeps long-polling: retro-compatible.
 //                                   The app never SETs it — it's a radio menu
 //                                   option; toggling it at the rig is announced
-//                                   with an unsolicited AIn; frame.)
+//                                   with an unsolicited AIn; frame, and a
+//                                   silence watchdog re-asks AI; only if
+//                                   nothing at all has arrived for a while.)
 // Query TX timeout: TT; → TTn;    (0..255 s, 0 = disabled — TOT guardrail that
 // Set TX timeout:  TTn; → TTn;     force-unkeys a stuck TX; out-of-range SETs
 //                                   are ignored, echo returns the old value.
@@ -244,13 +252,9 @@ export interface RadioCATControls {
 // The firmware supports serialized/batched queries in one write, e.g.
 // "FA;MD;AG0;FW;VO;AT;A2;NR;SM;DR;BL;AL;" — replies come back concatenated in the same order.
 
-const BLACKBRICK_POLL_CMDS = ['FA;', 'MD;', 'AG0;', 'FW;', 'VO;', 'AT;', 'A2;', 'NR;', 'SM;', 'DR;', 'BL;', 'AL;', 'AI;'];
-
-// Wait-mode poll, used while the radio's CAT auto-report is on: the radio
-// pushes setting changes itself, so only S-meter telemetry (which changes
-// continuously — no "change event" to report) and the AI flag (recovery in
-// case an AI0 announce frame was lost to line noise) still need polling.
-const BLACKBRICK_WAIT_POLL_CMDS = ['SM;', 'AI;'];
+// Used only while CAT auto-report is off/unknown — with auto-report active the
+// radio pushes every change (settings + throttled S-meter) and no poll runs.
+const BLACKBRICK_POLL_CMDS = ['FA;', 'MD;', 'AG0;', 'FW;', 'VO;', 'AT;', 'A2;', 'NR;', 'SM;', 'DR;', 'BL;', 'AL;'];
 
 const KENWOOD_MODE_MAP: Record<string, CATMode> = {
   '1': 'LSB', '2': 'USB', '3': 'CW', '4': 'FM', '5': 'AM', '6': 'RTTY',
@@ -280,6 +284,13 @@ interface QueueEntry {
 // How long after a user set-command to suppress poll overwrites for that field.
 const SET_GRACE_MS = 1500;
 
+// Wait mode (auto-report active): if NOTHING has arrived from the radio for
+// this long, one AI; query re-checks the link and the auto-report flag — the
+// only way to get stranded in wait mode is an AI0 announce (feature turned
+// off at the rig) lost to line noise, and this recovers from it. It is not a
+// poll: on a live band the throttled S-meter pushes keep resetting the clock.
+const SILENCE_RECHECK_MS = 15_000;
+
 // ── Factory ──────────────────────────────────────────────────────────────────
 
 export function useRadioCAT(): RadioCATControls {
@@ -302,9 +313,11 @@ export function useRadioCAT(): RadioCATControls {
   let pollIntervalMs = 100;
   let debug = false;
   let rigProfile: RigProfile = 'generic';
-  // True while the radio's CAT auto-report (AI) is on — switches the poll loop
-  // to the light SM/AI batch; the radio pushes everything else itself.
+  // True while the radio's CAT auto-report (AI) is on — polling stops
+  // entirely; the radio pushes settings changes and throttled SM telemetry.
   let autoReportActive = false;
+  // Timestamp of the last bytes received — drives the wait-mode silence watchdog.
+  let lastRxAt = 0;
   const encoder = new TextEncoder();
 
   let queue: QueueEntry[] = [];
@@ -475,6 +488,7 @@ export function useRadioCAT(): RadioCATControls {
         for (;;) {
           const { value, done } = await r.read();
           if (done) { log('debug', 'read loop: stream done'); break; }
+          lastRxAt = Date.now();
           rxBuf += dec.decode(value, { stream: true });
           // Guard against unbounded growth from a radio sending malformed data
           // with no ';' terminator — a Kenwood response is at most ~20 bytes.
@@ -569,6 +583,14 @@ export function useRadioCAT(): RadioCATControls {
       if (graceOver('agc')) setState(prev => ({ ...prev, agc: v }));
       return true;
     }
+    if (msg.startsWith('SM')) {
+      // Pushed S-meter telemetry (throttled by the firmware) — read-only,
+      // no set-grace needed; an empty "SM;" is never pushed, only polled.
+      const v = parseIntField(msg, 'SM');
+      if (v === null) return false;
+      setState(prev => ({ ...prev, sMeter: v }));
+      return true;
+    }
     const numFields = [
       ['VO', 'volume'], ['AT', 'att1'], ['A2', 'att2'], ['NR', 'nr'], ['FW', 'filter'],
       ['DR', 'drive'], ['BL', 'backlight'], ['AL', 'agcLevel'],
@@ -605,15 +627,27 @@ export function useRadioCAT(): RadioCATControls {
         const now = Date.now();
         const ls  = lastSet;
 
+        if (rigProfile === 'usdx-blackbrick' && autoReportActive) {
+          // Wait mode: no polling at all — the radio pushes settings changes
+          // and throttled SM telemetry, handled by applyReportFrame() in the
+          // read path. Only the silence watchdog runs here (see
+          // SILENCE_RECHECK_MS): one AI; query after total radio silence.
+          if (Date.now() - lastRxAt > SILENCE_RECHECK_MS) {
+            log('debug', 'wait mode: radio silent, re-checking AI');
+            let resp = '';
+            try { resp = await query('AI;', true); } catch { resp = ''; }
+            const v = parseIntField(resp, 'AI');
+            if (v !== null) applyAutoReportState(v >= 1);
+            else lastRxAt = Date.now(); // no answer — back off a full window rather than re-asking every tick; a lost port is handled by the read loop
+          }
+          return;
+        }
+
         if (rigProfile === 'usdx-blackbrick') {
           // Serialized batch — one round-trip for every polled field instead
           // of one per command, per the firmware's new multi-command support.
-          // With CAT auto-report active the radio pushes changes itself, so
-          // the batch shrinks to SM (continuous telemetry — nothing to
-          // "report") + AI (re-discovery in case an announce was lost).
-          const cmds = autoReportActive ? BLACKBRICK_WAIT_POLL_CMDS : BLACKBRICK_POLL_CMDS;
           let resp = '';
-          try { resp = await queryBatch(cmds, true); } catch { resp = ''; }
+          try { resp = await queryBatch(BLACKBRICK_POLL_CMDS, true); } catch { resp = ''; }
           const frames = resp.split(';').filter(Boolean).map(f => f + ';');
           const byPrefix = new Map<string, string>();
           for (const f of frames) byPrefix.set(f.substring(0, 2), f);
@@ -637,7 +671,6 @@ export function useRadioCAT(): RadioCATControls {
           const drive     = byPrefix.has('DR') ? parseIntField(byPrefix.get('DR')!, 'DR') : null;
           const backlight = byPrefix.has('BL') ? parseIntField(byPrefix.get('BL')!, 'BL') : null;
           const agcLevel  = byPrefix.has('AL') ? parseIntField(byPrefix.get('AL')!, 'AL') : null;
-          const autoRep   = byPrefix.has('AI') ? parseIntField(byPrefix.get('AI')!, 'AI') : null;
 
           log('debug', 'poll(batch) — freq:', freq, 'mode:', mode, 'agc:', agc, 'agcLvl:', agcLevel, 'filt:', filter,
             'vol:', volume, 'att1:', att1, 'att2:', att2, 'nr:', nr, 'sm:', sMeter, 'drive:', drive, 'bl:', backlight, `[q:${queue.length}]`);
@@ -658,10 +691,6 @@ export function useRadioCAT(): RadioCATControls {
             // sMeter is read-only telemetry — no grace period needed, always take the latest poll value.
             sMeter:    smRaw !== null ? sMeter : prev.sMeter,
           }));
-          // Capability/mode switch AFTER the state update: the poll that
-          // discovers AI1 is itself the "query once for the current state" —
-          // from the next cycle on, only the light SM/AI batch runs.
-          if (autoRep !== null) applyAutoReportState(autoRep >= 1);
         } else {
           const safeQuery = async (cmd: string): Promise<string> => {
             try { return await query(cmd, true); } catch { return ''; }
@@ -775,6 +804,21 @@ export function useRadioCAT(): RadioCATControls {
             await new Promise(res => setTimeout(res, 300));
           }
           log('warn', 'radio did not answer FV; — PU7FTW extensions hidden');
+        })();
+        // One-shot CAT auto-report discovery (AI; — same retry pattern as FV).
+        // Deliberately queried only here, at connection time: older firmware
+        // always answers AI0; (→ keep long-polling), and later toggles at the
+        // rig are announced with an unsolicited AIn; frame, so re-polling the
+        // capability would be wasted traffic.
+        (async () => {
+          for (let i = 0; i < 3; i++) {
+            let resp = '';
+            try { resp = await query('AI;'); } catch { /* retry */ }
+            const v = parseIntField(resp, 'AI');
+            if (v !== null) { applyAutoReportState(v >= 1); return; }
+            await new Promise(res => setTimeout(res, 300));
+          }
+          log('warn', 'radio did not answer AI; — assuming no auto-report (long poll)');
         })();
       }
     } catch (err) {

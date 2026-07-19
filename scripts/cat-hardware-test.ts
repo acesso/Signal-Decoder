@@ -137,6 +137,18 @@ function main(): void {
     // Drain any boot-time noise before starting.
     readAvailable(fd, 300);
 
+    // ── AI auto-report state: read it, then DISABLE for the deterministic
+    // part of the run — with AI1 the radio pushes unsolicited frames (incl.
+    // throttled SM telemetry on every dbm change) into any read window,
+    // which would break the strict batch-order check below. The dedicated
+    // AI section near the end re-enables it, validates the pushes, and
+    // restores this saved state. ──
+    const aiInitialResp = sendGet(fd, 'AI;', 'AI');
+    const aiInitial = parseIntField(aiInitialResp, 'AI');
+    record('AI; GET returns 0/1', aiInitial === 0 || aiInitial === 1, JSON.stringify(aiInitialResp));
+    if (aiInitial === 1) sendSetVerified(fd, 'AI0;', 'AI', 0);
+    readAvailable(fd, 500); // let any already-queued push frames drain out
+
     // ── IF; sanity ──
     const ifResp = sendGet(fd, 'IF;', 'IF');
     const ifOk = /IF\d{11}00000\+0000000000\d\d000000;/.test(ifResp);
@@ -395,11 +407,9 @@ function main(): void {
     // the radio pushes the standard GET reply frame whenever a CAT-mapped
     // setting changes — including changes made via CAT itself, which is what
     // makes the push observable from this script (a real knob turn can't be
-    // automated). The AI state persists to EEPROM, so it is restored below. ──
-    const aiBeforeResp = sendGet(fd, 'AI;', 'AI');
-    const aiBefore = parseIntField(aiBeforeResp, 'AI');
-    record('AI; GET returns 0/1', aiBefore === 0 || aiBefore === 1, JSON.stringify(aiBeforeResp));
-
+    // automated) — plus throttled SM telemetry. The AI state persists to
+    // EEPROM; the state saved at the top of the run is restored below. ──
+    const aiBefore = aiInitial;
     if (aiBefore !== null) {
       const aiOnResp = send(fd, 'AI1;');
       record('AI1 SET echoes the new state', parseIntField(aiOnResp, 'AI') === 1, JSON.stringify(aiOnResp));
@@ -435,6 +445,18 @@ function main(): void {
         }
         record('FA SET with AI1 triggers an unsolicited FA report', faRep.includes(faProbe), JSON.stringify(faRep));
         send(fd, faRestore, 600); // restore tuning (also auto-reported)
+      }
+
+      // SM telemetry push: sent on dbm change, rate-limited to 300 ms. Force a
+      // large dbm step with max analog attenuation and listen — the push must
+      // arrive without any SM; query on the wire. Restore afterwards.
+      const atForSm = parseIntField(sendGet(fd, 'AT;', 'AT'), 'AT');
+      if (atForSm !== null) {
+        const atSmProbe = atForSm === 7 ? 0 : 7; // guarantee a real attenuation step
+        const smWindow = send(fd, `AT${atSmProbe};`, 300) + readAvailable(fd, 2000);
+        record('SM telemetry pushed after attenuation change (no SM; query sent)', /SM-?\d+;/.test(smWindow), JSON.stringify(smWindow));
+        sendSetVerified(fd, `AT${atForSm};`, 'AT', atForSm);
+        readAvailable(fd, 800); // drain the restore's own pushes (AT echo + report, trailing SM)
       }
 
       // Turning auto-report OFF must still be announced (echo doubles as the

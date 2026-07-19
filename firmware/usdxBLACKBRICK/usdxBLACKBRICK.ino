@@ -81,7 +81,7 @@ Global variables use 1499 bytes (73%) of dynamic memory, leaving 549 bytes for l
 //                               RIT mode now allows mode to be changed.
 //  2023/04/17 - Release 4.00c : Ammended configuration for TRUSDX clone so that latched-relay band switching and SWR selection is included.
 //  2023/04/18 - Release 4.00d : Minor updates to handle both 5 and 8 band versions of (tr)usdx clone
-//  2026/07/19 - Release 4.02a : PU7FTW - CAT auto-report: new menu 8.7 "CAT auto rep" + AI;/AI0;/AI1; commands. When on, pushes the standard GET reply frame whenever a CAT-mapped setting changes locally (see catCheckReport), so clients can wait for updates instead of long-polling. NOTE: CAT_AUTO enum insertion shifts the EEPROM layout — the version bump forces a settings reset on first boot (recalibrate Ref frq).
+//  2026/07/19 - Release 4.02a : PU7FTW - CAT auto-report: new menu 8.7 "CAT auto rep" + AI;/AI0;/AI1; commands. When on, pushes the standard GET reply frame whenever a CAT-mapped setting changes locally, plus throttled S-meter telemetry (300ms min interval, on change only), so clients need no polling at all (see catCheckReport). NOTE: CAT_AUTO enum insertion shifts the EEPROM layout — the version bump forces a settings reset on first boot (recalibrate Ref frq).
 
 //  : Added new post mag IQ filter, added BlackBrick config.
 //  : todo see "// xyzzy Test with i_d"
@@ -5744,6 +5744,8 @@ void catCheckReport()
 	static uint32_t s_freq, s_fxtal;
 	static int8_t s_volume;
 	static uint8_t s_mode, s_filt, s_att, s_att2, s_nr, s_agc, s_agc_lvl, s_drive, s_tot, s_backlight, s_pwm_min, s_pwm_max, s_cat_auto;
+	static int16_t s_dbm;
+	static uint32_t sm_hold_ms;
 	static bool primed = false;
 
 	if (tx) return;  // never interleave reports with TX; pending diffs flush right after RX
@@ -5770,6 +5772,12 @@ void catCheckReport()
 	if (s_pwm_min != pwm_min)       { s_pwm_min = pwm_min;     if (live) Command_PM_GET(); }
 	if (s_pwm_max != pwm_max)       { s_pwm_max = pwm_max;     if (live) Command_PX_GET(); }
 	if (s_fxtal != si5351.fxtal)    { s_fxtal = si5351.fxtal;  if (live) Command_XF_GET(); }
+
+	// S-meter: continuous telemetry rather than a discrete setting — pushed on
+	// change so the client needs no poll at all, but rate-limited to one frame
+	// per 300 ms: a churning band costs at most ~25 bytes/s of UART time and
+	// two compares per loop pass, nothing the DSP feels.
+	if (live && dbm != s_dbm && millis() >= sm_hold_ms) { s_dbm = dbm; sm_hold_ms = millis() + 300; Command_SM_GET(); }
 }
 
 #endif //CAT

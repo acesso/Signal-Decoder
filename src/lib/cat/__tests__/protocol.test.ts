@@ -5,8 +5,9 @@
  * They validate command string construction, response parsing, multi-command
  * batching, and all custom PU7FTW extension commands (BL/VO/TQ/AT/A2/NR/AG0/AL/TT/FW/SM/DR/PM/PX),
  * plus the AI auto-report capability (firmware ≥4.02a): AI1 means the radio
- * pushes GET-format frames on local changes and the app drops its long poll
- * to a light SM;AI; batch; AI0 (and every older firmware) keeps the long poll.
+ * pushes GET-format frames on local changes and throttled SM telemetry, and
+ * the app stops polling entirely; AI0 (and every older firmware) keeps the
+ * long poll. AI is discovered once at connect, like FV.
  * Note: BL (backlight) is polled and surfaced in the UI again since the
  * 2026-07-04 firmware fix (BACKLIGHT_PIN moved to the correct pin, PD3).
  * PM/PX (PA bias endpoints) are deliberately NOT polled — they're fetched
@@ -231,7 +232,7 @@ describe('response parsing — custom BLACK_BRICK commands', () => {
 
   test('AI — CAT auto-report state (menu "CAT auto rep", firmware ≥4.02a)', () => {
     // 0 = off (also what ALL older firmwares answer — capability discovery:
-    // AI0 → keep long-polling; AI1 → radio pushes changes, drop to SM/AI poll).
+    // AI0 → keep long-polling; AI1 → radio pushes changes, no polling at all).
     expect(parseIntField('AI0;', 'AI')).toBe(0);
     expect(parseIntField('AI1;', 'AI')).toBe(1);
     expect(parseIntField('AI;', 'AI')).toBeNull();
@@ -326,11 +327,11 @@ describe('response parsing — custom BLACK_BRICK commands', () => {
 });
 
 describe('multi-command / batched poll parsing', () => {
-  const BATCH_RESPONSE = 'FA00014225000;MD2;AG01;FW3;VO8;AT2;A216;NR4;SM-68;DR5;BL1;AL4;AI1;';
+  const BATCH_RESPONSE = 'FA00014225000;MD2;AG01;FW3;VO8;AT2;A216;NR4;SM-68;DR5;BL1;AL4;';
 
-  test('splitFrames — all 13 frames', () => {
+  test('splitFrames — all 12 frames', () => {
     const frames = splitFrames(BATCH_RESPONSE);
-    expect(frames).toHaveLength(13);
+    expect(frames).toHaveLength(12);
     expect(frames[0]).toBe('FA00014225000;');
     expect(frames[1]).toBe('MD2;');
     expect(frames[2]).toBe('AG01;');
@@ -342,7 +343,6 @@ describe('multi-command / batched poll parsing', () => {
     expect(frames[8]).toBe('SM-68;');
     expect(frames[9]).toBe('DR5;');
     expect(frames[10]).toBe('BL1;');
-    expect(frames[12]).toBe('AI1;');
   });
 
   test('framesByPrefix — lookup by 2-char prefix', () => {
@@ -359,7 +359,6 @@ describe('multi-command / batched poll parsing', () => {
     expect(map.get('SM')).toBe('SM-68;');
     expect(map.get('DR')).toBe('DR5;');
     expect(map.get('BL')).toBe('BL1;');
-    expect(map.get('AI')).toBe('AI1;');
   });
 
   test('full batch parse — all fields', () => {
@@ -378,7 +377,6 @@ describe('multi-command / batched poll parsing', () => {
     expect(parseIntField(map.get('SM')!, 'SM')).toBe(-68);
     expect(parseIntField(map.get('DR')!, 'DR')).toBe(5);
     expect(parseIntField(map.get('BL')!, 'BL')).toBe(1);
-    expect(parseIntField(map.get('AI')!, 'AI')).toBe(1);
   });
 
   test('partial batch — missing fields stay null', () => {
@@ -425,19 +423,18 @@ describe('IF frame parsing', () => {
 });
 
 describe('BLACKBRICK_POLL_CMDS array', () => {
-  const BLACKBRICK_POLL_CMDS = ['FA;', 'MD;', 'AG0;', 'FW;', 'VO;', 'AT;', 'A2;', 'NR;', 'SM;', 'DR;', 'BL;', 'AL;', 'AI;'];
-  const BLACKBRICK_WAIT_POLL_CMDS = ['SM;', 'AI;'];
+  const BLACKBRICK_POLL_CMDS = ['FA;', 'MD;', 'AG0;', 'FW;', 'VO;', 'AT;', 'A2;', 'NR;', 'SM;', 'DR;', 'BL;', 'AL;'];
 
-  test('13 commands in poll array', () => {
-    expect(BLACKBRICK_POLL_CMDS).toHaveLength(13);
+  test('12 commands in poll array', () => {
+    expect(BLACKBRICK_POLL_CMDS).toHaveLength(12);
   });
 
-  test('AI; is included — capability discovery + recovery if an AI announce is lost', () => {
-    expect(BLACKBRICK_POLL_CMDS).toContain('AI;');
-  });
-
-  test('wait-mode poll (auto-report active) — only SM telemetry and the AI flag', () => {
-    expect(BLACKBRICK_WAIT_POLL_CMDS).toEqual(['SM;', 'AI;']);
+  test('AI; is intentionally NOT polled — discovered once at connect, like FV;', () => {
+    // With auto-report active there is no poll at all (the radio pushes
+    // settings + throttled SM); toggling the feature at the rig arrives as an
+    // unsolicited AIn; announce, and a silence watchdog re-asks only after
+    // total radio silence. Older firmware answers AI0; once → long poll.
+    expect(BLACKBRICK_POLL_CMDS).not.toContain('AI;');
   });
 
   test('AG0; is included', () => {
@@ -468,7 +465,7 @@ describe('BLACKBRICK_POLL_CMDS array', () => {
 
   test('prefixes derived from commands', () => {
     const prefixes = BLACKBRICK_POLL_CMDS.map(c => c.substring(0, 2));
-    expect(prefixes).toEqual(['FA', 'MD', 'AG', 'FW', 'VO', 'AT', 'A2', 'NR', 'SM', 'DR', 'BL', 'AL', 'AI']);
+    expect(prefixes).toEqual(['FA', 'MD', 'AG', 'FW', 'VO', 'AT', 'A2', 'NR', 'SM', 'DR', 'BL', 'AL']);
   });
 });
 
