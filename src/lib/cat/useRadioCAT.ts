@@ -548,8 +548,14 @@ export function useRadioCAT(): RadioCATControls {
     if (active !== autoReportActive) {
       autoReportActive = active;
       log('info', active
-        ? 'CAT auto-report on (AI1) — radio pushes changes, dropping to light SM/AI poll'
+        ? 'CAT auto-report on (AI1) — polling stops, radio pushes changes'
         : 'CAT auto-report off (AI0) — falling back to full long poll');
+      // Entering wait mode: query the complete current state ONCE — the
+      // pushes only cover changes from here on, and at connect time the AI
+      // discovery usually wins the race against the first long poll, so
+      // without this the UI would start empty. (Leaving wait mode needs
+      // nothing: the resumed long poll refreshes everything on its own.)
+      if (active) void refreshBlackbrickState(false);
     }
     setState(prev => prev.autoReport === active ? prev : ({ ...prev, autoReport: active }));
   };
@@ -605,6 +611,61 @@ export function useRadioCAT(): RadioCATControls {
     return false;
   };
 
+  // One batched query of every polled field, applied to state. Runs on every
+  // long-poll cycle, and ONCE when entering auto-report wait mode — the pushes
+  // only cover *changes*, so wait mode must start from a full snapshot.
+  const refreshBlackbrickState = async (isPoll: boolean) => {
+    const now = Date.now();
+    const ls  = lastSet;
+    // Serialized batch — one round-trip for every polled field instead
+    // of one per command, per the firmware's multi-command support.
+    let resp = '';
+    try { resp = await queryBatch(BLACKBRICK_POLL_CMDS, isPoll); } catch { resp = ''; }
+    const frames = resp.split(';').filter(Boolean).map(f => f + ';');
+    const byPrefix = new Map<string, string>();
+    for (const f of frames) byPrefix.set(f.substring(0, 2), f);
+
+    // AG0 replies as "AG0n;" — prefix is "AG", not "AG0"
+    const agcRaw = [...byPrefix.entries()].find(([k]) => k === 'AG')?.[1] ?? null;
+    const freq      = byPrefix.has('FA') ? parseFrequency(byPrefix.get('FA')!) : null;
+    const mode      = byPrefix.has('MD') ? parseMode(byPrefix.get('MD')!) : null;
+    const agc       = agcRaw ? parseIntField(agcRaw, 'AG0') : null;
+    const filter    = byPrefix.has('FW') ? parseIntField(byPrefix.get('FW')!, 'FW') : null;
+    const volume    = byPrefix.has('VO') ? parseIntField(byPrefix.get('VO')!, 'VO') : null;
+    const att1      = byPrefix.has('AT') ? parseIntField(byPrefix.get('AT')!, 'AT') : null;
+    const att2      = byPrefix.has('A2') ? parseIntField(byPrefix.get('A2')!, 'A2') : null;
+    const nr        = byPrefix.has('NR') ? parseIntField(byPrefix.get('NR')!, 'NR') : null;
+    // SM is special: during TX the firmware replies an empty "SM;" (nothing to
+    // measure — the ADC samples the mic). Frame present but valueless → reading
+    // is genuinely unavailable (null). Frame absent → dropped by line noise,
+    // keep the previous value.
+    const smRaw     = byPrefix.get('SM') ?? null;
+    const sMeter    = smRaw ? parseIntField(smRaw, 'SM') : null;
+    const drive     = byPrefix.has('DR') ? parseIntField(byPrefix.get('DR')!, 'DR') : null;
+    const backlight = byPrefix.has('BL') ? parseIntField(byPrefix.get('BL')!, 'BL') : null;
+    const agcLevel  = byPrefix.has('AL') ? parseIntField(byPrefix.get('AL')!, 'AL') : null;
+
+    log('debug', isPoll ? 'poll(batch)' : 'state refresh', '— freq:', freq, 'mode:', mode, 'agc:', agc, 'agcLvl:', agcLevel, 'filt:', filter,
+      'vol:', volume, 'att1:', att1, 'att2:', att2, 'nr:', nr, 'sm:', sMeter, 'drive:', drive, 'bl:', backlight, `[q:${queue.length}]`);
+
+    setState(prev => ({
+      ...prev,
+      frequency: freq   !== null && (now - ls.frequency > SET_GRACE_MS) ? freq   : prev.frequency,
+      mode:      mode   !== null && (now - ls.mode      > SET_GRACE_MS) ? mode   : prev.mode,
+      agc:       agc    !== null && (now - ls.agc       > SET_GRACE_MS) ? agc    : prev.agc,
+      agcLevel:  agcLevel !== null && (now - ls.agcLevel > SET_GRACE_MS) ? agcLevel : prev.agcLevel,
+      filter:    filter !== null && (now - ls.filter    > SET_GRACE_MS) ? filter : prev.filter,
+      volume:    volume !== null && (now - ls.volume    > SET_GRACE_MS) ? volume : prev.volume,
+      att1:      att1   !== null && (now - ls.att1      > SET_GRACE_MS) ? att1   : prev.att1,
+      att2:      att2   !== null && (now - ls.att2      > SET_GRACE_MS) ? att2   : prev.att2,
+      nr:        nr     !== null && (now - ls.nr        > SET_GRACE_MS) ? nr     : prev.nr,
+      drive:     drive  !== null && (now - ls.drive     > SET_GRACE_MS) ? drive  : prev.drive,
+      backlight: backlight !== null && (now - ls.backlight > SET_GRACE_MS) ? backlight : prev.backlight,
+      // sMeter is read-only telemetry — no grace period needed, always take the latest poll value.
+      sMeter:    smRaw !== null ? sMeter : prev.sMeter,
+    }));
+  };
+
   // ── Poll loop — self-scheduling setTimeout so the next poll only fires
   // after the current one fully completes. This prevents poll buildup when
   // the radio is slow or the USB-serial stack stalls. ─────────────────────
@@ -644,53 +705,7 @@ export function useRadioCAT(): RadioCATControls {
         }
 
         if (rigProfile === 'usdx-blackbrick') {
-          // Serialized batch — one round-trip for every polled field instead
-          // of one per command, per the firmware's new multi-command support.
-          let resp = '';
-          try { resp = await queryBatch(BLACKBRICK_POLL_CMDS, true); } catch { resp = ''; }
-          const frames = resp.split(';').filter(Boolean).map(f => f + ';');
-          const byPrefix = new Map<string, string>();
-          for (const f of frames) byPrefix.set(f.substring(0, 2), f);
-
-          // AG0 replies as "AG0n;" — prefix is "AG", not "AG0"
-          const agcRaw = [...byPrefix.entries()].find(([k]) => k === 'AG')?.[1] ?? null;
-          const freq      = byPrefix.has('FA') ? parseFrequency(byPrefix.get('FA')!) : null;
-          const mode      = byPrefix.has('MD') ? parseMode(byPrefix.get('MD')!) : null;
-          const agc       = agcRaw ? parseIntField(agcRaw, 'AG0') : null;
-          const filter    = byPrefix.has('FW') ? parseIntField(byPrefix.get('FW')!, 'FW') : null;
-          const volume    = byPrefix.has('VO') ? parseIntField(byPrefix.get('VO')!, 'VO') : null;
-          const att1      = byPrefix.has('AT') ? parseIntField(byPrefix.get('AT')!, 'AT') : null;
-          const att2      = byPrefix.has('A2') ? parseIntField(byPrefix.get('A2')!, 'A2') : null;
-          const nr        = byPrefix.has('NR') ? parseIntField(byPrefix.get('NR')!, 'NR') : null;
-          // SM is special: during TX the firmware replies an empty "SM;" (nothing to
-          // measure — the ADC samples the mic). Frame present but valueless → reading
-          // is genuinely unavailable (null). Frame absent → dropped by line noise,
-          // keep the previous value.
-          const smRaw     = byPrefix.get('SM') ?? null;
-          const sMeter    = smRaw ? parseIntField(smRaw, 'SM') : null;
-          const drive     = byPrefix.has('DR') ? parseIntField(byPrefix.get('DR')!, 'DR') : null;
-          const backlight = byPrefix.has('BL') ? parseIntField(byPrefix.get('BL')!, 'BL') : null;
-          const agcLevel  = byPrefix.has('AL') ? parseIntField(byPrefix.get('AL')!, 'AL') : null;
-
-          log('debug', 'poll(batch) — freq:', freq, 'mode:', mode, 'agc:', agc, 'agcLvl:', agcLevel, 'filt:', filter,
-            'vol:', volume, 'att1:', att1, 'att2:', att2, 'nr:', nr, 'sm:', sMeter, 'drive:', drive, 'bl:', backlight, `[q:${queue.length}]`);
-
-          setState(prev => ({
-            ...prev,
-            frequency: freq   !== null && (now - ls.frequency > SET_GRACE_MS) ? freq   : prev.frequency,
-            mode:      mode   !== null && (now - ls.mode      > SET_GRACE_MS) ? mode   : prev.mode,
-            agc:       agc    !== null && (now - ls.agc       > SET_GRACE_MS) ? agc    : prev.agc,
-            agcLevel:  agcLevel !== null && (now - ls.agcLevel > SET_GRACE_MS) ? agcLevel : prev.agcLevel,
-            filter:    filter !== null && (now - ls.filter    > SET_GRACE_MS) ? filter : prev.filter,
-            volume:    volume !== null && (now - ls.volume    > SET_GRACE_MS) ? volume : prev.volume,
-            att1:      att1   !== null && (now - ls.att1      > SET_GRACE_MS) ? att1   : prev.att1,
-            att2:      att2   !== null && (now - ls.att2      > SET_GRACE_MS) ? att2   : prev.att2,
-            nr:        nr     !== null && (now - ls.nr        > SET_GRACE_MS) ? nr     : prev.nr,
-            drive:     drive  !== null && (now - ls.drive     > SET_GRACE_MS) ? drive  : prev.drive,
-            backlight: backlight !== null && (now - ls.backlight > SET_GRACE_MS) ? backlight : prev.backlight,
-            // sMeter is read-only telemetry — no grace period needed, always take the latest poll value.
-            sMeter:    smRaw !== null ? sMeter : prev.sMeter,
-          }));
+          await refreshBlackbrickState(true);
         } else {
           const safeQuery = async (cmd: string): Promise<string> => {
             try { return await query(cmd, true); } catch { return ''; }
