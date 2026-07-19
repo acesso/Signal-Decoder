@@ -50,7 +50,7 @@ Global variables use 1499 bytes (73%) of dynamic memory, leaving 549 bytes for l
 */
 
 //  G8RDI Modifications log:
-#define VERSION   "4.01a"    // Fixed format "9.99z" : Additions and changes Copyright 2022-2023 GW8RDI - You can use and distribute if you maintain the copyright message, commercial use is prohibited.
+#define VERSION   "4.02a"    // Fixed format "9.99z" : Additions and changes Copyright 2022-2023 GW8RDI - You can use and distribute if you maintain the copyright message, commercial use is prohibited.
 
 //  2022/03/04 - Added delay to show serial number at start - G8RDI mod
 //               Added band change direction based on last freq step directions. See "case BE | DC:" - GW8RDI mod
@@ -81,6 +81,7 @@ Global variables use 1499 bytes (73%) of dynamic memory, leaving 549 bytes for l
 //                               RIT mode now allows mode to be changed.
 //  2023/04/17 - Release 4.00c : Ammended configuration for TRUSDX clone so that latched-relay band switching and SWR selection is included.
 //  2023/04/18 - Release 4.00d : Minor updates to handle both 5 and 8 band versions of (tr)usdx clone
+//  2026/07/19 - Release 4.02a : PU7FTW - CAT auto-report: new menu 8.7 "CAT auto rep" + AI;/AI0;/AI1; commands. When on, pushes the standard GET reply frame whenever a CAT-mapped setting changes locally (see catCheckReport), so clients can wait for updates instead of long-polling. NOTE: CAT_AUTO enum insertion shifts the EEPROM layout — the version bump forces a settings reset on first boot (recalibrate Ref frq).
 
 //  : Added new post mag IQ filter, added BlackBrick config.
 //  : todo see "// xyzzy Test with i_d"
@@ -457,6 +458,7 @@ static int8_t prev_mode;
 
 volatile uint8_t cat_active = 0;  // Run-time set when serial data being processed to keep shared LCD pins controlled
 static uint8_t cat_enabled = false;  // G8RDI mod - set to true in setup() after Serial.begin()
+static uint8_t cat_auto = 1;  // CAT auto-report (menu 8.7, AI; command): push unsolicited GET-format frames when a setting changes locally, so the client can wait instead of long-polling
 static uint8_t cat_baud_idx = 2;  // 0=9600,1=19200,2=38400,3=57600 — index into cat_baud_rates[]
 static const uint32_t cat_baud_rates[] = { 9600, 19200, 38400, 57600 };
 static const char* cat_baud_label[] = { "9600", "19200", "38400", "57600" };
@@ -4887,13 +4889,13 @@ const char* keyer_mode_label[] = { "IambicA", "IambicB","Straight" };  // GW8RDI
 
 #define _N(a) sizeof(a)/sizeof(a[0])
 
-#define N_PARAMS 46  // last visible menu param enum value (BACKL=46 after the AGC_LVL and TOT enum insertions); update when adding/removing enum entries BEFORE BACKL — getting this wrong makes a blank "hidden" menu slot appear at the wrap and drops the Backlight item
+#define N_PARAMS 47  // last visible menu param enum value (BACKL=47 after the AGC_LVL, TOT and CAT_AUTO enum insertions); update when adding/removing enum entries BEFORE BACKL — getting this wrong makes a blank "hidden" menu slot appear at the wrap and drops the Backlight item
 #ifdef KEEP_BAND_DATA
 #define I_PARAMS 5+9
-enum params_t { _NULL, VOLUME, MODE, FILTER, BAND, STEP, VFOSEL, RIT, AGC, AGC_LVL, NR, ATT, ATT2, SMETER, CWDEC, CWTONE, CWOFF, KEY_WPM, KEY_MODE, KEY_PIN, TONE_VOL, VOX, VOXGAIN, DRIVE, TOT, TXDELAY, MOX, CWINTERVAL, CWMSG1, CWMSG2, CWMSG3, CWMSG4, CWMSG5, CWMSG6, PWM_MIN, PWM_MAX, SIFXTAL, IQ_ADJ, CAT_ACTIVE, CAT_BAUD, CALIB, SR, CPULOAD, PARAM_A, PARAM_B, PARAM_C, BACKL, FREQA, FREQB, MODEA, MODEB, VERS, BAND_DATA0, BAND_DATA1, BAND_DATA2, BAND_DATA3, BAND_DATA4, BAND_DATA5, BAND_DATA6, BAND_DATA7, BAND_DATA8, ALL = 0xff };
+enum params_t { _NULL, VOLUME, MODE, FILTER, BAND, STEP, VFOSEL, RIT, AGC, AGC_LVL, NR, ATT, ATT2, SMETER, CWDEC, CWTONE, CWOFF, KEY_WPM, KEY_MODE, KEY_PIN, TONE_VOL, VOX, VOXGAIN, DRIVE, TOT, TXDELAY, MOX, CWINTERVAL, CWMSG1, CWMSG2, CWMSG3, CWMSG4, CWMSG5, CWMSG6, PWM_MIN, PWM_MAX, SIFXTAL, IQ_ADJ, CAT_ACTIVE, CAT_AUTO, CAT_BAUD, CALIB, SR, CPULOAD, PARAM_A, PARAM_B, PARAM_C, BACKL, FREQA, FREQB, MODEA, MODEB, VERS, BAND_DATA0, BAND_DATA1, BAND_DATA2, BAND_DATA3, BAND_DATA4, BAND_DATA5, BAND_DATA6, BAND_DATA7, BAND_DATA8, ALL = 0xff };
 #else
 #define I_PARAMS 5
-enum params_t { _NULL, VOLUME, MODE, FILTER, BAND, STEP, VFOSEL, RIT, AGC, AGC_LVL, NR, ATT, ATT2, SMETER, CWDEC, CWTONE, CWOFF, KEY_WPM, KEY_MODE, KEY_PIN, TONE_VOL, VOX, VOXGAIN, DRIVE, TOT, TXDELAY, MOX, CWINTERVAL, CWMSG1, CWMSG2, CWMSG3, CWMSG4, CWMSG5, CWMSG6, PWM_MIN, PWM_MAX, SIFXTAL, IQ_ADJ, CAT_ACTIVE, CAT_BAUD, CALIB, SR, CPULOAD, PARAM_A, PARAM_B, PARAM_C, BACKL, FREQA, FREQB, MODEA, MODEB, VERS, ALL = 0xff };
+enum params_t { _NULL, VOLUME, MODE, FILTER, BAND, STEP, VFOSEL, RIT, AGC, AGC_LVL, NR, ATT, ATT2, SMETER, CWDEC, CWTONE, CWOFF, KEY_WPM, KEY_MODE, KEY_PIN, TONE_VOL, VOX, VOXGAIN, DRIVE, TOT, TXDELAY, MOX, CWINTERVAL, CWMSG1, CWMSG2, CWMSG3, CWMSG4, CWMSG5, CWMSG6, PWM_MIN, PWM_MAX, SIFXTAL, IQ_ADJ, CAT_ACTIVE, CAT_AUTO, CAT_BAUD, CALIB, SR, CPULOAD, PARAM_A, PARAM_B, PARAM_C, BACKL, FREQA, FREQB, MODEA, MODEB, VERS, ALL = 0xff };
 #endif
 #define N_ALL_PARAMS (N_PARAMS+I_PARAMS)  // number of parameters
 
@@ -4986,6 +4988,7 @@ int8_t paramAction(uint8_t action, uint8_t id = ALL)  // list of parameters
 	case CAT_ACTIVE: paramAction(action, cat_enabled, 0x86, F("CAT"), offon_label, 0, 1, false);
 	if ((action == UPDATE_MENU) && cat_enabled) { Serial.begin(16000000ULL * cat_baud_rates[cat_baud_idx] / F_MCU); Command_IF(); }
 	break;
+	case CAT_AUTO: paramAction(action, cat_auto, 0x87, F("CAT auto rep"), offon_label, 0, 1, false); break;  // push unsolicited state reports on local changes; toggling is announced via AI so the client can switch polling mode (see catCheckReport)
 	case CAT_BAUD: paramAction(action, cat_baud_idx, 0x89, F("CAT baud"), cat_baud_label, 0, 3, false); break;
 #endif
 #ifdef DEBUG
@@ -5129,7 +5132,8 @@ void analyseCATcmd()    // Supported Kenwood TS-480 protocol CAT commands
 	else if (CMD('P','S',';'))                              Command_PS();
 	else if (CMD('P','S','1'))                              Command_PS1();
 	else if (CMD('A','I',';'))                              Command_AI();
-	else if (CMD('A','I','0'))                              Command_AI0();
+	else if (CMD('A','I','0'))                              Command_AI_SET(0);
+	else if (CMD('A','I','1'))                              Command_AI_SET(1);
 	else if (CMD('M','D',';'))                              Command_GetMD();
 	else if (CMD2('M','D') && CATcmd[3]==';')               Command_SetMD();
 	else if (CMD('R','X',';'))                              Command_RX();
@@ -5308,9 +5312,21 @@ void Command_IF()
 	Serial.print(Catbuffer);
 }
 
+// AI; → get CAT auto-report state (0=off, 1=on — menu 8.7 "CAT auto rep"),
+// AI0;/AI1; → set it. When on, the radio pushes an unsolicited GET-format
+// frame whenever a CAT-mapped setting changes locally (see catCheckReport),
+// so the client can sit in wait mode instead of long-polling. Stock/older
+// firmwares always answer AI0; — that's the client's capability discovery.
 void Command_AI()
 {
-	Serial.print("AI0;");
+	Serial.print(cat_auto ? F("AI1;") : F("AI0;"));
+}
+
+void Command_AI_SET(uint8_t v)
+{
+	cat_auto = v;
+	paramAction(SAVE, CAT_AUTO);
+	Command_AI();
 }
 
 void Command_XT1()
@@ -5375,11 +5391,6 @@ void Command_SetMD()
 	/*vfomode[vfosel % 2] = mode;
   si5351.iqmsa = 0;  // enforce PLL reset
 	change = true; */
-}
-
-void Command_AI0()
-{
-	Serial.print("AI0;");
 }
 
 void Command_RX()
@@ -5717,6 +5728,48 @@ void Command_XF_SET()
 		change = true;  // retune so the correction takes effect now
 	}
 	Command_XF_GET();
+}
+
+// ── CAT auto-report (menu 8.7 "CAT auto rep", AI; command) ──────────────────
+// When enabled, the radio pushes the standard GET reply frame for any
+// CAT-mapped setting the moment it changes locally (rotary, menu, buttons,
+// band memory), so the client gets updates without long-polling. ONE function
+// covers every control: called once per loop(), it diffs each CAT-visible
+// value against a shadow copy and emits the same Command_*_GET() reply a
+// query would produce. This catches every mutation path by construction —
+// no per-call-site hooks to forget. Changes made *via* CAT also pass through
+// here; the client sees a duplicate of the SET echo, which is idempotent.
+void catCheckReport()
+{
+	static uint32_t s_freq, s_fxtal;
+	static int8_t s_volume;
+	static uint8_t s_mode, s_filt, s_att, s_att2, s_nr, s_agc, s_agc_lvl, s_drive, s_tot, s_backlight, s_pwm_min, s_pwm_max, s_cat_auto;
+	static bool primed = false;
+
+	if (tx) return;  // never interleave reports with TX; pending diffs flush right after RX
+	bool live = primed && cat_enabled && cat_active;  // first pass only snapshots the boot state
+	if (live && Serial.availableForWrite() < 16) return;  // UART busy: defer the whole pass, diffs stay pending
+	primed = true;
+
+	// The AI announce bypasses the cat_auto gate: turning the feature OFF must
+	// still be reported once, so the client knows to fall back to polling.
+	if (s_cat_auto != cat_auto) { s_cat_auto = cat_auto;       if (live) Command_AI(); }
+	live = live && cat_auto;  // feature off: keep shadows synced silently
+	if (s_freq != freq)             { s_freq = freq;           if (live) Command_GETFreqA(); }
+	if (s_mode != mode)             { s_mode = mode;           if (live) Command_GetMD(); }
+	if (s_volume != volume)         { s_volume = volume;       if (live) Command_VO_GET(); }
+	if (s_filt != filt)             { s_filt = filt;           if (live) Command_FW_GET(); }
+	if (s_att != att)               { s_att = att;             if (live) Command_AT_GET(); }
+	if (s_att2 != att2)             { s_att2 = att2;           if (live) Command_A2_GET(); }
+	if (s_nr != nr)                 { s_nr = nr;               if (live) Command_NR_GET(); }
+	if (s_agc != agc)               { s_agc = agc;             if (live) Command_AG0_GET(); }
+	if (s_agc_lvl != agc_lvl)       { s_agc_lvl = agc_lvl;     if (live) Command_AL_GET(); }
+	if (s_drive != drive)           { s_drive = drive;         if (live) Command_DR_GET(); }
+	if (s_tot != tot)               { s_tot = tot;             if (live) Command_TT_GET(); }
+	if (s_backlight != backlight)   { s_backlight = backlight; if (live) Command_BL_GET(); }
+	if (s_pwm_min != pwm_min)       { s_pwm_min = pwm_min;     if (live) Command_PM_GET(); }
+	if (s_pwm_max != pwm_max)       { s_pwm_max = pwm_max;     if (live) Command_PX_GET(); }
+	if (s_fxtal != si5351.fxtal)    { s_fxtal = si5351.fxtal;  if (live) Command_XF_GET(); }
 }
 
 #endif //CAT
@@ -6828,6 +6881,10 @@ void loop()
 			cw_msg_event = 0;  // Done/aborted by key press (if CW aborts can also be caused by noise getting onto keys ADC line)
 	}
 #endif //CW_MESSAGE
+
+#ifdef CAT
+	catCheckReport();  // auto-report: push any locally-changed setting to the CAT client
+#endif
 
 	wdt_reset();
 
