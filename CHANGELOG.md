@@ -12,6 +12,14 @@ them into a version section when cutting a release.
 
 ## [Unreleased]
 
+## [0.7.6] - 2026-07-20
+
+### Added
+
+- Radio firmware (4.02a) CAT auto-report: the rig now pushes a setting's value the moment it changes locally, plus throttled S-meter telemetry, instead of waiting to be polled.
+- The app discovers this capability once at connect and, when present, stops polling entirely and applies the radio's pushed updates directly; a silence watchdog recovers if the radio ever turns the feature off without the app catching the announcement.
+- Older firmware is unaffected: the app falls back to its existing long poll exactly as before.
+
 ## [0.7.5] - 2026-07-12
 
 ### Fixed

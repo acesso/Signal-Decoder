@@ -1,6 +1,6 @@
 {
   "name": "signal-decoder",
-  "version": "0.7.5",
+  "version": "0.7.6",
   "description": "Free web-based signal decoder for amateur radio. Decode FT8/FT4 (with QSO tracking, world map, ADIF log, and CAT transmit), RTTY, CW, SSTV, NAVTEX/SITOR-B, and MFSK signals in real-time from your browser.",
   "keywords": [
     "ft8",
