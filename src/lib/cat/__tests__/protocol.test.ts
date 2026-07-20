@@ -1,9 +1,13 @@
 /**
- * CAT protocol unit tests — uSDX BLACK_BRICK 4.01a / TS-480 Kenwood dialect.
+ * CAT protocol unit tests — uSDX BLACK_BRICK 4.02a / TS-480 Kenwood dialect.
  *
  * These tests are pure JS: no hardware, no serial port, no browser APIs.
  * They validate command string construction, response parsing, multi-command
- * batching, and all custom PU7FTW extension commands (BL/VO/TQ/AT/A2/NR/AG0/AL/TT/FW/SM/DR/PM/PX).
+ * batching, and all custom PU7FTW extension commands (BL/VO/TQ/AT/A2/NR/AG0/AL/TT/FW/SM/DR/PM/PX),
+ * plus the AI auto-report capability (firmware ≥4.02a): AI1 means the radio
+ * pushes GET-format frames on local changes and throttled SM telemetry, and
+ * the app stops polling entirely; AI0 (and every older firmware) keeps the
+ * long poll. AI is discovered once at connect, like FV.
  * Note: BL (backlight) is polled and surfaced in the UI again since the
  * 2026-07-04 firmware fix (BACKLIGHT_PIN moved to the correct pin, PD3).
  * PM/PX (PA bias endpoints) are deliberately NOT polled — they're fetched
@@ -221,8 +225,29 @@ describe('response parsing — custom BLACK_BRICK commands', () => {
   test('FV — firmware version string, read-only (the app gates extensions on it)', () => {
     const parse = (r: string) => r.match(/FV(\d\.\d\d[a-z]?);/)?.[1] ?? null;
     expect(parse('FV4.01a;')).toBe('4.01a');
+    expect(parse('FV4.02a;')).toBe('4.02a');
     expect(parse('FV1.02;')).toBe('1.02');
     expect(parse('?;')).toBeNull();
+  });
+
+  test('AI — CAT auto-report state (menu "CAT auto rep", firmware ≥4.02a)', () => {
+    // 0 = off (also what ALL older firmwares answer — capability discovery:
+    // AI0 → keep long-polling; AI1 → radio pushes changes, no polling at all).
+    expect(parseIntField('AI0;', 'AI')).toBe(0);
+    expect(parseIntField('AI1;', 'AI')).toBe(1);
+    expect(parseIntField('AI;', 'AI')).toBeNull();
+    // SET wire format — AI0;/AI1; echo the new state like every other SET
+    expect('AI0;').toMatch(/^AI[01];$/);
+    expect('AI1;').toMatch(/^AI[01];$/);
+  });
+
+  test('auto-report frames — unsolicited pushes are plain GET replies', () => {
+    // With AI1 active the radio pushes the standard GET reply frame whenever a
+    // setting changes at the rig; the app parses them with the same helpers.
+    expect(parseIntField('VO8;', 'VO')).toBe(8);        // operator turned volume
+    expect(parseFrequency('FA00007074000;')).toBe(7074000);  // operator tuned
+    expect(parseMode('MD3;')).toBe('CW');               // operator changed mode
+    expect(parseIntField('AI0;', 'AI')).toBe(0);        // operator disabled auto-report → resume long poll
   });
 
   test('TT — TX time-out timer 0..255 s (default 30; firmware force-unkeys TX past the limit)', () => {
@@ -402,6 +427,14 @@ describe('BLACKBRICK_POLL_CMDS array', () => {
 
   test('12 commands in poll array', () => {
     expect(BLACKBRICK_POLL_CMDS).toHaveLength(12);
+  });
+
+  test('AI; is intentionally NOT polled — discovered once at connect, like FV;', () => {
+    // With auto-report active there is no poll at all (the radio pushes
+    // settings + throttled SM); toggling the feature at the rig arrives as an
+    // unsolicited AIn; announce, and a silence watchdog re-asks only after
+    // total radio silence. Older firmware answers AI0; once → long poll.
+    expect(BLACKBRICK_POLL_CMDS).not.toContain('AI;');
   });
 
   test('AG0; is included', () => {

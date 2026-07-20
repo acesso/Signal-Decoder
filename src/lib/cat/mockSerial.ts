@@ -52,6 +52,11 @@ export function createMockSerialPort(opts: MockSerialOptions = {}) {
     pwmMin: 10, pwmMax: 130,  // PA bias endpoints (firmware defaults)
     fxtal: 25_000_000,        // reference oscillator (XF, menu "Ref frq")
     tx: false,
+    // CAT auto-report (AI). Kept OFF here — the real firmware defaults to ON,
+    // but the mock never pushes unsolicited frames, so answering AI1; would
+    // park the app in wait mode with nothing arriving. AI0 keeps the perf
+    // testbed exercising the full long poll, which is what it measures.
+    autoReport: false,
   };
 
   const stats: MockStats = { polls: 0, lastPollAt: 0, maxPollGapMs: 0, avgPollGapMs: 0 };
@@ -77,6 +82,12 @@ export function createMockSerialPort(opts: MockSerialOptions = {}) {
       const v = parseInt(alSet[1], 10);
       if (v >= 1 && v <= 14) rig.agcLevel = v;
       return `AL${rig.agcLevel};`;
+    }
+    // AI0/AI1 SET — 3 chars, so before the generic (length > 3) set path.
+    const aiSet = cmd.match(/^AI([01])$/);
+    if (aiSet) {
+      rig.autoReport = aiSet[1] === '1';
+      return `AI${rig.autoReport ? 1 : 0};`;
     }
     const ttSet = cmd.match(/^TT(\d+)$/);
     if (ttSet) {
@@ -141,6 +152,7 @@ export function createMockSerialPort(opts: MockSerialOptions = {}) {
       case 'AL': return `AL${rig.agcLevel};`;
       case 'TT': return `TT${rig.txTimeout};`;
       case 'FV': return 'FV4.01a;';  // firmware version (FV, read-only)
+      case 'AI': return `AI${rig.autoReport ? 1 : 0};`;  // CAT auto-report state
       case 'BL': return `BL${rig.backlight};`;
       case 'PM': return `PM${rig.pwmMin};`;
       case 'PX': return `PX${rig.pwmMax};`;

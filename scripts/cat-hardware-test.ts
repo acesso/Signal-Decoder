@@ -1,5 +1,5 @@
 /**
- * CAT hardware test bed — uSDX BLACK_BRICK 4.01a.
+ * CAT hardware test bed — uSDX BLACK_BRICK 4.02a.
  *
  * Talks to the real, flashed radio over its CAT serial port and validates
  * that live behavior matches what src/lib/cat/__tests__/protocol.test.ts
@@ -111,7 +111,7 @@ function framesByPrefix(frames: string[]): Map<string, string> {
 // BL (backlight) is polled again since the 2026-07-04 firmware fix (BACKLIGHT_PIN
 // moved to the correct pin, PD3). PM/PX (PA bias) are deliberately NOT polled —
 // the app fetches them on demand when its PA settings panel opens.
-const BLACKBRICK_POLL_CMDS = ['FA;', 'MD;', 'AG0;', 'FW;', 'VO;', 'AT;', 'A2;', 'NR;', 'SM;', 'DR;', 'BL;', 'AL;', 'TT;'];
+const BLACKBRICK_POLL_CMDS = ['FA;', 'MD;', 'AG0;', 'FW;', 'VO;', 'AT;', 'A2;', 'NR;', 'SM;', 'DR;', 'BL;', 'AL;', 'TT;', 'AI;'];
 
 // ── Test bed ──────────────────────────────────────────────────────────────────
 
@@ -136,6 +136,18 @@ function main(): void {
   try {
     // Drain any boot-time noise before starting.
     readAvailable(fd, 300);
+
+    // ── AI auto-report state: read it, then DISABLE for the deterministic
+    // part of the run — with AI1 the radio pushes unsolicited frames (incl.
+    // throttled SM telemetry on every dbm change) into any read window,
+    // which would break the strict batch-order check below. The dedicated
+    // AI section near the end re-enables it, validates the pushes, and
+    // restores this saved state. ──
+    const aiInitialResp = sendGet(fd, 'AI;', 'AI');
+    const aiInitial = parseIntField(aiInitialResp, 'AI');
+    record('AI; GET returns 0/1', aiInitial === 0 || aiInitial === 1, JSON.stringify(aiInitialResp));
+    if (aiInitial === 1) sendSetVerified(fd, 'AI0;', 'AI', 0);
+    readAvailable(fd, 500); // let any already-queued push frames drain out
 
     // ── IF; sanity ──
     const ifResp = sendGet(fd, 'IF;', 'IF');
@@ -390,6 +402,70 @@ function main(): void {
     // memories and calibration on every run. Test it manually from the UI. ──
     const fdResp = sendGet(fd, 'FD;', 'FD');
     record('FD; returns an 11-value factory-defaults frame', /FD-?\d+(,-?\d+){10};/.test(fdResp), JSON.stringify(fdResp));
+
+    // ── AI; CAT auto-report (firmware ≥4.02a, menu "CAT auto rep"). With AI1
+    // the radio pushes the standard GET reply frame whenever a CAT-mapped
+    // setting changes — including changes made via CAT itself, which is what
+    // makes the push observable from this script (a real knob turn can't be
+    // automated) — plus throttled SM telemetry. The AI state persists to
+    // EEPROM; the state saved at the top of the run is restored below. ──
+    const aiBefore = aiInitial;
+    if (aiBefore !== null) {
+      const aiOnResp = send(fd, 'AI1;');
+      record('AI1 SET echoes the new state', parseIntField(aiOnResp, 'AI') === 1, JSON.stringify(aiOnResp));
+
+      // A SET now yields TWO frames: the synchronous echo plus the loop()
+      // watcher's unsolicited report. On a noise-eaten attempt, restore first
+      // (the watcher only reports actual *changes* — resending the same value
+      // produces no second frame) and probe once more.
+      const atNow = parseIntField(sendGet(fd, 'AT;', 'AT'), 'AT');
+      if (atNow !== null) {
+        const probe = atNow === 3 ? 5 : 3;
+        const gotBoth = (r: string) => (r.match(new RegExp(`AT${probe};`, 'g')) ?? []).length >= 2;
+        let atRep = send(fd, `AT${probe};`, 600);
+        if (!gotBoth(atRep)) {
+          sendSetVerified(fd, `AT${atNow};`, 'AT', atNow);
+          atRep = send(fd, `AT${probe};`, 600);
+        }
+        record('SET with AI1 yields echo + unsolicited auto-report frame', gotBoth(atRep), JSON.stringify(atRep));
+        sendSetVerified(fd, `AT${atNow};`, 'AT', atNow);
+      }
+
+      // FA SET has no echo in this firmware — any FA frame that comes back
+      // after a frequency SET is the auto-report itself. Same retry policy:
+      // restore the original tuning before a second attempt.
+      const faNow = parseIntField(sendGet(fd, 'FA;', 'FA'), 'FA');
+      const faRestore = faNow !== null ? `FA${String(faNow).padStart(11, '0')};` : '';
+      if (faNow !== null && faNow > 0) {
+        const faProbe = `FA${String(faNow + 1000).padStart(11, '0')};`;
+        let faRep = send(fd, faProbe, 800);
+        if (!faRep.includes(faProbe)) {
+          send(fd, faRestore, 600);
+          faRep = send(fd, faProbe, 800);
+        }
+        record('FA SET with AI1 triggers an unsolicited FA report', faRep.includes(faProbe), JSON.stringify(faRep));
+        send(fd, faRestore, 600); // restore tuning (also auto-reported)
+      }
+
+      // SM telemetry push: sent on dbm change, rate-limited to 300 ms. Force a
+      // large dbm step with max analog attenuation and listen — the push must
+      // arrive without any SM; query on the wire. Restore afterwards.
+      const atForSm = parseIntField(sendGet(fd, 'AT;', 'AT'), 'AT');
+      if (atForSm !== null) {
+        const atSmProbe = atForSm === 7 ? 0 : 7; // guarantee a real attenuation step
+        const smWindow = send(fd, `AT${atSmProbe};`, 300) + readAvailable(fd, 2000);
+        record('SM telemetry pushed after attenuation change (no SM; query sent)', /SM-?\d+;/.test(smWindow), JSON.stringify(smWindow));
+        sendSetVerified(fd, `AT${atForSm};`, 'AT', atForSm);
+        readAvailable(fd, 800); // drain the restore's own pushes (AT echo + report, trailing SM)
+      }
+
+      // Turning auto-report OFF must still be announced (echo doubles as the
+      // "fall back to polling" signal for the app), then restore the original.
+      const aiOffResp = send(fd, 'AI0;');
+      record('AI0 SET echoes the new state', parseIntField(aiOffResp, 'AI') === 0, JSON.stringify(aiOffResp));
+      const aiRestoreResp = sendSetVerified(fd, `AI${aiBefore};`, 'AI', aiBefore);
+      record('AI restored to its original value', parseIntField(aiRestoreResp, 'AI') === aiBefore, JSON.stringify(aiRestoreResp));
+    }
 
     // ── Unknown command should not desync the parser (firmware replies "?;") ──
     const unknownResp = send(fd, 'ZZ;');

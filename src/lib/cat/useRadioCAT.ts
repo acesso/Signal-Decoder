@@ -79,6 +79,14 @@ export interface RadioState {
    *  null until the post-connect query answers — the UI gates the PU7FTW
    *  extension controls on this instead of hardcoding a version anywhere. */
   firmwareVersion: string | null;
+  /** CAT auto-report state (AI; — menu "CAT auto rep", firmware ≥4.02a).
+   *  Discovered ONCE at connect (like firmwareVersion); false on older
+   *  firmware (always AI0;). While true, polling stops entirely — the radio
+   *  pushes settings changes and throttled S-meter telemetry itself; toggles
+   *  at the rig arrive as unsolicited AIn; announces. Deliberately NOT
+   *  user-controllable from the UI: it's a radio menu option, the app just
+   *  discovers and follows it. */
+  autoReport: boolean | null;
 }
 
 /** PA bias PWM endpoints (see PM/PX commands) — not polled; fetched on demand. */
@@ -184,7 +192,10 @@ export interface RadioCATControls {
 // Query filter: FW;    → FWn;      (0=Full 1=3000 2=2400 3=1800 4=500 5=200 6=100 7=50 Hz)
 // Set filter:   FWn;   → FWn;      (n in 0..7)
 // Query S-meter: SM;   → SMn;      (signed dBm, read-only — no SM SET. During TX
-//                                   replies an empty "SM;": no RX signal to measure)
+//                                   replies an empty "SM;": no RX signal to measure.
+//                                   With auto-report on, the firmware also PUSHES
+//                                   SMn; on change, ≤1 frame/300ms — the app's
+//                                   S-meter stays live without any polling.)
 // Query TX drive: DR;  → DRn;      (0..8, linear)
 // Set TX drive:   DRn; → DRn;
 // Query backlight: BL; → BLn;      (0=off, 1=on. Physical effect confirmed after
@@ -219,6 +230,20 @@ export interface RadioCATControls {
 //                                   from the PA settings panel only.)
 // Query firmware version: FV; → FV4.01a; (read-only — the app gates extension
 //                                   features on this instead of hardcoding)
+// Query auto-report: AI; → AIn;    (0=off 1=on — menu "CAT auto rep", firmware
+// Set auto-report: AI0;/AI1; → echo ≥4.02a. When on, the radio pushes the
+//                                   standard GET reply frame for any setting
+//                                   changed at the rig itself PLUS throttled
+//                                   S-meter telemetry (≤1 frame/300ms, on
+//                                   change), and the app stops polling
+//                                   entirely. Queried ONCE at connect time —
+//                                   older firmware always answers AI0; and the
+//                                   app keeps long-polling: retro-compatible.
+//                                   The app never SETs it — it's a radio menu
+//                                   option; toggling it at the rig is announced
+//                                   with an unsolicited AIn; frame, and a
+//                                   silence watchdog re-asks AI; only if
+//                                   nothing at all has arrived for a while.)
 // Query TX timeout: TT; → TTn;    (0..255 s, 0 = disabled — TOT guardrail that
 // Set TX timeout:  TTn; → TTn;     force-unkeys a stuck TX; out-of-range SETs
 //                                   are ignored, echo returns the old value.
@@ -227,6 +252,8 @@ export interface RadioCATControls {
 // The firmware supports serialized/batched queries in one write, e.g.
 // "FA;MD;AG0;FW;VO;AT;A2;NR;SM;DR;BL;AL;" — replies come back concatenated in the same order.
 
+// Used only while CAT auto-report is off/unknown — with auto-report active the
+// radio pushes every change (settings + throttled S-meter) and no poll runs.
 const BLACKBRICK_POLL_CMDS = ['FA;', 'MD;', 'AG0;', 'FW;', 'VO;', 'AT;', 'A2;', 'NR;', 'SM;', 'DR;', 'BL;', 'AL;'];
 
 const KENWOOD_MODE_MAP: Record<string, CATMode> = {
@@ -257,6 +284,13 @@ interface QueueEntry {
 // How long after a user set-command to suppress poll overwrites for that field.
 const SET_GRACE_MS = 1500;
 
+// Wait mode (auto-report active): if NOTHING has arrived from the radio for
+// this long, one AI; query re-checks the link and the auto-report flag — the
+// only way to get stranded in wait mode is an AI0 announce (feature turned
+// off at the rig) lost to line noise, and this recovers from it. It is not a
+// poll: on a live band the throttled S-meter pushes keep resetting the clock.
+const SILENCE_RECHECK_MS = 15_000;
+
 // ── Factory ──────────────────────────────────────────────────────────────────
 
 export function useRadioCAT(): RadioCATControls {
@@ -266,7 +300,7 @@ export function useRadioCAT(): RadioCATControls {
     isSupported: typeof navigator !== 'undefined' && 'serial' in navigator,
     volume: null, att1: null, att2: null, nr: null,
     agc: null, agcLevel: null, filter: null, sMeter: null, drive: null,
-    backlight: null, firmwareVersion: null,
+    backlight: null, firmwareVersion: null, autoReport: null,
   });
 
   let port:      SerialPort | null = null;
@@ -279,6 +313,11 @@ export function useRadioCAT(): RadioCATControls {
   let pollIntervalMs = 100;
   let debug = false;
   let rigProfile: RigProfile = 'generic';
+  // True while the radio's CAT auto-report (AI) is on — polling stops
+  // entirely; the radio pushes settings changes and throttled SM telemetry.
+  let autoReportActive = false;
+  // Timestamp of the last bytes received — drives the wait-mode silence watchdog.
+  let lastRxAt = 0;
   const encoder = new TextEncoder();
 
   let queue: QueueEntry[] = [];
@@ -358,12 +397,18 @@ export function useRadioCAT(): RadioCATControls {
   const handleResponse = (msg: string) => {
     const inf = inflight;
     if (!inf || inf.prefixes === null) {
-      log('debug', 'unsolicited →', msg.trim());
+      // Nothing awaited — auto-report frame (radio-side change), a SET echo,
+      // or the radio's boot IF; announce. Apply it if it parses as a report.
+      if (applyReportFrame(msg)) log('debug', 'report →', msg.trim());
+      else log('debug', 'unsolicited →', msg.trim());
       return;
     }
     const expected = inf.prefixes[inf.collected.length];
     if (msg.substring(0, 2) !== expected) {
-      log('debug', 'unexpected →', msg.trim(), '(waiting for', expected + ')');
+      // Not the awaited reply — the radio can interleave an auto-report frame
+      // between batch replies (its report pass runs between received chars).
+      if (applyReportFrame(msg)) log('debug', 'report (interleaved) →', msg.trim(), '(waiting for', expected + ')');
+      else log('debug', 'unexpected →', msg.trim(), '(waiting for', expected + ')');
       return;
     }
     inf.collected.push(msg);
@@ -443,6 +488,7 @@ export function useRadioCAT(): RadioCATControls {
         for (;;) {
           const { value, done } = await r.read();
           if (done) { log('debug', 'read loop: stream done'); break; }
+          lastRxAt = Date.now();
           rxBuf += dec.decode(value, { stream: true });
           // Guard against unbounded growth from a radio sending malformed data
           // with no ';' terminator — a Kenwood response is at most ~20 bytes.
@@ -495,6 +541,131 @@ export function useRadioCAT(): RadioCATControls {
     return m ? parseInt(m[1], 10) : null;
   };
 
+  // ── CAT auto-report (AI) ─────────────────────────────────────────────────
+
+  // Record an AI answer/announce and switch the poll loop's mode accordingly.
+  const applyAutoReportState = (active: boolean) => {
+    if (active !== autoReportActive) {
+      autoReportActive = active;
+      log('info', active
+        ? 'CAT auto-report on (AI1) — polling stops, radio pushes changes'
+        : 'CAT auto-report off (AI0) — falling back to full long poll');
+      // Entering wait mode: query the complete current state ONCE — the
+      // pushes only cover changes from here on, and at connect time the AI
+      // discovery usually wins the race against the first long poll, so
+      // without this the UI would start empty. (Leaving wait mode needs
+      // nothing: the resumed long poll refreshes everything on its own.)
+      if (active) void refreshBlackbrickState(false);
+    }
+    setState(prev => prev.autoReport === active ? prev : ({ ...prev, autoReport: active }));
+  };
+
+  // Apply an unsolicited GET-format frame pushed by the radio (firmware
+  // ≥4.02a auto-report, or a SET echo we didn't await). Returns true if the
+  // frame was recognized as a state report. Fields we just SET ourselves are
+  // ignored for SET_GRACE_MS — the UI already shows the target value and a
+  // trailing echo of an older SET must not flicker it backwards.
+  const applyReportFrame = (msg: string): boolean => {
+    const graceOver = (key: keyof typeof lastSet) => Date.now() - lastSet[key] > SET_GRACE_MS;
+    const freq = parseFrequency(msg);
+    if (freq !== null) {
+      if (graceOver('frequency')) setState(prev => ({ ...prev, frequency: freq }));
+      return true;
+    }
+    const mode = parseMode(msg);
+    if (mode !== null) {
+      if (graceOver('mode')) setState(prev => ({ ...prev, mode }));
+      return true;
+    }
+    if (msg.startsWith('AI')) {
+      const v = parseIntField(msg, 'AI');
+      if (v === null) return false;
+      applyAutoReportState(v >= 1);
+      return true;
+    }
+    if (msg.startsWith('AG0')) {
+      const v = parseIntField(msg, 'AG0');
+      if (v === null) return false;
+      if (graceOver('agc')) setState(prev => ({ ...prev, agc: v }));
+      return true;
+    }
+    if (msg.startsWith('SM')) {
+      // Pushed S-meter telemetry (throttled by the firmware) — read-only,
+      // no set-grace needed; an empty "SM;" is never pushed, only polled.
+      const v = parseIntField(msg, 'SM');
+      if (v === null) return false;
+      setState(prev => ({ ...prev, sMeter: v }));
+      return true;
+    }
+    const numFields = [
+      ['VO', 'volume'], ['AT', 'att1'], ['A2', 'att2'], ['NR', 'nr'], ['FW', 'filter'],
+      ['DR', 'drive'], ['BL', 'backlight'], ['AL', 'agcLevel'],
+    ] as const;
+    for (const [prefix, key] of numFields) {
+      if (!msg.startsWith(prefix)) continue;
+      const v = parseIntField(msg, prefix);
+      if (v === null) return false;
+      if (graceOver(key)) setState(prev => ({ ...prev, [key]: v }));
+      return true;
+    }
+    return false;
+  };
+
+  // One batched query of every polled field, applied to state. Runs on every
+  // long-poll cycle, and ONCE when entering auto-report wait mode — the pushes
+  // only cover *changes*, so wait mode must start from a full snapshot.
+  const refreshBlackbrickState = async (isPoll: boolean) => {
+    const now = Date.now();
+    const ls  = lastSet;
+    // Serialized batch — one round-trip for every polled field instead
+    // of one per command, per the firmware's multi-command support.
+    let resp = '';
+    try { resp = await queryBatch(BLACKBRICK_POLL_CMDS, isPoll); } catch { resp = ''; }
+    const frames = resp.split(';').filter(Boolean).map(f => f + ';');
+    const byPrefix = new Map<string, string>();
+    for (const f of frames) byPrefix.set(f.substring(0, 2), f);
+
+    // AG0 replies as "AG0n;" — prefix is "AG", not "AG0"
+    const agcRaw = [...byPrefix.entries()].find(([k]) => k === 'AG')?.[1] ?? null;
+    const freq      = byPrefix.has('FA') ? parseFrequency(byPrefix.get('FA')!) : null;
+    const mode      = byPrefix.has('MD') ? parseMode(byPrefix.get('MD')!) : null;
+    const agc       = agcRaw ? parseIntField(agcRaw, 'AG0') : null;
+    const filter    = byPrefix.has('FW') ? parseIntField(byPrefix.get('FW')!, 'FW') : null;
+    const volume    = byPrefix.has('VO') ? parseIntField(byPrefix.get('VO')!, 'VO') : null;
+    const att1      = byPrefix.has('AT') ? parseIntField(byPrefix.get('AT')!, 'AT') : null;
+    const att2      = byPrefix.has('A2') ? parseIntField(byPrefix.get('A2')!, 'A2') : null;
+    const nr        = byPrefix.has('NR') ? parseIntField(byPrefix.get('NR')!, 'NR') : null;
+    // SM is special: during TX the firmware replies an empty "SM;" (nothing to
+    // measure — the ADC samples the mic). Frame present but valueless → reading
+    // is genuinely unavailable (null). Frame absent → dropped by line noise,
+    // keep the previous value.
+    const smRaw     = byPrefix.get('SM') ?? null;
+    const sMeter    = smRaw ? parseIntField(smRaw, 'SM') : null;
+    const drive     = byPrefix.has('DR') ? parseIntField(byPrefix.get('DR')!, 'DR') : null;
+    const backlight = byPrefix.has('BL') ? parseIntField(byPrefix.get('BL')!, 'BL') : null;
+    const agcLevel  = byPrefix.has('AL') ? parseIntField(byPrefix.get('AL')!, 'AL') : null;
+
+    log('debug', isPoll ? 'poll(batch)' : 'state refresh', '— freq:', freq, 'mode:', mode, 'agc:', agc, 'agcLvl:', agcLevel, 'filt:', filter,
+      'vol:', volume, 'att1:', att1, 'att2:', att2, 'nr:', nr, 'sm:', sMeter, 'drive:', drive, 'bl:', backlight, `[q:${queue.length}]`);
+
+    setState(prev => ({
+      ...prev,
+      frequency: freq   !== null && (now - ls.frequency > SET_GRACE_MS) ? freq   : prev.frequency,
+      mode:      mode   !== null && (now - ls.mode      > SET_GRACE_MS) ? mode   : prev.mode,
+      agc:       agc    !== null && (now - ls.agc       > SET_GRACE_MS) ? agc    : prev.agc,
+      agcLevel:  agcLevel !== null && (now - ls.agcLevel > SET_GRACE_MS) ? agcLevel : prev.agcLevel,
+      filter:    filter !== null && (now - ls.filter    > SET_GRACE_MS) ? filter : prev.filter,
+      volume:    volume !== null && (now - ls.volume    > SET_GRACE_MS) ? volume : prev.volume,
+      att1:      att1   !== null && (now - ls.att1      > SET_GRACE_MS) ? att1   : prev.att1,
+      att2:      att2   !== null && (now - ls.att2      > SET_GRACE_MS) ? att2   : prev.att2,
+      nr:        nr     !== null && (now - ls.nr        > SET_GRACE_MS) ? nr     : prev.nr,
+      drive:     drive  !== null && (now - ls.drive     > SET_GRACE_MS) ? drive  : prev.drive,
+      backlight: backlight !== null && (now - ls.backlight > SET_GRACE_MS) ? backlight : prev.backlight,
+      // sMeter is read-only telemetry — no grace period needed, always take the latest poll value.
+      sMeter:    smRaw !== null ? sMeter : prev.sMeter,
+    }));
+  };
+
   // ── Poll loop — self-scheduling setTimeout so the next poll only fires
   // after the current one fully completes. This prevents poll buildup when
   // the radio is slow or the USB-serial stack stalls. ─────────────────────
@@ -517,54 +688,24 @@ export function useRadioCAT(): RadioCATControls {
         const now = Date.now();
         const ls  = lastSet;
 
+        if (rigProfile === 'usdx-blackbrick' && autoReportActive) {
+          // Wait mode: no polling at all — the radio pushes settings changes
+          // and throttled SM telemetry, handled by applyReportFrame() in the
+          // read path. Only the silence watchdog runs here (see
+          // SILENCE_RECHECK_MS): one AI; query after total radio silence.
+          if (Date.now() - lastRxAt > SILENCE_RECHECK_MS) {
+            log('debug', 'wait mode: radio silent, re-checking AI');
+            let resp = '';
+            try { resp = await query('AI;', true); } catch { resp = ''; }
+            const v = parseIntField(resp, 'AI');
+            if (v !== null) applyAutoReportState(v >= 1);
+            else lastRxAt = Date.now(); // no answer — back off a full window rather than re-asking every tick; a lost port is handled by the read loop
+          }
+          return;
+        }
+
         if (rigProfile === 'usdx-blackbrick') {
-          // Serialized batch — one round-trip for every polled field instead
-          // of one per command, per the firmware's new multi-command support.
-          let resp = '';
-          try { resp = await queryBatch(BLACKBRICK_POLL_CMDS, true); } catch { resp = ''; }
-          const frames = resp.split(';').filter(Boolean).map(f => f + ';');
-          const byPrefix = new Map<string, string>();
-          for (const f of frames) byPrefix.set(f.substring(0, 2), f);
-
-          // AG0 replies as "AG0n;" — prefix is "AG", not "AG0"
-          const agcRaw = [...byPrefix.entries()].find(([k]) => k === 'AG')?.[1] ?? null;
-          const freq      = byPrefix.has('FA') ? parseFrequency(byPrefix.get('FA')!) : null;
-          const mode      = byPrefix.has('MD') ? parseMode(byPrefix.get('MD')!) : null;
-          const agc       = agcRaw ? parseIntField(agcRaw, 'AG0') : null;
-          const filter    = byPrefix.has('FW') ? parseIntField(byPrefix.get('FW')!, 'FW') : null;
-          const volume    = byPrefix.has('VO') ? parseIntField(byPrefix.get('VO')!, 'VO') : null;
-          const att1      = byPrefix.has('AT') ? parseIntField(byPrefix.get('AT')!, 'AT') : null;
-          const att2      = byPrefix.has('A2') ? parseIntField(byPrefix.get('A2')!, 'A2') : null;
-          const nr        = byPrefix.has('NR') ? parseIntField(byPrefix.get('NR')!, 'NR') : null;
-          // SM is special: during TX the firmware replies an empty "SM;" (nothing to
-          // measure — the ADC samples the mic). Frame present but valueless → reading
-          // is genuinely unavailable (null). Frame absent → dropped by line noise,
-          // keep the previous value.
-          const smRaw     = byPrefix.get('SM') ?? null;
-          const sMeter    = smRaw ? parseIntField(smRaw, 'SM') : null;
-          const drive     = byPrefix.has('DR') ? parseIntField(byPrefix.get('DR')!, 'DR') : null;
-          const backlight = byPrefix.has('BL') ? parseIntField(byPrefix.get('BL')!, 'BL') : null;
-          const agcLevel  = byPrefix.has('AL') ? parseIntField(byPrefix.get('AL')!, 'AL') : null;
-
-          log('debug', 'poll(batch) — freq:', freq, 'mode:', mode, 'agc:', agc, 'agcLvl:', agcLevel, 'filt:', filter,
-            'vol:', volume, 'att1:', att1, 'att2:', att2, 'nr:', nr, 'sm:', sMeter, 'drive:', drive, 'bl:', backlight, `[q:${queue.length}]`);
-
-          setState(prev => ({
-            ...prev,
-            frequency: freq   !== null && (now - ls.frequency > SET_GRACE_MS) ? freq   : prev.frequency,
-            mode:      mode   !== null && (now - ls.mode      > SET_GRACE_MS) ? mode   : prev.mode,
-            agc:       agc    !== null && (now - ls.agc       > SET_GRACE_MS) ? agc    : prev.agc,
-            agcLevel:  agcLevel !== null && (now - ls.agcLevel > SET_GRACE_MS) ? agcLevel : prev.agcLevel,
-            filter:    filter !== null && (now - ls.filter    > SET_GRACE_MS) ? filter : prev.filter,
-            volume:    volume !== null && (now - ls.volume    > SET_GRACE_MS) ? volume : prev.volume,
-            att1:      att1   !== null && (now - ls.att1      > SET_GRACE_MS) ? att1   : prev.att1,
-            att2:      att2   !== null && (now - ls.att2      > SET_GRACE_MS) ? att2   : prev.att2,
-            nr:        nr     !== null && (now - ls.nr        > SET_GRACE_MS) ? nr     : prev.nr,
-            drive:     drive  !== null && (now - ls.drive     > SET_GRACE_MS) ? drive  : prev.drive,
-            backlight: backlight !== null && (now - ls.backlight > SET_GRACE_MS) ? backlight : prev.backlight,
-            // sMeter is read-only telemetry — no grace period needed, always take the latest poll value.
-            sMeter:    smRaw !== null ? sMeter : prev.sMeter,
-          }));
+          await refreshBlackbrickState(true);
         } else {
           const safeQuery = async (cmd: string): Promise<string> => {
             try { return await query(cmd, true); } catch { return ''; }
@@ -615,10 +756,11 @@ export function useRadioCAT(): RadioCATControls {
     writer = null;
     port   = null;
     rxBuf  = '';
+    autoReportActive = false;
     setState(prev => ({
       ...prev, connected: false, frequency: null, mode: null, ptt: false, error: null,
       volume: null, att1: null, att2: null, nr: null, agc: null, agcLevel: null, filter: null, sMeter: null, drive: null,
-      backlight: null, firmwareVersion: null,
+      backlight: null, firmwareVersion: null, autoReport: null,
     }));
   }
 
@@ -654,6 +796,7 @@ export function useRadioCAT(): RadioCATControls {
       pollIntervalMs = config.pollIntervalMs;
       rigProfile     = config.rigProfile;
       closing = false;  // fresh session — read-loop exit now means "port lost"
+      autoReportActive = false;  // re-discovered by the first full poll (AI;)
       port   = p;
       writer = p.writable.getWriter();
       const r = p.readable.getReader();
@@ -676,6 +819,21 @@ export function useRadioCAT(): RadioCATControls {
             await new Promise(res => setTimeout(res, 300));
           }
           log('warn', 'radio did not answer FV; — PU7FTW extensions hidden');
+        })();
+        // One-shot CAT auto-report discovery (AI; — same retry pattern as FV).
+        // Deliberately queried only here, at connection time: older firmware
+        // always answers AI0; (→ keep long-polling), and later toggles at the
+        // rig are announced with an unsolicited AIn; frame, so re-polling the
+        // capability would be wasted traffic.
+        (async () => {
+          for (let i = 0; i < 3; i++) {
+            let resp = '';
+            try { resp = await query('AI;'); } catch { /* retry */ }
+            const v = parseIntField(resp, 'AI');
+            if (v !== null) { applyAutoReportState(v >= 1); return; }
+            await new Promise(res => setTimeout(res, 300));
+          }
+          log('warn', 'radio did not answer AI; — assuming no auto-report (long poll)');
         })();
       }
     } catch (err) {
