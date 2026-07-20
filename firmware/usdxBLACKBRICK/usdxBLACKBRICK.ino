@@ -50,7 +50,7 @@ Global variables use 1499 bytes (73%) of dynamic memory, leaving 549 bytes for l
 */
 
 //  G8RDI Modifications log:
-#define VERSION   "4.02a"    // Fixed format "9.99z" : Additions and changes Copyright 2022-2023 GW8RDI - You can use and distribute if you maintain the copyright message, commercial use is prohibited.
+#define VERSION   "4.02b"    // Fixed format "9.99z" : Additions and changes Copyright 2022-2023 GW8RDI - You can use and distribute if you maintain the copyright message, commercial use is prohibited.
 
 //  2022/03/04 - Added delay to show serial number at start - G8RDI mod
 //               Added band change direction based on last freq step directions. See "case BE | DC:" - GW8RDI mod
@@ -82,6 +82,7 @@ Global variables use 1499 bytes (73%) of dynamic memory, leaving 549 bytes for l
 //  2023/04/17 - Release 4.00c : Ammended configuration for TRUSDX clone so that latched-relay band switching and SWR selection is included.
 //  2023/04/18 - Release 4.00d : Minor updates to handle both 5 and 8 band versions of (tr)usdx clone
 //  2026/07/19 - Release 4.02a : PU7FTW - CAT auto-report: new menu 8.7 "CAT auto rep" + AI;/AI0;/AI1; commands. When on, pushes the standard GET reply frame whenever a CAT-mapped setting changes locally, plus throttled S-meter telemetry (300ms min interval, on change only), so clients need no polling at all (see catCheckReport). NOTE: CAT_AUTO enum insertion shifts the EEPROM layout — the version bump forces a settings reset on first boot (recalibrate Ref frq).
+//  2026/07/20 - Release 4.02b : PU7FTW - Fixed NR (menu 1.9, CAT command NR) non-linearity: process_nr()'s single-pole low-pass used `1 << (nr-1)` as EA()'s integer divisor, a geometric time constant (1,2,4,8,16,32,64,128) that collapsed the audible range into the first 3-4 steps (~1243Hz down to ~155Hz by nr=4) while nr=5..8 were nearly indistinguishable (~78Hz down to ~10Hz) — heard/seen as disproportionate high-end signal reduction as NR increased. Replaced with EA_Q15() (fixed-point Q15 multiply instead of integer division) driven by a new nr_alpha_q15[8] table giving a LINEAR cutoff sweep, 1200Hz down to 150Hz in 8 even ~150Hz steps.
 
 //  : Added new post mag IQ filter, added BlackBrick config.
 //  : todo see "// xyzzy Test with i_d"
@@ -2425,6 +2426,11 @@ void dsp_tx_fm()
 
 #define EA(y, x, one_over_alpha)  (y) = (y) + ((x) - (y)) / (one_over_alpha); // exponental averaging [Lyons 13.33.1]
 #define MLEA(y, x, L, M)  (y)  = (y) + ((((x) - (y)) >> (L)) - (((x) - (y)) >> (M))); // multiplierless exponental averaging [Lyons 13.33.1], with alpha=1/2^L - 1/2^M
+// Fixed-point (Q15) exponential averaging: same recurrence as EA, but alpha is
+// a 0..32768 fraction instead of an integer 1/alpha — needed because EA's
+// integer divisor only takes powers of two (1,2,4,8..), which cannot express
+// a LINEAR cutoff-frequency sweep (see nr_alpha_q15[] below for why NR needed this).
+#define EA_Q15(y, x, alpha_q15)  (y) = (y) + (int16_t)(((int32_t)((x) - (y)) * (alpha_q15)) >> 15);
 
 
 const char m2c[] PROGMEM = "~ ETIANMSURWDKGOHVF*L*PJBXCYZQ**54S3***2**+***J16=/***H*7*G*8*90************?_****\"**.****@***'**-********;!*)*****,****:****";
@@ -2697,6 +2703,15 @@ volatile uint8_t agc = 2;
 volatile uint8_t agc = 1;
 #endif
 volatile uint8_t nr = 0;    // G8RDI mod
+// NR (menu 1.9, CAT command NR) single-pole low-pass cutoff, indexed nr-1.
+// Was `1 << (nr-1)` fed to the EA() integer-division macro — a geometric
+// 1/alpha (1,2,4,8,16,32,64,128) that put ALL 8 steps' audible range into the
+// first 3-4 clicks (cutoff collapsed from ~1243Hz to ~155Hz by nr=4) while
+// nr=5..8 were nearly indistinguishable (~78Hz down to ~10Hz). These Q15
+// alpha values instead give a LINEAR cutoff sweep, 1200Hz down to 150Hz in
+// 8 equal ~150Hz steps, computed via alpha = 1 - exp(-2*pi*fc/Fs) at the
+// ~7812Hz rate process_nr() actually runs at (F_SAMP_RX/8 decimation).
+static const uint16_t nr_alpha_q15[8] = { 20285, 18685, 16879, 14842, 12543, 9950, 7025, 3724 };
 volatile uint8_t att = 0;
 volatile uint8_t att2 = 0;  // note: values >=2 help prevent numeric overflow on strong signals
 volatile uint8_t _init = 0;
@@ -2987,7 +3002,7 @@ inline int16_t process_nr(int16_t in)
 	  else inv_gain = 32768;*/
 
 	static int16_t ea1;
-	ea1 = EA(ea1, in, 1 << (nr - 1));
+	EA_Q15(ea1, in, nr_alpha_q15[nr - 1]);
 	//static int16_t ea2;
 	//ea2 = EA(ea2, ea1, inv_gain);
 

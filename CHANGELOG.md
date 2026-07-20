@@ -12,6 +12,12 @@ them into a version section when cutting a release.
 
 ## [Unreleased]
 
+## [0.7.7] - 2026-07-20
+
+### Fixed
+
+- Radio firmware (4.02b) NR (noise reduction, menu 1.9): the filter's cutoff frequency was collapsing geometrically as the setting increased, so most of the range's audible effect was crammed into the first few steps and the rest sounded nearly identical. It now sweeps linearly across 8 evenly-spaced cutoff steps.
+
 ## [0.7.6] - 2026-07-20
 
 ### Added
