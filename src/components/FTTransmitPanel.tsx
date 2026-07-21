@@ -406,12 +406,24 @@ export default function FTTransmitPanel(props: FTTransmitPanelProps): JSX.Elemen
     () => props.onSetPTT,
   )
 
-  // Keep the auto-CQ cache in sync with mode/baseFreq changes.
+  // Keep the auto-CQ cache in sync with mode/baseFreq changes. Debounced:
+  // baseFreq (the "Audio Hz" field) commits on every single step-button
+  // click and every keystroke while typing (see NumberField's onInput/step),
+  // and syncParams() spawns a real encodeAsync() DSP encode — without this
+  // debounce, holding/repeatedly clicking the step buttons queued a fresh
+  // encode per click, almost all of them thrown away the instant the next
+  // one superseded them (see rebuildAutoCQCache's staleness guard), causing
+  // visible lag. Mode changes are rare/discrete (a dropdown pick), so only
+  // baseFreq's rapid-fire case needs debouncing — but both go through the
+  // same timer for one code path.
+  let syncParamsTimer: ReturnType<typeof setTimeout> | undefined
   createEffect(() => {
     void props.mode
     void baseFreq()
-    tx.syncParams()
+    if (syncParamsTimer) clearTimeout(syncParamsTimer)
+    syncParamsTimer = setTimeout(() => tx.syncParams(), 300)
   })
+  onCleanup(() => { if (syncParamsTimer) clearTimeout(syncParamsTimer) })
 
   // Register clearSent with parent so the global Reset button can clear TX history
   createEffect(() => {

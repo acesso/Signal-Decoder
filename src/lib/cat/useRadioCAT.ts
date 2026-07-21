@@ -31,6 +31,14 @@ export type CATMode = 'USB' | 'LSB' | 'AM' | 'FM' | 'CW' | 'RTTY';
  *  PU7FTW custom extension commands (VO/AT/A2/NR/AG0/FW/SM/DR) and batches its poll. */
 export type RigProfile = 'generic' | 'usdx-blackbrick';
 
+/** Physical link to the radio's CAT port. 'serial' is a direct Web Serial
+ *  connection (USB-serial cable into this machine). 'websocket' goes through
+ *  the ESP32 CAT bridge (firmware/esp32-cat-bridge) over Wi-Fi — the bridge
+ *  relays the exact same byte stream to/from the radio's UART, so the wire
+ *  protocol and all the parsing/queueing below are identical either way;
+ *  only how bytes get in and out of the browser differs. */
+export type CATTransportKind = 'serial' | 'websocket';
+
 export interface CATConnectionConfig {
   baudRate: number;
   dataBits: number;
@@ -44,6 +52,12 @@ export interface CATConnectionConfig {
   debug: boolean;
   /** Rig dialect — controls which CAT commands are available/polled */
   rigProfile: RigProfile;
+  /** Physical link — defaults to 'serial' if omitted (existing callers/tests
+   *  unaffected). 'websocket' requires wsUrl. */
+  transport?: CATTransportKind;
+  /** ws:// URL of the ESP32 CAT bridge's /cat endpoint, e.g.
+   *  "ws://usdx-bridge.local:8765/cat". Only used when transport is 'websocket'. */
+  wsUrl?: string;
 }
 
 export interface RadioState {
@@ -87,6 +101,18 @@ export interface RadioState {
    *  user-controllable from the UI: it's a radio menu option, the app just
    *  discovers and follows it. */
   autoReport: boolean | null;
+  /** Set when a PTT-OFF (RX;) command fails to get a confirmed RX0; reply
+   *  from the radio after CONFIRM_RETRIES attempts, over the 'websocket'
+   *  transport (see setPTT). This is NOT the radio's own TOT/time-out-timer
+   *  safety net (TT; — a hardware-level backstop that force-unkeys
+   *  regardless of CAT) — it's a faster, CAT-link-level signal that the
+   *  bridge/link itself may have failed to deliver the unkey command, so
+   *  the operator can react immediately (e.g. power-cycle the radio)
+   *  instead of waiting on the TOT. The app keeps retrying RX; in the
+   *  background even after this fires; cleared automatically the moment a
+   *  confirmed RX0; comes back. Deliberately NOT cleared by setPTT(true) —
+   *  arming TX again while this alarm is active would defeat its purpose. */
+  pttConfirmAlarm: boolean;
 }
 
 /** PA bias PWM endpoints (see PM/PX commands) — not polled; fetched on demand. */
@@ -161,6 +187,87 @@ export interface RadioCATControls {
   /** SET the reference oscillator (14–28 MHz; firmware rejects out-of-range and
    *  echoes the old value). Resolves with the radio-confirmed value. */
   setRefFreq: (hz: number) => Promise<number | null>;
+  /** One-shot GET /status against the ESP32 CAT bridge itself (Wi-Fi RSSI/
+   *  SSID/uptime/client count) — a plain HTTP fetch, not a CAT command, so
+   *  it works whether or not the CAT link to the radio is currently
+   *  connected. Only meaningful for the 'websocket' transport; resolves null
+   *  if wsUrl isn't set, the bridge doesn't answer, or the transport is
+   *  'serial' (no bridge to ask). Not polled — call when the advanced
+   *  settings panel's bridge section opens, same pattern as getPABias. */
+  getBridgeStatus: (wsUrl: string) => Promise<BridgeStatus | null>;
+  /** POST /reset against the ESP32 CAT bridge — reboots the bridge itself
+   *  (not the radio). Resolves true once the bridge acknowledges the
+   *  request; the bridge drops off Wi-Fi for a few seconds while it
+   *  restarts. Independent of CAT connection state, same as getBridgeStatus. */
+  resetBridge: (wsUrl: string) => Promise<boolean>;
+  /** One-shot GET /info: the bridge's firmware version + capability list.
+   *  Call once when the bridge panel opens (alongside getBridgeStatus) to
+   *  decide which of the controls below to show — an older bridge simply
+   *  won't report "backlight"/"wifi_config" in its features, so gate on
+   *  that instead of comparing version strings. Resolves null on the same
+   *  conditions as getBridgeStatus. */
+  getBridgeInfo: (wsUrl: string) => Promise<BridgeInfo | null>;
+  /** POST /backlight — sets the bridge's LCD backlight PWM duty (0..255,
+   *  see LCD_BACKLIGHT_MAX_DUTY in the firmware) immediately AND persists it
+   *  as the new boot default. Only meaningful if getBridgeInfo().features
+   *  includes "backlight". Resolves the duty the bridge confirmed (its
+   *  echo) and whether the save to flash succeeded, or null on failure. */
+  setBridgeBacklight: (wsUrl: string, duty: number) => Promise<{ duty: number; saved: boolean } | null>;
+  /** POST /wifi-config — persists a new Wi-Fi SSID/password to the bridge's
+   *  NVS flash and reboots it to apply (the bridge drops off the current
+   *  Wi-Fi network entirely once it restarts onto the new one — this
+   *  resolves true once the bridge ACKS the save, not once it's actually
+   *  reconnected on the new network, since the caller has no way to reach
+   *  it there without knowing the new network's own address). Only
+   *  meaningful if getBridgeInfo().features includes "wifi_config". */
+  setBridgeWifiConfig: (wsUrl: string, ssid: string, password: string) => Promise<boolean>;
+  /** POST /contrast — sets the bridge's LCD contrast (PCD8544 Vop register,
+   *  0..127, see LCD_CONTRAST_MAX in the firmware) immediately AND persists
+   *  it as the new boot default. Pure software (same SPI bus already
+   *  driving the framebuffer) — no extra hardware needed. Only meaningful
+   *  if getBridgeInfo().features includes "contrast". Resolves the vop the
+   *  bridge confirmed and whether the save to flash succeeded, or null on failure. */
+  setBridgeContrast: (wsUrl: string, vop: number) => Promise<{ vop: number; saved: boolean } | null>;
+}
+
+/** Snapshot of the ESP32 CAT bridge's own status — distinct from RadioState,
+ *  which is the radio's state as seen through the bridge. Sourced from the
+ *  bridge's GET /status (see firmware/esp32-cat-bridge/main/http_control.c). */
+export interface BridgeStatus {
+  wifiState: 'connected' | 'connecting' | 'disconnected';
+  ssid: string;
+  /** Live RSSI in dBm, refreshed at request time by the bridge (not a stale poll). */
+  rssi: number;
+  ip: string;
+  wsClients: number;
+  wsMaxClients: number;
+  /** Whether the bridge has heard from the radio itself recently — the same
+   *  "RIG:link/silent" signal shown on the bridge's own LCD. */
+  radioLinked: boolean;
+  uptimeSeconds: number;
+}
+
+/** Bridge firmware version + capability list, from GET /info. Features are
+ *  additive-only on the firmware side (see bridge_config.h's versioning
+ *  note) — the web app should always gate controls on feature PRESENCE,
+ *  never assume an absent feature will show up if you just wait/retry. */
+export interface BridgeInfo {
+  firmwareVersion: string;
+  features: string[];
+}
+
+// ws://host:port/cat -> http://host:port — the bridge's REST endpoints live
+// on the same httpd instance as the WebSocket, just plain HTTP routes.
+function bridgeHttpBase(wsUrl: string): string | null {
+  try {
+    const u = new URL(wsUrl);
+    if (u.protocol !== 'ws:' && u.protocol !== 'wss:') return null;
+    u.protocol = u.protocol === 'wss:' ? 'https:' : 'http:';
+    u.pathname = '';
+    return u.toString().replace(/\/$/, '');
+  } catch {
+    return null;
+  }
 }
 
 // ── Kenwood TS-series CAT protocol ───────────────────────────────────────────
@@ -301,11 +408,18 @@ export function useRadioCAT(): RadioCATControls {
     volume: null, att1: null, att2: null, nr: null,
     agc: null, agcLevel: null, filter: null, sMeter: null, drive: null,
     backlight: null, firmwareVersion: null, autoReport: null,
+    pttConfirmAlarm: false,
   });
 
   let port:      SerialPort | null = null;
-  let writer:    WritableStreamDefaultWriter<Uint8Array> | null = null;
+  // Minimal shape both transports satisfy — a real WritableStreamDefaultWriter
+  // for Web Serial, or a small WebSocket-backed adapter (see openWebSocket
+  // below). Everything downstream (drainQueue/disconnect) only ever calls
+  // .write()/.close() — close() is a no-op for the WS adapter since tearing
+  // down the WebSocket itself (via the `ws` variable) is the real teardown.
+  let writer:    { write(data: Uint8Array): Promise<void>; close(): Promise<void> } | null = null;
   let reader:    ReadableStreamDefaultReader<Uint8Array> | null = null;
+  let ws:        WebSocket | null = null;
   let rxBuf = '';
   let pollTimer: ReturnType<typeof setTimeout> | null = null;
   let pollRunning = false;
@@ -313,6 +427,12 @@ export function useRadioCAT(): RadioCATControls {
   let pollIntervalMs = 100;
   let debug = false;
   let rigProfile: RigProfile = 'generic';
+  // Hoisted from connect()'s local so the confirm-with-retry setters below
+  // can gate on it — confirmation is only meaningful/enabled over the
+  // bridge ('websocket'): a direct 'serial' connection already IS the CAT
+  // link, so there's no separate bridge hop that could silently swallow a
+  // command the way a flaky Wi-Fi/WebSocket relay could.
+  let transportKind: CATTransportKind = 'serial';
   // True while the radio's CAT auto-report (AI) is on — polling stops
   // entirely; the radio pushes settings changes and throttled SM telemetry.
   let autoReportActive = false;
@@ -478,6 +598,119 @@ export function useRadioCAT(): RadioCATControls {
     });
   };
 
+  // ── Confirmed SET: send, verify the radio actually applied it, retry ────────
+  // Over the 'websocket' transport, the browser<->radio path has an extra
+  // hop (the ESP32 bridge) that a plain write() can't see fail — a dropped
+  // Wi-Fi packet or a bridge hiccup would otherwise leave the UI showing a
+  // value the radio never actually received. confirmedSet() closes that gap
+  // by re-querying the radio after every SET and only trusting the UI state
+  // to the readback, retrying the whole SET+verify cycle on mismatch/timeout.
+  //
+  // Over 'serial' (a direct Web Serial connection), the browser already IS
+  // one end of the CAT link — there's no extra hop to fail silently — so
+  // this still runs (uniform behavior, and it's cheap: one extra query) but
+  // failures there would indicate a real radio/cable problem worth surfacing
+  // the same way.
+  const CONFIRM_RETRIES = 3;
+
+  // Generic confirm-with-retry, two shapes depending on whether the SET
+  // command itself carries a usable reply:
+  //   - hasEcho=true:  the SET is sent via query() and its OWN reply is what
+  //     `accept()` checks (e.g. PU7FTW extension commands, which echo the
+  //     effective value in the same frame — VOn; -> VOn;).
+  //   - hasEcho=false: FA/MD/TX/RX have no such echo (per the Kenwood spec —
+  //     see the protocol notes above), so the SET is sent via write() (fire-
+  //     and-forget, no wait) and confirmation comes from a SEPARATE
+  //     `verifyCmd` query afterward, checked by `accept()`.
+  // Retries the WHOLE cycle (SET + verify) up to CONFIRM_RETRIES times.
+  async function confirmedSet(
+    sendCmd: string,
+    opts: { hasEcho: true } | { hasEcho: false; verifyCmd: string },
+    accept: (reply: string) => boolean,
+  ): Promise<boolean> {
+    for (let attempt = 1; attempt <= CONFIRM_RETRIES; attempt++) {
+      let reply = '';
+      try {
+        reply = opts.hasEcho ? await query(sendCmd) : (await write(sendCmd), await query(opts.verifyCmd));
+      } catch { reply = ''; }
+      if (reply && reply !== '__timeout__' && reply !== '__disconnected__' && accept(reply)) return true;
+      log('warn', `confirmedSet: ${sendCmd} → "${reply}" did not confirm (attempt ${attempt}/${CONFIRM_RETRIES})`);
+    }
+    return false;
+  }
+
+  // ── WebSocket transport (ESP32 CAT bridge) ──────────────────────────────
+  // Bridges a binary WebSocket into the same writer/reader shapes the serial
+  // path uses, so startReadLoop/drainQueue below need no transport-specific
+  // branching — they just see "something with .write()" and "something with
+  // .read()". The bridge itself (firmware/esp32-cat-bridge) is byte-
+  // transparent: it relays whatever comes over the socket straight to the
+  // radio's UART and back, so the Kenwood frames flowing through here are
+  // identical to the Web Serial path.
+
+  const openWebSocket = (url: string): Promise<{
+    socket: WebSocket;
+    writer: { write(data: Uint8Array): Promise<void>; close(): Promise<void> };
+    reader: ReadableStreamDefaultReader<Uint8Array>;
+  }> => {
+    return new Promise((resolve, reject) => {
+      const socket = new WebSocket(url);
+      socket.binaryType = 'arraybuffer';
+
+      let streamController: ReadableStreamDefaultController<Uint8Array> | null = null;
+      const stream = new ReadableStream<Uint8Array>({
+        start(controller) { streamController = controller; },
+      });
+
+      const onOpen = () => {
+        socket.removeEventListener('open', onOpen);
+        socket.removeEventListener('error', onErrorBeforeOpen);
+        const socketWriter = {
+          write: (data: Uint8Array): Promise<void> => {
+            if (socket.readyState !== WebSocket.OPEN) {
+              return Promise.reject(new Error('CAT bridge socket not open'));
+            }
+            // WebSocket.send()'s TS signature wants an ArrayBuffer-backed view
+            // specifically (not the wider ArrayBufferLike | SharedArrayBuffer
+            // union Uint8Array's type allows) — slice() copies into a fresh
+            // plain ArrayBuffer, which also protects against `data`'s
+            // underlying buffer being mutated/reused by the caller (the queue
+            // never reuses buffers today, but this keeps the transport safe
+            // regardless).
+            socket.send(data.slice().buffer);
+            return Promise.resolve();
+          },
+          close: (): Promise<void> => Promise.resolve(), // real teardown is socket.close() in disconnect()
+        };
+        resolve({ socket, writer: socketWriter, reader: stream.getReader() });
+      };
+      const onErrorBeforeOpen = () => {
+        socket.removeEventListener('open', onOpen);
+        socket.removeEventListener('error', onErrorBeforeOpen);
+        reject(new Error('Could not connect to CAT bridge at ' + url));
+      };
+      socket.addEventListener('open', onOpen);
+      socket.addEventListener('error', onErrorBeforeOpen);
+
+      // These fire only after onOpen has resolved (post-handshake) — the
+      // stream controller exists by construction (start() runs synchronously
+      // during `new ReadableStream(...)` above, before this listener can fire).
+      socket.addEventListener('message', (ev: MessageEvent) => {
+        const data = ev.data instanceof ArrayBuffer ? new Uint8Array(ev.data) : null;
+        if (data && streamController) streamController.enqueue(data);
+      });
+      socket.addEventListener('close', () => {
+        try { streamController?.close(); } catch { /* already closed */ }
+      });
+      socket.addEventListener('error', () => {
+        // Post-open errors surface as a stream error so startReadLoop's catch
+        // block logs and its finally block runs the same "connection lost"
+        // path used for a dropped serial port.
+        try { streamController?.error(new Error('CAT bridge WebSocket error')); } catch { /* already closed */ }
+      });
+    });
+  };
+
   // ── Serial read loop ─────────────────────────────────────────────────────
 
   const startReadLoop = (r: ReadableStreamDefaultReader<Uint8Array>) => {
@@ -507,15 +740,20 @@ export function useRadioCAT(): RadioCATControls {
         log('debug', 'read loop ended:', e);
       } finally {
         // The loop only exits when the stream ends. If nobody called
-        // disconnect(), the port was yanked out from under us (USB unplugged,
-        // radio power-cycled, device re-enumerated) — tear down cleanly and
-        // surface a friendly warning instead of an unhandled NetworkError.
-        if (!closing && port) {
-          log('warn', 'serial port lost unexpectedly (cable unplugged / device re-enumerated)');
+        // disconnect(), the link was yanked out from under us (USB unplugged/
+        // device re-enumerated for serial; bridge rebooted or Wi-Fi dropped
+        // for the WebSocket transport) — tear down cleanly and surface a
+        // friendly warning instead of an unhandled NetworkError.
+        if (!closing && (port || ws)) {
+          log('warn', ws
+            ? 'CAT bridge connection lost (Wi-Fi dropped / bridge rebooted)'
+            : 'serial port lost unexpectedly (cable unplugged / device re-enumerated)');
           disconnect();
           setState(prev => ({
             ...prev,
-            error: 'Radio connection lost — CAT cable unplugged or port closed. Reconnect when it’s back.',
+            error: ws
+              ? 'Radio connection lost — CAT bridge unreachable. Reconnect when it’s back.'
+              : 'Radio connection lost — CAT cable unplugged or port closed. Reconnect when it’s back.',
           }));
         }
       }
@@ -752,20 +990,24 @@ export function useRadioCAT(): RadioCATControls {
     try { reader?.cancel().catch(() => {}); } catch { /* ignore */ }
     try { writer?.close().catch(() => {});  } catch { /* ignore */ }
     try { port?.close().catch(() => {});    } catch { /* ignore */ }
+    try { ws?.close();                      } catch { /* ignore */ }
     reader = null;
     writer = null;
     port   = null;
+    ws     = null;
     rxBuf  = '';
     autoReportActive = false;
     setState(prev => ({
       ...prev, connected: false, frequency: null, mode: null, ptt: false, error: null,
       volume: null, att1: null, att2: null, nr: null, agc: null, agcLevel: null, filter: null, sMeter: null, drive: null,
-      backlight: null, firmwareVersion: null, autoReport: null,
+      backlight: null, firmwareVersion: null, autoReport: null, pttConfirmAlarm: false,
     }));
   }
 
   const connect = async (config: CATConnectionConfig) => {
     debug = config.debug;
+    const transport = config.transport ?? 'serial';
+    transportKind = transport;
     // Dev-only: the performance testbed sets window.__catUseMock to run the
     // full CAT pipeline against a simulated radio (also enables CAT in
     // browsers without Web Serial, e.g. Firefox). Dynamic import keeps the
@@ -773,35 +1015,54 @@ export function useRadioCAT(): RadioCATControls {
     const useMock = import.meta.env.DEV
       && typeof window !== 'undefined'
       && (window as unknown as Record<string, unknown>).__catUseMock === true;
-    if (!useMock && !('serial' in navigator)) {
+    if (transport === 'serial' && !useMock && !('serial' in navigator)) {
       setState(prev => ({ ...prev, error: 'Web Serial API not supported in this browser' }));
       return;
     }
-    log('info', `connecting — ${config.baudRate} ${config.dataBits}${config.parity === 'none' ? 'N' : config.parity[0].toUpperCase()}${config.stopBits} timeout:${config.timeoutMs}ms debug:${config.debug} profile:${config.rigProfile}${useMock ? ' [MOCK]' : ''}`);
+    if (transport === 'websocket' && !config.wsUrl) {
+      setState(prev => ({ ...prev, error: 'CAT bridge address is required for the WebSocket transport' }));
+      return;
+    }
+    log('info', transport === 'websocket'
+      ? `connecting via CAT bridge — ${config.wsUrl} timeout:${config.timeoutMs}ms debug:${config.debug} profile:${config.rigProfile}`
+      : `connecting — ${config.baudRate} ${config.dataBits}${config.parity === 'none' ? 'N' : config.parity[0].toUpperCase()}${config.stopBits} timeout:${config.timeoutMs}ms debug:${config.debug} profile:${config.rigProfile}${useMock ? ' [MOCK]' : ''}`);
     try {
-      let p: SerialPort;
-      if (useMock) {
-        const { createMockSerialPort } = await import('$decoder-lib/cat/mockSerial');
-        p = createMockSerialPort() as unknown as SerialPort;
+      if (transport === 'websocket') {
+        const { socket, writer: w, reader: r } = await openWebSocket(config.wsUrl!);
+        timeoutMs      = config.timeoutMs;
+        pollIntervalMs = config.pollIntervalMs;
+        rigProfile     = config.rigProfile;
+        closing = false;  // fresh session — read-loop exit now means "bridge lost"
+        autoReportActive = false;  // re-discovered by the first full poll (AI;)
+        ws     = socket;
+        writer = w;
+        reader = r;
+        startReadLoop(r);
       } else {
-        const serial = (navigator as Navigator & { serial: { requestPort(): Promise<SerialPort> } }).serial;
-        p = await serial.requestPort();
+        let p: SerialPort;
+        if (useMock) {
+          const { createMockSerialPort } = await import('$decoder-lib/cat/mockSerial');
+          p = createMockSerialPort() as unknown as SerialPort;
+        } else {
+          const serial = (navigator as Navigator & { serial: { requestPort(): Promise<SerialPort> } }).serial;
+          p = await serial.requestPort();
+        }
+        await p.open({
+          baudRate: config.baudRate, dataBits: config.dataBits,
+          stopBits: config.stopBits, parity: config.parity, flowControl: 'none',
+        });
+        if (!p.writable || !p.readable) throw new Error('Port streams unavailable');
+        timeoutMs      = config.timeoutMs;
+        pollIntervalMs = config.pollIntervalMs;
+        rigProfile     = config.rigProfile;
+        closing = false;  // fresh session — read-loop exit now means "port lost"
+        autoReportActive = false;  // re-discovered by the first full poll (AI;)
+        port   = p;
+        writer = p.writable.getWriter();
+        const r = p.readable.getReader();
+        reader = r;
+        startReadLoop(r);
       }
-      await p.open({
-        baudRate: config.baudRate, dataBits: config.dataBits,
-        stopBits: config.stopBits, parity: config.parity, flowControl: 'none',
-      });
-      if (!p.writable || !p.readable) throw new Error('Port streams unavailable');
-      timeoutMs      = config.timeoutMs;
-      pollIntervalMs = config.pollIntervalMs;
-      rigProfile     = config.rigProfile;
-      closing = false;  // fresh session — read-loop exit now means "port lost"
-      autoReportActive = false;  // re-discovered by the first full poll (AI;)
-      port   = p;
-      writer = p.writable.getWriter();
-      const r = p.readable.getReader();
-      reader = r;
-      startReadLoop(r);
       setState(prev => ({ ...prev, connected: true, error: null }));
       log('info', 'polling every', config.pollIntervalMs + 'ms');
       schedulePoll();
@@ -848,85 +1109,128 @@ export function useRadioCAT(): RadioCATControls {
   const setFrequency = async (hz: number) => {
     lastSet.frequency = Date.now();
     log('info', 'setFrequency →', hz, 'Hz');
-    setState(prev => ({ ...prev, frequency: hz }));
-    await write(`FA${hz.toString().padStart(11, '0')};`);
+    setState(prev => ({ ...prev, frequency: hz })); // optimistic — perceived responsiveness
+    const cmd = `FA${hz.toString().padStart(11, '0')};`;
+    if (transportKind !== 'websocket') { await write(cmd); return; }
+    // FA; SET has no echo (see the protocol notes above) — confirm via a
+    // separate readback query, retried as a whole SET+verify cycle.
+    const confirmed = await confirmedSet(cmd, { hasEcho: false, verifyCmd: 'FA;' },
+      (reply) => parseFrequency(reply) === hz);
+    if (!confirmed) {
+      log('warn', 'setFrequency: bridge could not confirm the radio applied', hz, 'Hz after', CONFIRM_RETRIES, 'attempts');
+      setState(prev => ({ ...prev, error: `Frequency change to ${hz} Hz was not confirmed by the radio — link may be unreliable.` }));
+      // Don't silently keep showing the unconfirmed value — re-poll to show
+      // whatever the radio is ACTUALLY on, next poll tick will correct it.
+    }
   };
 
   const setMode = async (mode: CATMode) => {
     lastSet.mode = Date.now();
     log('info', 'setMode →', mode);
-    setState(prev => ({ ...prev, mode }));
-    await write(`MD${CAT_MODE_TO_KENWOOD[mode]};`);
+    setState(prev => ({ ...prev, mode })); // optimistic — perceived responsiveness
+    const cmd = `MD${CAT_MODE_TO_KENWOOD[mode]};`;
+    if (transportKind !== 'websocket') { await write(cmd); return; }
+    // MD; SET has no echo either — same confirm-via-readback pattern as frequency.
+    const confirmed = await confirmedSet(cmd, { hasEcho: false, verifyCmd: 'MD;' },
+      (reply) => parseMode(reply) === mode);
+    if (!confirmed) {
+      log('warn', 'setMode: bridge could not confirm the radio applied', mode, 'after', CONFIRM_RETRIES, 'attempts');
+      setState(prev => ({ ...prev, error: `Mode change to ${mode} was not confirmed by the radio — link may be unreliable.` }));
+    }
   };
 
+  // PTT is the one safety-critical setter: see RadioState.pttConfirmAlarm.
+  // Deliberately asymmetric between TX and RX —
+  //   - TX (keying up): shown optimistically. The PA already keys the
+  //     instant the SET reaches the radio regardless of what the UI shows,
+  //     so an optimistic UI here costs nothing safety-wise, only cosmetics.
+  //   - RX (un-keying): NEVER shown as confirmed until the radio's own
+  //     RX0; reply proves it. Claiming "safely off" before it's actually
+  //     off is the exact failure mode this whole feature exists to prevent.
+  //     On repeated failure to confirm RX, ptt stays true (never optimistic)
+  //     and pttConfirmAlarm fires — the radio's own TOT (TT;) is a separate,
+  //     slower hardware backstop, not a reason to stay quiet here.
   const setPTT = async (tx: boolean) => {
     log('info', 'setPTT →', tx ? 'TX' : 'RX');
-    setState(prev => ({ ...prev, ptt: tx }));
-    await write(tx ? 'TX;' : 'RX;');
+    if (transportKind !== 'websocket') {
+      setState(prev => ({ ...prev, ptt: tx }));
+      await write(tx ? 'TX;' : 'RX;');
+      return;
+    }
+    if (tx) {
+      setState(prev => ({ ...prev, ptt: true })); // optimistic, see above
+      const confirmed = await confirmedSet('TX;', { hasEcho: false, verifyCmd: 'TX;' },
+        (reply) => reply.startsWith('TX'));
+      if (!confirmed) {
+        log('warn', 'setPTT(true): bridge could not confirm the radio keyed TX after', CONFIRM_RETRIES, 'attempts');
+        setState(prev => ({ ...prev, error: 'Could not confirm the radio keyed TX — CAT link may be unreliable.' }));
+      }
+      return;
+    }
+    // RX: keep retrying beyond the initial confirmedSet() call — this is
+    // the one place "give up after 3 and move on" is not acceptable.
+    const confirmed = await confirmedSet('RX;', { hasEcho: false, verifyCmd: 'RX;' },
+      (reply) => reply.startsWith('RX'));
+    if (confirmed) {
+      setState(prev => ({ ...prev, ptt: false, pttConfirmAlarm: false }));
+      return;
+    }
+    log('error', 'setPTT(false): RADIO DID NOT CONFIRM RX AFTER', CONFIRM_RETRIES, 'ATTEMPTS — raising pttConfirmAlarm');
+    setState(prev => ({ ...prev, pttConfirmAlarm: true })); // ptt stays whatever it was — NOT set to false
+    // Keep trying in the background (fire-and-forget) until it confirms —
+    // the alarm stays up and ptt stays untouched until a real RX0; arrives.
+    void (async () => {
+      for (;;) {
+        const ok = await confirmedSet('RX;', { hasEcho: false, verifyCmd: 'RX;' }, (reply) => reply.startsWith('RX'));
+        if (ok) {
+          setState(prev => ({ ...prev, ptt: false, pttConfirmAlarm: false }));
+          return;
+        }
+        if (!writer) return; // disconnected — stop retrying into a dead link
+        await new Promise(res => setTimeout(res, 1000));
+      }
+    })();
   };
 
-  const setVolume = async (n: number) => {
-    lastSet.volume = Date.now();
-    log('info', 'setVolume →', n);
-    setState(prev => ({ ...prev, volume: n }));
-    await write(`VO${n};`);
-  };
+  // Shared factory for the PU7FTW extension setters below — all follow the
+  // identical shape: SET a numeric field, and the firmware always echoes
+  // the EFFECTIVE value in the same reply (the old value if the SET was
+  // rejected as out-of-range — see the protocol notes above). That echo is
+  // exactly what confirmedSet(hasEcho: true) checks, no separate verify
+  // query needed, unlike FA/MD/TX/RX which have no echo at all.
+  //
+  // Over 'serial', kept as the original fire-and-forget write() (unchanged
+  // behavior) — confirmation is gated to 'websocket' where the bridge hop
+  // can silently drop a command a direct connection can't.
+  function makeExtensionSetter(
+    prefix: string,
+    stateKey: keyof Pick<RadioState, 'volume' | 'att1' | 'att2' | 'nr' | 'agc' | 'agcLevel' | 'filter' | 'drive' | 'backlight'>,
+    lastSetKey: keyof typeof lastSet,
+  ) {
+    return async (n: number) => {
+      lastSet[lastSetKey] = Date.now();
+      log('info', `set${String(stateKey)} →`, n);
+      setState(prev => ({ ...prev, [stateKey]: n })); // optimistic — perceived responsiveness
+      const cmd = `${prefix}${n};`;
+      if (transportKind !== 'websocket') { await write(cmd); return; }
+      const confirmed = await confirmedSet(cmd, { hasEcho: true },
+        (reply) => parseIntField(reply, prefix) === n);
+      if (!confirmed) {
+        log('warn', `set${String(stateKey)}: bridge could not confirm the radio applied`, n, 'after', CONFIRM_RETRIES, 'attempts');
+        setState(prev => ({ ...prev, error: `Setting change (${prefix}${n}) was not confirmed by the radio — link may be unreliable.` }));
+      }
+    };
+  }
 
-  const setAtt1 = async (n: number) => {
-    lastSet.att1 = Date.now();
-    log('info', 'setAtt1 →', n);
-    setState(prev => ({ ...prev, att1: n }));
-    await write(`AT${n};`);
-  };
-
-  const setAtt2 = async (n: number) => {
-    lastSet.att2 = Date.now();
-    log('info', 'setAtt2 →', n);
-    setState(prev => ({ ...prev, att2: n }));
-    await write(`A2${n};`);
-  };
-
-  const setNR = async (n: number) => {
-    lastSet.nr = Date.now();
-    log('info', 'setNR →', n);
-    setState(prev => ({ ...prev, nr: n }));
-    await write(`NR${n};`);
-  };
-
-  const setAGC = async (n: number) => {
-    lastSet.agc = Date.now();
-    log('info', 'setAGC →', n);
-    setState(prev => ({ ...prev, agc: n }));
-    await write(`AG0${n};`);
-  };
-
-  const setAgcLevel = async (n: number) => {
-    lastSet.agcLevel = Date.now();
-    log('info', 'setAgcLevel →', n);
-    setState(prev => ({ ...prev, agcLevel: n }));
-    await write(`AL${n};`);
-  };
-
-  const setFilter = async (n: number) => {
-    lastSet.filter = Date.now();
-    log('info', 'setFilter →', n);
-    setState(prev => ({ ...prev, filter: n }));
-    await write(`FW${n};`);
-  };
-
-  const setDrive = async (n: number) => {
-    lastSet.drive = Date.now();
-    log('info', 'setDrive →', n);
-    setState(prev => ({ ...prev, drive: n }));
-    await write(`DR${n};`);
-  };
-
-  const setBacklight = async (n: number) => {
-    lastSet.backlight = Date.now();
-    log('info', 'setBacklight →', n);
-    setState(prev => ({ ...prev, backlight: n }));
-    await write(`BL${n};`);
-  };
+  const setVolume    = makeExtensionSetter('VO', 'volume', 'volume');
+  const setAtt1      = makeExtensionSetter('AT', 'att1', 'att1');
+  const setAtt2      = makeExtensionSetter('A2', 'att2', 'att2');
+  const setNR        = makeExtensionSetter('NR', 'nr', 'nr');
+  const setAGC       = makeExtensionSetter('AG0', 'agc', 'agc');
+  const setAgcLevel  = makeExtensionSetter('AL', 'agcLevel', 'agcLevel');
+  const setFilter    = makeExtensionSetter('FW', 'filter', 'filter');
+  const setDrive     = makeExtensionSetter('DR', 'drive', 'drive');
+  const setBacklight = makeExtensionSetter('BL', 'backlight', 'backlight');
 
   // ── PA bias (PM/PX) — on-demand only, never polled ─────────────────────────
 
@@ -1012,6 +1316,117 @@ export function useRadioCAT(): RadioCATControls {
     return parseIntField(resp, 'XF');
   };
 
+  // ── ESP32 CAT bridge status/control — plain HTTP, independent of the CAT
+  // queue/connection above (the bridge answers these even if the radio
+  // itself is unreachable) ────────────────────────────────────────────────
+
+  const getBridgeStatus = async (wsUrl: string): Promise<BridgeStatus | null> => {
+    const base = bridgeHttpBase(wsUrl);
+    if (!base) return null;
+    log('info', 'getBridgeStatus ←', base + '/status');
+    try {
+      const resp = await fetch(base + '/status', { signal: AbortSignal.timeout(5000) });
+      if (!resp.ok) return null;
+      const j = await resp.json();
+      if (typeof j.wifi_state !== 'string' || typeof j.rssi !== 'number') return null;
+      return {
+        wifiState: j.wifi_state, ssid: String(j.ssid ?? ''), rssi: j.rssi,
+        ip: String(j.ip ?? ''), wsClients: Number(j.ws_clients) || 0,
+        wsMaxClients: Number(j.ws_max_clients) || 0,
+        radioLinked: j.radio_linked === true, uptimeSeconds: Number(j.uptime_s) || 0,
+      };
+    } catch (err) {
+      log('warn', 'getBridgeStatus failed:', err);
+      return null;
+    }
+  };
+
+  const resetBridge = async (wsUrl: string): Promise<boolean> => {
+    const base = bridgeHttpBase(wsUrl);
+    if (!base) return false;
+    log('info', 'resetBridge →', base + '/reset');
+    try {
+      const resp = await fetch(base + '/reset', { method: 'POST', signal: AbortSignal.timeout(5000) });
+      return resp.ok;
+    } catch (err) {
+      log('warn', 'resetBridge failed:', err);
+      return false;
+    }
+  };
+
+  const getBridgeInfo = async (wsUrl: string): Promise<BridgeInfo | null> => {
+    const base = bridgeHttpBase(wsUrl);
+    if (!base) return null;
+    log('info', 'getBridgeInfo ←', base + '/info');
+    try {
+      const resp = await fetch(base + '/info', { signal: AbortSignal.timeout(5000) });
+      if (!resp.ok) return null;
+      const j = await resp.json();
+      if (typeof j.firmware_version !== 'string' || !Array.isArray(j.features)) return null;
+      return { firmwareVersion: j.firmware_version, features: j.features.map(String) };
+    } catch (err) {
+      log('warn', 'getBridgeInfo failed:', err);
+      return null;
+    }
+  };
+
+  const setBridgeBacklight = async (wsUrl: string, duty: number): Promise<{ duty: number; saved: boolean } | null> => {
+    const base = bridgeHttpBase(wsUrl);
+    if (!base) return null;
+    log('info', 'setBridgeBacklight →', duty);
+    try {
+      const resp = await fetch(base + '/backlight', {
+        method: 'POST', signal: AbortSignal.timeout(5000),
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ duty: Math.round(duty) }),
+      });
+      if (!resp.ok) return null;
+      const j = await resp.json();
+      if (typeof j.duty !== 'number') return null;
+      return { duty: j.duty, saved: j.saved === true };
+    } catch (err) {
+      log('warn', 'setBridgeBacklight failed:', err);
+      return null;
+    }
+  };
+
+  const setBridgeWifiConfig = async (wsUrl: string, ssid: string, password: string): Promise<boolean> => {
+    const base = bridgeHttpBase(wsUrl);
+    if (!base) return false;
+    log('info', 'setBridgeWifiConfig → ssid:', ssid);
+    try {
+      const resp = await fetch(base + '/wifi-config', {
+        method: 'POST', signal: AbortSignal.timeout(5000),
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ssid, password }),
+      });
+      return resp.ok;
+    } catch (err) {
+      log('warn', 'setBridgeWifiConfig failed:', err);
+      return false;
+    }
+  };
+
+  const setBridgeContrast = async (wsUrl: string, vop: number): Promise<{ vop: number; saved: boolean } | null> => {
+    const base = bridgeHttpBase(wsUrl);
+    if (!base) return null;
+    log('info', 'setBridgeContrast →', vop);
+    try {
+      const resp = await fetch(base + '/contrast', {
+        method: 'POST', signal: AbortSignal.timeout(5000),
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ vop: Math.round(vop) }),
+      });
+      if (!resp.ok) return null;
+      const j = await resp.json();
+      if (typeof j.vop !== 'number') return null;
+      return { vop: j.vop, saved: j.saved === true };
+    } catch (err) {
+      log('warn', 'setBridgeContrast failed:', err);
+      return null;
+    }
+  };
+
   onCleanup(() => { disconnect(); });
 
   return {
@@ -1019,5 +1434,6 @@ export function useRadioCAT(): RadioCATControls {
     setVolume, setAtt1, setAtt2, setNR, setAGC, setAgcLevel, setFilter, setDrive,
     setBacklight, getPABias, setPABias, getTxTimeout, setTxTimeout, resetRadio,
     getFactoryDefaults, factoryResetRadio, getRefFreq, setRefFreq,
+    getBridgeStatus, resetBridge, getBridgeInfo, setBridgeBacklight, setBridgeWifiConfig, setBridgeContrast,
   };
 }

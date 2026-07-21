@@ -51,3 +51,24 @@ export function loadString<T extends string>(key: string, fallback: T, valid: re
 export function saveString(key: string, value: string): void {
   if (typeof window !== 'undefined') localStorage.setItem(key, value);
 }
+
+/** Loads a JSON object, merged shallowly onto `fallback` so a partially-valid
+ *  (or older-shape) stored value still yields every expected field rather
+ *  than being discarded wholesale — new fields added after a value was
+ *  already saved just fall back to their default instead of nulling the rest. */
+export function loadObject<T extends object>(key: string, fallback: T): T {
+  if (typeof window === 'undefined') return fallback;
+  const raw = localStorage.getItem(key);
+  if (!raw) return fallback;
+  try {
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      return { ...fallback, ...parsed };
+    }
+  } catch { /* malformed — fall back */ }
+  return fallback;
+}
+
+export function saveObject<T extends object>(key: string, value: T): void {
+  if (typeof window !== 'undefined') localStorage.setItem(key, JSON.stringify(value));
+}
