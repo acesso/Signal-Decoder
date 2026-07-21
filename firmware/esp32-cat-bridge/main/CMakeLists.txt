@@ -1,0 +1,25 @@
+idf_component_register(
+    SRCS
+        "app_main.c"
+        "bridge_state.c"
+        "bridge_settings.c"
+        "wifi_net.c"
+        "cat_bridge.c"
+        "ws_server.c"
+        "http_control.c"
+        "lcd_pcd8544.c"
+        "status_display.c"
+    INCLUDE_DIRS "."
+    REQUIRES
+        esp_wifi
+        esp_netif
+        esp_event
+        esp_system
+        nvs_flash
+        driver
+        esp_driver_ledc
+        mdns
+        esp_http_server
+        esp_timer
+        freertos
+)

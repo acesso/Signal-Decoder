@@ -12,6 +12,21 @@ them into a version section when cutting a release.
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-07-21
+
+### Added
+
+- ESP32 CAT bridge firmware (`firmware/esp32-cat-bridge`): Wi-Fi-to-CAT bridge for the radio, replacing the USB-serial cable with a WebSocket relay, built on native ESP-IDF (not Arduino).
+- The bridge advertises itself via mDNS (`usdx-bridge.local`), supports multiple simultaneous browser clients, and drives a PCD8544 (Nokia 5110) LCD showing live Wi-Fi signal, radio link status, S-meter, and VFO frequency.
+- Bridge status/control HTTP API: firmware version + capability discovery (`GET /info`), live status (`GET /status`), and settings changes for backlight, LCD contrast, Wi-Fi network, and a remote restart — all persisted to flash.
+- The web app's Radio CAT panel gained a WebSocket transport option alongside the existing Web Serial connection, plus a Bridge panel exposing the above controls, gated on the connected bridge's reported capabilities.
+- CAT connection settings (transport, bridge address, serial port config) now persist across browser sessions.
+- Over the bridge transport, frequency/mode/PTT/extension-setting changes are now confirmed against the radio's own reply before the UI trusts them, with automatic retries; a failed PTT-off confirmation raises a persistent on-screen alarm and keeps retrying rather than silently assuming the radio unkeyed.
+
+### Fixed
+
+- The FT auto-CQ audio re-encoded on every single click of the Audio Hz stepper (and every keystroke while typing), causing visible lag; it's now debounced to fire once the value settles.
+
 ## [0.7.7] - 2026-07-20
 
 ### Fixed

@@ -1,0 +1,32 @@
+# Baseline project defaults for the ESP32 CAT bridge. idf.py set-target esp32
+# generates the full sdkconfig from these + component defaults; this file
+# only overrides what matters for this project (target chip, partition
+# table headroom, log level). Wi-Fi SSID/password/CAT baud are in
+# Kconfig.projbuild ("CAT Bridge Config" menu) and land in the generated
+# sdkconfig (gitignored) — not committed here since they're per-deployment.
+
+CONFIG_IDF_TARGET="esp32"
+
+# esp_http_server + mdns + wifi together need more than the default 4KB
+# main-task stack during init (mdns_init/httpd_start allocate on the
+# calling task's stack in places).
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
+
+# Bridge-only for now (see firmware README) — no SPIFFS/LittleFS partition
+# needed yet, default partition table is fine.
+CONFIG_PARTITION_TABLE_SINGLE_APP=y
+
+CONFIG_LOG_DEFAULT_LEVEL_INFO=y
+
+# httpd_ws_frame_t / HTTPD_WS_TYPE_* / httpd_ws_send_frame_async etc. are all
+# compiled out of esp_http_server unless this is enabled — required for the
+# /cat WebSocket route in ws_server.c.
+CONFIG_HTTPD_WS_SUPPORT=y
+
+# Core 1 is reserved for the CAT UART reader task alone (see
+# CAT_BRIDGE_TASK_CORE in bridge_config.h) — the Wi-Fi driver task already
+# defaults to core 0 (CONFIG_ESP_WIFI_TASK_PINNED_TO_CORE_0, unchanged
+# here), but lwIP's TCPIP task defaults to NO affinity, meaning it could
+# otherwise land on core 1 and contend with the CAT UART reader for CPU
+# time. Pin it to core 0 explicitly to close that gap.
+CONFIG_LWIP_TCPIP_TASK_AFFINITY_CPU0=y

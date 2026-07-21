@@ -1,0 +1,27 @@
+menu "CAT Bridge Config"
+
+    config BRIDGE_WIFI_SSID
+        string "Wi-Fi SSID"
+        default "myssid"
+        help
+            SSID of the home network the bridge joins in station mode.
+
+    config BRIDGE_WIFI_PASSWORD
+        string "Wi-Fi password"
+        default "mypassword"
+        help
+            WPA2-PSK password for BRIDGE_WIFI_SSID. Stored in sdkconfig
+            (not committed — see sdkconfig.defaults and .gitignore) since
+            it's build-local secret configuration, same treatment as any
+            other credential in this repo.
+
+    config BRIDGE_CAT_UART_BAUD
+        int "CAT UART baud rate"
+        default 38400
+        help
+            Must match the baud rate configured in the radio's CAT menu
+            (uSDX BLACK_BRICK: menu-selectable 9600-57600). Overridable at
+            runtime later via a WS control message if needed; for now this
+            is the boot-time default.
+
+endmenu

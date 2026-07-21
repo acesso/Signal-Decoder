@@ -8,10 +8,20 @@ import {
   type RadioCATControls,
   type PABias,
   type FactoryDefaults,
+  type BridgeStatus,
+  type BridgeInfo,
 } from '../lib/cat/useRadioCAT'
 import CalibrationWizard from './CalibrationWizard'
 import NumberField from './NumberField'
+import { loadObject, saveObject } from '../lib/storage'
 export { useRadioCAT }
+
+// Persisted across sessions (localStorage) so the transport choice, bridge
+// address, and serial port settings survive a reload — everything else in
+// CATConnectionConfig (timeoutMs/pollIntervalMs/debug) is left at its
+// hardcoded default each time; only the "which radio, how do I reach it"
+// half of the config is worth remembering.
+const CAT_CONFIG_STORAGE_KEY = 'signal-decoder:cat-connection-config';
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -185,33 +195,44 @@ function ModeSelector(props: { mode: CATMode | null; onChange: (m: CATMode) => v
 
 // ── PTTButton ─────────────────────────────────────────────────────────────────
 
-function PTTButton(props: { ptt: boolean; onToggle: () => void }) {
+function PTTButton(props: { ptt: boolean; onToggle: () => void; confirmAlarm?: boolean }) {
   return (
-    <button
-      onClick={props.onToggle}
-      title={props.ptt ? 'Transmitting — click to go back to RX' : 'Push to Talk — click to transmit'}
-      class={`flex items-center justify-center gap-1.5 text-xs font-bold w-16 py-1.5 rounded-md transition-colors border shrink-0
-        ${props.ptt
-          ? 'bg-[#f85149] border-[#f85149] text-white'
-          : 'bg-[#21262d] border-[#30363d] text-[#8b949e] hover:text-[#c9d1d9] hover:border-[#8b949e]'
-        }`}
-    >
-      <Show
-        when={props.ptt}
-        fallback={
-          <>
-            <svg xmlns="http://www.w3.org/2000/svg" class="h-3.5 w-3.5 shrink-0" viewBox="0 0 20 20" fill="currentColor">
-              <path fill-rule="evenodd" d="M7 4a3 3 0 016 0v4a3 3 0 11-6 0V4zm4 10.93A7.001 7.001 0 0017 8a1 1 0 10-2 0A5 5 0 015 8a1 1 0 00-2 0 7.001 7.001 0 006 6.93V17H6a1 1 0 100 2h8a1 1 0 100-2h-3v-2.07z" clip-rule="evenodd" />
-            </svg>
-            PTT
-          </>
+    <div class="flex flex-col items-center gap-1 shrink-0">
+      <button
+        onClick={props.onToggle}
+        title={
+          props.confirmAlarm
+            ? 'RADIO DID NOT CONFIRM RX — it may still be transmitting. Bridge is retrying automatically.'
+            : props.ptt ? 'Transmitting — click to go back to RX' : 'Push to Talk — click to transmit'
         }
+        class={`flex items-center justify-center gap-1.5 text-xs font-bold w-16 py-1.5 rounded-md transition-colors border
+          ${props.confirmAlarm
+            ? 'bg-[#f85149] border-[#f85149] text-white animate-pulse ring-2 ring-[#f85149] ring-offset-2 ring-offset-[#0d1117]'
+            : props.ptt
+              ? 'bg-[#f85149] border-[#f85149] text-white'
+              : 'bg-[#21262d] border-[#30363d] text-[#8b949e] hover:text-[#c9d1d9] hover:border-[#8b949e]'
+          }`}
       >
-        {/* Transmitting — pulsing dot replaces mic icon, label stays PTT */}
-        <span class="w-2 h-2 rounded-full bg-white animate-pulse shrink-0" />
-        PTT
+        <Show
+          when={props.ptt || props.confirmAlarm}
+          fallback={
+            <>
+              <svg xmlns="http://www.w3.org/2000/svg" class="h-3.5 w-3.5 shrink-0" viewBox="0 0 20 20" fill="currentColor">
+                <path fill-rule="evenodd" d="M7 4a3 3 0 016 0v4a3 3 0 11-6 0V4zm4 10.93A7.001 7.001 0 0017 8a1 1 0 10-2 0A5 5 0 015 8a1 1 0 00-2 0 7.001 7.001 0 006 6.93V17H6a1 1 0 100 2h8a1 1 0 100-2h-3v-2.07z" clip-rule="evenodd" />
+              </svg>
+              PTT
+            </>
+          }
+        >
+          {/* Transmitting (or unconfirmed-RX alarm) — pulsing dot replaces mic icon, label stays PTT */}
+          <span class="w-2 h-2 rounded-full bg-white animate-pulse shrink-0" />
+          PTT
+        </Show>
+      </button>
+      <Show when={props.confirmAlarm}>
+        <span class="text-[9px] font-bold text-[#f85149] whitespace-nowrap animate-pulse">⚠ TX NOT CONFIRMED OFF</span>
       </Show>
-    </button>
+    </div>
   )
 }
 
@@ -223,15 +244,44 @@ function SettingsPanel(props: {
   onConnect: () => void
 }) {
   const preset = () => RADIO_PRESETS[props.config.presetIdx]
+  const isWebSocket = () => props.config.transport === 'websocket'
 
   const applyPreset = (idx: number) => {
     const p = RADIO_PRESETS[idx]
-    props.onConfigChange({ presetIdx: idx, baudRate: p.baudRate, dataBits: p.dataBits, stopBits: p.stopBits, parity: p.parity, timeoutMs: props.config.timeoutMs, pollIntervalMs: props.config.pollIntervalMs, debug: props.config.debug, rigProfile: p.rigProfile })
+    props.onConfigChange({ ...props.config, presetIdx: idx, baudRate: p.baudRate, dataBits: p.dataBits, stopBits: p.stopBits, parity: p.parity, rigProfile: p.rigProfile })
   }
 
   return (
     <div class="mt-2 bg-[#161b22] border border-[#30363d] rounded-lg p-4 flex flex-col gap-4">
       <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+        <div class="sm:col-span-2 flex flex-col gap-1.5">
+          <label class="text-[10px] font-semibold uppercase tracking-widest text-[#8b949e]">Connection</label>
+          <div class="flex gap-1.5">
+            <button
+              type="button"
+              onClick={() => props.onConfigChange({ ...props.config, transport: 'serial' })}
+              class={`flex-1 text-xs font-semibold px-3 py-1.5 rounded-md border transition-colors
+                ${!isWebSocket()
+                  ? 'bg-[#21262d] border-[#388bfd] text-[#79c0ff]'
+                  : 'bg-[#0d1117] border-[#30363d] text-[#8b949e] hover:text-[#c9d1d9] hover:border-[#8b949e]'
+                }`}
+            >
+              USB / Serial cable
+            </button>
+            <button
+              type="button"
+              onClick={() => props.onConfigChange({ ...props.config, transport: 'websocket' })}
+              class={`flex-1 text-xs font-semibold px-3 py-1.5 rounded-md border transition-colors
+                ${isWebSocket()
+                  ? 'bg-[#21262d] border-[#388bfd] text-[#79c0ff]'
+                  : 'bg-[#0d1117] border-[#30363d] text-[#8b949e] hover:text-[#c9d1d9] hover:border-[#8b949e]'
+                }`}
+            >
+              Wi-Fi CAT bridge
+            </button>
+          </div>
+        </div>
+
         <div class="sm:col-span-2 flex flex-col gap-1.5">
           <label class="text-[10px] font-semibold uppercase tracking-widest text-[#8b949e]">Radio Model</label>
           <select
@@ -248,51 +298,74 @@ function SettingsPanel(props: {
           </Show>
         </div>
 
-        <div class="flex flex-col gap-1.5">
-          <label class="text-[10px] font-semibold uppercase tracking-widest text-[#8b949e]">Baud Rate</label>
-          <select
-            value={props.config.baudRate}
-            onChange={(e) => props.onConfigChange({ ...props.config, baudRate: Number(e.currentTarget.value) })}
-            class="bg-[#0d1117] border border-[#30363d] text-[#c9d1d9] text-xs rounded px-2 py-1.5 focus:outline-none focus:border-[#388bfd]"
-          >
-            <For each={BAUD_RATES}>{(b) => <option value={b}>{b}</option>}</For>
-          </select>
-        </div>
+        <Show
+          when={isWebSocket()}
+          fallback={
+            <>
+              <div class="flex flex-col gap-1.5">
+                <label class="text-[10px] font-semibold uppercase tracking-widest text-[#8b949e]">Baud Rate</label>
+                <select
+                  value={props.config.baudRate}
+                  onChange={(e) => props.onConfigChange({ ...props.config, baudRate: Number(e.currentTarget.value) })}
+                  class="bg-[#0d1117] border border-[#30363d] text-[#c9d1d9] text-xs rounded px-2 py-1.5 focus:outline-none focus:border-[#388bfd]"
+                >
+                  <For each={BAUD_RATES}>{(b) => <option value={b}>{b}</option>}</For>
+                </select>
+              </div>
 
-        <div class="flex flex-col gap-1.5">
-          <label class="text-[10px] font-semibold uppercase tracking-widest text-[#8b949e]">Data Bits</label>
-          <select
-            value={props.config.dataBits}
-            onChange={(e) => props.onConfigChange({ ...props.config, dataBits: Number(e.currentTarget.value) })}
-            class="bg-[#0d1117] border border-[#30363d] text-[#c9d1d9] text-xs rounded px-2 py-1.5 focus:outline-none focus:border-[#388bfd]"
-          >
-            <For each={[7, 8]}>{(n) => <option value={n}>{n}</option>}</For>
-          </select>
-        </div>
+              <div class="flex flex-col gap-1.5">
+                <label class="text-[10px] font-semibold uppercase tracking-widest text-[#8b949e]">Data Bits</label>
+                <select
+                  value={props.config.dataBits}
+                  onChange={(e) => props.onConfigChange({ ...props.config, dataBits: Number(e.currentTarget.value) })}
+                  class="bg-[#0d1117] border border-[#30363d] text-[#c9d1d9] text-xs rounded px-2 py-1.5 focus:outline-none focus:border-[#388bfd]"
+                >
+                  <For each={[7, 8]}>{(n) => <option value={n}>{n}</option>}</For>
+                </select>
+              </div>
 
-        <div class="flex flex-col gap-1.5">
-          <label class="text-[10px] font-semibold uppercase tracking-widest text-[#8b949e]">Stop Bits</label>
-          <select
-            value={props.config.stopBits}
-            onChange={(e) => props.onConfigChange({ ...props.config, stopBits: Number(e.currentTarget.value) })}
-            class="bg-[#0d1117] border border-[#30363d] text-[#c9d1d9] text-xs rounded px-2 py-1.5 focus:outline-none focus:border-[#388bfd]"
-          >
-            <For each={[1, 2]}>{(n) => <option value={n}>{n}</option>}</For>
-          </select>
-        </div>
+              <div class="flex flex-col gap-1.5">
+                <label class="text-[10px] font-semibold uppercase tracking-widest text-[#8b949e]">Stop Bits</label>
+                <select
+                  value={props.config.stopBits}
+                  onChange={(e) => props.onConfigChange({ ...props.config, stopBits: Number(e.currentTarget.value) })}
+                  class="bg-[#0d1117] border border-[#30363d] text-[#c9d1d9] text-xs rounded px-2 py-1.5 focus:outline-none focus:border-[#388bfd]"
+                >
+                  <For each={[1, 2]}>{(n) => <option value={n}>{n}</option>}</For>
+                </select>
+              </div>
 
-        <div class="flex flex-col gap-1.5">
-          <label class="text-[10px] font-semibold uppercase tracking-widest text-[#8b949e]">Parity</label>
-          <select
-            value={props.config.parity}
-            onChange={(e) => props.onConfigChange({ ...props.config, parity: e.currentTarget.value as 'none' | 'even' | 'odd' })}
-            class="bg-[#0d1117] border border-[#30363d] text-[#c9d1d9] text-xs rounded px-2 py-1.5 focus:outline-none focus:border-[#388bfd]"
-          >
-            <For each={['none', 'even', 'odd'] as const}>
-              {(p) => <option value={p}>{p.charAt(0).toUpperCase() + p.slice(1)}</option>}
-            </For>
-          </select>
-        </div>
+              <div class="flex flex-col gap-1.5">
+                <label class="text-[10px] font-semibold uppercase tracking-widest text-[#8b949e]">Parity</label>
+                <select
+                  value={props.config.parity}
+                  onChange={(e) => props.onConfigChange({ ...props.config, parity: e.currentTarget.value as 'none' | 'even' | 'odd' })}
+                  class="bg-[#0d1117] border border-[#30363d] text-[#c9d1d9] text-xs rounded px-2 py-1.5 focus:outline-none focus:border-[#388bfd]"
+                >
+                  <For each={['none', 'even', 'odd'] as const}>
+                    {(p) => <option value={p}>{p.charAt(0).toUpperCase() + p.slice(1)}</option>}
+                  </For>
+                </select>
+              </div>
+            </>
+          }
+        >
+          <div class="sm:col-span-2 flex flex-col gap-1.5">
+            <label class="text-[10px] font-semibold uppercase tracking-widest text-[#8b949e]">CAT Bridge Address</label>
+            <input
+              type="text"
+              value={props.config.wsUrl ?? ''}
+              onChange={(e) => props.onConfigChange({ ...props.config, wsUrl: e.currentTarget.value })}
+              placeholder="ws://usdx-bridge.local:8765/cat"
+              class="bg-[#0d1117] border border-[#30363d] text-[#c9d1d9] text-xs rounded px-2 py-1.5 focus:outline-none focus:border-[#388bfd] font-mono"
+            />
+            <p class="text-[10px] text-[#8b949e]">
+              Address of the ESP32 CAT bridge's WebSocket endpoint — defaults to its mDNS name,{' '}
+              <code class="text-[#79c0ff]">usdx-bridge.local</code>, if your network resolves it;
+              otherwise use its IP address (shown on the bridge's LCD).
+            </p>
+          </div>
+        </Show>
 
         <div class="flex flex-col gap-1.5">
           <label class="text-[10px] font-semibold uppercase tracking-widest text-[#8b949e]">Cmd Timeout (ms)</label>
@@ -328,13 +401,23 @@ function SettingsPanel(props: {
         </div>
       </div>
 
-      <p class="text-[10px] text-[#484f58] border-t border-[#21262d] pt-3">
-        <span class="text-[#8b949e] font-semibold">Linux / macOS:</span>{' '}
-        ensure your user is in the <code class="text-[#79c0ff]">dialout</code> group:{' '}
-        <code class="text-[#c9d1d9]">sudo usermod -a -G dialout $USER</code> then log out and back in.
-        The browser will present a port picker (<code class="text-[#79c0ff]">/dev/ttyUSB*</code> or{' '}
-        <code class="text-[#79c0ff]">/dev/ttyACM*</code>) when you click Connect.
-      </p>
+      <Show
+        when={isWebSocket()}
+        fallback={
+          <p class="text-[10px] text-[#484f58] border-t border-[#21262d] pt-3">
+            <span class="text-[#8b949e] font-semibold">Linux / macOS:</span>{' '}
+            ensure your user is in the <code class="text-[#79c0ff]">dialout</code> group:{' '}
+            <code class="text-[#c9d1d9]">sudo usermod -a -G dialout $USER</code> then log out and back in.
+            The browser will present a port picker (<code class="text-[#79c0ff]">/dev/ttyUSB*</code> or{' '}
+            <code class="text-[#79c0ff]">/dev/ttyACM*</code>) when you click Connect.
+          </p>
+        }
+      >
+        <p class="text-[10px] text-[#484f58] border-t border-[#21262d] pt-3">
+          Connects through the ESP32 CAT bridge over Wi-Fi instead of a USB cable — the radio's baud
+          rate is fixed on the bridge itself (set via its own firmware config) and isn't controlled from here.
+        </p>
+      </Show>
 
       <button
         onClick={props.onConnect}
@@ -806,6 +889,311 @@ function PABiasPanel(props: {
   )
 }
 
+// ── BridgeResetButton ─────────────────────────────────────────────────────────
+// Reboots the ESP32 bridge itself (not the radio). Two-step confirm like the
+// factory-reset button — it's disruptive (the bridge drops off Wi-Fi for a
+// few seconds) even though it's not destructive to any stored settings.
+
+function BridgeResetButton(props: { onConfirm: () => void; busy: boolean }) {
+  const [armed, setArmed] = createSignal(false)
+
+  createEffect(() => {
+    if (!armed()) return
+    const t = setTimeout(() => setArmed(false), 4000)
+    onCleanup(() => clearTimeout(t))
+  })
+
+  return (
+    <button
+      onClick={() => { if (!armed()) { setArmed(true); return } setArmed(false); props.onConfirm() }}
+      disabled={props.busy}
+      title={armed() ? 'Click again to confirm — reboots the bridge, briefly dropping Wi-Fi' : 'Restart the ESP32 CAT bridge'}
+      class={`text-[10px] font-semibold px-2.5 py-1.5 rounded border transition-colors whitespace-nowrap disabled:opacity-50
+        ${armed()
+          ? 'bg-[#da3633] border-[#f85149] text-white'
+          : 'bg-[#21262d] border-[#f0883e] text-[#f0883e] hover:bg-[#bd561d] hover:text-white'
+        }`}
+    >
+      {props.busy ? 'Restarting…' : armed() ? 'Restart bridge?' : 'Restart Bridge'}
+    </button>
+  )
+}
+
+// ── BridgeSliderControl ───────────────────────────────────────────────────────
+// Generic 0..max slider for a bridge LCD setting (backlight PWM duty,
+// contrast/Vop) — applies live and persists as the bridge's new boot
+// default. Local draft state so dragging the slider doesn't fire a request
+// per pixel; commits on release (change), not on every input event.
+
+function BridgeSliderControl(props: {
+  label: string
+  value: number
+  max: number
+  onCommit: (n: number) => void
+  busy: boolean
+}) {
+  const [draft, setDraft] = createSignal(props.value)
+  createEffect(() => setDraft(props.value))
+
+  return (
+    <div class="flex items-center gap-2">
+      <span class="text-[10px] font-semibold text-[#8b949e] whitespace-nowrap">{props.label}</span>
+      <input
+        type="range" min={0} max={props.max} step={1}
+        value={draft()}
+        disabled={props.busy}
+        onInput={(e) => setDraft(Number(e.currentTarget.value))}
+        onChange={(e) => props.onCommit(Number(e.currentTarget.value))}
+        class="w-28 accent-[#388bfd] disabled:opacity-50"
+      />
+      <span class="text-[10px] text-[#c9d1d9] font-mono w-8 text-right">{draft()}</span>
+    </div>
+  )
+}
+
+// ── BridgeWifiConfigForm ──────────────────────────────────────────────────────
+// Change the bridge's own Wi-Fi network — persists to the bridge's NVS and
+// reboots it onto the new network. Deliberately separate from the CAT
+// connection settings above: this reconfigures the ESP32 hardware itself,
+// not anything about how THIS browser talks to it.
+
+function BridgeWifiConfigForm(props: {
+  currentSsid: string
+  onSubmit: (ssid: string, password: string) => void
+  busy: boolean
+}) {
+  const [open, setOpen] = createSignal(false)
+  const [ssid, setSsid] = createSignal('')
+  const [password, setPassword] = createSignal('')
+
+  const handleOpen = () => { setSsid(props.currentSsid); setPassword(''); setOpen(true) }
+  const handleSubmit = (e: Event) => {
+    e.preventDefault()
+    if (!ssid().trim()) return
+    props.onSubmit(ssid().trim(), password())
+    setOpen(false)
+  }
+
+  return (
+    <Show
+      when={open()}
+      fallback={
+        <button
+          onClick={handleOpen}
+          disabled={props.busy}
+          class="text-[10px] font-semibold px-2.5 py-1.5 rounded border transition-colors whitespace-nowrap disabled:opacity-50 bg-[#21262d] border-[#30363d] text-[#8b949e] hover:text-[#c9d1d9] hover:border-[#8b949e]"
+        >
+          Change Wi-Fi Network…
+        </button>
+      }
+    >
+      <form onSubmit={handleSubmit} class="flex flex-col gap-2 w-full">
+        <div class="flex items-center gap-2 flex-wrap">
+          <input
+            type="text" placeholder="SSID" value={ssid()}
+            onInput={(e) => setSsid(e.currentTarget.value)}
+            class="bg-[#0d1117] border border-[#30363d] text-[#c9d1d9] text-xs rounded px-2 py-1.5 focus:outline-none focus:border-[#388bfd] flex-1 min-w-[8rem]"
+          />
+          <input
+            type="password" placeholder="Password" value={password()}
+            onInput={(e) => setPassword(e.currentTarget.value)}
+            class="bg-[#0d1117] border border-[#30363d] text-[#c9d1d9] text-xs rounded px-2 py-1.5 focus:outline-none focus:border-[#388bfd] flex-1 min-w-[8rem]"
+          />
+        </div>
+        <div class="flex items-center gap-2">
+          <button
+            type="submit"
+            disabled={props.busy || !ssid().trim()}
+            class="text-[10px] font-semibold px-2.5 py-1.5 rounded bg-[#238636] hover:bg-[#2ea043] text-white disabled:opacity-50"
+          >
+            {props.busy ? 'Saving…' : 'Save & Restart'}
+          </button>
+          <button
+            type="button" onClick={() => setOpen(false)} disabled={props.busy}
+            class="text-[10px] text-[#8b949e] hover:text-[#c9d1d9] disabled:opacity-50"
+          >
+            Cancel
+          </button>
+        </div>
+        <p class="text-[10px] text-[#f0883e]">
+          The bridge will restart onto the new network — this page won't be able to reach it until you know its new address.
+        </p>
+      </form>
+    </Show>
+  )
+}
+
+// ── BridgeStatusPanel ─────────────────────────────────────────────────────────
+// On-demand ESP32 CAT bridge status (Wi-Fi RSSI/SSID/IP, connected client
+// count, radio-link, uptime) plus firmware version/capabilities and
+// controls gated on them — queried once when this panel opens via GET
+// /status + GET /info, not part of any poll loop (the bridge is a separate
+// device from the radio; there's no reason to hit it on every CAT poll
+// tick). Only relevant for the 'websocket' transport — rendered only when
+// config().transport === 'websocket' by the parent.
+//
+// Capability gating: every control below only renders if getBridgeInfo()
+// reported the matching feature string — an older bridge firmware that
+// predates a given control simply won't show it, rather than showing a
+// button that 404s. See the versioning note in
+// firmware/esp32-cat-bridge/main/bridge_config.h.
+
+function BridgeStatusPanel(props: {
+  wsUrl: string
+  getBridgeStatus: (wsUrl: string) => Promise<BridgeStatus | null>
+  resetBridge: (wsUrl: string) => Promise<boolean>
+  getBridgeInfo: (wsUrl: string) => Promise<BridgeInfo | null>
+  setBridgeBacklight: (wsUrl: string, duty: number) => Promise<{ duty: number; saved: boolean } | null>
+  setBridgeContrast: (wsUrl: string, vop: number) => Promise<{ vop: number; saved: boolean } | null>
+  setBridgeWifiConfig: (wsUrl: string, ssid: string, password: string) => Promise<boolean>
+}) {
+  const [status, setStatus] = createSignal<BridgeStatus | null>(null)
+  const [info, setInfo] = createSignal<BridgeInfo | null>(null)
+  const [failed, setFailed] = createSignal(false)
+  const [loading, setLoading] = createSignal(true)
+  const [resetBusy, setResetBusy] = createSignal(false)
+  const [backlightBusy, setBacklightBusy] = createSignal(false)
+  const [backlightDuty, setBacklightDuty] = createSignal(0)
+  const [contrastBusy, setContrastBusy] = createSignal(false)
+  const [contrastVop, setContrastVop] = createSignal(0x3F) // matches LCD_CONTRAST_DEFAULT_VOP
+  const [wifiConfigBusy, setWifiConfigBusy] = createSignal(false)
+  let loadSeq = 0
+
+  const hasFeature = (name: string) => info()?.features.includes(name) ?? false
+
+  const load = async () => {
+    const seq = ++loadSeq
+    setLoading(true); setFailed(false)
+    const [s, i] = await Promise.all([props.getBridgeStatus(props.wsUrl), props.getBridgeInfo(props.wsUrl)])
+    if (seq !== loadSeq) return
+    setLoading(false)
+    if (s) setStatus(s); else setFailed(true)
+    setInfo(i)
+    // Neither backlight nor contrast has a readback in GET /status — the
+    // panel starts both sliders at a reasonable default (mid-range) rather
+    // than lying about the bridge's actual current values, which this
+    // endpoint doesn't report.
+  }
+
+  load()
+
+  const handleRefresh = () => { void load() }
+
+  const handleRestart = async () => {
+    setResetBusy(true)
+    await props.resetBridge(props.wsUrl)
+    // The bridge is rebooting — don't bother re-querying status right away,
+    // it won't answer for a few seconds. Leave the last-known status
+    // visible (stale-but-labeled) rather than blanking the panel.
+    setResetBusy(false)
+  }
+
+  const handleBacklightCommit = async (duty: number) => {
+    setBacklightBusy(true)
+    const result = await props.setBridgeBacklight(props.wsUrl, duty)
+    if (result) setBacklightDuty(result.duty)
+    setBacklightBusy(false)
+  }
+
+  const handleContrastCommit = async (vop: number) => {
+    setContrastBusy(true)
+    const result = await props.setBridgeContrast(props.wsUrl, vop)
+    if (result) setContrastVop(result.vop)
+    setContrastBusy(false)
+  }
+
+  const handleWifiConfigSubmit = async (ssid: string, password: string) => {
+    setWifiConfigBusy(true)
+    await props.setBridgeWifiConfig(props.wsUrl, ssid, password)
+    // Same reasoning as restart: the bridge is about to drop off this
+    // network entirely, so there's nothing more to query here.
+    setWifiConfigBusy(false)
+  }
+
+  const rssiQuality = (rssi: number): string =>
+    rssi >= -55 ? 'Excellent' : rssi >= -67 ? 'Good' : rssi >= -78 ? 'Weak' : 'Very weak'
+
+  return (
+    <div class="mt-2 bg-[#161b22] border border-[#30363d] rounded-lg p-4 flex flex-col gap-3">
+      <div class="flex items-center justify-between">
+        <span class="text-[10px] font-bold uppercase tracking-widest text-[#8b949e]">
+          ESP32 CAT Bridge
+          <Show when={info()}>{(i) => <span class="text-[#484f58] font-normal normal-case ml-1.5">v{i().firmwareVersion}</span>}</Show>
+        </span>
+        <button
+          onClick={handleRefresh}
+          disabled={loading()}
+          class="text-[10px] text-[#8b949e] hover:text-[#c9d1d9] disabled:opacity-50"
+        >
+          {loading() ? 'Loading…' : 'Refresh'}
+        </button>
+      </div>
+
+      <Show
+        when={status()}
+        fallback={
+          <p class="text-[10px] text-[#f0883e]">
+            {loading() ? 'Querying bridge…' : failed() ? 'Could not reach the bridge at ' + props.wsUrl + '.' : ''}
+          </p>
+        }
+      >
+        {(s) => (
+          <div class="grid grid-cols-2 gap-x-4 gap-y-1.5 text-[11px]">
+            <span class="text-[#8b949e]">Wi-Fi</span>
+            <span class="text-[#c9d1d9]">{s().ssid} ({s().wifiState})</span>
+            <span class="text-[#8b949e]">Signal</span>
+            <span class="text-[#c9d1d9]">{s().rssi} dBm — {rssiQuality(s().rssi)}</span>
+            <span class="text-[#8b949e]">IP address</span>
+            <span class="text-[#c9d1d9] font-mono">{s().ip || '—'}</span>
+            <span class="text-[#8b949e]">Radio link</span>
+            <span class={s().radioLinked ? 'text-[#3fb950]' : 'text-[#f0883e]'}>
+              {s().radioLinked ? 'linked' : 'silent'}
+            </span>
+            <span class="text-[#8b949e]">Connected clients</span>
+            <span class="text-[#c9d1d9]">{s().wsClients} / {s().wsMaxClients}</span>
+            <span class="text-[#8b949e]">Uptime</span>
+            <span class="text-[#c9d1d9]">{Math.floor(s().uptimeSeconds / 60)}m {s().uptimeSeconds % 60}s</span>
+          </div>
+        )}
+      </Show>
+
+      <Show when={hasFeature('backlight')}>
+        <div class="border-t border-[#21262d] pt-3">
+          <BridgeSliderControl label="Backlight" value={backlightDuty()} max={255} onCommit={(n) => void handleBacklightCommit(n)} busy={backlightBusy()} />
+        </div>
+      </Show>
+
+      <Show when={hasFeature('contrast')}>
+        <div class="border-t border-[#21262d] pt-3">
+          <BridgeSliderControl label="Contrast" value={contrastVop()} max={127} onCommit={(n) => void handleContrastCommit(n)} busy={contrastBusy()} />
+        </div>
+      </Show>
+
+      <Show when={hasFeature('wifi_config')}>
+        <div class="border-t border-[#21262d] pt-3">
+          <BridgeWifiConfigForm
+            currentSsid={status()?.ssid ?? ''}
+            onSubmit={(ssid, password) => void handleWifiConfigSubmit(ssid, password)}
+            busy={wifiConfigBusy()}
+          />
+        </div>
+      </Show>
+
+      <Show when={hasFeature('reset')}>
+        <div class="border-t border-[#21262d] pt-3 flex items-center gap-3 flex-wrap">
+          <BridgeResetButton onConfirm={() => void handleRestart()} busy={resetBusy()} />
+          <p class="text-[10px] text-[#8b949e] flex-1 min-w-[16rem]">
+            Reboots the ESP32 bridge itself — not the radio. CAT will briefly drop while it restarts and reconnects to Wi-Fi.
+          </p>
+        </div>
+      </Show>
+
+      {/* Future: audio in/out (WebRTC) once hardware exists — gated the
+          same way, on info()?.features.includes('audio'), not built yet. */}
+    </div>
+  )
+}
+
 // ── Main panel ────────────────────────────────────────────────────────────────
 
 const DEFAULT_CONFIG: CATConnectionConfig & { presetIdx: number } = {
@@ -813,6 +1201,27 @@ const DEFAULT_CONFIG: CATConnectionConfig & { presetIdx: number } = {
   baudRate: 38400, dataBits: 8, stopBits: 1, parity: 'none',
   timeoutMs: 200, pollIntervalMs: 500, debug: false,
   rigProfile: RADIO_PRESETS[0].rigProfile,
+  transport: 'serial', wsUrl: 'ws://usdx-bridge.local:8765/cat',
+}
+
+// Restores presetIdx/transport/wsUrl from localStorage, but re-derives
+// baudRate/dataBits/stopBits/parity/rigProfile from RADIO_PRESETS[presetIdx]
+// rather than trusting a stored copy of them — if RADIO_PRESETS ever changes
+// (reordered, added to), a stale stored value for those fields could
+// silently disagree with what the preset itself says. presetIdx is range-
+// checked since a shrunk preset list could otherwise index out of bounds.
+function loadInitialConfig(): CATConnectionConfig & { presetIdx: number } {
+  const stored = loadObject(CAT_CONFIG_STORAGE_KEY, DEFAULT_CONFIG)
+  const presetIdx = stored.presetIdx >= 0 && stored.presetIdx < RADIO_PRESETS.length
+    ? stored.presetIdx : DEFAULT_CONFIG.presetIdx
+  const preset = RADIO_PRESETS[presetIdx]
+  return {
+    ...stored,
+    presetIdx,
+    baudRate: preset.baudRate, dataBits: preset.dataBits,
+    stopBits: preset.stopBits, parity: preset.parity,
+    rigProfile: preset.rigProfile,
+  }
 }
 
 export default function RadioCATPanel(props: { cat: RadioCATControls; collapsed?: boolean }): JSX.Element {
@@ -822,7 +1231,13 @@ export default function RadioCATPanel(props: { cat: RadioCATControls; collapsed?
   const [showSettings, setShowSettings] = createSignal(false)
   const [showPABias, setShowPABias] = createSignal(false)
   const [showCalibration, setShowCalibration] = createSignal(false)
-  const [config, setConfig] = createSignal(DEFAULT_CONFIG)
+  const [showBridgeStatus, setShowBridgeStatus] = createSignal(false)
+  const [config, setConfig] = createSignal(loadInitialConfig())
+
+  // Persist on every change — matches the load side: everything is saved,
+  // but only presetIdx/transport/wsUrl (plus the re-derivable serial fields)
+  // are meaningfully restored on the next load via loadInitialConfig().
+  createEffect(() => { saveObject(CAT_CONFIG_STORAGE_KEY, config()) })
 
   const handleConnect    = () => { setShowSettings(false); cat.connect(config()).catch(() => {}) }
   const handleFreqCommit = (hz: number) => { cat.setFrequency(hz).catch(() => {}) }
@@ -842,6 +1257,7 @@ export default function RadioCATPanel(props: { cat: RadioCATControls; collapsed?
   const handleFactoryReset = () => { setShowPABias(false); cat.factoryResetRadio().catch(() => {}) }
   const handleOpenCalibration = () => { setShowPABias(false); setShowCalibration(true) }
   const handleCloseCalibration = () => { setShowCalibration(false) }
+  const handleToggleBridgeStatus = () => { setShowBridgeStatus((s) => !s) }
 
   return (
     <div>
@@ -870,6 +1286,21 @@ export default function RadioCATPanel(props: { cat: RadioCATControls; collapsed?
                 </svg>
                 {RADIO_PRESETS[config().presetIdx].label.split('/')[0].trim()}
               </button>
+              <Show when={config().transport === 'websocket'}>
+                <button
+                  onClick={handleToggleBridgeStatus}
+                  title="ESP32 CAT bridge status (Wi-Fi signal, restart) — independent of the CAT connection"
+                  class={`w-7 h-7 flex items-center justify-center rounded border transition-colors shrink-0
+                    ${showBridgeStatus()
+                      ? 'bg-[#21262d] border-[#388bfd] text-[#79c0ff]'
+                      : 'bg-[#21262d] border-[#30363d] text-[#8b949e] hover:text-[#c9d1d9] hover:border-[#8b949e]'
+                    }`}
+                >
+                  <svg xmlns="http://www.w3.org/2000/svg" class="h-3.5 w-3.5" viewBox="0 0 20 20" fill="currentColor">
+                    <path d="M10 2a5.5 5.5 0 00-5.5 5.5c0 1.7.77 3.22 1.98 4.23L10 18l3.52-6.27A5.48 5.48 0 0015.5 7.5 5.5 5.5 0 0010 2zm0 7.5a2 2 0 110-4 2 2 0 010 4z" />
+                  </svg>
+                </button>
+              </Show>
               <button
                 onClick={handleConnect}
                 class="flex items-center gap-1.5 bg-[#238636] hover:bg-[#2ea043] text-white text-xs font-semibold px-3 py-1.5 rounded-md transition-colors shrink-0"
@@ -889,6 +1320,21 @@ export default function RadioCATPanel(props: { cat: RadioCATControls; collapsed?
             <span class="w-2 h-2 rounded-full bg-white animate-pulse inline-block" />
             Disconnect
           </button>
+          <Show when={config().transport === 'websocket'}>
+            <button
+              onClick={handleToggleBridgeStatus}
+              title="ESP32 CAT bridge status (Wi-Fi signal, restart) — independent of the CAT connection"
+              class={`w-7 h-7 flex items-center justify-center rounded border transition-colors shrink-0
+                ${showBridgeStatus()
+                  ? 'bg-[#21262d] border-[#388bfd] text-[#79c0ff]'
+                  : 'bg-[#21262d] border-[#30363d] text-[#8b949e] hover:text-[#c9d1d9] hover:border-[#8b949e]'
+                }`}
+            >
+              <svg xmlns="http://www.w3.org/2000/svg" class="h-3.5 w-3.5" viewBox="0 0 20 20" fill="currentColor">
+                <path d="M10 2a5.5 5.5 0 00-5.5 5.5c0 1.7.77 3.22 1.98 4.23L10 18l3.52-6.27A5.48 5.48 0 0015.5 7.5 5.5 5.5 0 0010 2zm0 7.5a2 2 0 110-4 2 2 0 010 4z" />
+              </svg>
+            </button>
+          </Show>
         </Show>
 
         <Show when={state().connected}>
@@ -911,7 +1357,7 @@ export default function RadioCATPanel(props: { cat: RadioCATControls; collapsed?
           <div class="w-px h-6 bg-[#30363d] shrink-0" />
 
           {/* PTT */}
-          <PTTButton ptt={state().ptt} onToggle={handlePTTToggle} />
+          <PTTButton ptt={state().ptt} onToggle={handlePTTToggle} confirmAlarm={state().pttConfirmAlarm} />
 
           {/* uSDX BLACK_BRICK 4.01a extensions */}
           <Show when={config().rigProfile === 'usdx-blackbrick' && state().firmwareVersion !== null && !props.collapsed}>
@@ -933,15 +1379,25 @@ export default function RadioCATPanel(props: { cat: RadioCATControls; collapsed?
           <span class="text-[#f85149] text-xs font-mono truncate max-w-xs">{state().error}</span>
         </Show>
 
-        <Show when={!state().isSupported && !state().connected}>
+        <Show when={!state().isSupported && !state().connected && config().transport !== 'websocket'}>
           <span class="text-[10px] text-[#f0883e] ml-auto hidden sm:block shrink-0">
-            Web Serial not supported — use Chrome or Edge
+            Web Serial not supported — use Chrome/Edge, or switch to the Wi-Fi CAT bridge
           </span>
         </Show>
       </div>
 
       <Show when={!props.collapsed && showSettings() && !state().connected}>
         <SettingsPanel config={config()} onConfigChange={setConfig} onConnect={handleConnect} />
+      </Show>
+
+      <Show when={!props.collapsed && showBridgeStatus() && config().transport === 'websocket' && config().wsUrl}>
+        <BridgeStatusPanel
+          wsUrl={config().wsUrl!}
+          getBridgeStatus={cat.getBridgeStatus} resetBridge={cat.resetBridge}
+          getBridgeInfo={cat.getBridgeInfo}
+          setBridgeBacklight={cat.setBridgeBacklight} setBridgeContrast={cat.setBridgeContrast}
+          setBridgeWifiConfig={cat.setBridgeWifiConfig}
+        />
       </Show>
 
       <Show when={!props.collapsed && showPABias() && state().connected && config().rigProfile === 'usdx-blackbrick'}>
