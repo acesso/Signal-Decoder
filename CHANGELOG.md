@@ -12,6 +12,12 @@ them into a version section when cutting a release.
 
 ## [Unreleased]
 
+## [0.9.1] - 2026-07-24
+
+### Fixed
+
+- FT8/FT4 (and every other mode's audio capture) was completely broken on the deployed production build with `SyntaxError: missing ) after formal parameters` as soon as decoding started. Cause: the shared AudioWorklet processor file was TypeScript, loaded via `audioWorklet.addModule(new URL('./captureWorklet.ts', import.meta.url))` — Vite has built-in transpile support for that `new URL(...)` pattern with `new Worker(...)`, but not with AudioWorklet's `addModule()`, so the production build inlined the raw, untranspiled TypeScript source as a `data:` URL instead of compiling it to JavaScript first. Fixed by rewriting the processor as plain JavaScript (`captureWorklet.js`), which needs no transpilation and loads identically in dev and production.
+
 ## [0.9.0] - 2026-07-23
 
 ### Added
