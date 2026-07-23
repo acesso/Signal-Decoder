@@ -535,8 +535,8 @@ export default function FTDecoder(props: Props): JSX.Element {
     mergedCount.clear()
     gate.reset()
     setWindowStats(new Map())
-    // Restart audio capture to flush the ScriptProcessorNode and AudioContext —
-    // same effect as mode-switch; relieves main-thread audio callback buildup.
+    // Restart audio capture to flush the capture AudioWorklet and AudioContext —
+    // same effect as mode-switch; clears any stale accumulated sample buffer.
     if (processor.state().isRecording) {
       processor.stopRecording()
       setTimeout(() => {
