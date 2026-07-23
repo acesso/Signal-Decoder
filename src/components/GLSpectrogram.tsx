@@ -522,7 +522,12 @@ export default function GLSpectrogram(props: Props): JSX.Element {
 
     const t = ctx.createTexture()
     ctx.bindTexture(ctx.TEXTURE_2D, t)
-    ctx.texImage2D(ctx.TEXTURE_2D, 0, ctx.LUMINANCE, TEX_W, TEX_H, 0, ctx.LUMINANCE, ctx.UNSIGNED_BYTE, null)
+    // Passing null here only reserves storage — the driver lazily zero-fills
+    // it on first draw instead of now, which is what triggers "Tex image
+    // TEXTURE_2D level 0 is incurring lazy initialization" the first frame
+    // (before pushRow() has written any real rows). An explicit zeroed
+    // buffer forces eager allocation off the draw path.
+    ctx.texImage2D(ctx.TEXTURE_2D, 0, ctx.LUMINANCE, TEX_W, TEX_H, 0, ctx.LUMINANCE, ctx.UNSIGNED_BYTE, new Uint8Array(TEX_W * TEX_H))
     ctx.texParameteri(ctx.TEXTURE_2D, ctx.TEXTURE_MIN_FILTER, ctx.LINEAR)
     ctx.texParameteri(ctx.TEXTURE_2D, ctx.TEXTURE_MAG_FILTER, ctx.LINEAR)
     ctx.texParameteri(ctx.TEXTURE_2D, ctx.TEXTURE_WRAP_S, ctx.CLAMP_TO_EDGE)
