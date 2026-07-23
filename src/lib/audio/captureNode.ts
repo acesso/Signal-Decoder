@@ -25,7 +25,12 @@ function ensureWorkletModule(ctx: AudioContext): Promise<void> {
   let loaded = workletModuleLoaded.get(ctx);
   if (!loaded) {
     loaded = ctx.audioWorklet.addModule(
-      new URL('./captureWorklet.ts', import.meta.url),
+      // Plain .js, not .ts — Vite has no built-in transpile support for
+      // AudioWorklet's addModule(new URL(...)) the way it does for
+      // new Worker(new URL(...)); a .ts file here gets inlined untranspiled
+      // in production builds and fails to parse in the browser. See
+      // captureWorklet.js's header comment for the full explanation.
+      new URL('./captureWorklet.js', import.meta.url),
     );
     workletModuleLoaded.set(ctx, loaded);
   }
