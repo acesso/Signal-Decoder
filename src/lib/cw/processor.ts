@@ -9,6 +9,7 @@
 // passes strong signals.
 import { createSignal } from 'solid-js'
 import { CWDecoder, type CWStats } from '$decoder-lib/cw/decoder'
+import { createCaptureNode, type CaptureNode } from '$decoder-lib/audio/captureNode'
 
 export interface TextToken {
   text: string
@@ -53,8 +54,7 @@ export function createCWProcessor(params: CWProcessorParams) {
   let stream: MediaStream | null = null
   let decoder: CWDecoder | null = null
   let decoder2: CWDecoder | null = null
-  let processorNode: ScriptProcessorNode | null = null
-  let animFrame: number | null = null
+  let processorNode: CaptureNode | null = null
 
   let fftBuf: Uint8Array<ArrayBuffer> | null = null
   let tokens: TextToken[] = []
@@ -180,37 +180,9 @@ export function createCWProcessor(params: CWProcessorParams) {
         decoder2 = d2
       }
 
-      let usingProcessor = false
-      try {
-        if (typeof ctx.createScriptProcessor === 'function') {
-          const proc = ctx.createScriptProcessor(4096, 1, 1)
-          processorNode = proc
-          proc.onaudioprocess = (e) => {
-            processAudioChunk(e.inputBuffer.getChannelData(0))
-          }
-          analyserNode.connect(proc)
-          proc.connect(ctx.destination)
-          usingProcessor = true
-        }
-      } catch {
-        /* fall through to RAF */
-      }
-
-      if (!usingProcessor) {
-        const gain = ctx.createGain()
-        gain.gain.value = 0.001
-        analyserNode.connect(gain)
-        gain.connect(ctx.destination)
-
-        const poll = () => {
-          if (!analyser) return
-          const buf = new Float32Array(analyserNode.fftSize)
-          analyserNode.getFloatTimeDomainData(buf)
-          processAudioChunk(buf)
-          animFrame = requestAnimationFrame(poll)
-        }
-        animFrame = requestAnimationFrame(poll)
-      }
+      const proc = await createCaptureNode(ctx, 4096, processAudioChunk)
+      processorNode = proc
+      analyserNode.connect(proc.node)
 
       setState((prev) => ({ ...prev, isRecording: true, error: null, tokens: [] }))
     } catch (err) {
@@ -236,10 +208,6 @@ export function createCWProcessor(params: CWProcessorParams) {
     if (audioContext) {
       audioContext.close()
       audioContext = null
-    }
-    if (animFrame) {
-      cancelAnimationFrame(animFrame)
-      animFrame = null
     }
     decoder = null
     decoder2 = null

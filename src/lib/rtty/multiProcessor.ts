@@ -9,6 +9,7 @@
 
 import { createSignal } from 'solid-js'
 import { RTTYDecoder as RTTYCoreDecoder, type RTTYConfig } from '$decoder-lib/rtty/decoder'
+import { createCaptureNode, type CaptureNode } from '$decoder-lib/audio/captureNode'
 
 export interface ProcessorState {
   isRecording: boolean
@@ -30,7 +31,7 @@ export function createMultiRTTYProcessor(onText: (sessionId: string, chars: stri
   let audioContext: AudioContext | null = null
   let stream: MediaStream | null = null
   let source: MediaStreamAudioSourceNode | null = null
-  let processor: ScriptProcessorNode | null = null
+  let processor: CaptureNode | null = null
   let analyser: AnalyserNode | null = null
   let snrInterval: ReturnType<typeof setInterval> | null = null
 
@@ -134,20 +135,16 @@ export function createMultiRTTYProcessor(onText: (sessionId: string, chars: stri
       const sourceNode = ctx.createMediaStreamSource(mediaStream)
       source = sourceNode
 
-      const processorNode = ctx.createScriptProcessor(4096, 1, 1)
-      processor = processorNode
-
-      processorNode.onaudioprocess = (e) => {
-        const input = e.inputBuffer.getChannelData(0)
+      const proc = await createCaptureNode(ctx, 4096, (input) => {
         decoders.forEach((decoder, id) => {
           const text = decoder.processSamples(input)
           if (text) onText(id, text)
         })
-      }
+      })
+      processor = proc
 
       sourceNode.connect(analyserNode)
-      sourceNode.connect(processorNode)
-      processorNode.connect(ctx.destination)
+      sourceNode.connect(proc.node)
 
       snrInterval = setInterval(computeSNR, 200)
       setState((prev) => ({ ...prev, isRecording: true, errorMessage: null, status: 'syncing' }))
