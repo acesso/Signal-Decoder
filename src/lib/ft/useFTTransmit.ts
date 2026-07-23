@@ -7,6 +7,7 @@
 import { createSignal } from 'solid-js'
 import { FTMode, FT_WINDOW_SECONDS, FT_SUPPORTED } from '$decoder-lib/ft/decoder'
 import { audioRecorder } from '$decoder-lib/audio/ringRecorder'
+import { createCaptureNode, type CaptureNode } from '$decoder-lib/audio/captureNode'
 
 export interface TxQueueEntry {
   id: string;
@@ -220,7 +221,7 @@ export function createFTTransmit(
   let lastTxWindow       = -1; // epoch ms of last window we transmitted in
   let gain               = loadTxGain();
   let gainNode: GainNode | null = null;
-  let txTap: ScriptProcessorNode | null = null;
+  let txTap: CaptureNode | null = null;
   let queue: TxQueueEntry[] = [];
   const timers = new Set<ReturnType<typeof setTimeout>>();
   let audioCtx: AudioContext | null = null;
@@ -460,7 +461,7 @@ export function createFTTransmit(
           const src = ctx.createBufferSource();
           src.buffer = buf;
           src.connect(gainNode ?? ctx.destination);
-          if (txTap) src.connect(txTap);
+          if (txTap) src.connect(txTap.node);
           src.onended = () => resolve();
           src.start(ctx.currentTime);
         });
@@ -552,16 +553,16 @@ export function createFTTransmit(
       // Ring-buffer tap for the global "Rec" feature. Each playback source
       // also connects to this node (pre-gain, so the recording level doesn't
       // depend on the TX gain setting); its own output stays silent — the
-      // zeroed output buffer is never written, the destination link only
-      // keeps the node pulled so it records real-time silence between
-      // transmissions and the ring reflects the true output timeline.
+      // node's own output is never connected onward, only this capture path
+      // reads from it. AudioWorkletNode (unlike the old ScriptProcessorNode)
+      // runs its capture on the audio thread, not the main thread — this tap
+      // is literally the only record of what was actually played out, so a
+      // main-thread stall silently corrupting/dropping it here would be
+      // invisible until someone tried to verify a past transmission.
       const ctx = audioCtx;
-      const tap = ctx.createScriptProcessor(4096, 1, 1);
-      tap.onaudioprocess = (e) => {
-        audioRecorder.write('output', e.inputBuffer.getChannelData(0), ctx.sampleRate);
-      };
-      tap.connect(ctx.destination);
-      txTap = tap;
+      txTap = await createCaptureNode(ctx, 4096, (samples) => {
+        audioRecorder.write('output', samples, ctx.sampleRate);
+      });
     }
     if (audioCtx.state === 'suspended') {
       await audioCtx.resume();
@@ -574,7 +575,6 @@ export function createFTTransmit(
     isRunning = false;
     clearTimers();
     if (txTap) {
-      txTap.onaudioprocess = null;
       txTap.disconnect();
       txTap = null;
     }

@@ -317,10 +317,10 @@ it, no need to have been recording in advance.
 ### How the audio is tapped
 
 - **Input** taps the shared global-audio context (`useGlobalAudio`) — the one
-  the Start button opens and every decoder's spectrum feeds from — via a
-  `ScriptProcessorNode` (4096-sample blocks, ~85 ms cadence at 48 kHz) whose
-  output stays silent; it only copies each block into the ring. One tap covers
-  all decoder modes.
+  the Start button opens and every decoder's spectrum feeds from — via the
+  shared `captureNode`/`captureWorklet` AudioWorklet pair (4096-sample blocks,
+  ~85 ms cadence at 48 kHz) whose output stays silent; it only copies each
+  block into the ring. One tap covers all decoder modes.
 - **Output** taps the TX playback context (`useFTTransmit`): every
   `AudioBufferSourceNode` that plays a transmission also connects to a
   recording tap **pre-gain**, so the recorded level is full-scale regardless
@@ -345,8 +345,9 @@ it, no need to have been recording in advance.
 - **SolidJS**: Reactive UI framework
 - **TypeScript**: Type-safe development
 - **Web Audio API**: Real-time audio capture and processing
-  - ScriptProcessorNode (Chrome, Firefox, Edge)
-  - requestAnimationFrame polling (Safari, iOS)
+  - AudioWorkletNode (`src/lib/audio/captureWorklet.ts` + `captureNode.ts`) —
+    a thin raw-sample forwarder running on the dedicated real-time audio
+    thread, batched into decoder-sized chunks on the main thread
 - **Canvas API**: Progressive image rendering
 - **Tailwind CSS**: Utility-first styling
 

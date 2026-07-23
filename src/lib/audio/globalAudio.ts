@@ -6,6 +6,7 @@
 
 import { createSignal } from 'solid-js'
 import { audioRecorder } from '$decoder-lib/audio/ringRecorder'
+import { createCaptureNode, type CaptureNode } from '$decoder-lib/audio/captureNode'
 
 export interface GlobalAudioState {
   isRecording: boolean
@@ -28,14 +29,13 @@ function createGlobalAudio() {
 
   let stream: MediaStream | null = null
   let audioCtx: AudioContext | null = null
-  let recTap: ScriptProcessorNode | null = null
+  let recTap: CaptureNode | null = null
 
   function stop() {
     stream?.getTracks().forEach((t) => t.stop())
     stream = null
 
     if (recTap) {
-      recTap.onaudioprocess = null
       recTap.disconnect()
       recTap = null
     }
@@ -76,13 +76,13 @@ function createGlobalAudio() {
 
       // Ring-buffer tap for the retroactive "Rec" feature — continuously
       // feeds the last N seconds of input audio to audioRecorder so it can
-      // be saved as a WAV after the fact.
-      const tap = ctx.createScriptProcessor(4096, 1, 1)
-      source.connect(tap)
-      tap.onaudioprocess = (e) => {
-        audioRecorder.write('input', e.inputBuffer.getChannelData(0), ctx.sampleRate)
-      }
-      tap.connect(ctx.destination)
+      // be saved as a WAV after the fact. AudioWorkletNode's capture runs on
+      // the audio thread, not the main thread — this isn't subject to the
+      // main-thread jank ScriptProcessorNode's onaudioprocess was.
+      const tap = await createCaptureNode(ctx, 4096, (samples) => {
+        audioRecorder.write('input', samples, ctx.sampleRate)
+      })
+      source.connect(tap.node)
       recTap = tap
 
       setAnalyser(node)

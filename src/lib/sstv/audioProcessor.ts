@@ -3,6 +3,7 @@ import { createSignal } from 'solid-js'
 import { SSTVDecoder, type DecoderStats } from '$decoder-lib/sstv/decoder'
 import { VISDetector } from '$decoder-lib/sstv/vis-detector'
 import { SSTV_MODES } from '$decoder-lib/sstv/constants'
+import { createCaptureNode, type CaptureNode } from '$decoder-lib/audio/captureNode'
 
 export type SSTVMode = keyof typeof SSTV_MODES
 
@@ -91,8 +92,7 @@ export function createAudioProcessor(params: AudioProcessorParams) {
   let stream: MediaStream | null = null
   let decoder: SSTVDecoder | null = null
   let visDetector: VISDetector | null = null
-  let animationFrame: number | null = null
-  let processorNode: ScriptProcessorNode | null = null
+  let processorNode: CaptureNode | null = null
 
   let activeMode: SSTVMode = params.manualMode()
   let isDecoding = false
@@ -260,37 +260,11 @@ export function createAudioProcessor(params: AudioProcessorParams) {
         isDecoding = true
       }
 
-      let useScriptProcessor = false
-      try {
-        if (typeof ctx.createScriptProcessor === 'function') {
-          const proc = ctx.createScriptProcessor(4096, 1, 1)
-          processorNode = proc
-          proc.onaudioprocess = (event) => {
-            processAudioChunk(event.inputBuffer.getChannelData(0), sampleRate)
-          }
-          analyserNode.connect(proc)
-          proc.connect(ctx.destination)
-          useScriptProcessor = true
-        }
-      } catch {
-        /* fall through */
-      }
-
-      if (!useScriptProcessor) {
-        const silentGain = ctx.createGain()
-        silentGain.gain.value = 0.001
-        analyserNode.connect(silentGain)
-        silentGain.connect(ctx.destination)
-
-        const poll = () => {
-          if (!analyser) return
-          const buf = new Float32Array(analyserNode.fftSize)
-          analyserNode.getFloatTimeDomainData(buf)
-          processAudioChunk(buf, sampleRate)
-          animationFrame = requestAnimationFrame(poll)
-        }
-        animationFrame = requestAnimationFrame(poll)
-      }
+      const proc = await createCaptureNode(ctx, 4096, (input) => {
+        processAudioChunk(input, sampleRate)
+      })
+      processorNode = proc
+      analyserNode.connect(proc.node)
 
       setState((prev) => ({ ...prev, isRecording: true, error: null }))
     } catch (err) {
@@ -315,10 +289,6 @@ export function createAudioProcessor(params: AudioProcessorParams) {
     if (audioContext) {
       audioContext.close()
       audioContext = null
-    }
-    if (animationFrame) {
-      cancelAnimationFrame(animationFrame)
-      animationFrame = null
     }
     if (decoder) decoder.stop()
     if (visDetector) visDetector.reset()

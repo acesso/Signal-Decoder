@@ -4,6 +4,7 @@
 // explaining drift-correction/rollover are load-bearing, not stylistic).
 import { createSignal } from 'solid-js'
 import { type FTDecodeResult, type FTMessage, type FTMode, FT_WINDOW_SECONDS, FT_SUPPORTED, decodeFTAudio } from '$decoder-lib/ft/decoder'
+import { createCaptureNode, type CaptureNode } from '$decoder-lib/audio/captureNode'
 
 export interface FTProcessorState {
   isRecording: boolean
@@ -35,7 +36,7 @@ export function createFTProcessor(getMode: () => FTMode) {
   let audioContext: AudioContext | null = null
   let analyser: AnalyserNode | null = null
   let stream: MediaStream | null = null
-  let processorNode: ScriptProcessorNode | null = null
+  let processorNode: CaptureNode | null = null
   let sampleBuf: Float32Array | null = null
   let sampleCount = 0
   let windowStart: Date | null = null
@@ -207,19 +208,21 @@ export function createFTProcessor(getMode: () => FTMode) {
       analyser = analyserNode
       source.connect(analyserNode)
 
-      const proc = ctx.createScriptProcessor(4096, 1, 1)
-      processorNode = proc
-      proc.onaudioprocess = (e) => {
-        const input = e.inputBuffer.getChannelData(0)
+      // AudioWorkletNode's capture runs on the audio thread, not the main
+      // thread — unlike the old ScriptProcessorNode, dropped/delayed
+      // samples here directly cost decodable FT8 windows, so this is the
+      // most consequential of this app's several ScriptProcessorNode->
+      // AudioWorklet migration sites.
+      const proc = await createCaptureNode(ctx, 4096, (input) => {
         const buf = sampleBuf
         if (!buf) return
         const space = buf.length - sampleCount
         const copy = Math.min(input.length, space)
         buf.set(input.subarray(0, copy), sampleCount)
         sampleCount += copy
-      }
-      analyserNode.connect(proc)
-      proc.connect(ctx.destination)
+      })
+      processorNode = proc
+      analyserNode.connect(proc.node)
 
       isRunning = true
       setState((prev) => ({ ...prev, isRecording: true, error: null, status: 'waiting' }))
