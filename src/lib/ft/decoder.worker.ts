@@ -23,6 +23,7 @@
 
 import type { FTMode, FTDecoderParams } from './decoder';
 import { resampleTo12k } from './resample';
+import { detectSimdTier, type SimdTier } from './simdTier';
 
 export type WorkerRequest =
   | {
@@ -128,6 +129,40 @@ async function instantiate<T>(jsFile: string, wasmFile: string, factoryName: str
 let ft8monReady: Promise<FT8MonModule> | null = null;
 let ft8libReady: Promise<FT8LibModule> | null = null;
 
+// Tiers to try, in descending preference — detectSimdTier() picks the
+// engine's best-supported tier, but that's a static-validation check
+// (WebAssembly.validate), not a full instantiation guarantee, so on any
+// load failure at a given tier this falls back rather than failing the
+// whole engine outright. baseline has no filename suffix (matches the
+// long-standing ft8mon.wasm/ft8.wasm names other tooling already expects).
+const TIER_SUFFIX: Record<SimdTier, string> = {
+  'relaxed-simd': '-relaxed-simd',
+  simd128: '-simd128',
+  baseline: '',
+};
+
+function tiersFrom(tier: SimdTier): SimdTier[] {
+  const order: SimdTier[] = ['relaxed-simd', 'simd128', 'baseline'];
+  return order.slice(order.indexOf(tier));
+}
+
+async function instantiateBestTier<T>(baseName: string, factoryName: string): Promise<T> {
+  const tiers = tiersFrom(detectSimdTier());
+  let lastErr: unknown;
+  for (const tier of tiers) {
+    const suffix = TIER_SUFFIX[tier];
+    try {
+      const mod = await instantiate<T>(`${baseName}${suffix}.js`, `${baseName}${suffix}.wasm`, factoryName);
+      if (tier !== tiers[0]) console.warn(`[ft8 worker] ${baseName}: fell back to ${tier} tier`);
+      return mod;
+    } catch (err) {
+      lastErr = err;
+      console.warn(`[ft8 worker] ${baseName} ${tier} tier load failed, trying next:`, err);
+    }
+  }
+  throw lastErr;
+}
+
 // Latest params — applied to ft8mon on load and on every 'params' message.
 let params: FTDecoderParams = {
   osdDepth: 2, ldpcIters: 25, npasses: 3, osdLdpcThresh: 70,
@@ -154,7 +189,7 @@ function applyParams(mod: FT8MonModule) {
 function loadFt8Mon(): Promise<FT8MonModule> {
   if (ft8monReady) return ft8monReady;
   ft8monReady = (async () => {
-    const mod = await instantiate<FT8MonModule>('ft8mon.js', 'ft8mon.wasm', 'createFT8MonModule');
+    const mod = await instantiateBestTier<FT8MonModule>('ft8mon', 'createFT8MonModule');
     mod._ftm_init();
     applyParams(mod);
     self.postMessage({ type: 'ready', engines: ['ft8mon'] } satisfies WorkerResponse);
@@ -170,7 +205,7 @@ function loadFt8Mon(): Promise<FT8MonModule> {
 function loadFt8Lib(): Promise<FT8LibModule> {
   if (ft8libReady) return ft8libReady;
   ft8libReady = (async () => {
-    const mod = await instantiate<FT8LibModule>('ft8.js', 'ft8.wasm', 'createFT8Module');
+    const mod = await instantiateBestTier<FT8LibModule>('ft8', 'createFT8Module');
     mod._ft8_init();
     self.postMessage({ type: 'ready', engines: ['ft8_lib'] } satisfies WorkerResponse);
     return mod;
