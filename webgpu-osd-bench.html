@@ -1,0 +1,209 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>WebGPU OSD (ordered statistics decoder) kernel verification</title>
+  <style>
+    body { font-family: monospace; background: #0d1117; color: #c9d1d9; padding: 2rem; }
+    button { font-size: 1rem; padding: 0.5rem 1rem; cursor: pointer; margin-right: 0.5rem; }
+    pre { background: #161b22; padding: 1rem; border-radius: 6px; overflow-x: auto; white-space: pre-wrap; }
+    .fail { color: #f85149; }
+    .pass { color: #3fb950; }
+  </style>
+</head>
+<body>
+  <h1>osdDecode.wgsl real-GPU verification</h1>
+  <p>Runs the OSD (ordered statistics decoding) GPU kernel (one workgroup per candidate: parallel selection-sort by |LLR|, sequential 91-step Gauss-Jordan elimination with a barrier-synchronized pivot search each step, matmul-based zero-flip + depth-flip hypothesis testing) against real WebGPU hardware and compares every output against osdDecode.ts's plain-TS reference (itself a direct port of lib/ft8mon/osd.cc). This is the first time this kernel touches an actual WGSL compiler/GPU driver — everything before this was JS-simulated only.</p>
+  <button id="run">Run Verification</button>
+  <pre id="out">(not run yet)</pre>
+
+  <script type="module">
+    import { runOsdDecodeGpu, resetOsdGpuState } from '/src/lib/ft/webgpu/webgpuOsdDecode.ts';
+    import { osdDecode, ldpcEncode } from '/src/lib/ft/webgpu/osdDecode.ts';
+    import { ft8Crc, checkCrc } from '/src/lib/ft/webgpu/crc.ts';
+    import { isWebGpuAvailable } from '/src/lib/ft/webgpu/webgpuDevice.ts';
+
+    const out = document.getElementById('out');
+    const log = (s) => { out.textContent += s + '\n'; console.log(s); };
+
+    document.getElementById('run').addEventListener('click', async () => {
+      out.textContent = '';
+      resetOsdGpuState();
+      try {
+        await runVerification();
+      } catch (e) {
+        log(`\nERROR: ${e.message}\n${e.stack ?? ''}`);
+        out.className = 'fail';
+      }
+    });
+
+    // Deterministic seeded PRNG -- same LCG this session's other bench pages
+    // use (webgpu-searchboth-bench.html's randSamples), for reproducibility.
+    function seededRandom(seed) {
+      let s = seed >>> 0;
+      return () => {
+        s = (s * 1664525 + 1013904223) >>> 0;
+        return s / 4294967296;
+      };
+    }
+
+    // Builds a genuine CRC-valid 91-bit plaintext (77 payload bits + a REAL
+    // CRC-14 over them, matching check_crc()'s own "82-bit window" convention
+    // — see crc.ts's header comment) rather than random garbage, so
+    // osd_check()'s CRC gate can genuinely accept a correctly-recovered
+    // decode instead of every candidate looking like noise.
+    function makeValidPlain(rand) {
+      const plain = new Uint8Array(91);
+      for (let i = 0; i < 77; i++) plain[i] = rand() < 0.5 ? 0 : 1;
+      const aa = new Array(91).fill(0);
+      for (let i = 0; i < 77; i++) aa[i] = plain[i];
+      const crc = ft8Crc(aa, 82);
+      for (let i = 0; i < 14; i++) plain[77 + i] = crc[i];
+      return plain;
+    }
+
+    // Hint-forced +-4.97 LLR convention -- matches this app's actual live
+    // decoder output for confidently-decoded Costas-tone bits (see
+    // ldpcDecode.wgsl's own header comment on this convention), the
+    // realistic magnitude OSD's strongest-91 reordering operates on.
+    function toLlr(codeword) {
+      const ll = new Float32Array(174);
+      for (let i = 0; i < 174; i++) ll[i] = codeword[i] ? -4.97 : 4.97;
+      return ll;
+    }
+
+    async function runVerification() {
+      if (!(await isWebGpuAvailable())) {
+        log('WebGPU not available in this browser.');
+        out.className = 'fail';
+        return;
+      }
+      log('WebGPU available. Running checks...\n');
+
+      let pass = 0, fail = 0;
+      const check = (name, cond, detail) => {
+        if (cond) { pass++; log(`PASS  ${name}`); }
+        else { fail++; log(`FAIL  ${name}  ${detail ?? ''}`); }
+      };
+
+      // 1) Clean (zero-flip) decodes: no corruption at all, OSD should accept
+      // the received codeword directly at depth=0, matching osd_decode()'s
+      // own early-return-on-zero-flip-success path exactly.
+      {
+        const rand = seededRandom(11111);
+        const N = 10;
+        const llrBatch = [];
+        const truePlains = [];
+        for (let i = 0; i < N; i++) {
+          const plain = makeValidPlain(rand);
+          truePlains.push(plain);
+          llrBatch.push(toLlr(ldpcEncode(plain)));
+        }
+        const gpuResult = await runOsdDecodeGpu(llrBatch, 2);
+        for (let i = 0; i < N; i++) {
+          const cpu = osdDecode(new Float64Array(llrBatch[i]), 2);
+          const okMatch = cpu.ok === gpuResult.ok[i];
+          const plainMatch = cpu.ok && gpuResult.ok[i] && Array.from(cpu.plain).every((v, k) => v === gpuResult.plain[i][k]);
+          const depthMatch = cpu.depthUsed === gpuResult.depthUsed[i];
+          check(`clean candidate ${i}: ok=${gpuResult.ok[i]} matches CPU`, okMatch);
+          if (okMatch && cpu.ok) {
+            check(`clean candidate ${i}: plain bits match CPU`, plainMatch);
+            check(`clean candidate ${i}: depthUsed=0 matches CPU`, depthMatch, `cpu=${cpu.depthUsed} gpu=${gpuResult.depthUsed[i]}`);
+            check(`clean candidate ${i}: recovers the TRUE original plaintext`, Array.from(gpuResult.plain[i]).every((v, k) => v === truePlains[i][k]));
+          }
+        }
+      }
+
+      // 2) Depth-flip-required recoveries: weaken 2 bits (reduce |LLR| but
+      // keep original sign) so they land in the untrusted tail of the
+      // strongest-91 reordering -- this is the CPU-side test's own proven
+      // construction for exercising depth>0 (see osdDecode.test.ts).
+      {
+        const rand = seededRandom(12345);
+        const N = 20;
+        const llrBatch = [];
+        const truePlains = [];
+        for (let i = 0; i < N; i++) {
+          const plain = makeValidPlain(rand);
+          truePlains.push(plain);
+          const ll = toLlr(ldpcEncode(plain));
+          ll[10] = -ll[10] * 0.3;
+          ll[55] = -ll[55] * 0.3;
+          llrBatch.push(ll);
+        }
+        const gpuResult = await runOsdDecodeGpu(llrBatch, 2);
+        let gpuRecovered = 0;
+        for (let i = 0; i < N; i++) {
+          if (gpuResult.ok[i] && Array.from(gpuResult.plain[i]).every((v, k) => v === truePlains[i][k])) gpuRecovered++;
+        }
+        check(`weak-bit recovery: GPU recovers all ${N}/${N} true plaintexts (depth<=2)`, gpuRecovered === N, `recovered=${gpuRecovered}`);
+      }
+
+      // 3) Mixed corruption sweep (1-3 full bit-flips, varying per candidate)
+      // batched in ONE dispatch: exercises all three code paths (zero-flip
+      // success, depth-flip success, genuine failure) together, and is the
+      // REGRESSION TEST for the two real bugs found on actual GPU hardware
+      // this session: (a) gauss_jordan()'s pivot-search SWAP silently never
+      // updated which_arr (only b_scratch's rows), producing a
+      // self-consistent-looking but WRONG decoded plaintext whenever a
+      // pivot swap was needed (triggered by tied |LLR| values -- this app's
+      // hint-forced +-4.97 convention makes ties common in practice); (b)
+      // workgroupBarrier() alone does not order STORAGE-buffer accesses
+      // across invocations (only WORKGROUP-memory accesses) -- every
+      // b_scratch read/write across a barrier in gauss_jordan() needed a
+      // paired storageBarrier() too. Both were invisible to code review and
+      // only surfaced by comparing actual GPU output against the CPU
+      // reference on tied-LLR data. The critical property checked here is
+      // NOT "GPU always succeeds" (many candidates genuinely have no valid
+      // decode) but "GPU NEVER reports ok=true with a WRONG plaintext".
+      {
+        const rand = seededRandom(7777);
+        const N = 60;
+        const llrBatch = [];
+        const truePlains = [];
+        for (let trial = 0; trial < N; trial++) {
+          const plain = makeValidPlain(rand);
+          truePlains.push(plain);
+          const ll = toLlr(ldpcEncode(plain));
+          const flipCount = 1 + (trial % 3);
+          for (let k = 0; k < flipCount; k++) {
+            const idx = Math.floor(rand() * 174);
+            ll[idx] = -ll[idx];
+          }
+          llrBatch.push(ll);
+        }
+        const gpuResult = await runOsdDecodeGpu(llrBatch, 2);
+
+        let okMismatches = 0, wrongPlainCount = 0, depth0 = 0, depthPos = 0, failedCount = 0;
+        for (let i = 0; i < N; i++) {
+          const cpu = osdDecode(new Float64Array(llrBatch[i]), 2);
+          if (cpu.ok !== gpuResult.ok[i]) okMismatches++;
+          if (gpuResult.ok[i]) {
+            const matchesTrue = Array.from(gpuResult.plain[i]).every((v, k) => v === truePlains[i][k]);
+            if (!matchesTrue) wrongPlainCount++;
+            if (gpuResult.depthUsed[i] === 0) depth0++; else depthPos++;
+          } else {
+            failedCount++;
+          }
+        }
+        log(`  mixed corruption sweep: depth0=${depth0} depthPositive=${depthPos} failed=${failedCount} (of ${N})`);
+        check('mixed sweep: GPU ok matches CPU for every candidate', okMismatches === 0, `mismatches=${okMismatches}/${N}`);
+        check('mixed sweep: GPU NEVER returns ok=true with a WRONG plaintext', wrongPlainCount === 0, `wrong=${wrongPlainCount}`);
+        check('mixed sweep: depth-flip path (depth>0) genuinely exercised', depthPos > 0, `depthPositive=${depthPos}`);
+        check('mixed sweep: failure path genuinely exercised', failedCount > 0, `failed=${failedCount}`);
+      }
+
+      // 4) All-zero-plaintext rejection sanity check (osd_check()'s
+      // all-zero guard) -- checkCrc alone already rejects all-zero (no
+      // nonzero bits), confirming the CRC module this kernel's osd_check()
+      // relies on has the same guard the C source does.
+      {
+        check('all-zero plaintext fails checkCrc (osd_check would reject it)', checkCrc(new Uint8Array(91)) === false);
+      }
+
+      log(`\n${pass} passed, ${fail} failed`);
+      out.className = fail === 0 ? 'pass' : 'fail';
+    }
+  </script>
+</body>
+</html>

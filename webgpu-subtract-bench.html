@@ -1,0 +1,232 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>WebGPU subtract() GPU kernel verification</title>
+  <style>
+    body { font-family: monospace; background: #0d1117; color: #c9d1d9; padding: 2rem; }
+    button { font-size: 1rem; padding: 0.5rem 1rem; cursor: pointer; margin-right: 0.5rem; }
+    pre { background: #161b22; padding: 1rem; border-radius: 6px; overflow-x: auto; white-space: pre-wrap; }
+    .fail { color: #f85149; }
+    .pass { color: #3fb950; }
+  </style>
+</head>
+<body>
+  <h1>subtractFused.wgsl real-GPU verification</h1>
+  <p>Runs the GPU-accelerated subtraction pipeline (per-candidate amplitude/phase extraction + ramped waveform synthesis and subtraction, one workgroup per candidate) against real WebGPU hardware and compares it against subtract.ts's proven CPU reference (subtractDecodedSignal, a direct port of ft8mon's subtract()/analytic()/hilbert_shift()). Also checks the batch-within-pass multi-candidate combining strategy against strictly-sequential CPU subtraction.</p>
+  <button id="run">Run Verification</button>
+  <pre id="out">(not run yet)</pre>
+
+  <script type="module">
+    import { subtractDecodedSignal } from '/src/lib/ft/webgpu/subtract.ts';
+    import { runSubtractGpu, subtractSequentialCpu } from '/src/lib/ft/webgpu/subtractGpu.ts';
+    import { resetSubtractGpuState } from '/src/lib/ft/webgpu/webgpuSubtract.ts';
+    import { isWebGpuAvailable } from '/src/lib/ft/webgpu/webgpuDevice.ts';
+
+    const RATE = 12000;
+    const BLOCK = 1920;
+    const BIN_HZ = RATE / BLOCK; // 6.25
+
+    const out = document.getElementById('out');
+    const log = (s) => { out.textContent += s + '\n'; console.log(s); };
+
+    document.getElementById('run').addEventListener('click', async () => {
+      out.textContent = '';
+      resetSubtractGpuState();
+      try {
+        await runVerification();
+      } catch (e) {
+        log(`\nERROR: ${e.message}\n${e.stack ?? ''}`);
+        out.className = 'fail';
+      }
+    });
+
+    function seededRandom(seed) {
+      let s = seed >>> 0;
+      return () => { s = (s * 1664525 + 1013904223) >>> 0; return (s / 4294967296) * 2 - 1; };
+    }
+
+    function makeRe79(seed) {
+      const rng = seededRandom(seed);
+      return new Array(79).fill(0).map((_, i) => {
+        if (i < 7 || (i >= 36 && i < 43) || i >= 72) {
+          return [3, 1, 4, 0, 6, 5, 2][i < 7 ? i : i >= 72 ? i - 72 : i - 36];
+        }
+        return Math.floor((rng() * 0.5 + 0.5) * 8) % 8;
+      });
+    }
+
+    // Deterministic seeded synthetic FT8-like tone-burst signal: 79 pure
+    // sinusoids (one per symbol) at bin (bin0+re79[si])*BIN_HZ, embedded in
+    // low-amplitude noise -- same shape as costasCorrelation.test.ts's own
+    // synthesizeCostasSignal() helper, generalized to a full 79-symbol re79.
+    function synthesizeSignal(totalSamples, offSamples, bin0, re79, amp, noiseAmp, seed) {
+      const rng = seededRandom(seed);
+      const samples = new Float64Array(totalSamples);
+      for (let i = 0; i < totalSamples; i++) samples[i] = noiseAmp * rng();
+      for (let si = 0; si < 79; si++) {
+        const toneBin = bin0 + re79[si];
+        const freqHz = toneBin * BIN_HZ;
+        const base = offSamples + si * BLOCK;
+        for (let n = 0; n < BLOCK; n++) {
+          const idx = base + n;
+          if (idx >= 0 && idx < totalSamples) samples[idx] += amp * Math.cos((2 * Math.PI * freqHz * n) / RATE);
+        }
+      }
+      return samples;
+    }
+
+    function bandEnergy(samples, off, len, hz, rate) {
+      let re = 0, im = 0;
+      for (let i = 0; i < len; i++) {
+        const idx = off + i;
+        const x = idx >= 0 && idx < samples.length ? samples[idx] : 0;
+        const theta = (2 * Math.PI * hz * i) / rate;
+        re += x * Math.cos(theta);
+        im += x * Math.sin(theta);
+      }
+      return Math.hypot(re, im);
+    }
+
+    async function runVerification() {
+      if (!(await isWebGpuAvailable())) {
+        log('WebGPU not available in this browser.');
+        out.className = 'fail';
+        return;
+      }
+      log('WebGPU available. Running checks...\n');
+
+      let pass = 0, fail = 0;
+      const check = (name, cond, detail) => {
+        if (cond) { pass++; log(`PASS  ${name}`); }
+        else { fail++; log(`FAIL  ${name}  ${detail ?? ''}`); }
+      };
+
+      // 1) Single candidate: GPU orchestration (runSubtractGpu) vs CPU
+      // reference (subtractDecodedSignal) on a deterministic synthetic
+      // tone-burst signal.
+      {
+        const nSymbols = 85;
+        const totalSamples = nSymbols * BLOCK;
+        const offSamples = 2 * BLOCK;
+        const offSec = offSamples / RATE;
+        const bin0 = 300;
+        const hz0 = bin0 * BIN_HZ;
+        const re79 = makeRe79(99);
+        const amp = 1.0;
+        const noiseAmp = 0.02;
+        const samples = synthesizeSignal(totalSamples, offSamples, bin0, re79, amp, noiseAmp, 7);
+
+        const cpuResidual = subtractDecodedSignal(samples, re79, hz0, hz0, offSec, RATE);
+        const gpuResidual = await runSubtractGpu(new Float32Array(samples), [{ re79, hz0, hz1: hz0, offSec }], RATE);
+
+        let maxDiff = 0, sumSq = 0, sumSqRef = 0;
+        for (let i = 0; i < totalSamples; i++) {
+          const d = Math.abs(cpuResidual[i] - gpuResidual[i]);
+          maxDiff = Math.max(maxDiff, d);
+          sumSq += d * d;
+          sumSqRef += cpuResidual[i] * cpuResidual[i];
+        }
+        const relRms = Math.sqrt(sumSq / totalSamples) / Math.sqrt(sumSqRef / totalSamples + 1e-12);
+        log(`  single-candidate: maxDiff=${maxDiff.toFixed(5)} relRms=${relRms.toFixed(5)}`);
+        check('single-candidate GPU matches CPU subtract.ts reference', relRms < 0.05, `relRms=${relRms}`);
+      }
+
+      // 2) Two candidates, well-separated frequencies, batched into ONE
+      // GPU dispatch -- compares the GPU batch-and-sum combining strategy
+      // against strictly-SEQUENTIAL CPU subtraction (subtractSequentialCpu),
+      // and checks both signals are substantially removed.
+      {
+        const nSymbols = 85;
+        const totalSamples = nSymbols * BLOCK;
+        const offSamples = 2 * BLOCK;
+        const offSec = offSamples / RATE;
+        const bin0A = 200, bin0B = 600;
+        const re79A = makeRe79(11), re79B = makeRe79(22);
+        const amp = 0.8;
+        const noiseAmp = 0.02;
+
+        const rng = seededRandom(3);
+        const noise = new Float64Array(totalSamples);
+        for (let i = 0; i < totalSamples; i++) noise[i] = noiseAmp * rng();
+        const sigA = synthesizeSignal(totalSamples, offSamples, bin0A, re79A, amp, 0, 0);
+        const sigB = synthesizeSignal(totalSamples, offSamples, bin0B, re79B, amp, 0, 0);
+        const combined = new Float64Array(totalSamples);
+        for (let i = 0; i < totalSamples; i++) combined[i] = noise[i] + sigA[i] + sigB[i];
+
+        const candidates = [
+          { re79: re79A, hz0: bin0A * BIN_HZ, hz1: bin0A * BIN_HZ, offSec },
+          { re79: re79B, hz0: bin0B * BIN_HZ, hz1: bin0B * BIN_HZ, offSec },
+        ];
+
+        const gpuBatchResult = await runSubtractGpu(new Float32Array(combined), candidates, RATE);
+        const cpuSeqResult = subtractSequentialCpu(new Float32Array(combined), candidates, RATE);
+
+        let maxDiff = 0, sumSq = 0, sumSqRef = 0;
+        for (let i = 0; i < totalSamples; i++) {
+          const d = Math.abs(gpuBatchResult[i] - cpuSeqResult[i]);
+          maxDiff = Math.max(maxDiff, d);
+          sumSq += d * d;
+          sumSqRef += cpuSeqResult[i] * cpuSeqResult[i];
+        }
+        const relRms = Math.sqrt(sumSq / totalSamples) / Math.sqrt(sumSqRef / totalSamples + 1e-12);
+        log(`  two-candidate batch (GPU) vs sequential (CPU): maxDiff=${maxDiff.toFixed(5)} relRms=${relRms.toFixed(5)}`);
+        check('two-candidate GPU batch approximates sequential CPU subtraction', relRms < 0.1, `relRms=${relRms}`);
+
+        const checkSymbols = [10, 20, 50, 60];
+        function candEnergy(samples, bin0, re79) {
+          let e = 0;
+          for (const si of checkSymbols) {
+            const hz = (bin0 + re79[si]) * BIN_HZ;
+            const base = offSamples + si * BLOCK + Math.round(BLOCK * 0.3);
+            const len = Math.round(BLOCK * 0.4);
+            e += bandEnergy(samples, base, len, hz, RATE);
+          }
+          return e;
+        }
+        const beforeA = candEnergy(combined, bin0A, re79A);
+        const afterA = candEnergy(gpuBatchResult, bin0A, re79A);
+        const beforeB = candEnergy(combined, bin0B, re79B);
+        const afterB = candEnergy(gpuBatchResult, bin0B, re79B);
+        log(`  signal A energy: before=${beforeA.toFixed(2)} after=${afterA.toFixed(2)}`);
+        log(`  signal B energy: before=${beforeB.toFixed(2)} after=${afterB.toFixed(2)}`);
+        check('GPU batch substantially removes signal A', afterA < beforeA * 0.2, `${afterA} vs ${beforeA}`);
+        check('GPU batch substantially removes signal B', afterB < beforeB * 0.2, `${afterB} vs ${beforeB}`);
+      }
+
+      // 3) f32-precision regression check: a real bug this kernel had
+      // (found only via a real headless-GPU run, not code review) was
+      // catastrophic cancellation in the transition-ramp's `target_phase -
+      // actual` phase-matching subtraction, caused by theta growing to
+      // O(1000-2000) radians in magnitude before that subtraction (fixed by
+      // wrap_theta() -- see subtractFused.wgsl's header comment). This
+      // check targets a symbol INSIDE the buffer (not symbol 0 or 78, which
+      // have different ramp handling) specifically at a transition
+      // boundary, where the bug's error was largest (~2.0 absolute, on a
+      // ~1.0-amplitude signal -- i.e. WORSE than not subtracting at all).
+      {
+        const nSymbols = 85;
+        const totalSamples = nSymbols * BLOCK;
+        const offSamples = 2 * BLOCK;
+        const offSec = offSamples / RATE;
+        const bin0 = 300;
+        const hz0 = bin0 * BIN_HZ;
+        const re79 = makeRe79(99); // same seed the original bug was found with
+        const amp = 1.0;
+        const samples = synthesizeSignal(totalSamples, offSamples, bin0, re79, amp, 0.02, 7);
+
+        const cpuResidual = subtractDecodedSignal(samples, re79, hz0, hz0, offSec, RATE);
+        const gpuResidual = await runSubtractGpu(new Float32Array(samples), [{ re79, hz0, hz1: hz0, offSec }], RATE);
+
+        let maxDiff = 0;
+        for (let i = 0; i < totalSamples; i++) maxDiff = Math.max(maxDiff, Math.abs(cpuResidual[i] - gpuResidual[i]));
+        log(`  f32-precision regression check: maxDiff=${maxDiff.toFixed(5)} (bug produced ~2.0 before the wrap_theta fix)`);
+        check('no catastrophic-cancellation regression at transition ramps', maxDiff < 0.05, `maxDiff=${maxDiff}`);
+      }
+
+      log(`\n${pass} passed, ${fail} failed`);
+      out.className = fail === 0 ? 'pass' : 'fail';
+    }
+  </script>
+</body>
+</html>

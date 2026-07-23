@@ -1,0 +1,116 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>WebGPU parallel LDPC decode benchmark</title>
+  <style>
+    body { font-family: monospace; background: #0d1117; color: #c9d1d9; padding: 2rem; }
+    button { font-size: 1rem; padding: 0.5rem 1rem; cursor: pointer; margin-right: 0.5rem; }
+    pre { background: #161b22; padding: 1rem; border-radius: 6px; overflow-x: auto; white-space: pre-wrap; }
+    .fail { color: #f85149; }
+    .pass { color: #3fb950; }
+  </style>
+</head>
+<body>
+  <h1>FT8 LDPC decode: WebGPU parallel vs CPU/WASM feasibility benchmark</h1>
+  <p>Loads 19 real LLR arrays captured from ft8mon's own successful decodes (all ldpc_ok=83, CRC-valid), synthetically replicates them up to a target candidate count, and runs LDPC belief-propagation 2 ways: (1) plain-TS CPU reference (ldpcDecode.ts, one candidate at a time, sequential — same shape as ft8mon's own per-candidate loop), (2) WGSL GPU kernel (ldpcDecode.wgsl, ALL candidates dispatched in parallel, one GPU invocation each). Verifies every candidate's decoded output matches the real ft8mon-captured answer before reporting timings. <strong>Note:</strong> the current scratch-buffer layout puts one m/e block per candidate in a single storage buffer, which hits WebGPU's 128&nbsp;MiB default <code>maxStorageBufferBindingSize</code> around ~1161 candidates on most devices — past that, <code>runLdpcDecodeGpu</code> throws a clear error instead of the silent all-zero corruption this used to produce.</p>
+  <label>Candidate count: <input id="n" type="number" value="100" min="1" max="1161" /></label>
+  <button id="run">Run Benchmark</button>
+  <pre id="out">(not run yet)</pre>
+
+  <script type="module">
+    import { runLdpcDecodeGpu, resetLdpcGpuState } from '/src/lib/ft/webgpu/webgpuLdpcDecode.ts';
+    import { ldpcDecode } from '/src/lib/ft/webgpu/ldpcDecode.ts';
+    import { isWebGpuAvailable } from '/src/lib/ft/webgpu/webgpuDevice.ts';
+
+    const out = document.getElementById('out');
+    const log = (s) => { out.textContent += s + '\n'; console.log(s); };
+
+    document.getElementById('run').addEventListener('click', async () => {
+      out.textContent = '';
+      resetLdpcGpuState();
+      try {
+        await runBenchmark();
+      } catch (e) {
+        log(`\nERROR: ${e.message}`);
+        out.className = 'fail';
+      }
+    });
+
+    async function runBenchmark() {
+
+      const gpuAvailable = await isWebGpuAvailable();
+      log(`WebGPU available: ${gpuAvailable}`);
+      if (!gpuAvailable) {
+        log('No WebGPU adapter in this browser/session — cannot proceed with GPU path.');
+        return;
+      }
+
+      // Deliberately allow past the ~1161-candidate ceiling (see the page's
+      // header note) so the clear thrown-error path is reachable/testable,
+      // rather than silently clamping it away.
+      const targetN = Math.max(1, Math.min(5000, Number(document.getElementById('n').value) || 100));
+
+      const resp = await fetch('/webgpu-bench-wav/ldpc-real-decodes.json');
+      const realFixtures = await resp.json();
+      log(`Loaded ${realFixtures.length} real ft8mon LDPC decodes (all ldpc_ok=83).`);
+
+      // Replicate up to targetN candidates — real decode workloads reuse
+      // the same small set of real fixtures cyclically (this only tests
+      // throughput/parallelism, not decode diversity — correctness is
+      // already established per-fixture by ldpcDecodeRealData.test.ts).
+      const candidates = [];
+      for (let i = 0; i < targetN; i++) {
+        candidates.push(realFixtures[i % realFixtures.length]);
+      }
+      log(`Testing with ${candidates.length} candidates (real fixtures replicated cyclically).\n`);
+
+      const llrPerCandidate = candidates.map(c => new Float32Array(c.llr));
+
+      // --- Path 1: plain-TS CPU reference, sequential (matches ft8mon's own per-candidate loop shape) ---
+      const tCpu0 = performance.now();
+      const cpuResults = [];
+      for (const llr of llrPerCandidate) {
+        cpuResults.push(ldpcDecode(new Float64Array(llr), 25));
+      }
+      const tCpu1 = performance.now();
+
+      let cpuAllMatch = true;
+      for (let i = 0; i < candidates.length; i++) {
+        const expected = candidates[i].plain;
+        const got = Array.from(cpuResults[i].plain);
+        if (cpuResults[i].ok !== 83 || !got.every((b, j) => b === expected[j])) {
+          cpuAllMatch = false;
+          log(`CPU MISMATCH at candidate ${i} (${candidates[i].filename})`);
+        }
+      }
+      log(`[1] Plain-TS CPU reference (sequential, ${candidates.length} candidates): ${(tCpu1 - tCpu0).toFixed(2)}ms total, ${((tCpu1 - tCpu0) / candidates.length).toFixed(3)}ms/candidate`);
+      log(`    correctness: ${cpuAllMatch ? 'PASS — all candidates match ft8mon' : 'FAIL — see mismatches above'}`);
+
+      // --- Path 2: WGSL GPU kernel, all candidates dispatched together ---
+      const gpuResult = await runLdpcDecodeGpu(llrPerCandidate, 25);
+
+      let gpuAllMatch = true;
+      for (let i = 0; i < candidates.length; i++) {
+        const expected = candidates[i].plain;
+        const got = Array.from(gpuResult.plain[i]);
+        if (gpuResult.ok[i] !== 83 || !got.every((b, j) => b === expected[j])) {
+          gpuAllMatch = false;
+          log(`GPU MISMATCH at candidate ${i} (${candidates[i].filename}): ok=${gpuResult.ok[i]}`);
+        }
+      }
+      log(`\n[2] WGSL GPU kernel (parallel, ${candidates.length} candidates dispatched together):`);
+      log(`    upload=${gpuResult.timings.uploadMs.toFixed(2)}ms dispatch=${gpuResult.timings.dispatchMs.toFixed(2)}ms readback=${gpuResult.timings.readbackMs.toFixed(2)}ms total=${gpuResult.timings.totalMs.toFixed(2)}ms`);
+      log(`    ${(gpuResult.timings.totalMs / candidates.length).toFixed(3)}ms/candidate (amortized)`);
+      log(`    correctness: ${gpuAllMatch ? 'PASS — all candidates match ft8mon' : 'FAIL — see mismatches above'}`);
+
+      log(`\n--- Summary ---`);
+      const speedup = (tCpu1 - tCpu0) / gpuResult.timings.totalMs;
+      log(`CPU total: ${(tCpu1 - tCpu0).toFixed(2)}ms   GPU total: ${gpuResult.timings.totalMs.toFixed(2)}ms   speedup: ${speedup.toFixed(2)}x`);
+      log(`Overall correctness: ${(cpuAllMatch && gpuAllMatch) ? 'PASS' : 'FAIL'}`);
+
+      out.className = (cpuAllMatch && gpuAllMatch) ? 'pass' : 'fail';
+    }
+  </script>
+</body>
+</html>

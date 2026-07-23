@@ -1,0 +1,229 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>WebGPU searchBoth grid-search kernel verification</title>
+  <style>
+    body { font-family: monospace; background: #0d1117; color: #c9d1d9; padding: 2rem; }
+    button { font-size: 1rem; padding: 0.5rem 1rem; cursor: pointer; margin-right: 0.5rem; }
+    pre { background: #161b22; padding: 1rem; border-radius: 6px; overflow-x: auto; white-space: pre-wrap; }
+    .fail { color: #f85149; }
+    .pass { color: #3fb950; }
+  </style>
+</head>
+<body>
+  <h1>searchBoth.wgsl real-GPU verification</h1>
+  <p>Runs the fused searchBoth grid-search GPU kernel (one workgroup per candidate, entire hz&times;off grid search + a race-free parallel reduction to the single best result, all in one dispatch) against real WebGPU hardware and compares every output against fineSync.ts's already-proven CPU reference (searchBothDefault/searchBoth). This is the first time this kernel touches an actual WGSL compiler/GPU driver — everything before this was JS-simulated only (see the task's scratchpad simulation, not included here).</p>
+  <button id="run">Run Verification</button>
+  <pre id="out">(not run yet)</pre>
+
+  <script type="module">
+    import { runSearchBothGpu, resetSearchBothGpuState } from '/src/lib/ft/webgpu/webgpuSearchBoth.ts';
+    import { searchBothDefault, searchBoth } from '/src/lib/ft/webgpu/fineSync.ts';
+    import { isWebGpuAvailable } from '/src/lib/ft/webgpu/webgpuDevice.ts';
+    import fixture from '/src/lib/ft/webgpu/__tests__/fixtures/fineSyncPipeline.json';
+
+    const SECOND_HZ_N = 4;
+    const SECOND_HZ_WIN = 3.5;
+    const SECOND_OFF_WIN = 0.5;
+    const SECOND_OFF_N = 5;
+
+    const out = document.getElementById('out');
+    const log = (s) => { out.textContent += s + '\n'; console.log(s); };
+
+    document.getElementById('run').addEventListener('click', async () => {
+      out.textContent = '';
+      resetSearchBothGpuState();
+      try {
+        await runVerification();
+      } catch (e) {
+        log(`\nERROR: ${e.message}\n${e.stack ?? ''}`);
+        out.className = 'fail';
+      }
+    });
+
+    function randSamples(n, seed) {
+      let s = seed >>> 0;
+      const out = new Float64Array(n);
+      for (let i = 0; i < n; i++) {
+        s = (s * 1664525 + 1013904223) >>> 0;
+        out[i] = (s / 4294967296) * 2 - 1;
+      }
+      return out;
+    }
+
+    // Synthetic FT8-like signal: a genuine Costas-preamble tone burst (not
+    // pure noise) so the grid search has an actual peak to find — a pure
+    // noise buffer would make "best" arbitrary/tied and not a meaningful
+    // correctness check (same reasoning as the JS-simulation scratchpad
+    // this kernel was designed against).
+    function synthFt8Like(len, hzOffset, offOffset) {
+      const out = new Float64Array(len);
+      const toneHz0 = 25 + hzOffset;
+      const symbols = [3, 1, 4, 0, 6, 5, 2];
+      let phase = 0;
+      for (let rep = 0; rep < 3; rep++) {
+        for (let si = 0; si < 7; si++) {
+          const toneHz = toneHz0 + symbols[si] * 6.25;
+          for (let i = 0; i < 32; i++) {
+            const t = offOffset + (rep * 36 + si) * 32 + i;
+            if (t >= 0 && t < len) out[t] += Math.cos(phase);
+            phase += (2 * Math.PI * toneHz) / 200;
+          }
+        }
+      }
+      return out;
+    }
+
+    function factorRadixSchedule(n) {
+      const factors = []; let remaining = n;
+      for (const p of [2, 3, 5]) while (remaining % p === 0) { factors.push(p); remaining /= p; }
+      if (remaining > 1) factors.push(remaining);
+      return factors;
+    }
+
+    // Grid-shape math mirrors fineSync.ts's searchBoth()/searchTimeFine()
+    // exactly (see the module doc there) — used here only to detect ahead
+    // of time whether a given bestOff would produce a non-2/3/5-smooth
+    // window (a known, documented limitation this kernel shares with
+    // fftGeneralFused.wgsl — see webgpuSearchBoth.ts's module header), so
+    // the bench can report that case as an explicit SKIP rather than a
+    // false FAIL.
+    function windowIsSmooth(bestOff, offWin) {
+      const off0In = bestOff - offWin, offNval = bestOff + offWin;
+      const off0c = Math.max(0, off0In);
+      const n = (offNval - off0c) + 79 * 32 + 32;
+      return factorRadixSchedule(n).every((f) => f <= 5);
+    }
+
+    async function runVerification() {
+      if (!(await isWebGpuAvailable())) {
+        log('WebGPU not available in this browser.');
+        out.className = 'fail';
+        return;
+      }
+      log('WebGPU available. Running checks...\n');
+
+      let pass = 0, fail = 0, skip = 0;
+      const check = (name, cond, detail) => {
+        if (cond) { pass++; log(`PASS  ${name}`); }
+        else { fail++; log(`FAIL  ${name}  ${detail ?? ''}`); }
+      };
+      const skipCheck = (name, detail) => { skip++; log(`SKIP  ${name}  ${detail ?? ''}`); };
+
+      // 1) Real fixture data — the exact captured samples200x/bestOff from
+      // a real ft8mon decode (see fineSyncPipeline.test.ts for how this
+      // fixture was produced). This is the highest-value check: does the
+      // GPU kernel find the SAME best (hz, off) as searchBothDefault on
+      // genuine radio-captured data?
+      {
+        const samples200 = new Float64Array(fixture.pipeline.samples200x);
+        const bestOff = fixture.pipeline.bestOff;
+        const cpuBest = searchBothDefault(samples200, bestOff)[0];
+        const [gpuBest] = await runSearchBothGpu([
+          { samples200, hz0: 25, hzN: SECOND_HZ_N, hzWin: SECOND_HZ_WIN, off0: bestOff, offN: SECOND_OFF_N, offWin: SECOND_OFF_WIN * 32 },
+        ]);
+        const hzErr = Math.abs(cpuBest.hz - gpuBest.hz);
+        const offMatch = cpuBest.off === gpuBest.off;
+        const strRelErr = Math.abs(cpuBest.strength - gpuBest.strength) / Math.max(Math.abs(cpuBest.strength), 1e-9);
+        log(`  real fixture: cpu={hz:${cpuBest.hz.toFixed(4)}, off:${cpuBest.off}, str:${cpuBest.strength.toExponential(4)}}`);
+        log(`  real fixture: gpu={hz:${gpuBest.hz.toFixed(4)}, off:${gpuBest.off}, str:${gpuBest.strength.toExponential(4)}}`);
+        check('real fixture data: hz matches', hzErr < 1e-4, `|diff|=${hzErr}`);
+        check('real fixture data: off matches exactly', offMatch, `cpu=${cpuBest.off} gpu=${gpuBest.off}`);
+        check('real fixture data: strength within 1% (f32 accumulation)', strRelErr < 0.01, `relErr=${strRelErr.toExponential(3)}`);
+      }
+
+      // 2) Synthetic Costas-burst data at several bestOff values, batched
+      // in ONE dispatch (confirms multi-candidate batching doesn't
+      // cross-contaminate between workgroups, same discipline as
+      // webgpu-fftgeneral-bench.html's batch check).
+      {
+        const offWin = SECOND_OFF_WIN * 32;
+        const bestOffs = [50, 304, 700, 1200, 2000].filter((b) => windowIsSmooth(b, offWin));
+        const skippedOffs = [50, 304, 700, 1200, 2000].filter((b) => !windowIsSmooth(b, offWin));
+        for (const b of skippedOffs) {
+          skipCheck(`synthetic batch bestOff=${b}`, 'window length not 2/3/5-smooth (documented kernel limitation, same as fftGeneralFused.wgsl)');
+        }
+
+        const inputs = bestOffs.map((bestOff) => {
+          const len = Math.max(4000, bestOff + 3000);
+          const samples200 = synthFt8Like(len, 0.3, bestOff);
+          return { samples200, hz0: 25, hzN: SECOND_HZ_N, hzWin: SECOND_HZ_WIN, off0: bestOff, offN: SECOND_OFF_N, offWin };
+        });
+
+        const gpuResults = await runSearchBothGpu(inputs);
+        bestOffs.forEach((bestOff, i) => {
+          const cpuBest = searchBothDefault(inputs[i].samples200, bestOff)[0];
+          const gpuBest = gpuResults[i];
+          const hzErr = Math.abs(cpuBest.hz - gpuBest.hz);
+          const offMatch = cpuBest.off === gpuBest.off;
+          check(
+            `synthetic batch bestOff=${bestOff}: hz+off match`,
+            hzErr < 1e-4 && offMatch,
+            `cpu={hz:${cpuBest.hz.toFixed(3)},off:${cpuBest.off}} gpu={hz:${gpuBest.hz.toFixed(3)},off:${gpuBest.off}}`,
+          );
+        });
+      }
+
+      // 3) Pure-noise sanity check (no injected tone): GPU and CPU should
+      // still agree on which (hz,off) scores highest, even though the
+      // "best" is somewhat arbitrary noise-driven — this checks the kernel
+      // reproduces the CPU's numeric ranking, not that either found a real
+      // signal.
+      {
+        const bestOff = 400;
+        const offWin = SECOND_OFF_WIN * 32;
+        if (windowIsSmooth(bestOff, offWin)) {
+          const len = 4000;
+          const samples200 = randSamples(len, 42);
+          const cpuBest = searchBothDefault(samples200, bestOff)[0];
+          const [gpuBest] = await runSearchBothGpu([
+            { samples200, hz0: 25, hzN: SECOND_HZ_N, hzWin: SECOND_HZ_WIN, off0: bestOff, offN: SECOND_OFF_N, offWin },
+          ]);
+          const hzErr = Math.abs(cpuBest.hz - gpuBest.hz);
+          const offMatch = cpuBest.off === gpuBest.off;
+          check('pure-noise ranking agreement', hzErr < 1e-4 && offMatch, `cpu={hz:${cpuBest.hz},off:${cpuBest.off}} gpu={hz:${gpuBest.hz},off:${gpuBest.off}}`);
+        } else {
+          skipCheck('pure-noise ranking agreement', 'window length not 2/3/5-smooth');
+        }
+      }
+
+      // 4) EVEN-stage-count window length — a regression check for a real
+      // bug found on real GPU hardware: run_fft_stages() used to hardcode
+      // its inverse-FFT call to start from buf_a unconditionally, which is
+      // only correct when the forward FFT's own stage count is ODD (this
+      // repo's actual shift200 windows are almost always n=2592, 9 stages,
+      // ODD, so that bug was invisible in default-parameter testing).
+      // n=2916 (offWin=178, off0 far from the buffer start so no
+      // clamping) factors to [2,2,3,3,3,3,3,3] — 8 stages, EVEN — and
+      // specifically exercises the fix. Uses searchBoth() directly (not
+      // searchBothDefault(), which hardcodes this repo's usual small
+      // offWin) so a non-default offWin can be requested.
+      {
+        const bestOff = 1000, offWin = 178, hzWin = 3.5, hzN = 4, offN = 5;
+        const len = 6000;
+        if (windowIsSmooth(bestOff, offWin)) {
+          const samples200 = synthFt8Like(len, 0.3, bestOff);
+          const cpuBest = searchBoth(samples200, 25, hzN, hzWin, bestOff, offN, offWin).slice().sort((a, b) => b.strength - a.strength)[0];
+          const [gpuBest] = await runSearchBothGpu([
+            { samples200, hz0: 25, hzN, hzWin, off0: bestOff, offN, offWin },
+          ]);
+          const hzErr = Math.abs(cpuBest.hz - gpuBest.hz);
+          const offMatch = cpuBest.off === gpuBest.off;
+          log(`  even-stage-count (n=2916, 8 stages): cpu={hz:${cpuBest.hz},off:${cpuBest.off}} gpu={hz:${gpuBest.hz},off:${gpuBest.off}}`);
+          check(
+            'even-stage-count window (regression for fwd/inverse buffer-selection bug)',
+            hzErr < 1e-4 && offMatch,
+            `cpu={hz:${cpuBest.hz},off:${cpuBest.off}} gpu={hz:${gpuBest.hz},off:${gpuBest.off}}`,
+          );
+        } else {
+          skipCheck('even-stage-count window', 'window length not 2/3/5-smooth on this parameter choice');
+        }
+      }
+
+      log(`\n${pass} passed, ${fail} failed, ${skip} skipped`);
+      out.className = fail === 0 ? 'pass' : 'fail';
+    }
+  </script>
+</body>
+</html>

@@ -1,0 +1,157 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>WebGPU coarse-search benchmark</title>
+  <style>
+    body { font-family: monospace; background: #0d1117; color: #c9d1d9; padding: 2rem; }
+    button { font-size: 1rem; padding: 0.5rem 1rem; cursor: pointer; }
+    pre { background: #161b22; padding: 1rem; border-radius: 6px; overflow-x: auto; white-space: pre-wrap; }
+    .fail { color: #f85149; }
+    .pass { color: #3fb950; }
+  </style>
+</head>
+<body>
+  <h1>FT8 coarse-search: WebGPU vs CPU/WASM feasibility benchmark</h1>
+  <p>Loads a real 15s FT8 WAV, runs the coarse Costas-sync search 4 ways: (1) full GPU pipeline (9-dispatch FFT+correlation both on GPU), (2) GPU correlation-only (CPU-computed spectrogram fed to GPU), (3) plain-TS CPU reference (fft1920.ts + costasCorrelation.ts, no GPU), (4) FUSED GPU pipeline (all 9 FFT stages in ONE dispatch via workgroup-shared memory, no per-stage storage round-trip). Compares top-candidate correctness against ft8mon's own previously-measured output, and reports timings for each path.</p>
+  <button id="run">Run Benchmark</button>
+  <pre id="out">(not run yet)</pre>
+
+  <script type="module">
+    import { runCoarseSearchGpu, runCoarseSearchGpuCorrelationOnly, runCoarseSearchGpuFusedFft, isWebGpuAvailable, resetGpuState } from '/src/lib/ft/webgpu/webgpuCoarseSearch.ts';
+    import { fft1920, FFT_N } from '/src/lib/ft/webgpu/fft1920.ts';
+    import { coarseGrid, magSpectrogram } from '/src/lib/ft/webgpu/costasCorrelation.ts';
+
+    const out = document.getElementById('out');
+    const log = (s) => { out.textContent += s + '\n'; console.log(s); };
+
+    function readWavArrayBuffer(buf) {
+      const dv = new DataView(buf);
+      let off = 12, rate = null, dataOff = null, dataLen = null;
+      while (off + 8 <= buf.byteLength) {
+        const id = String.fromCharCode(dv.getUint8(off), dv.getUint8(off+1), dv.getUint8(off+2), dv.getUint8(off+3));
+        const size = dv.getUint32(off + 4, true);
+        if (id === 'fmt ') rate = dv.getUint32(off + 12, true);
+        if (id === 'data') { dataOff = off + 8; dataLen = size; }
+        off += 8 + size + (size & 1);
+      }
+      const n = dataLen / 2;
+      const samples = new Float32Array(n);
+      for (let i = 0; i < n; i++) samples[i] = dv.getInt16(dataOff + i * 2, true) / 32768;
+      return { samples, rate };
+    }
+
+    document.getElementById('run').addEventListener('click', async () => {
+      out.textContent = '';
+      resetGpuState();
+
+      const gpuAvailable = await isWebGpuAvailable();
+      log(`WebGPU available: ${gpuAvailable}`);
+      if (!gpuAvailable) {
+        log('No WebGPU adapter in this browser/session — cannot proceed with GPU paths.');
+        return;
+      }
+
+      const resp = await fetch('/webgpu-bench-wav/sample1.wav');
+      const buf = await resp.arrayBuffer();
+      const { samples, rate } = readWavArrayBuffer(buf);
+      log(`Loaded sample1.wav: rate=${rate}, samples=${samples.length}`);
+      if (rate !== 12000) {
+        log(`FAIL — expected 12000 Hz (ft8mon's native rate), got ${rate}`);
+        return;
+      }
+
+      const nSymbols = Math.floor(samples.length / FFT_N);
+      log(`nSymbols=${nSymbols}`);
+      const samplesBySymbol = samples.subarray(0, nSymbols * FFT_N);
+
+      // Search params matching a realistic coarse() call: si0..si1 covering
+      // the sync search window, full 3kHz band's worth of bins.
+      const params = { si0: 0, siCount: Math.min(30, nSymbols - 79), bi0: 100, biCount: 400 };
+      log(`Search grid: siCount=${params.siCount} biCount=${params.biCount} = ${params.siCount * params.biCount} cells`);
+
+      // --- Path 1: plain-TS CPU reference (no GPU at all) ---
+      const tCpu0 = performance.now();
+      const cpuMags = new Float64Array(nSymbols * FFT_N);
+      for (let si = 0; si < nSymbols; si++) {
+        const block = new Float64Array(FFT_N * 2);
+        for (let n = 0; n < FFT_N; n++) block[n * 2] = samplesBySymbol[si * FFT_N + n];
+        const spec = fft1920(block);
+        for (let bi = 0; bi < FFT_N; bi++) {
+          cpuMags[si * FFT_N + bi] = Math.hypot(spec[bi * 2], spec[bi * 2 + 1]);
+        }
+      }
+      const cpuGrid = coarseGrid(cpuMags, { si0: params.si0, siCount: params.siCount, bi0: params.bi0, biCount: params.biCount, nbins: FFT_N, nSymbols });
+      const tCpu1 = performance.now();
+      let cpuMaxIdx = 0;
+      for (let i = 1; i < cpuGrid.length; i++) if (cpuGrid[i] > cpuGrid[cpuMaxIdx]) cpuMaxIdx = i;
+      const cpuBestSi = params.si0 + Math.floor(cpuMaxIdx / params.biCount);
+      const cpuBestBi = params.bi0 + (cpuMaxIdx % params.biCount);
+      log(`\n[1] Plain-TS CPU reference: ${(tCpu1 - tCpu0).toFixed(2)}ms total (FFT+correlation)`);
+      log(`    top candidate: si=${cpuBestSi} bi=${cpuBestBi} strength=${cpuGrid[cpuMaxIdx].toFixed(6)}`);
+      log(`    (ft8mon's own real coarse search on this same file previously found: si=12 bi=198 strength=0.504725)`);
+
+      // --- Path 2: GPU correlation-only (feed the same CPU-computed spectrogram to GPU) ---
+      const specInterleaved = new Float32Array(nSymbols * FFT_N * 2);
+      for (let si = 0; si < nSymbols; si++) {
+        const block = new Float64Array(FFT_N * 2);
+        for (let n = 0; n < FFT_N; n++) block[n * 2] = samplesBySymbol[si * FFT_N + n];
+        const spec = fft1920(block);
+        for (let i = 0; i < FFT_N * 2; i++) specInterleaved[si * FFT_N * 2 + i] = spec[i];
+      }
+      const gpuCorrOnlyResult = await runCoarseSearchGpuCorrelationOnly(specInterleaved, nSymbols, params);
+      let gpuCorrMaxIdx = 0;
+      for (let i = 1; i < gpuCorrOnlyResult.strengths.length; i++) {
+        if (gpuCorrOnlyResult.strengths[i] > gpuCorrOnlyResult.strengths[gpuCorrMaxIdx]) gpuCorrMaxIdx = i;
+      }
+      const gpuCorrBestSi = params.si0 + Math.floor(gpuCorrMaxIdx / params.biCount);
+      const gpuCorrBestBi = params.bi0 + (gpuCorrMaxIdx % params.biCount);
+      log(`\n[2] GPU correlation-only (CPU FFT, GPU correlation grid):`);
+      log(`    upload=${gpuCorrOnlyResult.timings.uploadMs.toFixed(2)}ms dispatch=${gpuCorrOnlyResult.timings.dispatchMs.toFixed(2)}ms readback=${gpuCorrOnlyResult.timings.readbackMs.toFixed(2)}ms total=${gpuCorrOnlyResult.timings.totalMs.toFixed(2)}ms`);
+      log(`    top candidate: si=${gpuCorrBestSi} bi=${gpuCorrBestBi} strength=${gpuCorrOnlyResult.strengths[gpuCorrMaxIdx].toFixed(6)}`);
+
+      // --- Path 3: full GPU pipeline (FFT AND correlation both on GPU) ---
+      const gpuFullResult = await runCoarseSearchGpu(samplesBySymbol, nSymbols, params);
+      let gpuFullMaxIdx = 0;
+      for (let i = 1; i < gpuFullResult.strengths.length; i++) {
+        if (gpuFullResult.strengths[i] > gpuFullResult.strengths[gpuFullMaxIdx]) gpuFullMaxIdx = i;
+      }
+      const gpuFullBestSi = params.si0 + Math.floor(gpuFullMaxIdx / params.biCount);
+      const gpuFullBestBi = params.bi0 + (gpuFullMaxIdx % params.biCount);
+      log(`\n[3] Full GPU pipeline (GPU FFT + GPU correlation):`);
+      log(`    upload=${gpuFullResult.timings.uploadMs.toFixed(2)}ms dispatch=${gpuFullResult.timings.dispatchMs.toFixed(2)}ms readback=${gpuFullResult.timings.readbackMs.toFixed(2)}ms total=${gpuFullResult.timings.totalMs.toFixed(2)}ms`);
+      log(`    top candidate: si=${gpuFullBestSi} bi=${gpuFullBestBi} strength=${gpuFullResult.strengths[gpuFullMaxIdx].toFixed(6)}`);
+
+      // --- Path 4: FUSED GPU pipeline (all 9 FFT stages in one dispatch) ---
+      const gpuFusedResult = await runCoarseSearchGpuFusedFft(samplesBySymbol, nSymbols, params);
+      let gpuFusedMaxIdx = 0;
+      for (let i = 1; i < gpuFusedResult.strengths.length; i++) {
+        if (gpuFusedResult.strengths[i] > gpuFusedResult.strengths[gpuFusedMaxIdx]) gpuFusedMaxIdx = i;
+      }
+      const gpuFusedBestSi = params.si0 + Math.floor(gpuFusedMaxIdx / params.biCount);
+      const gpuFusedBestBi = params.bi0 + (gpuFusedMaxIdx % params.biCount);
+      log(`\n[4] FUSED GPU pipeline (1 dispatch, all 9 FFT stages via workgroup-shared memory):`);
+      log(`    upload=${gpuFusedResult.timings.uploadMs.toFixed(2)}ms dispatch=${gpuFusedResult.timings.dispatchMs.toFixed(2)}ms readback=${gpuFusedResult.timings.readbackMs.toFixed(2)}ms total=${gpuFusedResult.timings.totalMs.toFixed(2)}ms`);
+      log(`    top candidate: si=${gpuFusedBestSi} bi=${gpuFusedBestBi} strength=${gpuFusedResult.strengths[gpuFusedMaxIdx].toFixed(6)}`);
+      log(`    vs unfused full-GPU total: ${gpuFullResult.timings.totalMs.toFixed(2)}ms  (fused is ${(gpuFullResult.timings.totalMs / gpuFusedResult.timings.totalMs).toFixed(2)}x unfused)`);
+
+      // --- Correctness check ---
+      log(`\n--- Correctness ---`);
+      const allAgree = (
+        cpuBestSi === gpuCorrBestSi && cpuBestBi === gpuCorrBestBi &&
+        cpuBestSi === gpuFullBestSi && cpuBestBi === gpuFullBestBi &&
+        cpuBestSi === gpuFusedBestSi && cpuBestBi === gpuFusedBestBi
+      );
+      log(allAgree
+        ? `PASS — all 4 paths agree on the top candidate cell (si=${cpuBestSi}, bi=${cpuBestBi})`
+        : `FAIL — paths disagree on top candidate: CPU=(${cpuBestSi},${cpuBestBi}) GPU-corr-only=(${gpuCorrBestSi},${gpuCorrBestBi}) GPU-full=(${gpuFullBestSi},${gpuFullBestBi}) GPU-fused=(${gpuFusedBestSi},${gpuFusedBestBi})`);
+
+      log(`\n--- Reference: previously measured on this exact WAV (Node, PROF-instrumented ft8mon WASM) ---`);
+      log(`ft8mon coarse search (full 3kHz band, all 16 sub-bin shifts): ~0.37-0.50s per pass`);
+      log(`This benchmark's grid (${params.siCount}x${params.biCount} cells, single shift) is a SUBSET of that — direct multiplier comparison needs matching grid sizes, see writeup.`);
+
+      out.className = allAgree ? 'pass' : 'fail';
+    });
+  </script>
+</body>
+</html>

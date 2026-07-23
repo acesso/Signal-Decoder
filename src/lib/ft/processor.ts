@@ -5,6 +5,13 @@
 import { createSignal } from 'solid-js'
 import { type FTDecodeResult, type FTMessage, type FTMode, FT_WINDOW_SECONDS, FT_SUPPORTED, decodeFTAudio } from '$decoder-lib/ft/decoder'
 import { createCaptureNode, type CaptureNode } from '$decoder-lib/audio/captureNode'
+import { decodeFTAudioGpu, isGpuDecodeAvailable } from '$decoder-lib/ft/webgpu/decodeGpuBridge'
+
+// Dev-only GPU decode path — lets the user live-compare the WebGPU FT8
+// pipeline against the real WASM decoder by running dev (GPU) and a
+// production build (WASM) in separate tabs. No fallback: if this throws,
+// it throws, same as any other bug surfaced during testing.
+const USE_GPU_DECODE = import.meta.env.DEV
 
 export interface FTProcessorState {
   isRecording: boolean
@@ -123,9 +130,15 @@ export function createFTProcessor(getMode: () => FTMode) {
         if (flushTimer === null) flushTimer = setTimeout(flush, PARTIAL_FLUSH_MS)
       }
 
-      decodeFTAudio(captured, sampleRate, getMode(), onPartial)
+      const runDecode = async (): Promise<FTMessage[]> => {
+        if (USE_GPU_DECODE && (await isGpuDecodeAvailable()) && getMode() === 'FT8') {
+          return decodeFTAudioGpu(captured, sampleRate)
+        }
+        return decodeFTAudio(captured, sampleRate, getMode(), onPartial)
+      }
+
+      runDecode()
         .then((messages) => ({ messages, decodeMs: performance.now() - t0 }))
-        .catch(() => ({ messages: [] as FTMessage[], decodeMs: performance.now() - t0 }))
         .then(({ messages, decodeMs }) => {
           if (flushTimer !== null) {
             clearTimeout(flushTimer)
