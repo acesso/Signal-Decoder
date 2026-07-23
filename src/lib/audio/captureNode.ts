@@ -9,21 +9,27 @@ export interface CaptureNode {
   disconnect(): void;
 }
 
-let workletModuleLoaded: Promise<void> | null = null;
+// AudioWorklet module registration is PER-AudioContext — addModule() on one
+// context does not register the processor on another. This app runs several
+// independent AudioContexts concurrently (one per decoder mode, plus one for
+// TX — see globalAudio.ts, cw/processor.ts, ft/processor.ts,
+// ft/useFTTransmit.ts, mfsk/processor.ts, rtty/multiProcessor.ts,
+// sstv/audioProcessor.ts), so the cache must be keyed per-context, not a
+// single shared module-level promise — a shared cache meant every context
+// after the first one skipped its own addModule() call and then failed to
+// construct its AudioWorkletNode with "Unknown AudioWorklet name
+// 'capture-forwarder'".
+const workletModuleLoaded = new WeakMap<AudioContext, Promise<void>>();
 
 function ensureWorkletModule(ctx: AudioContext): Promise<void> {
-  // audioWorklet.addModule is idempotent per-context if the same URL is
-  // added twice, but multiple concurrent callers on a fresh context would
-  // otherwise race — cache the in-flight promise, not just a boolean, keyed
-  // per call (contexts are short-lived/one-per-feature in this app, so a
-  // single module-level cache is fine — see globalAudio.ts's own single-
-  // shared-AudioContext pattern this mirrors).
-  if (!workletModuleLoaded) {
-    workletModuleLoaded = ctx.audioWorklet.addModule(
+  let loaded = workletModuleLoaded.get(ctx);
+  if (!loaded) {
+    loaded = ctx.audioWorklet.addModule(
       new URL('./captureWorklet.ts', import.meta.url),
     );
+    workletModuleLoaded.set(ctx, loaded);
   }
-  return workletModuleLoaded;
+  return loaded;
 }
 
 /**

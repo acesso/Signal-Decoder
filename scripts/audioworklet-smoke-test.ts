@@ -90,24 +90,65 @@ async function main() {
 
     console.log('Result:', JSON.stringify(result, null, 2));
 
+    let failed = false;
     if ('error' in result) {
       console.error('FAIL — evaluate threw:', result.error);
-      process.exitCode = 1;
+      failed = true;
     } else if (result.chunkCount === 0) {
       console.error('FAIL — worklet produced zero chunks in 1s of synthetic audio');
-      process.exitCode = 1;
+      failed = true;
     } else if (!result.allCorrectSize) {
       console.error('FAIL — some chunks were not the expected 4096-sample size');
-      process.exitCode = 1;
+      failed = true;
     } else if (!result.hasSignal) {
       console.error('FAIL — chunks arrived but contained no signal above noise floor (silence forwarded instead of the oscillator)');
-      process.exitCode = 1;
+      failed = true;
     } else if (pageErrors.length > 0) {
       console.error('FAIL — page errors occurred:', pageErrors);
-      process.exitCode = 1;
+      failed = true;
     } else {
       console.log(`PASS — ${result.chunkCount} chunks of 4096 samples, real signal present, no page errors`);
     }
+
+    // Regression check: this app runs several independent AudioContexts
+    // concurrently (one per decoder mode, plus one for TX — see
+    // globalAudio.ts, cw/processor.ts, ft/processor.ts,
+    // ft/useFTTransmit.ts, mfsk/processor.ts, rtty/multiProcessor.ts,
+    // sstv/audioProcessor.ts), so createCaptureNode's worklet-module cache
+    // MUST be keyed per-AudioContext — a shared/global cache means every
+    // context after the first skips its own addModule() call and then
+    // fails to construct its AudioWorkletNode ("Unknown AudioWorklet name
+    // 'capture-forwarder'"), which is exactly what happened in practice
+    // (FT8 Start Decoding = 2nd context of the session; switching decoder
+    // modes = a new context each time). The single-context test above
+    // can't catch this — it must open several contexts, matching real use.
+    const multiCtxResult = await page.evaluate(async () => {
+      const mod = await import('/src/lib/audio/captureNode.ts');
+      const outcomes: Array<{ i: number; ok: boolean; error?: string }> = [];
+      for (let i = 0; i < 4; i++) {
+        try {
+          const ctx = new AudioContext();
+          const capture = await mod.createCaptureNode(ctx, 4096, () => {});
+          capture.disconnect();
+          await ctx.close();
+          outcomes.push({ i, ok: true });
+        } catch (e) {
+          outcomes.push({ i, ok: false, error: e instanceof Error ? e.message : String(e) });
+        }
+      }
+      return outcomes;
+    }).catch(e => [{ i: -1, ok: false, error: `evaluate threw: ${e.message}` }]);
+
+    console.log('Multi-context result:', JSON.stringify(multiCtxResult, null, 2));
+    const multiCtxFailures = multiCtxResult.filter(r => !r.ok);
+    if (multiCtxFailures.length > 0) {
+      console.error(`FAIL — ${multiCtxFailures.length}/${multiCtxResult.length} sequential AudioContexts failed to create a capture node`);
+      failed = true;
+    } else {
+      console.log(`PASS — all ${multiCtxResult.length} sequential AudioContexts created capture nodes successfully`);
+    }
+
+    process.exitCode = failed ? 1 : 0;
   } finally {
     await browser.close();
   }

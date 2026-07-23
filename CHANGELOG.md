@@ -12,6 +12,20 @@ them into a version section when cutting a release.
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-07-23
+
+### Added
+
+- WASM SIMD128 and Relaxed SIMD builds of both FT8/FT4 decoders (ft8mon, ft8_lib), with runtime feature detection (`WebAssembly.validate()` probes) and automatic fallback down to the existing baseline build. FFTW is rebuilt per SIMD tier so the gains reach the FFT hot path, not just wrapper code. Verified against all 31 reference WAVs with zero decode-set regressions: ~4% faster (SIMD128) / ~7% faster (Relaxed SIMD) than baseline at a fixed decode budget.
+
+### Changed
+
+- All audio capture (RX for every decoder mode, plus the FT8/FT4 TX tap) migrated from the deprecated `ScriptProcessorNode` (runs on the main thread, subject to jank from UI work/GC pauses) to `AudioWorkletNode` (runs on the dedicated real-time audio thread). No decode logic changed — only the capture mechanism. The old RAF-polling fallback (for browsers lacking `ScriptProcessorNode`) was removed; AudioWorklet is now assumed always available.
+
+### Fixed
+
+- The AudioWorklet capture helper cached its module-load promise globally instead of per-`AudioContext`, so every context after the first (e.g. clicking "Start Decoding" in FT8, or switching decoder modes) failed with `Unknown AudioWorklet name 'capture-forwarder'`. Fixed by keying the cache per-context.
+
 ## [0.8.1] - 2026-07-23
 
 ### Fixed
