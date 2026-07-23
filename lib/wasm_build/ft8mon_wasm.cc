@@ -43,12 +43,65 @@
 
 #define DECODE_RATE 12000
 
-/* ── linear-interpolation resampler (float in → double out) ─────────────── */
+/* Anti-alias low-pass applied before decimation. Without this, any input
+ * content above the new Nyquist (DECODE_RATE/2) folds back down into the
+ * passband under plain linear-interpolation resampling and corrupts exactly
+ * the FFT bins the LLR computation reads. Windowed-sinc FIR, cutoff set a
+ * bit inside the new Nyquist (0.45x, not 0.5x) so the filter's own
+ * finite-length transition band doesn't let aliasing content leak past the
+ * edge; Hamming window for a well-behaved (no ringing) stopband. Mirrors
+ * decoder.worker.ts's designLowPassFir()/applyFir() exactly (same cutoff
+ * fraction, same tap count, same formula). */
+#define ANTIALIAS_CUTOFF_FRACTION 0.45 /* of the OUTPUT sample rate */
+#define ANTIALIAS_TAPS 63              /* odd length, symmetric FIR */
+
+static std::vector<double> design_lowpass_fir(double cutoff_hz, double sample_rate_hz, int num_taps)
+{
+    std::vector<double> taps(num_taps);
+    double mid = (num_taps - 1) / 2.0;
+    double fc  = cutoff_hz / sample_rate_hz; /* normalized cutoff (0..0.5) */
+    double sum = 0;
+    for (int i = 0; i < num_taps; i++) {
+        double x = i - mid;
+        double sinc = (x == 0) ? 2 * fc : sin(2 * M_PI * fc * x) / (M_PI * x);
+        double hamming = 0.54 - 0.46 * cos((2 * M_PI * i) / (num_taps - 1));
+        double w = sinc * hamming;
+        taps[i] = w;
+        sum += w;
+    }
+    for (int i = 0; i < num_taps; i++) taps[i] /= sum; /* unity gain at DC */
+    return taps;
+}
+
+static std::vector<double> apply_fir(const float* in, int in_len, const std::vector<double>& taps)
+{
+    int num_taps = (int)taps.size();
+    double half = (num_taps - 1) / 2.0;
+    std::vector<double> out(in_len);
+    for (int i = 0; i < in_len; i++) {
+        double acc = 0;
+        for (int k = 0; k < num_taps; k++) {
+            int idx = (int)(i + k - half);
+            if (idx >= 0 && idx < in_len) acc += taps[k] * in[idx];
+        }
+        out[i] = acc;
+    }
+    return out;
+}
+
+/* ── anti-aliased resampler (float in → double out) ──────────────────────── */
 static std::vector<double> resample_to_12k(const float* in, int in_len, int in_rate)
 {
     if (in_rate == DECODE_RATE) {
         return std::vector<double>(in, in + in_len);
     }
+
+    /* Anti-alias filter only matters when decimating (output rate < input
+     * rate) — an upsample has no aliasing to guard against. */
+    std::vector<double> filtered = (in_rate > DECODE_RATE)
+        ? apply_fir(in, in_len, design_lowpass_fir(ANTIALIAS_CUTOFF_FRACTION * DECODE_RATE, in_rate, ANTIALIAS_TAPS))
+        : std::vector<double>(in, in + in_len);
+
     long long n_out = (long long)in_len * DECODE_RATE / in_rate;
     std::vector<double> out(n_out);
     double step = (double)in_rate / DECODE_RATE;
@@ -56,8 +109,8 @@ static std::vector<double> resample_to_12k(const float* in, int in_len, int in_r
         double pos  = i * step;
         int    idx  = (int)pos;
         double frac = pos - idx;
-        double s0   = in[idx];
-        double s1   = (idx + 1 < in_len) ? in[idx + 1] : s0;
+        double s0   = filtered[idx];
+        double s1   = (idx + 1 < in_len) ? filtered[idx + 1] : s0;
         out[i] = s0 + frac * (s1 - s0);
     }
     return out;

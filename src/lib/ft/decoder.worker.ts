@@ -22,6 +22,7 @@
  */
 
 import type { FTMode, FTDecoderParams } from './decoder';
+import { resampleTo12k } from './resample';
 
 export type WorkerRequest =
   | {
@@ -222,33 +223,6 @@ function decodeWithFt8Lib(mod: FT8LibModule, samples: Float32Array, sampleRate: 
   } finally {
     mod._free(ptr);
   }
-}
-
-// ── Resample (moved off the main thread) ────────────────────────────────────
-// ft8mon's fixed internal decode rate (see ft8mon_wasm.cc's DECODE_RATE).
-// Mirrors resample_to_12k() in ft8mon_wasm.cc exactly (same linear-
-// interpolation formula, same edge clamping). Run once, in a worker, before
-// frequency-slice fan-out dispatches the same resampled audio to every
-// slice — a naive main-thread loop over a full 15s/48kHz window (~720k
-// samples) is expensive enough to visibly stutter the UI; doing the
-// identical work here keeps that off the thread that has to keep rendering.
-const FT8MON_DECODE_RATE = 12000;
-
-function resampleTo12k(samples: Float32Array, sampleRate: number): Float32Array {
-  if (sampleRate === FT8MON_DECODE_RATE) return samples;
-  const inLen = samples.length;
-  const nOut = Math.floor((inLen * FT8MON_DECODE_RATE) / sampleRate);
-  const out = new Float32Array(nOut);
-  const step = sampleRate / FT8MON_DECODE_RATE;
-  for (let i = 0; i < nOut; i++) {
-    const pos  = i * step;
-    const idx  = Math.floor(pos);
-    const frac = pos - idx;
-    const s0   = samples[idx];
-    const s1   = idx + 1 < inLen ? samples[idx + 1] : s0;
-    out[i] = s0 + frac * (s1 - s0);
-  }
-  return out;
 }
 
 // ── Message handler ──────────────────────────────────────────────────────────

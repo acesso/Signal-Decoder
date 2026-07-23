@@ -131,12 +131,19 @@ clean-fftw:
 # Usage (from project root, then): node lib/wasm_build/testbuild/test_decode.mjs
 .PHONY: test-modules
 
+# .cjs, not .js: Emscripten's MODULARIZE glue is UMD-style (module.exports =
+# ...) with no ESM export statements. The project root's package.json sets
+# "type": "module", so a plain .js file here is loaded via Node's ESM loader,
+# which treats a script with no export statements as a module with an empty
+# namespace instead of erroring — dynamic import() "succeeds" with .default
+# silently undefined. A .cjs extension forces CommonJS interpretation
+# regardless of the package's module type.
 # Later -s flags override earlier ones, so ENVIRONMENT/SINGLE_FILE are re-set here.
 test-modules: $(FFTW_LIB)
 	mkdir -p testbuild
 	em++ $(EMMON_FLAGS) -s SINGLE_FILE=1 -s ENVIRONMENT='node' \
-	    $(FT8MON_SRC) $(FT8MON_WRAPPER) $(FFTW_LIB) -o testbuild/ft8mon-node.js
+	    $(FT8MON_SRC) $(FT8MON_WRAPPER) $(FFTW_LIB) -o testbuild/ft8mon-node.cjs
 	emcc $(EMCC_FLAGS) -s SINGLE_FILE=1 -s ENVIRONMENT='node' \
 	    -s EXPORT_NAME='createFT8LibModule' \
-	    $(FT8_SRC) $(WRAPPER) -o testbuild/ft8lib-node.js
+	    $(FT8_SRC) $(WRAPPER) -o testbuild/ft8lib-node.cjs
 	@echo "Node test modules built in testbuild/"

@@ -12,6 +12,13 @@ them into a version section when cutting a release.
 
 ## [Unreleased]
 
+## [0.8.1] - 2026-07-23
+
+### Fixed
+
+- FT8/FT4 audio resampling to ft8mon's 12kHz decode rate had no anti-aliasing filter before decimation, letting content above the new Nyquist fold back into the decode band and corrupt the LDPC soft-decision metric; added a windowed-sinc low-pass FIR before decimation in both the JS worker and the WASM wrapper. Live A/B against a real off-air WebSDR signal showed ~10% more decodes over the same 5-minute window.
+- The WASM decoder regression benchmark (`make test-modules`) was silently broken on current Node — its generated test modules are CommonJS but got a `.js` extension in an ESM-typed project, so dynamic import returned an empty module instead of erroring; renamed to `.cjs`.
+
 ## [0.8.0] - 2026-07-21
 
 ### Added
