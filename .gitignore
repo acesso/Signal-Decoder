@@ -69,4 +69,4 @@ fldigi-*/
 fldigi_src/
 # WASM build intermediates (FFTW cross-compile cache, node test builds)
 lib/wasm_build/fftw-build/
-lib/wasm_build/testbuild/*.js
+lib/wasm_build/testbuild/*.cjs
