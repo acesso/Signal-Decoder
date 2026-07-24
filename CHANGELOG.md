@@ -12,6 +12,13 @@ them into a version section when cutting a release.
 
 ## [Unreleased]
 
+## [0.9.2] - 2026-07-24
+
+### Fixed
+
+- FT8/FT4's UTC clock skew warning could false-positive on a genuinely fresh page load, reporting an implausible multi-hour skew that a plain reload immediately cleared. A real clock is never off by hours; the check now rejects any first reading over 1 hour of apparent skew and silently retries once before showing the warning, instead of trusting a possibly-broken first-load measurement.
+- WebGL spectrogram texture was allocated with no initial data, causing the driver to lazily zero-fill it on the first draw call instead of upfront — this triggered a "Tex image TEXTURE_2D level 0 is incurring lazy initialization" console warning on every load. Fixed by eagerly initializing the texture with a zeroed buffer.
+
 ## [0.9.1] - 2026-07-24
 
 ### Fixed
