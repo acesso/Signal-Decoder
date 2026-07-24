@@ -392,22 +392,50 @@ export default function FTDecoder(props: Props): JSX.Element {
   // Cloudflare's own network — far more reliable than dedicated "time API"
   // services, which have a history of outages/CORS resets). Warn if local
   // clock is off by >1s, since FT8/4 timing is UTC-slot-synchronized.
+  //
+  // On a genuinely fresh page load (first visit in a tab/profile, competing
+  // with service-worker registration, WASM fetch/compile, and audio-node
+  // setup for the browser's attention), this fetch/RTT measurement has been
+  // observed to occasionally produce a wildly implausible skew (thousands of
+  // seconds) that a plain reload immediately clears — some one-time first-
+  // load contention delays either t0's capture or the response's arrival in
+  // a way that breaks the RTT-midpoint assumption, without there being an
+  // actual multi-hour clock error. A REAL clock skew is never this large in
+  // practice (even a totally unconfigured NTP-less clock drifts by seconds
+  // to minutes, not hours) — so treat an extreme first reading as a bad
+  // measurement, not a bad clock: silently retry once (past whatever
+  // start-of-page contention caused it) before ever showing the warning.
+  const IMPLAUSIBLE_SKEW_S = 3600 // 1 hour — real NTP drift never gets close to this
   const [clockSkewS, setClockSkewS] = createSignal<number | null>(null)
   onMount(() => {
     const controller = new AbortController()
-    const t0 = Date.now()
-    fetch('https://cloudflare.com/cdn-cgi/trace', { signal: controller.signal })
-      .then((r) => r.text())
-      .then((text) => {
-        const m = text.match(/^ts=([\d.]+)/m)
-        if (!m) return
-        const rtt = Date.now() - t0
-        const serverMs = parseFloat(m[1]) * 1000 + rtt / 2
-        const skewS = (Date.now() - serverMs) / 1000
-        setClockSkewS(skewS)
-      })
-      .catch(() => {})
-    onCleanup(() => controller.abort())
+    let cancelled = false
+    function checkSkew(isRetry: boolean) {
+      const t0 = Date.now()
+      fetch('https://cloudflare.com/cdn-cgi/trace', { signal: controller.signal, cache: 'no-store' })
+        .then((r) => r.text())
+        .then((text) => {
+          if (cancelled) return
+          const m = text.match(/^ts=([\d.]+)/m)
+          if (!m) return
+          const rtt = Date.now() - t0
+          const serverMs = parseFloat(m[1]) * 1000 + rtt / 2
+          const skewS = (Date.now() - serverMs) / 1000
+          if (Math.abs(skewS) > IMPLAUSIBLE_SKEW_S && !isRetry) {
+            // Bad first-load measurement, not a real clock error — try once
+            // more rather than surface a false-positive warning.
+            checkSkew(true)
+            return
+          }
+          setClockSkewS(skewS)
+        })
+        .catch(() => {})
+    }
+    checkSkew(false)
+    onCleanup(() => {
+      cancelled = true
+      controller.abort()
+    })
   })
 
   // Frozen VFO per decoded window: windowStart.getTime() -> vfoHz at that moment.
