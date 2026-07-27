@@ -655,8 +655,14 @@ export default function FTTransmitPanel(props: FTTransmitPanelProps): JSX.Elemen
   const suggestions = createMemo(() => {
     const vfo = props.vfoFrequency ?? 0
     const latestCutoff = Date.now() - SUG_LATEST_WINDOW_MS
+    // A station that has directly answered our callsign is mid-QSO with us —
+    // the discovery chips (CQ only, special, country, VFO, latest) exist to
+    // narrow down who to call next, not to hide someone we already owe a
+    // reply to. Only sugMyOnly is exempted from this: it's the inverse ask
+    // ("show me just my own contacts"), so repliedToMe already satisfies it.
     const filteredSugs = contactSugs().filter(s => {
       if (sugMyOnly() && s.thread.length === 0) return false
+      if (s.repliedToMe) return true
       if (sugCountryFilter() && s.countryCode !== sugCountryFilter()) return false
       if (sugCQOnly() && !s.isCQ) return false
       // Same rule as the map's VFO-only pin filter: keep stations whose
@@ -678,7 +684,13 @@ export default function FTTransmitPanel(props: FTTransmitPanelProps): JSX.Elemen
       if (sugSort() === 'far')    return distKm(b) - distKm(a)
       return 0 // default: keep buildSuggestions order (priority + recency)
     })
-    return [cqSug(), ...sortedSugs.slice(0, DISPLAY_LIMIT - 1)]
+    // Pin replied-to contacts ahead of the display cap regardless of sort —
+    // a station we're mid-QSO with must never scroll off because 70 other
+    // stations happened to be heard more recently or sort earlier by SNR/distance.
+    const replied    = sortedSugs.filter(s => s.repliedToMe)
+    const notReplied = sortedSugs.filter(s => !s.repliedToMe)
+    const shown = [...replied, ...notReplied].slice(0, DISPLAY_LIMIT - 1)
+    return [cqSug(), ...shown]
   })
 
   const addSuggestion = (sug: Suggestion) => {
