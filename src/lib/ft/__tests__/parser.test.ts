@@ -180,6 +180,31 @@ describe('isValidCallsign — ITU prefix + shape', () => {
     expect(isValidCallsign('<...>')).toBe(false);
     expect(isValidCallsign('13=0')).toBe(false);
   });
+
+  it('accepts real-world callsigns previously missed by an incomplete/exact-only prefix table', () => {
+    expect(isValidCallsign('Z62NS')).toBe(true);       // Kosovo
+    expect(isValidCallsign('IS0/IK2YCW')).toBe(true);  // Italy, portable in Sardinia
+    expect(isValidCallsign('IZ6OUX')).toBe(true);       // Italy
+    expect(isValidCallsign('BG4UCZ')).toBe(true);       // China
+    expect(isValidCallsign('ON7DE')).toBe(true);        // Belgium
+  });
+
+  it('accepts a LETTER+DIGIT allocation whose digit doubles as the FT8 packing digit (4-char call, no separate digit)', () => {
+    // "D2UY": Angola's prefix is itself "D2" — with only a 2-letter suffix
+    // there's no second digit, so the regex's own required digit and the
+    // prefix's digit are the same character. Must prefer the 2-char
+    // letter+digit reading ("D2") over backtracking to a bare "D" (never
+    // itself allocated) plus digit "2".
+    expect(isValidCallsign('D2UY')).toBe(true);
+  });
+
+  it('accepts a 2-char allocation whose region digit could otherwise be misread as a 3-char prefix', () => {
+    // "9A60CBM": Croatia's prefix is "9A" (2 chars) + region digit "6" + a
+    // longer suffix "0CBM" — but the same string also parses as a 3-char
+    // prefix "9A6" + digit "0" + suffix "CBM", and "9A6" was never itself
+    // allocated. Must prefer the 2-char reading that IS allocated.
+    expect(isValidCallsign('9A60CBM')).toBe(true);
+  });
 });
 
 describe('classifyCallsign', () => {
