@@ -14,6 +14,7 @@ import { flagEmoji } from './lookup';
 const ALLOC: Array<[string, string]> = [
   // North America
   ['AA-AL', 'US'], ['K', 'US'], ['N', 'US'], ['W', 'US'],
+  ['KA-KZ', 'US'], ['NA-NZ', 'US'], ['WA-WZ', 'US'],
   ['VA-VG', 'CA'], ['VO', 'CA'], ['VX-VY', 'CA'], ['XJ-XO', 'CA'], ['CF-CK', 'CA'], ['CY-CZ', 'CA'],
   ['XA-XI', 'MX'],
   // Central America & Caribbean
@@ -32,17 +33,19 @@ const ALLOC: Array<[string, string]> = [
   ['FY', 'GF'], ['3G', 'CL'], ['XQ-XR', 'CL'], ['VP8', 'FK'],
   // Europe
   ['G', 'GB'], ['M', 'GB'], ['2', 'GB'],
+  ['GA-GZ', 'GB'], ['MA-MZ', 'GB'], ['2A-2Z', 'GB'],
   ['EI-EJ', 'IE'], ['F', 'FR'], ['TK', 'FR'],
-  ['DA-DR', 'DE'], ['I', 'IT'], ['EA-EH', 'ES'], ['AM-AO', 'ES'], ['CQ-CU', 'PT'],
+  ['DA-DR', 'DE'], ['I', 'IT'], ['IA-IZ', 'IT'], ['EA-EH', 'ES'], ['AM-AO', 'ES'], ['CQ-CU', 'PT'],
   ['ON-OT', 'BE'], ['PA-PI', 'NL'], ['LX', 'LU'], ['HB', 'CH'], ['HE', 'CH'], ['OE', 'AT'],
   ['OU-OZ', 'DK'], ['OY', 'FO'], ['TF', 'IS'], ['LA-LN', 'NO'], ['JW-JX', 'NO'],
   ['SA-SM', 'SE'], ['OF-OJ', 'FI'], ['ES', 'EE'], ['YL', 'LV'], ['LY', 'LT'],
   ['SN-SR', 'PL'], ['HF', 'PL'], ['3Z', 'PL'], ['OK-OL', 'CZ'], ['OM', 'SK'],
   ['HA', 'HU'], ['HG', 'HU'], ['YO-YR', 'RO'], ['LZ', 'BG'], ['SV-SZ', 'GR'], ['5B', 'CY'],
   ['9A', 'HR'], ['S5', 'SI'], ['E7', 'BA'], ['YT-YU', 'RS'], ['4O', 'ME'], ['Z3', 'MK'], ['ZA', 'AL'],
+  ['Z6', 'XK'],
   ['9H', 'MT'], ['3A', 'MC'], ['HV', 'VA'],
   ['EU-EW', 'BY'], ['EM-EO', 'UA'], ['UR-UZ', 'UA'], ['ER', 'MD'],
-  ['R', 'RU'], ['UA-UI', 'RU'],
+  ['R', 'RU'], ['UA-UI', 'RU'], ['RA-RZ', 'RU'],
   ['C3', 'AD'], ['HB0', 'LI'], ['T7', 'SM'], ['ZB', 'GI'],
   // Asia & Middle East
   ['TA-TC', 'TR'], ['YM', 'TR'], ['4X', 'IL'], ['4Z', 'IL'], ['OD', 'LB'], ['YK', 'SY'], ['JY', 'JO'],
@@ -51,7 +54,9 @@ const ALLOC: Array<[string, string]> = [
   ['UN-UQ', 'KZ'], ['UJ-UM', 'UZ'], ['EX', 'KG'], ['EY', 'TJ'], ['EZ', 'TM'],
   ['AP-AS', 'PK'], ['VU', 'IN'], ['AT-AW', 'IN'], ['4S', 'LK'], ['9N', 'NP'], ['S2', 'BD'],
   ['JA-JS', 'JP'], ['7J-7N', 'JP'], ['8J-8N', 'JP'], ['HL', 'KR'], ['DS-DT', 'KR'], ['6K-6N', 'KR'],
-  ['BV', 'TW'], ['B', 'CN'], ['VR', 'HK'],
+  ['BV', 'TW'], ['B', 'CN'],
+  ['BA-BL', 'CN'], ['BP', 'CN'], ['BR-BU', 'CN'], ['BW', 'CN'], ['BY-BZ', 'CN'], // BM/BN/BO/BQ/BV/BX are Taiwan (BV), not mainland China
+  ['VR', 'HK'],
   ['HS', 'TH'], ['E2', 'TH'], ['XV', 'VN'], ['3W', 'VN'], ['XU', 'KH'], ['XW', 'LA'], ['XZ', 'MM'],
   ['9M', 'MY'], ['9W', 'MY'], ['9V', 'SG'], ['YB-YH', 'ID'], ['7A-7I', 'ID'], ['8A-8I', 'ID'],
   ['DU-DZ', 'PH'], ['4D-4I', 'PH'],
@@ -64,10 +69,10 @@ const ALLOC: Array<[string, string]> = [
   ['3D2', 'FJ'],
   // Africa
   ['CN', 'MA'], ['7R', 'DZ'], ['7T-7Y', 'DZ'], ['3V', 'TN'], ['5A', 'LY'], ['SU', 'EG'], ['ST', 'SD'],
-  ['ET', 'ET'], ['5Y-5Z', 'KE'], ['5X', 'UG'], ['5H', 'TZ'], ['9J', 'ZM'], ['7Q', 'MW'], ['Z2', 'ZW'],
+  ['ET', 'ET'], ['5Y-5Z', 'KE'], ['5X', 'UG'], ['5H-5I', 'TZ'], ['9I-9J', 'ZM'], ['7Q', 'MW'], ['Z2', 'ZW'],
   ['A2', 'BW'], ['V5', 'NA'], ['7P', 'LS'], ['ZR-ZU', 'ZA'], ['5R', 'MG'], ['3B', 'MU'],
   ['9G', 'GH'], ['5N', 'NG'], ['6V-6W', 'SN'], ['TJ', 'CM'], ['TR', 'GA'], ['9Q-9T', 'CD'],
-  ['EL', 'LR'], ['9X', 'RW'], ['9U', 'BI'], ['D2', 'AO'], ['C9', 'MZ'], ['TT', 'TD'],
+  ['EL', 'LR'], ['9X', 'RW'], ['9U', 'BI'], ['D2-D3', 'AO'], ['C9', 'MZ'], ['TT', 'TD'],
   ['5T', 'MR'], ['5U', 'NE'], ['5V', 'TG'], ['TU', 'CI'], ['XT', 'BF'], ['TY', 'BJ'], ['TZ', 'ML'], ['3X', 'GN'],
   ['Z8', 'SS'], ['J2', 'DJ'], ['T5', 'SO'], ['6O', 'SO'], ['TN', 'CG'], ['TL', 'CF'], ['3C', 'GQ'],
   ['9L', 'SL'], ['J5', 'GW'], ['C5', 'GM'], ['D4', 'CV'], ['3DA', 'SZ'], ['S7', 'SC'], ['D6', 'KM'],

@@ -12,6 +12,13 @@ them into a version section when cutting a release.
 
 ## [Unreleased]
 
+## [0.9.3] - 2026-07-27
+
+### Fixed
+
+- Real callsigns (e.g. Z62NS, IS0/IK2YCW, IZ6OUX, BG4UCZ, D2UY, 9A60CBM) were rejected as invalid because the hardcoded ITU prefix table was missing Kosovo entirely and only listed several countries' shortest ITU block (Italy as "I", China as "B") while the validator matched longer, more specific sub-prefixes exactly — added the missing entries and every real 2-char sub-block for Italy, China, the US, UK, and Russia, plus corrected Angola (D2-D3), Tanzania (5H-5I), and Zambia (9I-9J).
+- Callsigns whose ITU prefix is itself a letter+digit pair (D2 Angola, 9A Croatia, V2 Antigua, etc.) could still fail validation even after the table fix, because the shape regex's required packing digit and the prefix's own digit are the same character in a short callsign — the parser now prefers the longer, actually-allocated reading instead of always backtracking to an unallocated bare letter.
+
 ## [0.9.2] - 2026-07-24
 
 ### Fixed
