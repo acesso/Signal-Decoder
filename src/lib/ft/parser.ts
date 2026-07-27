@@ -43,7 +43,19 @@ export interface ParsedFTMsg {
 const CS_STANDARD = /^([A-Z0-9]{1,2})[0-9][A-Z]{1,3}$/;
 function standardPrefix(w: string): string | null {
   const m = w.match(CS_STANDARD);
-  return m && /[A-Z]/.test(m[1]) ? m[1] : null;
+  if (!m || !/[A-Z]/.test(m[1])) return null;
+  // Some real ITU allocations are a LETTER+DIGIT pair (D2 Angola, V2 Antigua,
+  // A2 Botswana, T7 San Marino, ...). When the whole callsign is only 4 chars
+  // (e.g. "D2UY"), the regex's own required digit and the prefix's digit are
+  // the same character, and JS regex backtracking always resolves the greedy
+  // {1,2} group down to the 1-char reading ("D") — there's no textual way to
+  // tell "D2UY" apart from a hypothetical 1-char-prefix "D2UY" up front. Retry
+  // with the 2-char letter+digit reading and prefer it when IT is the one
+  // that's actually allocated (the 1-char reading never is, for these).
+  if (m[1].length === 1 && w.length >= 2 && /[0-9]/.test(w[1]) && isExactKnownPrefix(w.slice(0, 2))) {
+    return w.slice(0, 2);
+  }
+  return m[1];
 }
 // Nonstandard/58-bit shape (no slash): everything real that doesn't fit the
 // 28-bit standard field above — a 3-character prefix (many real ITU
@@ -54,8 +66,19 @@ const CS_NONSTANDARD_3CHAR_PREFIX = /^([A-Z0-9]{3})[0-9][A-Z0-9]{1,3}$/;
 const CS_NONSTANDARD_LONG_SUFFIX  = /^([A-Z0-9]{1,2})[0-9][A-Z0-9]{4,7}$/;
 function nonstandardPrefix(w: string): string | null {
   const m3 = w.match(CS_NONSTANDARD_3CHAR_PREFIX);
-  if (m3 && /[A-Z]/.test(m3[1])) return m3[1];
   const mLong = w.match(CS_NONSTANDARD_LONG_SUFFIX);
+  if (m3 && /[A-Z]/.test(m3[1])) {
+    // Same digit-boundary ambiguity as standardPrefix's D2/A2/etc case, one
+    // level up: some real 2-char allocations (9A Croatia, S5 Slovenia, ...)
+    // followed by a region digit and a longer suffix (9A60CBM) parse just as
+    // validly as a 3-char prefix (9A6) + digit + short suffix. Prefer the
+    // 2-char reading when it's the one that's actually allocated — the 3-char
+    // reading never is, for these.
+    if (mLong && mLong[1].length === 2 && /[A-Z]/.test(mLong[1]) && isExactKnownPrefix(mLong[1])) {
+      return mLong[1];
+    }
+    return m3[1];
+  }
   return mLong && /[A-Z]/.test(mLong[1]) ? mLong[1] : null;
 }
 
