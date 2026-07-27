@@ -12,6 +12,12 @@ them into a version section when cutting a release.
 
 ## [Unreleased]
 
+## [0.9.4] - 2026-07-27
+
+### Fixed
+
+- A station that had directly answered our CQ could silently vanish from Suggested Messages: the "CQ only"/"special"/country/VFO/"latest" filter chips applied to every suggestion equally, so a contact mid-QSO with us could be hidden the moment their most recent heard message no longer matched an active chip (e.g. after they answered, `isCQ` turns false, so "CQ only" would then hide them). Separately, the display cap (top 8) only weighted replied-to contacts, it didn't guarantee them a slot, so a busy band (dozens of contacts) could push a real reply past the cutoff. Replied-to contacts are now exempt from the discovery chips and pinned ahead of the display cap.
+
 ## [0.9.3] - 2026-07-27
 
 ### Fixed
