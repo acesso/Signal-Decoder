@@ -12,6 +12,10 @@ them into a version section when cutting a release.
 
 ## [Unreleased]
 
+## [0.9.6] - 2026-07-27
+
+No functional change — verifies the release/deploy pipeline (and the new update-available prompt) end-to-end.
+
 ## [0.9.5] - 2026-07-27
 
 ### Fixed
