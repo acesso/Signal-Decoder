@@ -47,6 +47,13 @@ export default defineConfig({
     // `disable: NODE_ENV === 'development'` avoids.
     VitePWA({
       registerType: 'autoUpdate',
+      // Registered manually via virtual:pwa-register in src/index.tsx instead
+      // of the plugin's auto-injected registerSW.js — that script only calls
+      // navigator.serviceWorker.register() once on load with no update
+      // detection, so an already-open tab could sit on a stale cached bundle
+      // indefinitely even after a new version deployed. The manual register
+      // call gets an onNeedRefresh callback so the UI can prompt instead.
+      injectRegister: false,
       includeAssets: ['favicon.svg', 'icon-192.png', 'icon-512.png', 'og-image.png'],
       manifest: {
         name: 'Signal Decoder',

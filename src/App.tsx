@@ -10,6 +10,7 @@ import MFSKDecoder from './components/MFSKDecoder'
 import FTTransmitPanel, { type TxStatus } from './components/FTTransmitPanel'
 import RadioCATPanel, { useRadioCAT } from './components/RadioCATPanel'
 import PWAInstallPrompt from './components/PWAInstallPrompt'
+import UpdateAvailablePrompt from './components/UpdateAvailablePrompt'
 import { globalAudio } from './lib/audio/globalAudio'
 import type { DecoderControls } from './lib/decoderControls'
 import { type FTDecoderStats, type FTDecoderStatus, type FTMode, subscribeDecoderStats, subscribeDecoderStatus } from '$decoder-lib/ft/decoder'
@@ -625,6 +626,7 @@ function App(): JSX.Element {
       <MemDebugBar contacts={ftContacts()} />
 
       <PWAInstallPrompt />
+      <UpdateAvailablePrompt />
     </main>
   )
 }

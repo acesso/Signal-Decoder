@@ -12,6 +12,12 @@ them into a version section when cutting a release.
 
 ## [Unreleased]
 
+## [0.9.5] - 2026-07-27
+
+### Fixed
+
+- A tab left open across a new deploy could keep running stale JS indefinitely: the PWA's auto-injected `registerSW.js` only calls `navigator.serviceWorker.register()` once on load with no update detection, so even though the new service worker installs and activates in the background, the already-loaded page never knew to refresh. Now registered manually with update detection, surfacing a small dismissible "Update available — Reload" prompt instead of silently staying stale or force-reloading mid-decode/mid-QSO.
+
 ## [0.9.4] - 2026-07-27
 
 ### Fixed
