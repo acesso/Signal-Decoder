@@ -255,11 +255,24 @@ function buildSuggestions(myCall: string, myGrid: string, contacts: Map<string, 
     const replieToUs = theirMsgs.filter(m => m.parsed.callee?.toUpperCase() === myCallUp)
     const ourMsgs    = c.msgs.filter(m => m.role === 'rx' && m.parsed.caller?.toUpperCase() === myCallUp)
 
+    // Latest of their transmissions by timestamp — gate replays can append
+    // released messages out of push order.
+    const lastHeard = theirMsgs.reduce((latest, m) => m.windowStart > latest.windowStart ? m : latest, theirMsgs[0])
+
     const repliedToMe   = replieToUs.length > 0
-    const lastTheirMsg  = replieToUs[replieToUs.length - 1] ?? theirMsgs[theirMsgs.length - 1]
     const lastOurMsg    = ourMsgs[ourMsgs.length - 1]
+    // Abandoned exchange: after our last transmission to them, the most
+    // recent thing we actually heard from them was addressed to someone
+    // ELSE, not us — they've moved on (e.g. working another station).
+    // Treating our last stale exchange as still "in progress" would have
+    // the state machine forever propose "continue" (re-send RR73/report/etc)
+    // for a QSO the other side already walked away from, so this resets to
+    // a fresh "answer" instead of trusting a reply that's no longer current.
+    const abandoned = !!lastOurMsg && lastHeard.windowStart > lastOurMsg.windowStart
+      && lastHeard.parsed.callee?.toUpperCase() !== myCallUp
+    const lastTheirMsg  = abandoned ? undefined : (replieToUs[replieToUs.length - 1] ?? theirMsgs[theirMsgs.length - 1])
     const lastRx        = lastTheirMsg?.parsed.type ?? null
-    const lastSent      = lastOurMsg?.parsed.type ?? null
+    const lastSent      = abandoned ? null : (lastOurMsg?.parsed.type ?? null)
 
     let nextTxType: ReturnType<typeof nextTxMsgType>
     if (!lastSent) {
@@ -269,20 +282,26 @@ function buildSuggestions(myCall: string, myGrid: string, contacts: Map<string, 
       if (nextTxType === 'cq') continue
     }
 
-    // Use best SNR across all their messages to us (not just the latest)
+    // Use best SNR across all their messages to us (not just the latest);
+    // fall back to their last heard transmission (even if abandoned/to
+    // someone else) rather than 0 — it's still the best signal data we have.
     const bestSnr  = replieToUs.length
       ? replieToUs.reduce((best, m) => m.snr > best ? m.snr : best, -99)
-      : (lastTheirMsg ? lastTheirMsg.snr : 0)
+      : lastHeard.snr
     const reportDb = Math.round(bestSnr)
     const message  = buildFTMessage(nextTxType, myCall, c.callsign, reportDb, myGrid)
 
     // Build exchange thread: interleave their direct messages and our replies,
-    // sorted by time, keep the last 4 entries.
+    // sorted by time, keep the last 4 entries. When abandoned, append their
+    // most recent transmission too (even though it's not addressed to us) —
+    // otherwise the thread only ever shows OUR side of a stale exchange with
+    // no visible sign they've since answered someone else.
     const threadMsgs: Array<{ t: Date; raw: string; mine: boolean; snr?: number }> = [
       ...repliedToMe
         ? replieToUs.map(m => ({ t: m.windowStart, raw: m.raw, mine: false, snr: m.snr }))
         : theirMsgs.slice(-2).map(m => ({ t: m.windowStart, raw: m.raw, mine: false, snr: m.snr })),
       ...ourMsgs.map(m => ({ t: m.windowStart, raw: m.raw, mine: true })),
+      ...abandoned ? [{ t: lastHeard.windowStart, raw: lastHeard.raw, mine: false, snr: lastHeard.snr }] : [],
     ].sort((a, b) => a.t.getTime() - b.t.getTime()).slice(-4)
 
     const thread: QSOStep[] = threadMsgs.map(m => ({ raw: m.raw, mine: m.mine, snr: m.snr, time: m.t }))
@@ -296,9 +315,6 @@ function buildSuggestions(myCall: string, myGrid: string, contacts: Map<string, 
     }
 
     const pfx = callsignCountry(c.callsign)
-    // Latest of their transmissions by timestamp — gate replays can append
-    // released messages out of push order.
-    const lastHeard = theirMsgs.reduce((latest, m) => m.windowStart > latest.windowStart ? m : latest, theirMsgs[0])
     const lastTxParsed = lastHeard.parsed
     // Honor a numeric QSY request when answering their CQ: move OUR TX audio
     // to where they said they're listening (pure Audio Hz — the VFO already
