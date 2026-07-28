@@ -12,6 +12,12 @@ them into a version section when cutting a release.
 
 ## [Unreleased]
 
+## [0.9.7] - 2026-07-27
+
+### Fixed
+
+- Suggested Messages kept proposing "continue this QSO" (re-send report/RR73/73) for a station that had already moved on to work someone else — the state machine only looked at the last message that station ever sent *specifically to us*, ignoring that their most recent transmission overall had gone to a different callsign. It now detects this abandonment (their latest heard transmission is newer than our last message to them, and wasn't addressed to us) and resets to a fresh answer instead of endlessly retrying a QSO the other side already left; the suggestion's thread now also shows their abandoning transmission so it's visible in the UI, not just inferred.
+
 ## [0.9.6] - 2026-07-27
 
 No functional change — verifies the release/deploy pipeline (and the new update-available prompt) end-to-end.
