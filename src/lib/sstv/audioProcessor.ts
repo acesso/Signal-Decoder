@@ -2,8 +2,10 @@
 import { createSignal } from 'solid-js'
 import { SSTVDecoder, type DecoderStats } from '$decoder-lib/sstv/decoder'
 import { VISDetector } from '$decoder-lib/sstv/vis-detector'
+import { SyncIntervalDetector } from '$decoder-lib/sstv/sync-interval-detector'
 import { SSTV_MODES } from '$decoder-lib/sstv/constants'
 import { createCaptureNode, type CaptureNode } from '$decoder-lib/audio/captureNode'
+import { estimateSignalReport, type SignalReport } from '$decoder-lib/sstv/signalReport'
 
 export type SSTVMode = keyof typeof SSTV_MODES
 
@@ -16,6 +18,7 @@ export interface CapturedImage {
   thumbnailUrl: string
   captureTime: Date
   duration: number
+  signalReport: SignalReport
 }
 
 export interface AudioProcessorState {
@@ -92,6 +95,11 @@ export function createAudioProcessor(params: AudioProcessorParams) {
   let stream: MediaStream | null = null
   let decoder: SSTVDecoder | null = null
   let visDetector: VISDetector | null = null
+  // Fallback for tuning in mid-transmission (VIS header already passed) —
+  // runs alongside visDetector while listening, mode-agnostic, and identifies
+  // the mode from the timing between sync pulses instead of the VIS code.
+  // See sync-interval-detector.ts for why this works for every mode.
+  let syncIntervalDetector: SyncIntervalDetector | null = null
   let processorNode: CaptureNode | null = null
 
   let activeMode: SSTVMode = params.manualMode()
@@ -110,7 +118,7 @@ export function createAudioProcessor(params: AudioProcessorParams) {
     }
   }
 
-  function captureCurrentImage(sampleRate: number, nextMode?: SSTVMode) {
+  function captureCurrentImage(sampleRate: number, nextMode?: SSTVMode, nextModeVia: 'VIS' | 'sync timing' = 'VIS') {
     if (!decoder) return
     const { width, height } = decoder.getDimensions()
     const rawData = decoder.getImageData()
@@ -118,6 +126,9 @@ export function createAudioProcessor(params: AudioProcessorParams) {
     const thumbUrl = makeThumbnail(dataCopy, width, height)
     const duration = (Date.now() - decodingStart) / 1000
     const mode = activeMode
+    const lastStats = state().stats
+    const completeness = lastStats && lastStats.totalLines > 0 ? lastStats.currentLine / lastStats.totalLines : 0
+    const signalReport = estimateSignalReport(lastStats?.snr ?? null, completeness, dataCopy, width, height)
 
     const img: CapturedImage = {
       id: `${Date.now()}-${Math.random().toString(36).slice(2)}`,
@@ -128,6 +139,7 @@ export function createAudioProcessor(params: AudioProcessorParams) {
       thumbnailUrl: thumbUrl,
       captureTime: new Date(),
       duration,
+      signalReport,
     }
 
     capturedImages = [img, ...capturedImages]
@@ -141,16 +153,18 @@ export function createAudioProcessor(params: AudioProcessorParams) {
       isDecoding = true
       decodingStart = Date.now()
       visDetector?.reset()
+      syncIntervalDetector?.reset()
       setState((prev) => ({
         ...prev,
         stats: null,
         activeMode: nextMode,
         isListeningForVIS: false,
-        detectionStatus: `VIS detected: ${SSTV_MODES[nextMode].name}`,
+        detectionStatus: `${nextModeVia} detected: ${SSTV_MODES[nextMode].name}`,
         capturedImages,
       }))
     } else if (params.autoDetect()) {
       visDetector?.reset()
+      syncIntervalDetector?.reset()
       setState((prev) => ({
         ...prev,
         stats: null,
@@ -173,25 +187,46 @@ export function createAudioProcessor(params: AudioProcessorParams) {
     const chunkMs = (inputData.length / sampleRate) * 1000
 
     if (params.autoDetect() && !isDecoding) {
+      let detectedMode: SSTVMode | null = null
+      let detectedVia: 'VIS' | 'sync timing' = 'VIS'
+
       if (visDetector) {
         const result = visDetector.process(inputData)
         if (result.detected && result.modeName) {
-          const detectedMode = result.modeName as SSTVMode
-          activeMode = detectedMode
-          isDecoding = true
-          decodingStart = Date.now()
-          silenceMs = 0
-
-          decoder = new SSTVDecoder(sampleRate, detectedMode, params.autoSlant())
-          decoder.start()
-
-          setState((prev) => ({
-            ...prev,
-            activeMode: detectedMode,
-            isListeningForVIS: false,
-            detectionStatus: `VIS detected: ${SSTV_MODES[detectedMode].name}`,
-          }))
+          detectedMode = result.modeName as SSTVMode
+          detectedVia = 'VIS'
         }
+      }
+
+      // Fallback for tuning in mid-transmission — the VIS header already
+      // passed, so it'll never fire; sync-pulse timing works regardless of
+      // where in the transmission we joined. Only consulted when VIS hasn't
+      // already found something this same chunk (VIS is authoritative when
+      // both fire — it identifies the mode directly rather than inferring it).
+      if (!detectedMode && syncIntervalDetector) {
+        const result = syncIntervalDetector.process(inputData)
+        if (result.detected && result.modeName) {
+          detectedMode = result.modeName as SSTVMode
+          detectedVia = 'sync timing'
+        }
+      }
+
+      if (detectedMode) {
+        activeMode = detectedMode
+        isDecoding = true
+        decodingStart = Date.now()
+        silenceMs = 0
+
+        decoder = new SSTVDecoder(sampleRate, detectedMode, params.autoSlant())
+        decoder.start()
+        syncIntervalDetector?.reset()
+
+        setState((prev) => ({
+          ...prev,
+          activeMode: detectedMode,
+          isListeningForVIS: false,
+          detectionStatus: `${detectedVia} detected: ${SSTV_MODES[detectedMode].name}`,
+        }))
       }
     } else if (isDecoding && decoder) {
       decoder.processSamples(inputData)
@@ -205,7 +240,7 @@ export function createAudioProcessor(params: AudioProcessorParams) {
       if (params.autoDetect() && visDetector) {
         const visResult = visDetector.process(inputData)
         if (visResult.detected && visResult.modeName) {
-          captureCurrentImage(sampleRate, visResult.modeName as SSTVMode)
+          captureCurrentImage(sampleRate, visResult.modeName as SSTVMode, 'VIS')
           return
         }
       }
@@ -252,6 +287,7 @@ export function createAudioProcessor(params: AudioProcessorParams) {
 
       if (params.autoDetect()) {
         visDetector = new VISDetector(sampleRate)
+        syncIntervalDetector = new SyncIntervalDetector(sampleRate)
         isDecoding = false
         setState((prev) => ({ ...prev, isListeningForVIS: true, detectionStatus: 'Listening for VIS…', activeMode }))
       } else {
@@ -292,6 +328,7 @@ export function createAudioProcessor(params: AudioProcessorParams) {
     }
     if (decoder) decoder.stop()
     if (visDetector) visDetector.reset()
+    if (syncIntervalDetector) syncIntervalDetector.reset()
     isDecoding = false
     setState((prev) => ({ ...prev, isRecording: false, isListeningForVIS: false, detectionStatus: '' }))
   }
