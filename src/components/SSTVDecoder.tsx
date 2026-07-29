@@ -6,6 +6,7 @@ import { createAudioProcessor, type CapturedImage, type SSTVMode } from '../lib/
 import { SSTV_MODES } from '$decoder-lib/sstv/constants'
 import { DecoderState } from '$decoder-lib/sstv/decoder'
 import { loadNumberArray, saveNumberArray } from '$decoder-lib/storage'
+import { formatSignalReport } from '$decoder-lib/sstv/signalReport'
 
 const DEFAULT_PANEL_WEIGHTS = [1.5, 1, 0.75]
 const LS_PANEL_WEIGHTS = 'sstv_panel_weights'
@@ -28,7 +29,7 @@ function GalleryCard(props: { img: CapturedImage; onClick: () => void }) {
   )
 }
 
-function ImageModal(props: { img: CapturedImage; onClose: () => void }) {
+function ImageModal(props: { img: CapturedImage; onClose: () => void; onReply?: (img: CapturedImage) => void }) {
   function handleDownload() {
     const canvas = document.createElement('canvas')
     canvas.width = props.img.width
@@ -78,6 +79,7 @@ function ImageModal(props: { img: CapturedImage; onClose: () => void }) {
                 { label: 'Captured', value: props.img.captureTime.toLocaleTimeString() },
                 { label: 'Duration', value: dur() },
                 { label: 'Resolution', value: `${props.img.width}×${props.img.height}` },
+                { label: 'Signal Report', value: `${formatSignalReport(props.img.signalReport)} (RSV)` },
               ]}
             >
               {({ label, value }) => (
@@ -95,6 +97,15 @@ function ImageModal(props: { img: CapturedImage; onClose: () => void }) {
             >
               Close
             </button>
+            <Show when={props.onReply}>
+              <button
+                onClick={() => props.onReply?.(props.img)}
+                class="flex items-center gap-2 rounded-md border border-[#58a6ff]/40 bg-[#58a6ff]/10 px-4 py-2 text-sm font-semibold text-[#58a6ff] transition-colors hover:bg-[#58a6ff]/20"
+                title="Open the Compose & Transmit panel with this image, your callsign, timestamp, and signal report pre-filled"
+              >
+                Reply
+              </button>
+            </Show>
             <button
               onClick={handleDownload}
               class="flex items-center gap-2 rounded-md bg-[#238636] px-4 py-2 text-sm font-semibold text-white transition-colors hover:bg-[#2ea043]"
@@ -115,7 +126,7 @@ function ImageModal(props: { img: CapturedImage; onClose: () => void }) {
   )
 }
 
-export default function SSTVDecoder(props: DecoderProps): JSX.Element {
+export default function SSTVDecoder(props: DecoderProps & { onReply?: (img: CapturedImage) => void }): JSX.Element {
   const [manualMode, setManualMode] = createSignal<SSTVMode>('ROBOT36')
   const [autoDetect, setAutoDetect] = createSignal(true)
   const [autoSlant, setAutoSlant] = createSignal(true)
@@ -351,7 +362,9 @@ export default function SSTVDecoder(props: DecoderProps): JSX.Element {
               {modeCfg().width}×{modeCfg().height} px
             </div>
             <Show when={autoDetect()}>
-              <div class="mt-1 text-[10px] text-[#8b949e] italic">{processor.state().isListeningForVIS ? 'Waiting for VIS…' : 'Auto-detected'}</div>
+              <div class="mt-1 text-[10px] text-[#8b949e] italic">
+                {processor.state().isListeningForVIS ? 'Listening for VIS or sync timing…' : (processor.state().detectionStatus || 'Auto-detected')}
+              </div>
             </Show>
           </div>
 
@@ -447,7 +460,7 @@ export default function SSTVDecoder(props: DecoderProps): JSX.Element {
         </div>
       </details>
 
-      <Show when={selectedImage()}>{(img) => <ImageModal img={img()} onClose={() => setSelectedImage(null)} />}</Show>
+      <Show when={selectedImage()}>{(img) => <ImageModal img={img()} onClose={() => setSelectedImage(null)} onReply={props.onReply} />}</Show>
     </div>
   )
 }

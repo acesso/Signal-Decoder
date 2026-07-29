@@ -4,6 +4,7 @@
 import { createEffect, createMemo, createSignal, For, onCleanup, onMount, Show, type JSX } from 'solid-js'
 import RTTYDecoder from './components/RTTYDecoder'
 import SSTVDecoder from './components/SSTVDecoder'
+import SSTVComposer, { type SSTVTxStatus } from './components/SSTVComposer'
 import CWDecoder from './components/CWDecoder'
 import FTDecoder, { FTModeSelector } from './components/FTDecoder'
 import MFSKDecoder from './components/MFSKDecoder'
@@ -16,6 +17,7 @@ import type { DecoderControls } from './lib/decoderControls'
 import { type FTDecoderStats, type FTDecoderStatus, type FTMode, subscribeDecoderStats, subscribeDecoderStatus } from '$decoder-lib/ft/decoder'
 import type { Contact } from '$decoder-lib/ft/parser'
 import { audioRecorder, REC_DURATION_CHOICES_SEC } from '$decoder-lib/audio/ringRecorder'
+import type { CapturedImage } from '$decoder-lib/sstv/audioProcessor'
 
 type DecoderMode = 'rtty' | 'sstv' | 'cw' | 'ft' | 'mfsk'
 
@@ -421,6 +423,31 @@ function TxSummaryChips(props: { s: TxStatus | null }): JSX.Element {
   )
 }
 
+// ── SSTV TX collapsed summary chip ──────────────────────────────────────────
+// Simpler than the FT ring (no fixed UTC window to animate against — SSTV
+// transmits are one-shot, variable-length), just a pulsing dot + phase label
+// + live percentage/remaining time, shown only while the panel is collapsed.
+
+const SSTV_TX_STATUS_COLOR: Record<SSTVTxStatus['phase'], string> = { idle: '#484f58', encoding: '#58a6ff', playing: '#2ea043' }
+const SSTV_TX_STATUS_LABEL: Record<SSTVTxStatus['phase'], string> = { idle: 'IDLE', encoding: 'ENC', playing: 'TX' }
+
+function SSTVTxSummaryChip(props: { s: SSTVTxStatus | null }): JSX.Element {
+  return (
+    <Show when={props.s && props.s.phase !== 'idle'}>
+      <span class="sstv-tx-summary-chip ml-3 inline-flex items-center gap-1.5 align-middle font-mono text-[10px] font-bold" style={{ 'line-height': '1' }}>
+        <span
+          class={`inline-block h-2 w-2 shrink-0 rounded-full ${props.s!.phase === 'playing' ? 'animate-pulse' : ''}`}
+          style={{ background: SSTV_TX_STATUS_COLOR[props.s!.phase] }}
+        />
+        <span style={{ color: SSTV_TX_STATUS_COLOR[props.s!.phase] }}>{SSTV_TX_STATUS_LABEL[props.s!.phase]}</span>
+        <Show when={props.s!.phase === 'playing'}>
+          <span class="text-[#8b949e]">{Math.round(props.s!.progress * 100)}% · {props.s!.remainingSec}s left</span>
+        </Show>
+      </span>
+    </Show>
+  )
+}
+
 // ── App ─────────────────────────────────────────────────────────────────────
 
 function App(): JSX.Element {
@@ -468,6 +495,20 @@ function App(): JSX.Element {
 
   function handleForMode(m: DecoderMode) {
     return m === 'rtty' ? rtty : m === 'sstv' ? sstv : m === 'cw' ? cw : m === 'ft' ? ft : mfsk
+  }
+
+  // ── SSTV "Reply" — a captured image's Reply button opens the composer
+  // panel (pre-filled) so the operator can send a QSO card back without
+  // re-navigating. The composer consumes the request once, then clears it.
+  const [replyRequest, setReplyRequest] = createSignal<CapturedImage | null>(null)
+  const [sstvTxStatus, setSstvTxStatus] = createSignal<SSTVTxStatus | null>(null)
+  let sstvComposerDetailsEl: HTMLDetailsElement | undefined
+  function handleSSTVReply(img: CapturedImage) {
+    setReplyRequest(img)
+    if (sstvComposerDetailsEl) {
+      sstvComposerDetailsEl.open = true
+      sstvComposerDetailsEl.scrollIntoView({ behavior: 'smooth', block: 'start' })
+    }
   }
 
   const activeHandle = createMemo(() => handleForMode(mode()))
@@ -593,12 +634,34 @@ function App(): JSX.Element {
           </div>
         </Show>
 
+        {/* SSTV QSO Card composer — only shown when SSTV mode is active */}
+        <Show when={mode() === 'sstv'}>
+          <div class="pb-3">
+            {/* chip hidden via CSS when panel is open, same trick as the FT panel's tx-summary-chips */}
+            <style>{`details[open] .sstv-tx-summary-chip { display: none !important; }`}</style>
+            <details ref={sstvComposerDetailsEl} class="rounded-lg border border-[#30363d] bg-[#161b22]">
+              <summary class="flex cursor-pointer items-center rounded-lg px-4 py-3 text-sm font-semibold transition-colors select-none hover:bg-[#21262d] sm:px-5">
+                Compose &amp; Transmit QSO Card
+                <SSTVTxSummaryChip s={sstvTxStatus()} />
+              </summary>
+              <div class="px-4 pb-4 sm:px-5 sm:pb-5">
+                <SSTVComposer
+                  replyRequest={replyRequest()}
+                  onReplyConsumed={() => setReplyRequest(null)}
+                  onSetPTT={cat.state().connected ? cat.setPTT : undefined}
+                  onStatusChange={setSstvTxStatus}
+                />
+              </div>
+            </details>
+          </div>
+        </Show>
+
         {/* All decoders mounted persistently, toggled via CSS */}
         <div class={mode() === 'rtty' ? '' : 'hidden'}>
           <RTTYDecoder handle={rtty} onStateChange={() => {}} analyser={globalAudio.analyser()} vfoFrequency={vfoFrequency()} />
         </div>
         <div class={mode() === 'sstv' ? '' : 'hidden'}>
-          <SSTVDecoder handle={sstv} onStateChange={() => {}} analyser={globalAudio.analyser()} vfoFrequency={vfoFrequency()} />
+          <SSTVDecoder handle={sstv} onStateChange={() => {}} analyser={globalAudio.analyser()} vfoFrequency={vfoFrequency()} onReply={handleSSTVReply} />
         </div>
         <div class={mode() === 'cw' ? '' : 'hidden'}>
           <CWDecoder handle={cw} onStateChange={() => {}} analyser={globalAudio.analyser()} vfoFrequency={vfoFrequency()} />

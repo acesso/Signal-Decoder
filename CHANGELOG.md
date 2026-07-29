@@ -12,6 +12,16 @@ them into a version section when cutting a release.
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-07-29
+
+### Added
+
+- SSTV QSO Card composer: compose and transmit a QSO card image over SSTV, with drop/upload/paste/URL image sources, draggable multi-line text overlays, and draggable/resizable reply boxes for a recipient to fill in by hand.
+- Reply-to-received-image workflow: reply from the decoder's gallery pre-fills an inset of the received image, a timestamp/callsign/RSV text layer, and an automatically estimated RSV (Readability/Strength/Video) signal report.
+- Saved QSO cards persist and are fully editable — reload a saved card's image, text, and layout back into the composer, save changes in place, rename, or send immediately.
+- Auto-PTT, TX gain (dB), and a live transmit countdown/status chip for the SSTV composer, matching the FT8/4 transmit panel's conventions.
+- Automatic mid-stream SSTV mode detection: when the VIS header is missed (tuning in after a transmission already started), the decoder now identifies the mode from sync-pulse timing instead of giving up.
+
 ## [0.9.8] - 2026-07-28
 
 ### Added
