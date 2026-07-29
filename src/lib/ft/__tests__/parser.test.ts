@@ -531,6 +531,25 @@ describe('nextTxMsgType — QSO auto-sequencing incl. retries', () => {
   });
 });
 
+describe('nextTxMsgType — Fox/Hound (DXpedition) mode', () => {
+  it('jumps straight to RR73 once Fox reports us, skipping the normal r_report step', () => {
+    expect(nextTxMsgType('answer', 'report', true)).toBe('rr73');
+    expect(nextTxMsgType('answer', 'r_report', true)).toBe('rr73');
+  });
+
+  it('defaults to normal-QSO behavior when foxHound is omitted or false', () => {
+    expect(nextTxMsgType('answer', 'report')).toBe('r_report');
+    expect(nextTxMsgType('answer', 'report', false)).toBe('r_report');
+  });
+
+  it('leaves every other state unaffected by foxHound', () => {
+    expect(nextTxMsgType('cq', 'answer', true)).toBe('report');
+    expect(nextTxMsgType('rr73', 'tx73', true)).toBe('cq');
+    expect(nextTxMsgType('answer', 'rr73', true)).toBe('tx73');
+    expect(nextTxMsgType('answer', 'cq', true)).toBe('answer'); // keep calling in
+  });
+});
+
 describe('callsignCountry', () => {
   it('resolves countries from callsign prefixes', () => {
     expect(callsignCountry('LX1TI')?.countryCode).toBe('LU');

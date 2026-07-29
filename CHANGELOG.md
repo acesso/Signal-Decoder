@@ -12,6 +12,20 @@ them into a version section when cutting a release.
 
 ## [Unreleased]
 
+## [0.9.8] - 2026-07-28
+
+### Added
+
+- Configurable pre-key (warm-up) and post-key (cool-down) delays around Auto-PTT, for external PAs/relays that need time to switch.
+- Fox/Hound (DXpedition) mode toggle for Suggested Messages — jumps straight to RR73 once Fox reports you instead of the normal R+report round-trip.
+- Requeue icon on Sent Log entries to quickly resend a past message.
+
+### Fixed
+
+- Suggested Messages could get stuck proposing a report/RR73 reply based on a station's transmission to a *different* callsign, instead of only advancing on replies actually addressed to us.
+- The TX Queue countdown and TX ring flashed a full window remaining for one frame at the exact instant a transmission fired, making it look like TX happened a window early.
+- The TX Queue countdown reset to a full window and back when the upcoming window had already been decided as a skip (forced listen window, empty queue, or Auto-CQ not yet due) instead of counting through to the real next opportunity.
+
 ## [0.9.7] - 2026-07-27
 
 ### Fixed

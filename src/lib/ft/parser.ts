@@ -662,7 +662,16 @@ export function qsyAudioOffsetHz(cqTag: string | undefined, vfoHz: number): numb
 // of the two (it's our turn); 'cq' means the exchange needs nothing from us.
 // A received 73 is never answered — replying to a sign-off would 73-ping-pong
 // between two auto-sequencers.
-export function nextTxMsgType(lastSent: MsgType | null, lastRx: MsgType | null): TxMsgType {
+//
+// foxHound: DXpedition Fox/Hound mode (WSJT-X "Type F/H") compresses the
+// Hound's side of the exchange — Fox logs the Hound after a single report and
+// never round-trips an R+report acknowledgment, so once Fox reports us we
+// must jump straight to RR73. Sending r_report here (the normal-QSO next
+// step) would be a wasted transmission Fox simply ignores, burning one of a
+// Hound's limited call-in slots for nothing. Only the 'answer' state differs;
+// every other state (we called CQ, or the exchange is past the report step)
+// behaves the same either way.
+export function nextTxMsgType(lastSent: MsgType | null, lastRx: MsgType | null, foxHound = false): TxMsgType {
   if (!lastSent) return 'cq';
 
   // We CQ'd (or never addressed them): grid answer → report; a direct
@@ -676,10 +685,12 @@ export function nextTxMsgType(lastSent: MsgType | null, lastRx: MsgType | null):
     return 'report';
   }
 
-  // We answered their CQ: they report → R+report; they close → 73 back;
-  // anything else (incl. their repeated CQ) → keep answering.
+  // We answered their CQ (called in to a Fox, in F/H terms): they report →
+  // R+report normally, but Fox's report means we're logged — go straight to
+  // RR73; they close → 73 back; anything else (incl. their repeated CQ) →
+  // keep answering/calling in.
   if (lastSent === 'answer') {
-    if (lastRx === 'report' || lastRx === 'r_report') return 'r_report';
+    if (lastRx === 'report' || lastRx === 'r_report') return foxHound ? 'rr73' : 'r_report';
     if (lastRx === 'rr73' || lastRx === 'rrr')        return 'tx73';
     if (lastRx === 'tx73')                            return 'cq';
     return 'answer';
