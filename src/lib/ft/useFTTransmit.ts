@@ -47,6 +47,17 @@ export interface FTTransmitState {
   outputDeviceId: string;
   txGain: number;
   sinkIdSupported: boolean;
+  preKeyMs: number;
+  postKeyMs: number;
+  /** epoch ms of the next window boundary the loop has confirmed it will
+   *  actually transmit on (head-of-queue entry or auto-CQ) — null once a
+   *  window's skip/send decision has been made but nothing will send at the
+   *  upcoming boundary (forced listen window, empty queue, auto-CQ not due).
+   *  The UI reads this instead of guessing from queue length/allowConsecutiveTx,
+   *  so the countdown reflects the loop's ACTUAL decision for the current
+   *  cycle rather than resetting at a boundary nothing sends on, only to
+   *  restart the countdown a full window later. */
+  nextTxAtMs: number | null;
 }
 
 // ── localStorage persistence ──────────────────────────────────────────────────
@@ -59,6 +70,8 @@ const LS_AUTOPTT         = 'ft_auto_ptt';
 const LS_CONSECUTIVE_TX  = 'ft_consecutive_tx';
 const LS_BASE_FREQ       = 'ft_base_freq';
 const LS_AUTOCQ_INTERVAL = 'ft_autocq_interval_min';
+const LS_PREKEY_MS       = 'ft_prekey_ms';
+const LS_POSTKEY_MS      = 'ft_postkey_ms';
 
 export const DEFAULT_BASE_FREQ = 1850;
 export function loadBaseFreq(): number {
@@ -141,6 +154,33 @@ export function saveAutoCQ(v: boolean) {
   if (typeof window !== 'undefined') localStorage.setItem(LS_AUTOCQ, String(v));
 }
 
+// Pre-key (warm-up) and post-key (cool-down/hang) delays around PTT, for
+// external PAs/relays that need time to switch before RF audio starts (and to
+// stay keyed briefly after audio ends, e.g. a relay's release bounce). PTT
+// keys at the normal window boundary as always; preKeyMs then delays audio
+// start by that much (so transmissions start slightly late rather than early
+// — keying early without shifting playback requires reworking the window-
+// boundary bookkeeping, which turned out fragile and was reverted). Default 0
+// (off) — most setups (audio-only, VOX, solid-state PAs) don't need this.
+const MAX_PREKEY_MS  = 2000;
+const MAX_POSTKEY_MS = 2000;
+export function loadPreKeyMs(): number {
+  if (typeof window === 'undefined') return 0;
+  const n = parseInt(localStorage.getItem(LS_PREKEY_MS) ?? '', 10);
+  return Number.isFinite(n) ? Math.max(0, Math.min(MAX_PREKEY_MS, n)) : 0;
+}
+export function savePreKeyMs(v: number) {
+  if (typeof window !== 'undefined') localStorage.setItem(LS_PREKEY_MS, String(v));
+}
+export function loadPostKeyMs(): number {
+  if (typeof window === 'undefined') return 0;
+  const n = parseInt(localStorage.getItem(LS_POSTKEY_MS) ?? '', 10);
+  return Number.isFinite(n) ? Math.max(0, Math.min(MAX_POSTKEY_MS, n)) : 0;
+}
+export function savePostKeyMs(v: number) {
+  if (typeof window !== 'undefined') localStorage.setItem(LS_POSTKEY_MS, String(v));
+}
+
 const LS_AUTOREPLY = 'ft_auto_reply';
 export function loadAutoReply(): boolean {
   if (typeof window === 'undefined') return false;
@@ -209,6 +249,9 @@ export function createFTTransmit(
     outputDeviceId: loadOutputDevice(),
     txGain: loadTxGain(),
     sinkIdSupported: typeof AudioContext !== 'undefined' && 'setSinkId' in AudioContext.prototype,
+    preKeyMs: loadPreKeyMs(),
+    postKeyMs: loadPostKeyMs(),
+    nextTxAtMs: null,
   });
 
   let isRunning          = false;
@@ -218,6 +261,8 @@ export function createFTTransmit(
   let lastAutoCQAtMs     = 0; // epoch ms of the last auto-CQ transmission, 0 = none sent yet this session
   let autoPTTOn          = loadAutoPTT();
   let allowConsecutiveTx = loadAllowConsecutiveTx();
+  let preKeyMs           = loadPreKeyMs();
+  let postKeyMs          = loadPostKeyMs();
   let lastTxWindow       = -1; // epoch ms of last window we transmitted in
   let gain               = loadTxGain();
   let gainNode: GainNode | null = null;
@@ -360,6 +405,9 @@ export function createFTTransmit(
         (lastTxWindow === prevWindowStart || lastTxWindow === currentWindowStart);
 
       if (skipForListen) {
+        // Nothing will transmit at the upcoming boundary — the UI's countdown
+        // must not show time-to-that-boundary as if it were a real chance.
+        setState(prev => ({ ...prev, nextTxAtMs: null }));
         await sleepToNextBoundary(windowSec);
         if (!isRunning) break;
         continue;
@@ -375,10 +423,18 @@ export function createFTTransmit(
       const useAutoCQ       = !queuedEntry && autoCQOn && !!autoCQSamples && autoCQDue;
 
       if (!queuedEntry && !useAutoCQ) {
+        // Same as above: this window's decision is locked in as "nothing to
+        // send" (empty queue, or auto-CQ not due yet) — a message queued a
+        // moment from now can't go out until the NEXT-next boundary, so the
+        // countdown shouldn't imply the upcoming one is live.
+        setState(prev => ({ ...prev, nextTxAtMs: null }));
         await sleepToNextBoundary(windowSec);
         if (!isRunning) break;
         continue;
       }
+
+      // Committed to transmitting at this window's boundary (currentWindowStart).
+      setState(prev => ({ ...prev, nextTxAtMs: currentWindowStart }));
 
       // ── Resolve samples ───────────────────────────────────────────────────
       let samples: Float32Array | null = null;
@@ -450,6 +506,14 @@ export function createFTTransmit(
         } catch { /* CAT not connected or timed out */ }
       }
 
+      // Pre-key (warm-up) hold: give an external PA/relay time to switch
+      // before RF audio starts. This delays audio start by preKeyMs relative
+      // to the window boundary (simpler and safer than trying to key early
+      // without shifting playback — see git history for why that approach
+      // was reverted). Only meaningful with Auto-PTT actually wired up.
+      if (preKeyMs > 0 && autoPTTOn && onSetPTT) await sleep(preKeyMs);
+      if (!isRunning) break;
+
       try {
         const ctx = await getAudioContext();
         const owned = new Float32Array(samples.length);
@@ -471,6 +535,11 @@ export function createFTTransmit(
           error: err instanceof Error ? err.message : 'Audio playback failed',
         }));
       }
+
+      // Post-key hold (cool-down): keep PTT up briefly after audio ends before
+      // unkeying, e.g. to let an external PA/relay settle before it drops.
+      // Only meaningful with Auto-PTT actually wired up.
+      if (postKeyMs > 0 && autoPTTOn && onSetPTT) await sleep(postKeyMs);
 
       // Auto-PTT off
       const onSetPTTOff = getOnSetPTT();
@@ -641,6 +710,20 @@ export function createFTTransmit(
     setState(prev => ({ ...prev, autoCQIntervalMin: clamped }));
   }
 
+  function setPreKeyMs(v: number) {
+    const clamped = Math.max(0, Math.min(MAX_PREKEY_MS, Math.round(v)));
+    preKeyMs = clamped;
+    savePreKeyMs(clamped);
+    setState(prev => ({ ...prev, preKeyMs: clamped }));
+  }
+
+  function setPostKeyMs(v: number) {
+    const clamped = Math.max(0, Math.min(MAX_POSTKEY_MS, Math.round(v)));
+    postKeyMs = clamped;
+    savePostKeyMs(clamped);
+    setState(prev => ({ ...prev, postKeyMs: clamped }));
+  }
+
   function setAutoCQMessage(msg: string) {
     autoCQMessage = msg;
     rebuildAutoCQCache(msg);
@@ -694,6 +777,8 @@ export function createFTTransmit(
     setTxGain,
     setAutoPTT,
     setAllowConsecutiveTx,
+    setPreKeyMs,
+    setPostKeyMs,
     clearSent,
     syncParams,
     destroy,

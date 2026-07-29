@@ -14,17 +14,24 @@ import { FT_WINDOW_SECONDS, DEFAULT_DECODER_PARAMS, type FTMode } from '$decoder
 import { fmtAbsHz } from '$decoder-lib/formatFreq'
 import NumberField from './NumberField'
 
-// rAF-driven countdown: seconds until next window boundary, updated at ~4 Hz
+// rAF-driven countdown: seconds until next window boundary, updated at ~4 Hz.
+// Uses epoch time (not Date.getSeconds()) so it matches useFTTransmit's own
+// boundary math (Date.now() % windowMs) exactly, with no minute-of-hour
+// wraparound involved.
 function useWindowCountdown(windowSec: () => number): () => number {
   const [secs, setSecs] = createSignal(0)
   let raf = 0
   let last = -1
   const tick = () => {
     const totalMs = windowSec() * 1000
-    const now = new Date()
-    const elapsed = (now.getSeconds() * 1000 + now.getMilliseconds()) % totalMs
+    const elapsed = Date.now() % totalMs
     const remaining = (totalMs - elapsed) / 1000
-    const rounded = Math.ceil(remaining * 100) / 100 // 0.01s resolution
+    // At the exact zero-crossing instant, elapsed % totalMs collapses to 0,
+    // which reads as "totalMs remaining" (a full window) instead of "we just
+    // hit the boundary" — without this, the ring/ETA can flash the FULL
+    // window value for one rAF tick right as a queued message actually fires,
+    // making it look like TX happened a whole window early.
+    const rounded = remaining >= windowSec() ? 0 : Math.ceil(remaining * 100) / 100 // 0.01s resolution
     if (rounded !== last) { last = rounded; setSecs(rounded) }
     raf = requestAnimationFrame(tick)
   }
@@ -87,10 +94,17 @@ function TxRing(props: { status: string; windowSec: number; playing: boolean }) 
       if (!svg) { raf = requestAnimationFrame(tick); return }
 
       const totalMs  = props.windowSec * 1000
-      const now      = new Date()
-      const elapsed  = (now.getSeconds() * 1000 + now.getMilliseconds()) % totalMs
+      // Epoch-based (not Date.getSeconds()) to match useFTTransmit's own
+      // boundary math exactly. At the precise zero-crossing instant this
+      // collapses to elapsed=0 — treat that as "just completed a full cycle"
+      // (progress=1, nextMs=0), not "no time has elapsed" (which flashed an
+      // empty ring / a full-window countdown for one rAF tick right as a
+      // queued message actually fired).
+      const rawElapsed = Date.now() % totalMs
+      const wrapped  = rawElapsed === 0
+      const elapsed  = wrapped ? totalMs : rawElapsed
       const progress = elapsed / totalMs
-      const nextMs   = totalMs - elapsed
+      const nextMs   = wrapped ? 0 : totalMs - elapsed
       const secVal   = (nextMs / 1000).toFixed(1)
 
       if (secVal === prev) { raf = requestAnimationFrame(tick); return }
@@ -223,7 +237,7 @@ function lastHeardMs(c: Contact): number {
   return 0
 }
 
-function buildSuggestions(myCall: string, myGrid: string, contacts: Map<string, Contact>, vfoHz = 0): Suggestion[] {
+function buildSuggestions(myCall: string, myGrid: string, contacts: Map<string, Contact>, vfoHz = 0, foxHound = false): Suggestion[] {
   const sugs: Suggestion[] = []
 
   sugs.push({
@@ -270,7 +284,13 @@ function buildSuggestions(myCall: string, myGrid: string, contacts: Map<string, 
     // a fresh "answer" instead of trusting a reply that's no longer current.
     const abandoned = !!lastOurMsg && lastHeard.windowStart > lastOurMsg.windowStart
       && lastHeard.parsed.callee?.toUpperCase() !== myCallUp
-    const lastTheirMsg  = abandoned ? undefined : (replieToUs[replieToUs.length - 1] ?? theirMsgs[theirMsgs.length - 1])
+    // Only a message actually ADDRESSED TO US can advance the state machine —
+    // e.g. a Fox reporting a different Hound (KQ4YOL) must never be read as
+    // Fox reporting us just because it's their most recent transmission
+    // overall. Falling back to theirMsgs here (instead of leaving lastRx
+    // null) previously caused a stale "R+Report"/"RR73" suggestion to
+    // resurface after re-calling a Fox who'd moved on to another station.
+    const lastTheirMsg  = abandoned ? undefined : replieToUs[replieToUs.length - 1]
     const lastRx        = lastTheirMsg?.parsed.type ?? null
     const lastSent      = abandoned ? null : (lastOurMsg?.parsed.type ?? null)
 
@@ -278,7 +298,7 @@ function buildSuggestions(myCall: string, myGrid: string, contacts: Map<string, 
     if (!lastSent) {
       nextTxType = 'answer'
     } else {
-      nextTxType = nextTxMsgType(lastSent, lastRx)
+      nextTxType = nextTxMsgType(lastSent, lastRx, foxHound)
       if (nextTxType === 'cq') continue
     }
 
@@ -306,13 +326,9 @@ function buildSuggestions(myCall: string, myGrid: string, contacts: Map<string, 
 
     const thread: QSOStep[] = threadMsgs.map(m => ({ raw: m.raw, mine: m.mine, snr: m.snr, time: m.t }))
 
-    const labelMap: Record<string, string> = {
-      answer:   'Answer',
-      report:   'Report',
-      r_report: 'R+Report',
-      rr73:     'RR73',
-      tx73:     '73',
-    }
+    const labelMap: Record<string, string> = foxHound
+      ? { answer: 'Call Fox', report: 'Report', r_report: 'R+Report', rr73: 'RR73', tx73: '73' }
+      : { answer: 'Answer',   report: 'Report', r_report: 'R+Report', rr73: 'RR73', tx73: '73' }
 
     const pfx = callsignCountry(c.callsign)
     const lastTxParsed = lastHeard.parsed
@@ -586,7 +602,7 @@ export default function FTTransmitPanel(props: FTTransmitPanelProps): JSX.Elemen
 
       // For the very first reply to a station, treat as if we just sent CQ
       const effectiveLastSent: MsgType = lastSentType ?? 'cq'
-      const nextType = nextTxMsgType(effectiveLastSent, lastTheirType)
+      const nextType = nextTxMsgType(effectiveLastSent, lastTheirType, foxHound())
 
       // 'cq' means complete or unrecognised — nothing to send
       if (nextType === 'cq') { autoReplied.set(callsign, fingerprint); continue }
@@ -632,6 +648,10 @@ export default function FTTransmitPanel(props: FTTransmitPanelProps): JSX.Elemen
   const [sugVfoOnly,       setSugVfoOnly]       = createSignal(false)
   const [sugLatestOnly,    setSugLatestOnly]    = createSignal(false)
   const [sugSpecialOnly,   setSugSpecialOnly]   = createSignal(false)
+  // Fox/Hound (DXpedition) mode: compresses the call-in sequence — once Fox
+  // reports us we jump straight to RR73 instead of the normal r_report step,
+  // since Fox logs a Hound after one report and never round-trips an ack.
+  const [foxHound,         setFoxHound]         = createSignal(false)
 
   const SUG_LATEST_WINDOW_MS = 5 * 60_000
 
@@ -641,7 +661,7 @@ export default function FTTransmitPanel(props: FTTransmitPanelProps): JSX.Elemen
   const myGridUp = createMemo(() => myGrid().toUpperCase())
 
   const allSuggestions = createMemo(
-    () => buildSuggestions(myCallUp(), myGridUp(), props.contacts, props.vfoFrequency ?? 0),
+    () => buildSuggestions(myCallUp(), myGridUp(), props.contacts, props.vfoFrequency ?? 0, foxHound()),
   )
 
   const myLatLon = createMemo(
@@ -864,6 +884,28 @@ export default function FTTransmitPanel(props: FTTransmitPanelProps): JSX.Elemen
               </div>
               <span class="text-[10px] text-[#8b949e] whitespace-nowrap">Auto-PTT</span>
             </div>
+            {/* Pre-key (warm-up) delay — only meaningful with Auto-PTT */}
+            <div class={`flex items-center gap-1 ${!tx.state().autoPTT ? 'opacity-40' : ''}`}
+              title="Key PTT this many ms before the transmission starts, to let an external PA/relay warm up">
+              <span class="text-[10px] text-[#8b949e] whitespace-nowrap">Pre-key</span>
+              <NumberField value={tx.state().preKeyMs}
+                onCommit={tx.setPreKeyMs}
+                disabled={!tx.state().autoPTT}
+                min={0} max={2000} step={10}
+                class="bg-[#0d1117] border border-[#30363d] rounded px-1.5 py-1 text-xs font-mono text-[#c9d1d9] w-14 focus:outline-none focus:border-[#388bfd] disabled:cursor-not-allowed" />
+              <span class="text-[10px] text-[#8b949e] whitespace-nowrap">ms</span>
+            </div>
+            {/* Post-key (cool-down/hang) delay — only meaningful with Auto-PTT */}
+            <div class={`flex items-center gap-1 ${!tx.state().autoPTT ? 'opacity-40' : ''}`}
+              title="Hold PTT this many ms after the transmission ends before unkeying, to let an external PA/relay settle">
+              <span class="text-[10px] text-[#8b949e] whitespace-nowrap">Post-key</span>
+              <NumberField value={tx.state().postKeyMs}
+                onCommit={tx.setPostKeyMs}
+                disabled={!tx.state().autoPTT}
+                min={0} max={2000} step={10}
+                class="bg-[#0d1117] border border-[#30363d] rounded px-1.5 py-1 text-xs font-mono text-[#c9d1d9] w-14 focus:outline-none focus:border-[#388bfd] disabled:cursor-not-allowed" />
+              <span class="text-[10px] text-[#8b949e] whitespace-nowrap">ms</span>
+            </div>
             {/* Consecutive TX */}
             <div onClick={() => tx.setAllowConsecutiveTx(!tx.state().allowConsecutiveTx)}
               title={tx.state().allowConsecutiveTx
@@ -1037,6 +1079,20 @@ export default function FTTransmitPanel(props: FTTransmitPanelProps): JSX.Elemen
                     ✨ special
                   </button>
                 </Show>
+                {/* Fox/Hound (DXpedition) mode — compresses the reply sequence */}
+                <button
+                  onClick={() => setFoxHound(v => !v)}
+                  title={foxHound()
+                    ? 'Fox/Hound mode on — call-in jumps straight to RR73 once Fox reports you (Fox never round-trips an R+report ack)'
+                    : 'Fox/Hound mode off — normal QSO sequence (report → R+report → RR73)'}
+                  class={`text-[9px] font-mono px-1.5 py-0.5 rounded border transition-colors ${
+                    foxHound()
+                      ? 'border-[#3fb950]/50 text-[#3fb950] bg-[#3fb950]/10'
+                      : 'border-[#30363d] text-[#484f58] hover:text-[#8b949e]'
+                  }`}
+                >
+                  🦊 F/H
+                </button>
                 {/* Country select */}
                 <Show when={sugCountryOptions().length > 1}>
                   <select
@@ -1232,9 +1288,23 @@ export default function FTTransmitPanel(props: FTTransmitPanelProps): JSX.Elemen
             <div class="space-y-1">
               <For each={tx.state().queue}>
                 {(entry, idx) => {
+                  // nextTxAtMs is the loop's own confirmed next-TX boundary for
+                  // the head-of-queue entry — it's null whenever the upcoming
+                  // window's skip/send decision has already been made as "skip"
+                  // (forced listen window, or the queue was empty when that
+                  // decision was made). Falling back to secToWindow() in that
+                  // case would count down to a boundary nothing will actually
+                  // send on, hit zero, and then restart a full window later —
+                  // this instead keeps counting through to the REAL next
+                  // opportunity once the loop reports one.
+                  const baseEtaSec = createMemo(() => {
+                    const tick = secToWindow() // tracked dependency: re-evaluate Date.now() every countdown tick
+                    const at = tx.state().nextTxAtMs
+                    return at !== null ? Math.max(0, (at - Date.now()) / 1000) : tick + windowSec()
+                  })
                   const etaSec = createMemo(() => idx() === 0
-                    ? (isPlaying() ? 0 : secToWindow())
-                    : secToWindow() + idx() * windowSec())
+                    ? (isPlaying() ? 0 : baseEtaSec())
+                    : baseEtaSec() + idx() * windowSec())
                   const etaLabel = createMemo(() => isPlaying() && idx() === 0 ? 'TX' : `${etaSec().toFixed(2)}s`)
                   const isPending = () => entry.encodeStatus === 'pending'
                   const isError   = () => entry.encodeStatus === 'error'
@@ -1326,6 +1396,18 @@ export default function FTTransmitPanel(props: FTTransmitPanelProps): JSX.Elemen
                         <Show when={entry.error}>
                           <span class="shrink-0 text-[10px] text-[#f85149]" title={entry.error}>⚠</span>
                         </Show>
+                        <button
+                          onClick={() => tx.enqueue({ id: uid(), message: entry.message, label: entry.label })}
+                          class="shrink-0 text-[#484f58] hover:text-[#58a6ff] p-0.5"
+                          title="Requeue — resend this message"
+                        >
+                          <svg class="w-3 h-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+                            <path d="M3 12a9 9 0 0 1 15.3-6.4L21 8" />
+                            <path d="M21 3v5h-5" />
+                            <path d="M21 12a9 9 0 0 1-15.3 6.4L3 16" />
+                            <path d="M3 21v-5h5" />
+                          </svg>
+                        </button>
                       </div>
                     )
                   }}
