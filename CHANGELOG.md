@@ -12,6 +12,12 @@ them into a version section when cutting a release.
 
 ## [Unreleased]
 
+## [0.10.2] - 2026-07-30
+
+### Fixed
+
+- SSTV auto-detect mid-decode VIS re-check was false-triggering almost immediately after a decode started (especially over an echoey self-loopback path), causing a rapid loop of mostly-black partial captures instead of one clean image. Mid-decode VIS hits are now ignored for the first few seconds of a decode, when a legitimate back-to-back transmission couldn't yet have started.
+
 ## [0.10.1] - 2026-07-30
 
 ### Added

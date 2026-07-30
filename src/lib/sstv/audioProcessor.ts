@@ -34,6 +34,15 @@ export interface AudioProcessorState {
 
 const SILENCE_THRESHOLD = 0.008
 const SILENCE_DURATION_MS = 2500
+// A real back-to-back transmission's VIS header can't start until the current
+// image is nearly done — VIS is ~0.9s of leader/break/bits, which itself can
+// resemble a couple of Robot36 sync-spaced scan lines (150ms each) closely
+// enough to false-trigger the Goertzel classifier on the image's own
+// luminance/chroma tones, especially over an echoey/distorted loopback path.
+// Ignoring mid-decode VIS hits before this floor stops that early false
+// re-trigger loop while still catching genuine next-transmission headers
+// later in the decode.
+const MIN_DECODE_MS_BEFORE_MIDSTREAM_VIS = 3000
 
 function makeThumbnail(data: Uint8ClampedArray, width: number, height: number): string {
   const canvas = document.createElement('canvas')
@@ -239,7 +248,7 @@ export function createAudioProcessor(params: AudioProcessorParams) {
 
       if (params.autoDetect() && visDetector) {
         const visResult = visDetector.process(inputData)
-        if (visResult.detected && visResult.modeName) {
+        if (visResult.detected && visResult.modeName && Date.now() - decodingStart >= MIN_DECODE_MS_BEFORE_MIDSTREAM_VIS) {
           captureCurrentImage(sampleRate, visResult.modeName as SSTVMode, 'VIS')
           return
         }
