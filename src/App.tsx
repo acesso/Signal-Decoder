@@ -18,6 +18,7 @@ import { type FTDecoderStats, type FTDecoderStatus, type FTMode, subscribeDecode
 import type { Contact } from '$decoder-lib/ft/parser'
 import { audioRecorder, REC_DURATION_CHOICES_SEC } from '$decoder-lib/audio/ringRecorder'
 import type { CapturedImage } from '$decoder-lib/sstv/audioProcessor'
+import { trackEvent } from '$decoder-lib/analytics'
 
 type DecoderMode = 'rtty' | 'sstv' | 'cw' | 'ft' | 'mfsk'
 
@@ -517,7 +518,10 @@ function App(): JSX.Element {
 
   async function handleStart() {
     const node = await globalAudio.start()
-    if (node) await activeHandle().current?.start()
+    if (node) {
+      await activeHandle().current?.start()
+      trackEvent('decode_start', mode() === 'ft' ? { mode: mode(), ft_mode: ftMode() } : { mode: mode() })
+    }
   }
   function handleStop() {
     activeHandle().current?.stop()
@@ -533,6 +537,7 @@ function App(): JSX.Element {
   function handleFTModeChange(m: FTMode) {
     setFTMode(m)
     saveFTMode(m)
+    trackEvent('ft_mode_change', { mode: m })
   }
 
   // Switching mode: stop previous decoder (but keep global audio), connect new decoder
@@ -543,6 +548,7 @@ function App(): JSX.Element {
     if (wasRecording) prevHandle.current?.stop()
     setMode(newMode)
     saveMode(newMode)
+    trackEvent('decoder_mode_change', { mode: newMode })
     const nextHandle = handleForMode(newMode)
     if (wasRecording && globalAudio.analyser()) {
       await nextHandle.current?.start()

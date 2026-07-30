@@ -14,6 +14,7 @@ import { fmtAbsHz } from '$decoder-lib/formatFreq'
 import VirtualList from './VirtualList'
 import { loadNumber, saveNumber, loadBoolean, saveBoolean } from '$decoder-lib/storage'
 import FTLeafletMap from './FTLeafletMap'
+import { trackEvent } from '$decoder-lib/analytics'
 
 const LS_MAP_HEIGHT       = 'ft_map_height'
 const LS_CONTACTS_SORT_KEY = 'ft_contacts_sort_key'
@@ -1014,6 +1015,7 @@ export default function FTContactsPanel(props: Props): JSX.Element {
     a.click()
     document.body.removeChild(a)
     URL.revokeObjectURL(url)
+    trackEvent('adif_export', { qso_count: records.length })
   }
 
   function handleImportFile(e: Event) {
@@ -1029,6 +1031,7 @@ export default function FTContactsPanel(props: Props): JSX.Element {
         if (records.length === 0) { setImportStatus({ count: 0, err: 'No valid QSO records found' }); return }
         props.onImportADIF?.(content)
         setImportStatus({ count: records.length })
+        trackEvent('adif_import', { qso_count: records.length })
         setTimeout(() => setImportStatus(null), 4000)
       } catch {
         setImportStatus({ count: 0, err: 'Failed to parse ADIF file' })

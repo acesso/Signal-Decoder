@@ -41,6 +41,7 @@ jobs:
         run: npm run build
         env:
           BASE_PATH: ${{ steps.pages.outputs.base_path }}
+          VITE_GA_MEASUREMENT_ID: ${{ secrets.GA_MEASUREMENT_ID }}
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
         with:

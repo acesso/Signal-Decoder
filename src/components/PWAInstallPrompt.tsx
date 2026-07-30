@@ -1,5 +1,6 @@
 // Port of src/components/PWAInstallPrompt.tsx (Next.js app).
 import { createSignal, onCleanup, onMount, Show, type JSX } from 'solid-js'
+import { trackEvent } from '$decoder-lib/analytics'
 
 interface BeforeInstallPromptEvent extends Event {
   prompt: () => Promise<void>
@@ -45,6 +46,12 @@ export default function PWAInstallPrompt(): JSX.Element {
 
     window.addEventListener('beforeinstallprompt', handleBeforeInstallPrompt)
 
+    // Fires on an actual completed install (Chromium-based browsers only —
+    // iOS's manual "Add to Home Screen" isn't observable by JS at all, so the
+    // best signal there is the prompt/outcome tracking in handleInstallClick).
+    const handleAppInstalled = () => trackEvent('pwa_installed')
+    window.addEventListener('appinstalled', handleAppInstalled)
+
     // For iOS, show custom prompt after delay if not in standalone
     if (ios && !isInStandalone) {
       setTimeout(() => {
@@ -54,6 +61,7 @@ export default function PWAInstallPrompt(): JSX.Element {
 
     onCleanup(() => {
       window.removeEventListener('beforeinstallprompt', handleBeforeInstallPrompt)
+      window.removeEventListener('appinstalled', handleAppInstalled)
     })
   })
 
@@ -67,6 +75,7 @@ export default function PWAInstallPrompt(): JSX.Element {
       // Chromium-based browsers
       prompt.prompt()
       const { outcome } = await prompt.userChoice
+      trackEvent('pwa_install_prompt_outcome', { outcome })
 
       if (outcome === 'accepted') {
         console.log('User accepted the install prompt')
