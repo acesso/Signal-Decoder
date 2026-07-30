@@ -10,6 +10,7 @@
 // contacts panel's explicit Clear empties it.
 import { createSignal } from 'solid-js';
 import type { QSORecord } from './parser';
+import { trackEvent } from '../analytics';
 
 const LS_KEY = 'ft_qso_log';
 const MAX_RECORDS = 5000;
@@ -86,18 +87,21 @@ function recEqual(a: QSORecord, b: QSORecord): boolean {
 export function qsoLogUpsert(incoming: QSORecord[]): void {
   if (incoming.length === 0) return;
   let next: QSORecord[] | null = null;
+  let newlyConfirmed = 0;
   for (const rec of incoming) {
     const list = next ?? records();
     const i = list.findIndex(ex => sameQSO(ex, rec));
     if (i >= 0) {
       const merged = mergeQSO(list[i], rec);
       if (!recEqual(merged, list[i])) {
+        if (merged.confirmed && !list[i].confirmed) newlyConfirmed++;
         next = next ?? [...records()];
         next[i] = merged;
       }
     } else {
       next = next ?? [...records()];
       next.push(rec);
+      if (rec.confirmed) newlyConfirmed++;
     }
   }
   if (next) {
@@ -105,6 +109,9 @@ export function qsoLogUpsert(incoming: QSORecord[]): void {
     setRecords(next);
     save(next);
   }
+  // One event per upsert batch (not per QSO) — a busy decode window can touch
+  // dozens of contacts at once, and GA doesn't need per-QSO granularity here.
+  if (newlyConfirmed > 0) trackEvent('qso_confirmed', { count: newlyConfirmed });
 }
 
 export function qsoLogClear(): void {
