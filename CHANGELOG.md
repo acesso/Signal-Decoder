@@ -12,6 +12,12 @@ them into a version section when cutting a release.
 
 ## [Unreleased]
 
+## [0.10.1] - 2026-07-30
+
+### Added
+
+- Google Analytics 4 pageview and custom-event tracking (decoder mode switches, decode starts, QSO confirmations, ADIF export/import, PWA install), enabled only in production builds.
+
 ## [0.10.0] - 2026-07-29
 
 ### Added
