@@ -12,6 +12,12 @@ them into a version section when cutting a release.
 
 ## [Unreleased]
 
+## [0.10.4] - 2026-07-31
+
+### Fixed
+
+- SSTV auto-detect was still looping on a real (weak, ~-84dBm) over-the-air signal after 0.10.3's fix — the silence-timeout completion path was using raw RMS amplitude, which a weak/noisy real signal can dip under for seconds at a time while still transmitting. Silence detection is now based on in-band SSTV tone energy vs. broadband noise energy (Goertzel), which stays accurate regardless of the signal's absolute level.
+
 ## [0.10.3] - 2026-07-31
 
 ### Fixed
