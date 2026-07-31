@@ -12,6 +12,12 @@ them into a version section when cutting a release.
 
 ## [Unreleased]
 
+## [0.10.3] - 2026-07-31
+
+### Fixed
+
+- SSTV auto-detect was still looping on rapid, mostly-black partial captures after 0.10.2's timing guard — the real fix removes the mid-decode VIS re-check entirely instead of just delaying it. Once auto-detect locks onto a transmission, it now decodes undisturbed to real completion or a silence timeout before ever re-arming VIS listening, instead of racing a second VIS scan against the active decode.
+
 ## [0.10.2] - 2026-07-30
 
 ### Fixed
