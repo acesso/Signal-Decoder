@@ -6,6 +6,7 @@ import { SyncIntervalDetector } from '$decoder-lib/sstv/sync-interval-detector'
 import { SSTV_MODES } from '$decoder-lib/sstv/constants'
 import { createCaptureNode, type CaptureNode } from '$decoder-lib/audio/captureNode'
 import { estimateSignalReport, type SignalReport } from '$decoder-lib/sstv/signalReport'
+import { GoertzelFilter } from '$decoder-lib/sstv/dsp'
 
 export type SSTVMode = keyof typeof SSTV_MODES
 
@@ -32,8 +33,39 @@ export interface AudioProcessorState {
   capturedImages: CapturedImage[]
 }
 
-const SILENCE_THRESHOLD = 0.008
 const SILENCE_DURATION_MS = 2500
+// Raw RMS amplitude is a poor silence proxy on a real radio: a weak/noisy
+// signal (e.g. -80dBm+ HF, fading, AGC pumping) can dip under any fixed
+// absolute threshold for seconds at a time while a transmission is still very
+// much in progress, which was firing the silence-completion path every few
+// seconds and produced a loop of mostly-black partial captures. Instead,
+// compare in-band SSTV tone energy (sync/VIS/luminance/chrominance all live
+// in 1100-2300Hz) against out-of-band noise energy — true silence has no tone
+// energy at all, regardless of the ambient noise floor's absolute level.
+// Several bins spanning the SSTV tone range, and many broadband reference
+// bins spread well outside it — averaged (not maxed) on both sides so a
+// single noisy bin can't swing the ratio. A lone Goertzel bin on white noise
+// has too much chunk-to-chunk variance on its own to trust individually.
+const SILENCE_INBAND_FREQS = [1100, 1300, 1500, 1700, 1900, 2100, 2300]
+const SILENCE_NOISE_FREQS = [100, 200, 300, 500, 700, 900, 3000, 3300, 3600, 4000, 4500, 5000]
+const SILENCE_SNR_THRESHOLD = 2.5 // in-band/noise-band average-magnitude ratio below this counts as silence
+
+function average(values: number[]): number {
+  return values.reduce((sum, v) => sum + v, 0) / values.length
+}
+
+export function isChunkSilent(samples: Float32Array, sampleRate: number): boolean {
+  const inBand = SILENCE_INBAND_FREQS.map((f) => new GoertzelFilter(sampleRate, f))
+  const noiseBand = SILENCE_NOISE_FREQS.map((f) => new GoertzelFilter(sampleRate, f))
+  for (let i = 0; i < samples.length; i++) {
+    const s = samples[i]
+    for (const f of inBand) f.processSample(s)
+    for (const f of noiseBand) f.processSample(s)
+  }
+  const inBandPower = average(inBand.map((f) => f.getMagnitude()))
+  const noisePower = Math.max(1e-6, average(noiseBand.map((f) => f.getMagnitude())))
+  return inBandPower / noisePower < SILENCE_SNR_THRESHOLD
+}
 
 function makeThumbnail(data: Uint8ClampedArray, width: number, height: number): string {
   const canvas = document.createElement('canvas')
@@ -165,9 +197,6 @@ export function createAudioProcessor(params: AudioProcessorParams) {
   }
 
   function processAudioChunk(inputData: Float32Array, sampleRate: number) {
-    let rmsSum = 0
-    for (let i = 0; i < inputData.length; i++) rmsSum += inputData[i] * inputData[i]
-    const rms = Math.sqrt(rmsSum / inputData.length)
     const chunkMs = (inputData.length / sampleRate) * 1000
 
     if (params.autoDetect() && !isDecoding) {
@@ -221,7 +250,7 @@ export function createAudioProcessor(params: AudioProcessorParams) {
         return
       }
 
-      if (rms < SILENCE_THRESHOLD) {
+      if (isChunkSilent(inputData, sampleRate)) {
         silenceMs += chunkMs
         if (silenceMs >= SILENCE_DURATION_MS) {
           captureCurrentImage(sampleRate)
