@@ -12,6 +12,12 @@ them into a version section when cutting a release.
 
 ## [Unreleased]
 
+## [0.10.5] - 2026-07-31
+
+### Fixed
+
+- SSTV auto-detect could still get stuck decoding forever (e.g. finishing at 249/256 lines and never re-arming for the next transmission) if the tone/silence heuristic missed real dead air. Added a hard backstop: if a decode makes no line progress for 6 seconds, it now force-completes and re-arms VIS listening regardless of what the silence check thinks.
+
 ## [0.10.4] - 2026-07-31
 
 ### Fixed
