@@ -1,4 +1,5 @@
-import { isChunkSilent } from '../audioProcessor'
+import { isChunkSilent, expectedDurationMs } from '../audioProcessor'
+import { SSTV_MODES } from '../constants'
 
 const SAMPLE_RATE = 44100
 const CHUNK_SIZE = 4096
@@ -62,5 +63,25 @@ describe('isChunkSilent', () => {
 
   test('digital silence (all zeros) is silent', () => {
     expect(isChunkSilent(new Float32Array(CHUNK_SIZE), SAMPLE_RATE)).toBe(true)
+  })
+})
+
+describe('expectedDurationMs', () => {
+  test('matches height * scanTime with a tolerance margin, for every mode', () => {
+    for (const [name, cfg] of Object.entries(SSTV_MODES)) {
+      const raw = cfg.height * cfg.scanTime
+      const expected = expectedDurationMs(name as keyof typeof SSTV_MODES)
+      expect(expected).toBeGreaterThanOrEqual(raw)
+      // Tolerance margin should be modest — enough to absorb slant/clock
+      // drift, not so much that a real dead transmission gets decoded as
+      // still-active for many extra seconds.
+      expect(expected).toBeLessThan(raw * 1.3)
+    }
+  })
+
+  test('Robot36 (150ms/line, 240 lines = 36s) is on the right order of magnitude', () => {
+    const ms = expectedDurationMs('ROBOT36')
+    expect(ms).toBeGreaterThan(35_000)
+    expect(ms).toBeLessThan(45_000)
   })
 })

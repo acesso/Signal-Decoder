@@ -34,7 +34,7 @@ export interface AudioProcessorState {
 }
 
 const SILENCE_DURATION_MS = 2500
-// Hard backstop, independent of the silence heuristic above: if a decode
+// Hard backstop, independent of the silence heuristic below: if a decode
 // makes no line progress at all for this long, something is wrong (the
 // transmission ended and the tone/silence classifier missed it, a new
 // unrelated transmission started, the signal degraded, etc.) — force a
@@ -42,6 +42,22 @@ const SILENCE_DURATION_MS = 2500
 // Comfortably longer than the slowest single-line scan time across all
 // modes (PD290 ≈ 1.2s/line) plus the silence timeout itself.
 const STALL_TIMEOUT_MS = 6000
+// A VIS header (unlike a sync-timing-only lock) tells us the mode directly,
+// so the transmission's total length is fully predictable: height * scanTime.
+// A VIS-confirmed decode is therefore a known-duration event, not something
+// that needs guessing at when it's over — auto-detect scanning (VIS + sync
+// timing) has no business running again until that deadline passes, and once
+// it does pass the decode should be considered finished regardless of how
+// many lines actually landed (line-count/slant errors, dropped sync pulses,
+// etc. can leave currentLine short of totalLines even on a clean signal).
+// A tolerance margin absorbs modest clock drift/slant between transmitter
+// and receiver without cutting off a still-legitimately-finishing image.
+const EXPECTED_DURATION_TOLERANCE = 1.15
+
+export function expectedDurationMs(mode: SSTVMode): number {
+  const cfg = SSTV_MODES[mode]
+  return cfg.height * cfg.scanTime * EXPECTED_DURATION_TOLERANCE
+}
 // Raw RMS amplitude is a poor silence proxy on a real radio: a weak/noisy
 // signal (e.g. -80dBm+ HF, fading, AGC pumping) can dip under any fixed
 // absolute threshold for seconds at a time while a transmission is still very
@@ -265,6 +281,18 @@ export function createAudioProcessor(params: AudioProcessorParams) {
       }
 
       const now = Date.now()
+
+      if (params.autoDetect() && now - decodingStart >= expectedDurationMs(activeMode)) {
+        // The mode's full expected length (known from VIS/scanTime, not a
+        // guess) has elapsed — the transmission is over regardless of how
+        // many lines actually landed. This is the primary way an auto-
+        // detected decode ends; stall/silence below only cover decodes that
+        // never get this far (e.g. the signal drops out long before the
+        // mode's natural length would even be reached).
+        captureCurrentImage(sampleRate)
+        return
+      }
+
       if (stats.currentLine > lastProgressLine) {
         lastProgressLine = stats.currentLine
         lastProgressAt = now
