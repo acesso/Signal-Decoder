@@ -34,6 +34,14 @@ export interface AudioProcessorState {
 }
 
 const SILENCE_DURATION_MS = 2500
+// Hard backstop, independent of the silence heuristic above: if a decode
+// makes no line progress at all for this long, something is wrong (the
+// transmission ended and the tone/silence classifier missed it, a new
+// unrelated transmission started, the signal degraded, etc.) — force a
+// capture and re-arm auto-detect rather than risk getting stuck forever.
+// Comfortably longer than the slowest single-line scan time across all
+// modes (PD290 ≈ 1.2s/line) plus the silence timeout itself.
+const STALL_TIMEOUT_MS = 6000
 // Raw RMS amplitude is a poor silence proxy on a real radio: a weak/noisy
 // signal (e.g. -80dBm+ HF, fading, AGC pumping) can dip under any fixed
 // absolute threshold for seconds at a time while a transmission is still very
@@ -138,6 +146,8 @@ export function createAudioProcessor(params: AudioProcessorParams) {
   let isDecoding = false
   let decodingStart = 0
   let silenceMs = 0
+  let lastProgressLine = 0
+  let lastProgressAt = 0
   let capturedImages: CapturedImage[] = []
 
   // Call from a createEffect that depends on params.manualMode()/autoDetect()
@@ -192,6 +202,8 @@ export function createAudioProcessor(params: AudioProcessorParams) {
       decoder = new SSTVDecoder(sampleRate, activeMode, params.autoSlant())
       decoder.start()
       isDecoding = true
+      lastProgressLine = 0
+      lastProgressAt = Date.now()
       setState((prev) => ({ ...prev, stats: null, capturedImages }))
     }
   }
@@ -229,6 +241,8 @@ export function createAudioProcessor(params: AudioProcessorParams) {
         isDecoding = true
         decodingStart = Date.now()
         silenceMs = 0
+        lastProgressLine = 0
+        lastProgressAt = Date.now()
 
         decoder = new SSTVDecoder(sampleRate, detectedMode, params.autoSlant())
         decoder.start()
@@ -246,6 +260,19 @@ export function createAudioProcessor(params: AudioProcessorParams) {
       const stats = decoder.getStats()
 
       if (stats.currentLine >= stats.totalLines && stats.totalLines > 0) {
+        captureCurrentImage(sampleRate)
+        return
+      }
+
+      const now = Date.now()
+      if (stats.currentLine > lastProgressLine) {
+        lastProgressLine = stats.currentLine
+        lastProgressAt = now
+      } else if (now - lastProgressAt >= STALL_TIMEOUT_MS) {
+        // Backstop independent of the silence heuristic below — whatever the
+        // reason (transmission ended and went undetected, a new unrelated
+        // transmission started, signal dropped out), no line progress for
+        // this long means we're not usefully decoding anymore.
         captureCurrentImage(sampleRate)
         return
       }
