@@ -12,6 +12,12 @@ them into a version section when cutting a release.
 
 ## [Unreleased]
 
+## [0.10.6] - 2026-08-01
+
+### Changed
+
+- SSTV auto-detect now uses the mode's known, predictable transmission length (height × scan time, from the VIS-identified mode) as the primary signal that a decode is finished, instead of inferring it from silence/stall heuristics. A VIS or sync-timing lock means the mode — and therefore the exact expected duration — is already known, so auto-detect scanning stays suspended for that whole predictable window; the silence and stall checks remain only as fallbacks for a signal that clearly drops out well before that.
+
 ## [0.10.5] - 2026-07-31
 
 ### Fixed
