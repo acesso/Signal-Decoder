@@ -16,6 +16,17 @@ export interface FTProcessorState {
 
 const PARTIAL_FLUSH_MS = 250
 
+// FT8's 79 symbols × 0.160s = 12.64s of actual transmission in a 15s slot;
+// FT4's 105 symbols × 0.048s = 5.04s in a 7.5s slot — both leave ~2.3-2.5s of
+// trailing silence before the next boundary (see FT8_SYMBOL_PERIOD/FT8_NN and
+// FT4_SYMBOL_PERIOD/FT4_NN in lib/ft8_lib/ft8/constants.h). Decoding this
+// early — instead of waiting for the full window — uses that dead air
+// productively: a message that's actually there has already fully arrived,
+// so nothing is lost, and results land ~2s sooner. Kept under the real
+// silence gap (not right at 2.3-2.5s) so a slightly late-starting or
+// slightly-longer-than-nominal transmission doesn't get truncated.
+const EARLY_DECODE_MS = 2000
+
 function msUntilNextWindow(windowSec: number): number {
   const totalMs = windowSec * 1000
   const now = new Date()
@@ -165,12 +176,33 @@ export function createFTProcessor(getMode: () => FTMode) {
         console.debug(`[ft] window armed ${lateMs} ms after the UTC boundary — decode Δ will shift by ~+${(lateMs / 1000).toFixed(1)}s`)
       }
 
-      const sleepMs = msUntilNextWindow(curWindowSec) || curWindowSec * 1000
+      const windowMs = curWindowSec * 1000
+      const toBoundaryMs = msUntilNextWindow(curWindowSec) || windowMs
+      // Wake up EARLY_DECODE_MS before the real boundary and decode whatever
+      // has accumulated so far — a real transmission has already finished by
+      // then (see EARLY_DECODE_MS comment), so this loses nothing but the
+      // trailing silence. Too-short windows (or a loop that's arming more
+      // than EARLY_DECODE_MS late) fall back to the old boundary-exact wake.
+      const earlyMs = toBoundaryMs - EARLY_DECODE_MS
+      const sleepMs = earlyMs > 100 ? earlyMs : toBoundaryMs
       await sleep(sleepMs)
       if (!isRunning) break
 
+      const dWindowStart = windowStart!
+      const decodedEarly = sleepMs === earlyMs
+      if (decodedEarly) {
+        setState((prev) => ({ ...prev, status: 'decoding' }))
+        // Snapshot without resetting sampleBuf — capture keeps filling it
+        // (the AudioWorklet callback doesn't know or care about this early
+        // wake) through the remaining trailing silence up to the real
+        // boundary, where the rollover logic below still runs normally.
+        dispatchDecode(sampleBuf.slice(0, sampleCount), sampleRate, dWindowStart)
+        await sleep(EARLY_DECODE_MS)
+        if (!isRunning) break
+        setState((prev) => ({ ...prev, status: 'recording' }))
+      }
+
       const nowMs = Date.now()
-      const windowMs = curWindowSec * 1000
       const sinceBoundary = nowMs % windowMs
       const total = sampleCount
       const tailSamples = sinceBoundary > 50 && sinceBoundary < windowMs / 2 ? Math.min(Math.round((sinceBoundary / 1000) * sampleRate), total) : 0
@@ -178,15 +210,17 @@ export function createFTProcessor(getMode: () => FTMode) {
         console.debug(`[ft] window rollover ${sinceBoundary} ms after the UTC boundary — carrying ${tailSamples} samples into the next window`)
       }
 
-      const captured = sampleBuf.slice(0, total - tailSamples)
-      const dWindowStart = windowStart!
+      // Already decoded this window early — the samples captured between
+      // then and the real boundary are the expected trailing silence, not a
+      // second message, so there's nothing left to dispatch; skip the slice.
+      const captured = decodedEarly ? null : sampleBuf.slice(0, total - tailSamples)
       const nextBuf = new Float32Array(capacity)
       if (tailSamples > 0) nextBuf.set(sampleBuf.subarray(total - tailSamples, total))
       sampleBuf = nextBuf
       sampleCount = tailSamples
       windowStart = tailSamples > 0 ? new Date(nowMs - sinceBoundary) : new Date()
 
-      dispatchDecode(captured, sampleRate, dWindowStart)
+      if (captured) dispatchDecode(captured, sampleRate, dWindowStart)
     }
   }
 
