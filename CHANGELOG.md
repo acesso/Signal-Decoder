@@ -12,6 +12,12 @@ them into a version section when cutting a release.
 
 ## [Unreleased]
 
+## [0.11.1] - 2026-08-06
+
+### Changed
+
+- FT8/FT4 decode now starts ~2s before the window boundary instead of waiting for it — both protocols' actual transmission ends well before their nominal window length (FT8: 12.64s of 15s, FT4: 5.04s of 7.5s), so the trailing silence was previously just idle wait time.
+
 ## [0.11.0] - 2026-08-05
 
 ### Added
