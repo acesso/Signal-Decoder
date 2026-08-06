@@ -12,6 +12,12 @@ them into a version section when cutting a release.
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-08-05
+
+### Added
+
+- RTTY transmit: compose and send text as Baudot/ASCII FSK audio, with independent carrier shift/baud/bits/parity/stop/sideband settings (seeded from the active decoder session) and a Live mode that transmits each character as you type instead of waiting for Send.
+
 ## [0.10.7] - 2026-08-05
 
 ### Fixed
