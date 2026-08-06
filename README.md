@@ -2,10 +2,10 @@
     📡 Signal Decoder
 </h1>
 <p align="center">
-   <strong>Decode radio signals in your browser!</strong> Free, open-source web application for real-time decoding of RTTY (Radio Teletype / Baudot), CW (Morse code), SSTV (Slow Scan Television), FT8/FT4 digital signals, and MFSK modes from microphone input. Works offline as a PWA. Forked from <a href="https://github.com/smolgroot/sstv-decoder">smolgroot/sstv-decoder</a>.
+   <strong>Free online RTTY, CW (Morse code), SSTV, FT8/FT4, and MFSK decoder — decode ham radio signals in your browser, no install required.</strong> Real-time RTTY (Radio Teletype / Baudot) decoding, Morse code decoding with automatic WPM detection, Slow Scan Television (SSTV) image decoding, FT8/FT4 digital mode decoding with QSO logging, and MFSK/NAVTEX decoding — all from your microphone or radio audio input. Works offline as an installable PWA. Forked from <a href="https://github.com/smolgroot/sstv-decoder">smolgroot/sstv-decoder</a>.
 </p>
 <p align="center">
-   <em>This is a fully vibe coded project — every line was written by an AI coding agent driven by human prompts.</em>
+   <em>Built entirely with AI coding agents (Claude Code) from human prompts — no hand-written code.</em>
 </p>
 <br />
 
@@ -898,7 +898,7 @@ I welcome contributions! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for guide
 - Writing and running tests
 - Code quality standards
 - Submitting pull requests
-- Adding new SSTV modes
+- Adding a new decoder mode (SSTV variant, MFSK preset, or otherwise)
 
 ## License
 

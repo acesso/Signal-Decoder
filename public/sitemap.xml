@@ -2,14 +2,14 @@
 <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9"
         xmlns:image="http://www.google.com/schemas/sitemap-image/1.1">
     <url>
-        <loc>https://sstv-decoder.vercel.app/</loc>
-        <lastmod>2025-11-17</lastmod>
+        <loc>https://acesso.github.io/Signal-Decoder/</loc>
+        <lastmod>2026-08-06</lastmod>
         <changefreq>weekly</changefreq>
         <priority>1.0</priority>
         <image:image>
-            <image:loc>https://sstv-decoder.vercel.app/og-image.png</image:loc>
-            <image:title>SSTV Decoder Interface</image:title>
-            <image:caption>Real-time SSTV signal decoder interface with spectrum analyzer</image:caption>
+            <image:loc>https://acesso.github.io/Signal-Decoder/og-image.png</image:loc>
+            <image:title>Signal Decoder Interface</image:title>
+            <image:caption>Real-time RTTY, CW, SSTV, FT8/FT4, and MFSK signal decoder interface with spectrum analyzer</image:caption>
         </image:image>
     </url>
 </urlset>

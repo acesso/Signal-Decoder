@@ -1,14 +1,14 @@
-# OG Image Placeholder
+# OG Image
 
-Please add an Open Graph image (1200x630px) to:
-`/public/og-image.png`
+`/public/og-image.png` (1200x630px) is the Open Graph / Twitter Card image used for
+social media link previews (Twitter, Facebook, LinkedIn, Discord, Slack, etc.),
+referenced from `index.html`'s `og:image`/`twitter:image` tags.
 
-This image will be used for social media previews (Twitter, Facebook, LinkedIn, etc.)
+It's a real screenshot of the app (RTTY mode) with a "Signal Decoder" title card
+and mode-pill overlay composited on top — not a generic placeholder.
 
-Recommended content:
-- Screenshot of the SSTV decoder interface
-- Decoded SSTV image example
-- App title "SSTV Decoder"
-- Tagline "Real-time Slow Scan Television Decoder"
-
-You can use the screenshot from `doc/screenshot.png` and resize it to 1200x630px with text overlay.
+To regenerate after a UI redesign: take a fresh screenshot of the app (any mode
+that looks clean/representative works — RTTY and FT8 are good candidates), then
+composite a title/tagline/mode-list overlay at exactly 1200x630px. Keep the
+project name and mode list ("RTTY · CW · SSTV · FT8/FT4 · MFSK") accurate to
+whatever the app currently supports.

@@ -1,6 +1,6 @@
-# Contributing to SSTV Decoder
+# Contributing to Signal Decoder
 
-Thank you for your interest in contributing to the SSTV Decoder project! This document provides guidelines and instructions for contributing.
+Thank you for your interest in contributing to Signal Decoder! This document provides guidelines and instructions for contributing.
 
 ## Table of Contents
 
@@ -9,7 +9,7 @@ Thank you for your interest in contributing to the SSTV Decoder project! This do
 - [Testing Requirements](#testing-requirements)
 - [Code Quality](#code-quality)
 - [Submitting Changes](#submitting-changes)
-- [Adding New SSTV Modes](#adding-new-sstv-modes)
+- [Adding a New Decoder Mode](#adding-a-new-decoder-mode)
 
 ## Getting Started
 
@@ -19,14 +19,14 @@ Thank you for your interest in contributing to the SSTV Decoder project! This do
 2. Clone your fork locally:
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/sstv-decoder.git
-cd sstv-decoder
+git clone https://github.com/YOUR_USERNAME/Signal-Decoder.git
+cd Signal-Decoder
 ```
 
 3. Add the upstream repository as a remote:
 
 ```bash
-git remote add upstream https://github.com/smolgroot/sstv-decoder.git
+git remote add upstream https://github.com/acesso/Signal-Decoder.git
 ```
 
 4. Install dependencies:
@@ -35,22 +35,24 @@ git remote add upstream https://github.com/smolgroot/sstv-decoder.git
 npm install
 ```
 
+Node's version is pinned in `.nvmrc` — run `nvm use` (installing it first with `nvm install` if needed) before running any `npm`/`node` command, so you build against the same runtime CI does.
+
 ### Create a Branch
 
 Always create a new branch for your work. Use descriptive branch names that indicate the purpose of your changes:
 
 ```bash
 # For new features
-git checkout -b feature/add-scottie-s1-mode
+git checkout -b feature/rtty-encoder
 
 # For bug fixes
-git checkout -b fix/sync-detection-timing
+git checkout -b fix/ft8-window-boundary
 
 # For documentation
-git checkout -b docs/improve-api-documentation
+git checkout -b docs/improve-cw-decoder-notes
 
 # For tests
-git checkout -b test/add-martin-decoder-tests
+git checkout -b test/add-mfsk-varicode-tests
 ```
 
 Keep your branch up to date with the main branch:
@@ -66,8 +68,8 @@ git rebase upstream/main
 
 - Write clean, readable code following the existing code style
 - Use TypeScript for type safety
-- Add comments for complex algorithms or non-obvious logic
-- Follow the existing project structure
+- Add comments only where the *why* isn't obvious from the code itself (a non-obvious constraint, a workaround for a specific bug, a subtle invariant) — not to restate what the code does
+- Follow the existing project structure: each decoder mode lives under `src/lib/<mode>/` (DSP/protocol logic) with a matching `src/components/<Mode>Decoder.tsx` (UI)
 
 ### 2. Run Tests Locally
 
@@ -88,17 +90,12 @@ npm run test:coverage
 
 ### 3. Check Code Quality
 
-Run the linters to ensure code quality:
-
 ```bash
-# Run ESLint
-npm run lint
-
-# Run TypeScript type checking
+# TypeScript type checking + production build
 npm run build
 ```
 
-Fix any linting errors or warnings before committing.
+This project does not currently run a separate linter (no ESLint config) — `npm run build`'s type-check is the enforced quality gate. Fix any type errors before committing.
 
 ## Testing Requirements
 
@@ -114,9 +111,18 @@ All new code should include appropriate tests. The project uses Jest for testing
 
 #### Test File Organization
 
-Tests are located in `src/lib/sstv/__tests__/`:
+Tests live alongside each mode's implementation, in `src/lib/<mode>/__tests__/`:
 
-- `{component}.test.ts` - Tests for the corresponding component
+- `src/lib/sstv/__tests__/` — SSTV line decoders, DSP, constants
+- `src/lib/ft/__tests__/` — FT8/FT4 parser, gate logic, resampling
+- `src/lib/rtty/__tests__/` — RTTY/encoder
+- `src/lib/mfsk/__tests__/` — MFSK/NAVTEX decoders
+- `src/lib/cat/__tests__/` — CAT radio-control protocol
+- `src/lib/audio/__tests__/` — shared audio utilities
+
+Conventions:
+
+- `{component}.test.ts` — tests for the corresponding component
 - Use descriptive test names with `describe` and `test` blocks
 - Group related tests using nested `describe` blocks
 
@@ -151,9 +157,17 @@ describe('YourComponent', () => {
 });
 ```
 
-### Adding New SSTV Mode Tests
+### Decode Round-Trips Are the Strongest Test
 
-When implementing a new SSTV mode decoder, you **must** create a corresponding test file:
+Where a mode has both an encoder and a decoder (RTTY, FT8/FT4 via the vendored
+libs, SSTV), the most valuable test is an encode → decode round-trip: generate
+a known message as audio, run it back through the decoder, and assert the
+output matches. See `src/lib/rtty/__tests__/encoder.test.ts` for the pattern.
+This catches framing/timing bugs that unit tests on either side alone would miss.
+
+### Adding Tests for a New SSTV Mode
+
+When implementing a new SSTV mode decoder, you **must** create a corresponding test file.
 
 #### Line Decoder Test Template
 
@@ -292,13 +306,14 @@ npm run test:coverage
 
 The output shows coverage for each file:
 
-```
+```text
 File                      | % Stmts | % Branch | % Funcs | % Lines |
 --------------------------|---------|----------|---------|---------|
 your-component.ts         |   95.5  |   87.5   |   100   |   96.2  |
 ```
 
 Aim for:
+
 - **Core algorithms**: 90%+ coverage
 - **Line decoders**: 95%+ coverage
 - **DSP components**: 90%+ coverage
@@ -317,28 +332,20 @@ Aim for:
 
 - Use 2 spaces for indentation
 - Use single quotes for strings
-- Add semicolons at the end of statements
 - Use meaningful variable and function names
 - Keep functions small and focused (single responsibility)
+- Default to no comments; add one only when the *why* is genuinely non-obvious
 
 ### Comments and Documentation
 
-- Add JSDoc comments for public functions and classes
-- Document complex algorithms with explanatory comments
-- Reference original implementations when porting code
+- Add JSDoc comments for public functions and classes where the contract isn't obvious from the signature
+- Document complex algorithms with explanatory comments — reference the protocol spec or original implementation when porting code
 - Update relevant `.md` files in the `doc/` directory
 
-### Running Linters
+### Type Checking
 
 ```bash
-# Check for linting issues
-npm run lint
-
-# Auto-fix linting issues (when possible)
-npm run lint -- --fix
-
-# Type check
-npx tsc --noEmit
+npx tsc -b --noEmit
 ```
 
 ## Submitting Changes
@@ -349,7 +356,6 @@ Checklist:
 
 - [ ] All tests pass (`npm test`)
 - [ ] Test coverage meets requirements (`npm run test:coverage`)
-- [ ] No linting errors (`npm run lint`)
 - [ ] TypeScript compiles without errors (`npm run build`)
 - [ ] Code follows project style guidelines
 - [ ] New features include tests
@@ -362,10 +368,10 @@ Write clear, descriptive commit messages:
 
 ```bash
 # Good commit messages
-git commit -m "feat: add Scottie S1 mode decoder with interlaced RGB"
-git commit -m "fix: correct sync detection timing for PD180 mode"
-git commit -m "test: add comprehensive tests for Martin M1 decoder"
-git commit -m "docs: update PD180 specifications with SNR details"
+git commit -m "feat: add RTTY text-to-FSK encoder with live TX mode"
+git commit -m "fix: correct FT8 window rollover timing near UTC boundary"
+git commit -m "test: add round-trip tests for the RTTY encoder"
+git commit -m "docs: update CONTRIBUTING with current test layout"
 
 # Less helpful commit messages (avoid these)
 git commit -m "updates"
@@ -374,6 +380,7 @@ git commit -m "wip"
 ```
 
 Use conventional commit prefixes:
+
 - `feat:` - New features
 - `fix:` - Bug fixes
 - `test:` - Adding or updating tests
@@ -400,10 +407,10 @@ git push origin your-branch-name
 
 Use a clear, descriptive title:
 
-```
-feat: Add Scottie S1 mode decoder with RGB sequential encoding
-fix: Correct sync pulse detection for weak signals
-test: Add comprehensive tests for PD180 line decoder
+```text
+feat: Add RTTY text-to-FSK encoder with live TX mode
+fix: Correct FT8 window rollover timing near UTC boundary
+test: Add round-trip tests for the RTTY encoder
 docs: Improve DSP algorithm documentation
 ```
 
@@ -440,7 +447,7 @@ Relates to #456 (if applicable)
 
 - [ ] Code follows project style guidelines
 - [ ] Tests pass locally
-- [ ] Linters pass
+- [ ] TypeScript compiles without errors
 - [ ] Documentation updated
 - [ ] Commit messages are clear and descriptive
 ```
@@ -452,71 +459,61 @@ Relates to #456 (if applicable)
 - Update your PR by pushing new commits to your branch
 - Once approved, your PR will be merged
 
-## Adding New SSTV Modes
+## Adding a New Decoder Mode
 
-When adding a new SSTV mode (e.g., Scottie S1, Martin M1), follow this checklist:
+Signal Decoder currently supports RTTY, CW, SSTV, FT8/FT4, and MFSK. Adding a
+new mode (or a new sub-mode of an existing one, like an SSTV variant or an
+MFSK preset) follows the same general shape regardless of which family it
+belongs to:
 
 ### 1. Research the Mode
 
-- Find official specifications
-- Understand timing, resolution, and color encoding
+- Find official specifications (protocol RFCs, WSJT-X docs, fldigi source, etc.)
+- Understand timing, bandwidth, and encoding
 - Check reference implementations
-- Document SNR characteristics and typical use cases
+- Note characteristic SNR/robustness behavior and typical use cases
 
-### 2. Add Mode Specifications
+### 2. Add Mode Constants
 
-Update `src/lib/sstv/constants.ts`:
+Add the mode's timing/encoding constants to the relevant `constants.ts` (SSTV)
+or the mode's own module (RTTY/CW/FT/MFSK don't centralize constants the same
+way — follow the existing pattern in that mode's directory).
 
-```typescript
-export const YOUR_MODE: SSTVMode = {
-  name: 'Your Mode Name',
-  resolution: { width: 320, height: 240 },
-  scanLineTime: 0.428, // seconds
-  syncPulseTime: 0.009, // seconds
-  // ... other specifications
-};
-```
+### 3. Implement the Decoder
 
-### 3. Create Line Decoder
-
-Create `src/lib/sstv/your-mode-line-decoder.ts`:
+Create the decoder under `src/lib/<mode>/`:
 
 - Implement timing calculations
-- Implement color decoding (YUV, RGB, etc.)
-- Handle sample rate scaling
-- Add debug logging if needed
+- Implement the mode's specific demodulation/decoding
+- Handle sample rate scaling (this app auto-detects 44.1kHz or 48kHz mic input)
+- Add debug logging if it'll help diagnose sync/decode issues later
 
 ### 4. Create Comprehensive Tests
 
-Create `src/lib/sstv/__tests__/your-mode-line-decoder.test.ts`:
+Create `src/lib/<mode>/__tests__/your-mode.test.ts`:
 
 - Follow the test template above
-- Aim for 95%+ coverage
+- Aim for 90%+ coverage on the core algorithm
 - Test all edge cases
-- Verify color conversion accuracy
+- If there's a matching encoder, add a round-trip test (see [Decode Round-Trips](#decode-round-trips-are-the-strongest-test))
 
-### 5. Update Constants Tests
+### 5. Wire Up the UI
 
-Add tests for your mode in `src/lib/sstv/__tests__/constants.test.ts`.
+- Add or extend the mode's `src/components/<Mode>Decoder.tsx`
+- Register the mode in `src/App.tsx`'s mode list if it's a new top-level mode
 
-### 6. Update Main Decoder
+### 6. Update Documentation
 
-Update `src/lib/sstv/decoder.ts` to integrate the new mode.
+- Add the mode to README.md's Features/supported-modes sections
+- For SSTV modes specifically: create `doc/YOUR_MODE.md` and update `doc/MODE_COMPARISON.md`
+- Add usage instructions where relevant
 
-### 7. Update Documentation
-
-- Add mode to README.md supported modes table
-- Create `doc/YOUR_MODE.md` with detailed specifications
-- Update `doc/MODE_COMPARISON.md`
-- Add usage instructions
-
-### 8. Verify Everything
+### 7. Verify Everything
 
 ```bash
 npm test                  # All tests pass
 npm run test:coverage     # Coverage ≥ 70%
-npm run lint              # No linting errors
-npm run build             # Builds successfully
+npm run build             # Type-checks and builds successfully
 ```
 
 ## Questions?
@@ -532,4 +529,4 @@ If you have questions or need help:
 
 By contributing to this project, you agree that your contributions will be licensed under the same 0BSD license as the project.
 
-Thank you for contributing to SSTV Decoder! 🎉
+Thank you for contributing to Signal Decoder! 🎉
