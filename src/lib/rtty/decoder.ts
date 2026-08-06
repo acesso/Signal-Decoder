@@ -44,6 +44,13 @@ export class RTTYDecoder {
   // Baudot shift state
   private inFigs = false;
 
+  // Squelch — hard gate set externally (from FFT band energy, same approach
+  // as cw/decoder.ts's setSquelch): while closed, samples are demodulated as
+  // usual (oscillators/filters keep running so there's no re-sync transient
+  // when it reopens) but the FSM is forced back to IDLE every sample, so
+  // noise below threshold can never trigger a false start-bit edge.
+  private squelchClosed = false;
+
   constructor(sampleRate: number, config: RTTYConfig) {
     this.sampleRate = sampleRate;
     this.config = { ...config };
@@ -55,6 +62,10 @@ export class RTTYDecoder {
     this.reconfigure();
     // Abort any in-progress frame so we re-sync on the new parameters
     this.fsmState = 'IDLE';
+  }
+
+  setSquelch(closed: boolean): void {
+    this.squelchClosed = closed;
   }
 
   private reconfigure(): void {
@@ -141,7 +152,11 @@ export class RTTYDecoder {
     let output = '';
 
     for (let i = 0; i < samples.length; i++) {
-      const symbol = this.demodSample(samples[i]);
+      // Always demodulate (keeps oscillator phase and filter state current,
+      // so there's no transient when squelch reopens) but force the FSM's
+      // view of the symbol to mark (idle line state) while closed.
+      const demod = this.demodSample(samples[i]);
+      const symbol = this.squelchClosed ? 1 : demod;
 
       if (this.fsmState === 'IDLE') {
         // Detect mark→space falling edge = start of start bit

@@ -34,9 +34,13 @@ interface RTTYDecoderProps extends DecoderProps {
 export default function RTTYDecoder(props: RTTYDecoderProps): JSX.Element {
   const sessions = createSessionsStore(DEFAULT_CONFIG)
   const initialSession = sessions.initialSession
-  const processor = createMultiRTTYProcessor((sessionId, chars) => {
-    sessions.dispatch({ type: 'APPEND_TEXT', id: sessionId, chars })
-  })
+  const [squelch, setSquelch] = createSignal(0)
+  const processor = createMultiRTTYProcessor(
+    (sessionId, chars) => {
+      sessions.dispatch({ type: 'APPEND_TEXT', id: sessionId, chars })
+    },
+    squelch,
+  )
 
   const activeSession = createMemo(
     () => sessions.state().sessions.find((s) => s.id === sessions.state().activeSessionId) ?? sessions.state().sessions[0],
@@ -291,6 +295,8 @@ export default function RTTYDecoder(props: RTTYDecoderProps): JSX.Element {
                   : newHz - half
             updateSessionConfig(sessions.state().activeSessionId, { centerFreq: Math.round(newCenter) })
           }}
+          squelch={squelch()}
+          onSquelchChange={setSquelch}
           vfoFrequency={props.vfoFrequency}
           class="min-w-0"
           style={{ flex: panelWeights()[1] }}

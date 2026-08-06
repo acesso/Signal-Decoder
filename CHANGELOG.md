@@ -17,6 +17,8 @@ them into a version section when cutting a release.
 ### Added
 
 - RTTY transmit: compose and send text as Baudot/ASCII FSK audio, with independent carrier shift/baud/bits/parity/stop/sideband settings (seeded from the active decoder session) and a Live mode that transmits each character as you type instead of waiting for Send.
+- RTTY squelch, matching CW's: drag the line on the spectrum or use the slider to gate the decoder below a signal-strength threshold, per session.
+- RTTY transmit panel shows an estimated TX duration next to the message box and the Send button, and defaults to 170 Hz shift / 45.45 baud (the common amateur RTTY parameters) with Carrier Shift now a preset select instead of free entry.
 
 ## [0.10.7] - 2026-08-05
 

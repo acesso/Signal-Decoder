@@ -139,3 +139,49 @@ describe('encodeRTTYText', () => {
     expect(dropped).toEqual(['~']);
   });
 });
+
+describe('RTTYDecoder.setSquelch', () => {
+  test('closed squelch blocks decode entirely, even with a valid signal present', () => {
+    const message = 'CQ CQ DE TEST';
+    const { codes } = encodeBaudotChars(message);
+    const samples = encodeRTTYSamples(codes, BASE_CONFIG, SAMPLE_RATE);
+
+    const decoder = new RTTYDecoder(SAMPLE_RATE, BASE_CONFIG);
+    decoder.setSquelch(true);
+    const out = decodeAll(decoder, samples);
+
+    expect(out).toBe('');
+  });
+
+  test('reopening squelch mid-stream lets the rest of the message decode', () => {
+    const message = 'REOPEN TEST MESSAGE HERE';
+    const { codes } = encodeBaudotChars(message);
+    const samples = encodeRTTYSamples(codes, BASE_CONFIG, SAMPLE_RATE, 0.3, 0.3);
+
+    const decoder = new RTTYDecoder(SAMPLE_RATE, BASE_CONFIG);
+    decoder.setSquelch(true);
+    // Feed the first half closed (nothing should decode), then reopen for the rest.
+    const half = Math.floor(samples.length / 2);
+    decodeAll(decoder, samples.subarray(0, half));
+    decoder.setSquelch(false);
+    const out = decodeAll(decoder, samples.subarray(half));
+
+    // Whatever full characters remain after the reopen point should decode
+    // cleanly — not asserting on the exact prefix since the cut can land
+    // mid-character, but SOME of the tail message must come through.
+    expect(out.length).toBeGreaterThan(0);
+    expect(message.replace(/\s+/g, ' ')).toContain(out.replace(/\s+/g, ' ').trim().split(' ').pop());
+  });
+
+  test('does not affect decode when never engaged', () => {
+    const message = 'NORMAL DECODE';
+    const { codes } = encodeBaudotChars(message);
+    const samples = encodeRTTYSamples(codes, BASE_CONFIG, SAMPLE_RATE);
+
+    const decoder = new RTTYDecoder(SAMPLE_RATE, BASE_CONFIG);
+    decoder.setSquelch(false);
+    const out = decodeAll(decoder, samples);
+
+    expect(out.replace(/\s+/g, ' ').trim()).toBe(message);
+  });
+});
