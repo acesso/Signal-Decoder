@@ -24,7 +24,14 @@ const DEFAULT_CONFIG: RTTYConfig = {
   reverseShift: false,
 }
 
-export default function RTTYDecoder(props: DecoderProps): JSX.Element {
+interface RTTYDecoderProps extends DecoderProps {
+  /** Reports the active session's config on every change, so a sibling TX
+   *  panel (mounted outside this component, same pattern as
+   *  FTTransmitPanel's onBaseFreqHandle) can seed its own settings from it. */
+  onActiveConfigChange?: (config: RTTYConfig) => void
+}
+
+export default function RTTYDecoder(props: RTTYDecoderProps): JSX.Element {
   const sessions = createSessionsStore(DEFAULT_CONFIG)
   const initialSession = sessions.initialSession
   const processor = createMultiRTTYProcessor((sessionId, chars) => {
@@ -141,6 +148,9 @@ export default function RTTYDecoder(props: DecoderProps): JSX.Element {
     // calls the live decoder's updateConfig() — which resets its bit-sync
     // FSM — permanently garbling the active session's decode.
     processor.updateSessionConfig(activeSessionId(), activeConfig())
+  })
+  createEffect(() => {
+    props.onActiveConfigChange?.(activeConfig())
   })
 
   const markFreq = createMemo(() =>

@@ -3,12 +3,14 @@
 // every decoder), the FT transmit panel, and the memory/resource debug bar.
 import { createEffect, createMemo, createSignal, For, onCleanup, onMount, Show, type JSX } from 'solid-js'
 import RTTYDecoder from './components/RTTYDecoder'
+import RTTYTransmitPanel, { type RTTYTxStatus } from './components/RTTYTransmitPanel'
 import SSTVDecoder from './components/SSTVDecoder'
 import SSTVComposer, { type SSTVTxStatus } from './components/SSTVComposer'
 import CWDecoder from './components/CWDecoder'
 import FTDecoder, { FTModeSelector } from './components/FTDecoder'
 import MFSKDecoder from './components/MFSKDecoder'
 import FTTransmitPanel, { type TxStatus } from './components/FTTransmitPanel'
+import type { RTTYConfig } from '$decoder-lib/rtty/decoder'
 import RadioCATPanel, { useRadioCAT } from './components/RadioCATPanel'
 import PWAInstallPrompt from './components/PWAInstallPrompt'
 import UpdateAvailablePrompt from './components/UpdateAvailablePrompt'
@@ -449,6 +451,25 @@ function SSTVTxSummaryChip(props: { s: SSTVTxStatus | null }): JSX.Element {
   )
 }
 
+const RTTY_TX_STATUS_COLOR: Record<RTTYTxStatus['phase'], string> = { idle: '#484f58', encoding: '#58a6ff', playing: '#2ea043' }
+const RTTY_TX_STATUS_LABEL: Record<RTTYTxStatus['phase'], string> = { idle: 'IDLE', encoding: 'ENC', playing: 'TX' }
+
+function RTTYTxSummaryChip(props: { s: RTTYTxStatus | null }): JSX.Element {
+  return (
+    <Show when={props.s && props.s.phase !== 'idle'}>
+      <span class="rtty-tx-summary-chip ml-3 inline-flex items-center gap-1.5 align-middle font-mono text-[10px] font-bold" style={{ 'line-height': '1' }}>
+        <span
+          class={`inline-block h-2 w-2 shrink-0 rounded-full ${props.s!.phase === 'playing' ? 'animate-pulse' : ''}`}
+          style={{ background: RTTY_TX_STATUS_COLOR[props.s!.phase] }}
+        />
+        <span style={{ color: RTTY_TX_STATUS_COLOR[props.s!.phase] }}>
+          {props.s!.live ? 'LIVE' : RTTY_TX_STATUS_LABEL[props.s!.phase]}
+        </span>
+      </span>
+    </Show>
+  )
+}
+
 // ── App ─────────────────────────────────────────────────────────────────────
 
 function App(): JSX.Element {
@@ -503,6 +524,8 @@ function App(): JSX.Element {
   // re-navigating. The composer consumes the request once, then clears it.
   const [replyRequest, setReplyRequest] = createSignal<CapturedImage | null>(null)
   const [sstvTxStatus, setSstvTxStatus] = createSignal<SSTVTxStatus | null>(null)
+  const [rttyTxStatus, setRttyTxStatus] = createSignal<RTTYTxStatus | null>(null)
+  const [rttyActiveConfig, setRttyActiveConfig] = createSignal<RTTYConfig | null>(null)
   let sstvComposerDetailsEl: HTMLDetailsElement | undefined
   function handleSSTVReply(img: CapturedImage) {
     setReplyRequest(img)
@@ -662,9 +685,36 @@ function App(): JSX.Element {
           </div>
         </Show>
 
+        {/* RTTY transmit panel — only shown when RTTY mode is active */}
+        <Show when={mode() === 'rtty' && rttyActiveConfig()}>
+          <div class="pb-3">
+            <style>{`details[open] .rtty-tx-summary-chip { display: none !important; }`}</style>
+            <details class="rounded-lg border border-[#30363d] bg-[#161b22]">
+              <summary class="flex cursor-pointer items-center rounded-lg px-4 py-3 text-sm font-semibold transition-colors select-none hover:bg-[#21262d] sm:px-5">
+                Transmit
+                <RTTYTxSummaryChip s={rttyTxStatus()} />
+              </summary>
+              <div class="px-4 pb-4 sm:px-5 sm:pb-5">
+                <RTTYTransmitPanel
+                  seedConfig={rttyActiveConfig()!}
+                  vfoFrequency={vfoFrequency()}
+                  onSetPTT={cat.state().connected ? cat.setPTT : undefined}
+                  onStatusChange={setRttyTxStatus}
+                />
+              </div>
+            </details>
+          </div>
+        </Show>
+
         {/* All decoders mounted persistently, toggled via CSS */}
         <div class={mode() === 'rtty' ? '' : 'hidden'}>
-          <RTTYDecoder handle={rtty} onStateChange={() => {}} analyser={globalAudio.analyser()} vfoFrequency={vfoFrequency()} />
+          <RTTYDecoder
+            handle={rtty}
+            onStateChange={() => {}}
+            analyser={globalAudio.analyser()}
+            vfoFrequency={vfoFrequency()}
+            onActiveConfigChange={setRttyActiveConfig}
+          />
         </div>
         <div class={mode() === 'sstv' ? '' : 'hidden'}>
           <SSTVDecoder handle={sstv} onStateChange={() => {}} analyser={globalAudio.analyser()} vfoFrequency={vfoFrequency()} onReply={handleSSTVReply} />
