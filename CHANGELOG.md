@@ -12,6 +12,12 @@ them into a version section when cutting a release.
 
 ## [Unreleased]
 
+## [0.10.7] - 2026-08-05
+
+### Fixed
+
+- RTTY's active decoder session permanently garbled its own decode (while other, non-active sessions worked fine) — a SolidJS-port reactivity gap made the active session's config effect re-run on every decoded character instead of only on real config changes, resetting the demodulator's bit-sync on nearly every audio chunk.
+
 ## [0.10.6] - 2026-08-01
 
 ### Changed

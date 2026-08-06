@@ -129,11 +129,18 @@ export default function RTTYDecoder(props: DecoderProps): JSX.Element {
     sessions.dispatch({ type: 'UPDATE_COLOR', id, color })
   }
 
+  const activeSessionId = createMemo(() => activeSession().id)
   createEffect(() => {
-    processor.updateSessionConfig(sessions.state().activeSessionId, activeConfig())
+    processor.setActiveSession(activeSessionId())
   })
   createEffect(() => {
-    processor.setActiveSession(sessions.state().activeSessionId)
+    // activeSessionId/activeConfig are memos so APPEND_TEXT (which replaces
+    // the session object on every decoded chunk, but not its .id or .config)
+    // doesn't re-trigger this. Reading sessions.state().activeSessionId
+    // directly here instead would: every dispatch reruns the effect, which
+    // calls the live decoder's updateConfig() — which resets its bit-sync
+    // FSM — permanently garbling the active session's decode.
+    processor.updateSessionConfig(activeSessionId(), activeConfig())
   })
 
   const markFreq = createMemo(() =>
