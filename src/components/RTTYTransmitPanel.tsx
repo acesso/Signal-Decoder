@@ -3,11 +3,22 @@
 // Auto-PTT patterns as FTTransmitPanel.tsx / SSTVComposer.tsx.
 import { createEffect, createMemo, createSignal, For, onCleanup, Show, type JSX } from 'solid-js'
 import { createRTTYTransmit } from '../lib/rtty/useRTTYTransmit'
+import { encodeBaudotChars, encodeAsciiChars } from '../lib/rtty/encoder'
 import type { RTTYConfig } from '$decoder-lib/rtty/decoder'
 import { loadBoolean, saveBoolean } from '$decoder-lib/storage'
 import NumberField from './NumberField'
 
 const BAUD_RATES = [45, 45.45, 50, 65, 75, 100, 110, 150, 200, 300]
+// Common amateur/commercial RTTY shifts — 170Hz is the near-universal
+// amateur standard, 425/450/850 cover common commercial/military gear.
+const CARRIER_SHIFTS = [170, 200, 425, 450, 850]
+
+// TX panel intentionally does NOT seed carrier shift/baud from the active
+// decoder session — 170Hz/45.45 baud (the standard amateur RTTY parameters)
+// are far more likely to be what someone wants to transmit than whatever a
+// decoder session happens to be tuned to for receiving a specific signal.
+const DEFAULT_TX_SHIFT = 170
+const DEFAULT_TX_BAUD = 45.45
 
 export interface RTTYTxStatus {
   phase: 'idle' | 'encoding' | 'playing'
@@ -29,15 +40,21 @@ const LS_LIVE = 'rtty_tx_live'
 export default function RTTYTransmitPanel(props: Props): JSX.Element {
   const tx = createRTTYTransmit(() => props.onSetPTT)
 
-  const [config, setConfig] = createSignal<RTTYConfig>({ ...props.seedConfig })
+  const [config, setConfig] = createSignal<RTTYConfig>({
+    ...props.seedConfig,
+    carrierShift: DEFAULT_TX_SHIFT,
+    baudRate: DEFAULT_TX_BAUD,
+  })
   const [message, setMessage] = createSignal('')
   const [live, setLiveState] = createSignal(loadBoolean(LS_LIVE, false))
 
+  // Bits/parity/stop/sideband still seed from the decoder session (once);
+  // carrier shift/baud keep their fixed TX defaults regardless.
   let seeded = false
   createEffect(() => {
     if (seeded) return
     seeded = true
-    setConfig({ ...props.seedConfig })
+    setConfig((prev) => ({ ...props.seedConfig, carrierShift: prev.carrierShift, baudRate: prev.baudRate }))
   })
 
   const patchConfig = (patch: Partial<RTTYConfig>) => setConfig((prev) => ({ ...prev, ...patch }))
@@ -52,6 +69,24 @@ export default function RTTYTransmitPanel(props: Props): JSX.Element {
   createEffect(() => {
     props.onStatusChange?.({ phase: tx.state().phase, live: tx.state().live })
   })
+
+  // Estimated TX duration — pure bit-count math (start + data + parity +
+  // stop bits per char, over baud rate), no need to run the actual DSP
+  // synthesis just to know how long it'll take.
+  const estimatedSeconds = createMemo(() => {
+    const cfg = config()
+    const { codes } = cfg.bitsPerChar === 5 ? encodeBaudotChars(message()) : encodeAsciiChars(message())
+    if (codes.length === 0) return 0
+    const bitsPerCharTotal = 1 + cfg.bitsPerChar + (cfg.parity !== 'none' ? 1 : 0) + cfg.stopBits
+    return (codes.length * bitsPerCharTotal) / cfg.baudRate
+  })
+
+  const fmtDuration = (sec: number): string => {
+    if (sec < 60) return `${sec.toFixed(1)}s`
+    const m = Math.floor(sec / 60)
+    const s = Math.round(sec % 60)
+    return `${m}m ${s}s`
+  }
 
   const txDb = createMemo(() => {
     const g = tx.state().txGain
@@ -106,7 +141,13 @@ export default function RTTYTransmitPanel(props: Props): JSX.Element {
       <div class="grid grid-cols-2 gap-x-3 gap-y-2 sm:grid-cols-4">
         <label class="flex flex-col gap-0.5">
           <span class="text-[10px] text-[#8b949e]">Carrier Shift (Hz)</span>
-          <NumberField value={config().carrierShift} min={1} onCommit={(n) => patchConfig({ carrierShift: n })} class={inputCls} />
+          <select
+            value={config().carrierShift}
+            onChange={(e) => patchConfig({ carrierShift: parseFloat(e.currentTarget.value) })}
+            class={inputCls}
+          >
+            <For each={CARRIER_SHIFTS}>{(s) => <option value={s}>{s}</option>}</For>
+          </select>
         </label>
         <label class="flex flex-col gap-0.5">
           <span class="text-[10px] text-[#8b949e]">Center Freq (Hz)</span>
@@ -178,7 +219,14 @@ export default function RTTYTransmitPanel(props: Props): JSX.Element {
       {/* Message composer */}
       <div class="space-y-1.5">
         <div class="flex items-center justify-between">
-          <span class="text-[10px] font-semibold uppercase tracking-wide text-[#8b949e]">Message</span>
+          <span class="flex items-center gap-2 text-[10px] font-semibold uppercase tracking-wide text-[#8b949e]">
+            Message
+            <Show when={estimatedSeconds() > 0}>
+              <span class="font-mono font-normal normal-case text-[#8b949e]" title="Estimated transmit time at the current baud rate/framing">
+                ~{fmtDuration(estimatedSeconds())} TX
+              </span>
+            </Show>
+          </span>
           <label
             class="flex items-center gap-1.5 text-[10px] text-[#8b949e]"
             title="Live: each character transmits as you type it. Off: type a full message, then press Send."
@@ -235,13 +283,18 @@ export default function RTTYTransmitPanel(props: Props): JSX.Element {
               </button>
             }
           >
-            <button
-              onClick={handleSend}
-              disabled={!message().trim()}
-              class="rounded-md bg-[#238636] px-4 py-1.5 text-xs font-semibold text-white transition-colors hover:bg-[#2ea043] disabled:cursor-not-allowed disabled:opacity-40"
-            >
-              Send
-            </button>
+            <div class="flex items-center gap-2">
+              <button
+                onClick={handleSend}
+                disabled={!message().trim()}
+                class="rounded-md bg-[#238636] px-4 py-1.5 text-xs font-semibold text-white transition-colors hover:bg-[#2ea043] disabled:cursor-not-allowed disabled:opacity-40"
+              >
+                Send
+              </button>
+              <Show when={estimatedSeconds() > 0}>
+                <span class="font-mono text-[10px] text-[#8b949e]">~{fmtDuration(estimatedSeconds())}</span>
+              </Show>
+            </div>
           </Show>
         </Show>
 
