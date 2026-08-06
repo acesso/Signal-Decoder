@@ -2,9 +2,8 @@ User-agent: *
 Allow: /
 
 # Sitemap
-Sitemap: https://sstv-decoder.vercel.app/sitemap.xml
+Sitemap: https://acesso.github.io/Signal-Decoder/sitemap.xml
 
 # Disallow service worker and build files
 Disallow: /sw.js
 Disallow: /workbox-*.js
-Disallow: /_next/static/

@@ -5,40 +5,65 @@
     <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=5, user-scalable=yes" />
     <meta name="theme-color" content="#238636" />
-    <title>Signal Decoder</title>
+    <title>Signal Decoder — Free Online RTTY, CW, SSTV, FT8/FT4 &amp; MFSK Decoder</title>
     <meta
       name="description"
-      content="Free web-based signal decoder for amateur radio. Decode RTTY (Baudot), CW (Morse code), SSTV, MFSK, and FT8/FT4 signals in real-time from your microphone. Works offline as a PWA."
+      content="Free web-based signal decoder for amateur radio. Decode RTTY (Baudot), CW (Morse code), SSTV, FT8/FT4 digital modes, and MFSK/NAVTEX signals in real-time from your microphone — no install, runs entirely in your browser. Works offline as a PWA."
     />
     <meta
       name="keywords"
-      content="SSTV, Slow Scan Television, Robot36, Amateur Radio, Ham Radio, ISS, ISS SSTV, Signal Decoder, Web Audio, Radio Decoder, FM Demodulation, Digital Signal Processing, DSP, FT8, FT4, RTTY, CW, Morse Code, MFSK"
+      content="RTTY decoder, online RTTY decoder, CW decoder, Morse code decoder, SSTV decoder online, Slow Scan Television, Robot36, FT8 decoder, FT4 decoder, MFSK decoder, NAVTEX decoder, SITOR-B, Amateur Radio, Ham Radio, ISS SSTV, Web Audio API, browser radio decoder, Digital Signal Processing, DSP"
     />
-    <meta name="author" content="smolgroot" />
+    <meta name="author" content="acesso" />
     <meta name="application-name" content="Signal Decoder" />
     <meta name="format-detection" content="telephone=no,email=no,address=no" />
     <meta name="msapplication-TileColor" content="#238636" />
     <meta name="msapplication-config" content="/browserconfig.xml" />
     <meta name="robots" content="index, follow" />
+    <link rel="canonical" href="https://acesso.github.io/Signal-Decoder/" />
 
-    <meta property="og:title" content="Signal Decoder" />
-    <meta property="og:description" content="Free web-based signal decoder for amateur radio. Decode RTTY, CW, SSTV, MFSK, and FT8/FT4 signals in real-time from your microphone." />
+    <meta property="og:title" content="Signal Decoder — Free RTTY, CW, SSTV, FT8/FT4 &amp; MFSK Decoder" />
+    <meta property="og:description" content="Free web-based signal decoder for amateur radio. Decode RTTY, CW (Morse code), SSTV, MFSK, and FT8/FT4 signals in real-time from your microphone." />
     <meta property="og:image" content="/og-image.png" />
     <meta property="og:type" content="website" />
     <meta property="og:locale" content="en_US" />
     <meta property="og:site_name" content="Signal Decoder" />
+    <meta property="og:url" content="https://acesso.github.io/Signal-Decoder/" />
 
     <meta name="twitter:card" content="summary_large_image" />
-    <meta name="twitter:site" content="@smolgroot" />
-    <meta name="twitter:creator" content="@smolgroot" />
-    <meta name="twitter:title" content="Signal Decoder" />
-    <meta name="twitter:description" content="Free web-based signal decoder for amateur radio. Decode RTTY, CW, SSTV, MFSK, and FT8/FT4 signals in real-time from your microphone." />
+    <meta name="twitter:title" content="Signal Decoder — Free RTTY, CW, SSTV, FT8/FT4 &amp; MFSK Decoder" />
+    <meta name="twitter:description" content="Free web-based signal decoder for amateur radio. Decode RTTY, CW (Morse code), SSTV, MFSK, and FT8/FT4 signals in real-time from your microphone." />
     <meta name="twitter:image" content="/og-image.png" />
 
     <meta name="apple-mobile-web-app-capable" content="yes" />
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
     <meta name="apple-mobile-web-app-title" content="Signal Decoder" />
     <link rel="apple-touch-icon" href="/icon-192.png" />
+
+    <script type="application/ld+json">
+      {
+        "@context": "https://schema.org",
+        "@type": "WebApplication",
+        "name": "Signal Decoder",
+        "url": "https://acesso.github.io/Signal-Decoder/",
+        "description": "Free web-based signal decoder for amateur radio. Decode RTTY (Baudot), CW (Morse code), SSTV, FT8/FT4 digital modes, and MFSK/NAVTEX signals in real-time from your microphone.",
+        "applicationCategory": "UtilitiesApplication",
+        "operatingSystem": "Any (runs in a web browser)",
+        "offers": {
+          "@type": "Offer",
+          "price": "0",
+          "priceCurrency": "USD"
+        },
+        "featureList": [
+          "RTTY (Radio Teletype / Baudot) decoding",
+          "CW (Morse code) decoding with automatic speed detection",
+          "SSTV (Slow Scan Television) image decoding — 15 modes",
+          "FT8/FT4 digital mode decoding with QSO logging and ADIF export",
+          "MFSK and NAVTEX/SITOR-B decoding",
+          "Offline-capable Progressive Web App"
+        ]
+      }
+    </script>
   </head>
   <body>
     <div id="root"></div>

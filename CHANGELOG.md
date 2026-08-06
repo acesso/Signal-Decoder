@@ -12,6 +12,14 @@ them into a version section when cutting a release.
 
 ## [Unreleased]
 
+## [0.11.2] - 2026-08-06
+
+### Changed
+
+- README/CONTRIBUTING/site metadata cleanup: dropped the "vibe coded" phrasing, corrected CONTRIBUTING.md (still described the project as its original SSTV-only fork, with a `npm run lint` step that doesn't exist), and fixed `robots.txt`/`sitemap.xml` pointing at a stale `sstv-decoder.vercel.app` domain instead of the live `acesso.github.io/Signal-Decoder`.
+- Regenerated the social-share preview image (`og-image.png`) — it still said "SSTV DECODER" over an old screenshot; now shows the current multi-mode UI with correct branding.
+- Added canonical URL, `og:url`, and JSON-LD `WebApplication` structured data to `index.html`; corrected `author`/removed stale `@smolgroot` Twitter attribution; made `<title>`/description/keywords more specific to what people actually search for.
+
 ## [0.11.1] - 2026-08-06
 
 ### Changed
