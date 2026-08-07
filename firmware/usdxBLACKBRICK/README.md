@@ -72,6 +72,22 @@ All removals follow the same pattern: feature flag commented out (or code delete
 | ATT1 hardware apply | extracted `apply_att1()`, called from both menu and CAT SET (stock only re-applied from the menu dial) |
 | Encoder boot glitch | pull-ups settle + `PCIFR` clear before enabling pin-change interrupts (stock stepped the VFO once at power-on) |
 
+## Fixes (4.02c, 2026-08-07)
+
+Found during an investigation into a "foggy"/rising RX noise floor reported after a few minutes on 7.074 MHz FT8 and, separately, right after TX. Several distinct bugs were found and fixed; the post-TX noise-floor rise itself remains **unresolved** — RX-side AGC/NR/filter/CIC state and a forced PLL relock were all ruled out as the cause (see below).
+
+| Fix | Detail |
+|---|---|
+| AGC unbounded gain ratchet | `process_agc()`'s gain-up path had no ceiling below `INT16_MAX` (~256× gain) and no decay path during extended quiet periods — added `CENTIGAIN_MAX` (the algorithm's own documented ~60 dB range) and a symmetric decay-down branch so gain settles instead of only climbing. This was the original rising-noise-floor-over-several-minutes symptom. |
+| AGC state not reset across TX | `decayCount`/`agc_small` (the AGC's ratchet-window countdown) carried through TX unreset, so a countdown nearly at zero pre-TX could push gain up within a handful of samples post-TX. Now reset on every TX→RX transition in `switch_rxtx()`. Confirmed insufficient alone to fix the post-TX fog (still reproduces with AGC disabled entirely). |
+| CIC filter state never reset | The live 3rd-order CIC decimation filter's integrator/comb state (`i_s0za1/zb0/zb1`, `i_s1za1/zb0/zb1` and Q-channel counterparts, `sdr_rx_common_i/q()`) was never reset anywhere, unlike every downstream DSP stage which is `_init`-guarded. Now flushed on the same `_init` trigger. Did not resolve the post-TX fog. |
+| CAT command buffer overflow | `CATcmd[32]` terminator write (`serialEvent()`) was out of bounds for a command landing exactly 32 bytes with `;` as the last byte — the overrun check only ran on the non-`;` path. Fixed to check before every write. |
+| `freq_last`/`mode_last` out-of-bounds write | The debounced frequency auto-save path wrote these arrays without the bounds check the manual band-change path already had; `bandval` can be 0 (160 m) or 10 (6 m), both outside the 9-slot array. Reachable via normal operation on either band. |
+| TX drive integer overflow | `_amp << drive` (`ssb()`) could wrap a `uint16_t` past 65535 on a loud peak before the clip check ran, aliasing to a near-zero output sample instead of clamping to max. Widened to a 32-bit intermediate before the shift. |
+| EEPROM write wear | `paramAction`'s SAVE path used `eeprom_write_block` (always writes) instead of `eeprom_update_block` (skips unchanged bytes) — call sites without their own debounce burned write cycles on no-op saves. |
+
+Two hardware-level theories for the post-TX fog were tested and reverted (no effect): forcing a full si5351 PLL relock (`iqmsa = 0`) on RX-resume, and reordering RX-resume so the si5351 RX clock output re-enables only after the antenna relay and PLL frequency have settled (rather than before). Both are back to the pre-experiment sequence; the post-TX noise-floor rise is suspected hardware-side (thermal, relay, or PLL/RF residue) pending a scope/spectrum-analyzer check.
+
 ## Known hardware quirk
 
 The LCD shares its data pins with the UART (PD0/PD1); every LCD write briefly

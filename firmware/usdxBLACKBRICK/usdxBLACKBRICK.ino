@@ -50,7 +50,7 @@ Global variables use 1499 bytes (73%) of dynamic memory, leaving 549 bytes for l
 */
 
 //  G8RDI Modifications log:
-#define VERSION   "4.02b"    // Fixed format "9.99z" : Additions and changes Copyright 2022-2023 GW8RDI - You can use and distribute if you maintain the copyright message, commercial use is prohibited.
+#define VERSION   "4.02c"    // Fixed format "9.99z" : Additions and changes Copyright 2022-2023 GW8RDI - You can use and distribute if you maintain the copyright message, commercial use is prohibited.
 
 //  2022/03/04 - Added delay to show serial number at start - G8RDI mod
 //               Added band change direction based on last freq step directions. See "case BE | DC:" - GW8RDI mod
@@ -2276,8 +2276,8 @@ inline int16_t ssb(int16_t in)
 	//_amp = (_amp > vox_thresh) ? _amp : 0;   // vox_thresh = 4 is a good setting
 	//if(!(_amp > vox_thresh)) return 0;
 
-	_amp = _amp << (drive);
-	_amp = ((_amp > 255) || (drive == 8)) ? 255 : _amp; // clip or when drive=8 use max output
+	uint32_t _amp32 = (uint32_t)_amp << (drive);  // widen before the shift: _amp<<drive can exceed 65535 (uint16_t) on loud peaks, wrapping past the clip check below instead of clamping
+	_amp = ((_amp32 > 255) || (drive == 8)) ? 255 : _amp32; // clip or when drive=8 use max output
 	amp = (tx) ? lut[_amp] : 0;
 
 	static int16_t prev_phase;
@@ -2738,6 +2738,15 @@ volatile uint8_t _init = 0;
 static int16_t centiGain = 128;
 #define DECAY_FACTOR 400      // AGC decay occurs <DECAY_FACTOR> slower than attack.
 static uint16_t decayCount = DECAY_FACTOR;
+// Lifted out of process_agc() so switch_rxtx() can reset the AGC's ratchet window on TX->RX:
+// otherwise a countdown that was nearly at zero right before keying up resumes immediately at
+// RX and can push centiGain up within a handful of samples, instead of needing a full fresh window.
+static bool agc_small = true;
+// Design range is ~60dB (comment above): gain of 0.25..255 -> centiGain of 32..32640 (128*255).
+// On a quiet band with no strong signals to ever trip the fast-attack branch, the ramp-up-only
+// decay below has no counterpressure and will otherwise climb toward INT16_MAX (~256x gain),
+// amplifying the receiver's own noise floor. Clamp to the algorithm's own stated ceiling.
+#define CENTIGAIN_MAX (128 * 255)
 #define HI(x)  ((x) >> 8)
 #define LO(x)  ((x) & 0xFF)
 
@@ -2748,7 +2757,6 @@ volatile uint8_t agc_lvl = 4;
 
 inline int16_t process_agc(int16_t in)
 {
-	static bool small = true;
 	int16_t out;
 
 	if (centiGain >= 128)
@@ -2762,16 +2770,20 @@ inline int16_t process_agc(int16_t in)
 	}
 	else {
 		if (HI(abs(out)) > agc_lvl)          // lower bound = agc_lvl*256 (default 4 -> HI(1024))
-			small = false;
-		if (--decayCount == 0) {               // But slow ramp up of gain when signal disappears
-			if (small) {                         // 400 samples below lower threshold - increase gain
-				if (centiGain < (INT16_MAX - (INT16_MAX >> 4)))
+			agc_small = false;
+		if (--decayCount == 0) {               // Slow ramp when signal has been steady for a whole window
+			if (agc_small) {                     // 400 samples below lower threshold - increase gain
+				if (centiGain < (CENTIGAIN_MAX - (CENTIGAIN_MAX >> 4)))
 					centiGain += (centiGain >> 4);
 				else
-					centiGain = INT16_MAX;
+					centiGain = CENTIGAIN_MAX;
+			}
+			else if (centiGain > 32) {            // output was in/above target window - ease gain back down
+				centiGain -= (centiGain >> 5);     // half the up-step rate: settle at target, don't hunt
+				if (centiGain < 32) centiGain = 32;
 			}
 			decayCount = DECAY_FACTOR;
-			small = true;
+			agc_small = true;
 		}
 	}
 	return out;
@@ -3606,7 +3618,18 @@ inline int16_t sdr_rx_common_i()    // Get RX AC samples
 	prev_adc = adc;
 
 #ifdef AF_OUT
-	if (_init) { ocomb = 0; ozi1 = 0; ozi2 = 0; } // hack - G8RDI mod todo could go into Setup() ??????
+	if (_init) {
+		ocomb = 0; ozi1 = 0; ozi2 = 0; prev_adc = 0;
+		// CIC comb/integrator state (i_s0za1/zb0/zb1, i_s1za1/zb0/zb1 and the q_ counterparts,
+		// defined near sdr_rx_00..07 above) was never reset on RX restart, unlike every
+		// downstream stage which is _init-guarded. TX leaves this recursive filter state stale,
+		// and RX resumes feeding it discontinuous samples right after TX, producing a settling
+		// transient. Reset both I and Q sides here (not in sdr_rx_common_q()) because sdr_rx_00
+		// - which runs first on RX resume and is what clears _init via process() - only calls
+		// this function; splitting the reset would mean the Q side never sees _init==1.
+		i_s0za1 = 0; i_s0zb0 = 0; i_s0zb1 = 0; i_s1za1 = 0; i_s1zb0 = 0; i_s1zb1 = 0;
+		q_s0za1 = 0; q_s0zb0 = 0; q_s0zb1 = 0; q_s1za1 = 0; q_s1zb0 = 0; q_s1zb1 = 0; q_ac2 = 0;
+	} // hack - G8RDI mod todo could go into Setup() ??????
 	ozi2 = ozi1 + ozi2;          // Integrator section
 	ozi1 = ocomb + ozi1;
 	OCR1AL = min(max((ozi2 >> 5) + 128, 0), 255);   // Output to audio PWM port
@@ -4465,6 +4488,7 @@ void switch_rxtx(uint8_t tx_enable)
 		}
 		else {
 			centiGain = _centiGain;  // restore AGC setting
+			decayCount = DECAY_FACTOR; agc_small = true;  // give the AGC's ratchet window a fresh start post-TX, rather than resuming mid-countdown from before keying up
 #ifdef SEMI_QSK
 			semi_qsk_timeout = 0;
 #endif
@@ -4789,7 +4813,7 @@ void actionCommon(uint8_t action, uint8_t * ptr, uint8_t size) {
 	case SAVE:
 		//noInterrupts();
 		//for(n = size; n; --n){ wdt_reset(); eeprom_write_byte((uint8_t *)eeprom_addr++, *ptr++); }
-		eeprom_write_block((const void*)ptr, (void*)eeprom_addr, size);
+		eeprom_update_block((const void*)ptr, (void*)eeprom_addr, size);  // update, not write: skips bytes that already match, reduces wear on repeated SAVE of an unchanged value
 		//interrupts();
 		break;
 	case SKIP:
@@ -5224,6 +5248,7 @@ void serialEvent() {
 		rxend_event = millis() + 10;  // block display until this moment, to prevent CAT cmds that initiate display changes to interfere with the next CAT cmd e.g. Hamlib: FA00007071000;ID;
 		char data = Serial.read();
 		if (data < ' ' && data != ';') { if (cat_ptr == 0) return; else { cat_ptr = 0; return; } }  // discard CR/LF and other control chars; reset if mid-command
+		if (cat_ptr > (CATCMD_SIZE - 2)) { Serial.print("E;"); cat_ptr = 0; return; }  // overrun - leave room for the '\0' terminator below, even when data==';'
 		CATcmd[cat_ptr++] = data;
 		if (data == ';') {
 			CATcmd[cat_ptr] = '\0'; // terminate the array
@@ -5234,7 +5259,6 @@ void serialEvent() {
 			analyseCATcmd();
 			delay(10);
 		}
-		else if (cat_ptr > (CATCMD_SIZE - 1)) { Serial.print("E;"); cat_ptr = 0; } // overrun
 	}
 }
 #endif //CAT
@@ -6858,8 +6882,10 @@ void loop()
 		paramAction(SAVE, FREQA);  // single-VFO: persist frequency
 
 #ifdef KEEP_BAND_DATA  // G8RDI mod
-		freq_last[bandval - 1] = freq;
-		mode_last[bandval - 1] = mode;
+		if (bandval > 0 && bandval <= BANDCOUNT) {  // bandval can be 0 (<=2MHz, 160m) or 10 (>32MHz, 6m) - out of freq_last[]/mode_last[] range
+			freq_last[bandval - 1] = freq;
+			mode_last[bandval - 1] = mode;
+		}
 
 /* 230401
 		switch (bandval - 1)    // G8RDI mod - added Save only changed
