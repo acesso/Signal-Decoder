@@ -12,6 +12,12 @@ them into a version section when cutting a release.
 
 ## [Unreleased]
 
+## [0.11.4] - 2026-08-07
+
+### Fixed
+
+- SSTV auto-detect no longer cuts a VIS-confirmed decode short on a mid-transmission fade or quiet gap; only the mode's known expected duration (or full line completion) ends it now.
+
 ## [0.11.3] - 2026-08-07
 
 ### Fixed

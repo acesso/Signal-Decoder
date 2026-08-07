@@ -164,6 +164,12 @@ export function createAudioProcessor(params: AudioProcessorParams) {
   let silenceMs = 0
   let lastProgressLine = 0
   let lastProgressAt = 0
+  // VIS gives the mode from an explicit header code — ground truth, so the
+  // decode's total length is fully known and stall/silence are irrelevant
+  // (a fade or gap mid-transmission is not "done", it's just quiet for a
+  // while). Sync-timing is only an inference from pulse spacing, so it keeps
+  // the stall/silence safety nets as a hedge against having guessed wrong.
+  let visConfirmed = false
   let capturedImages: CapturedImage[] = []
 
   // Call from a createEffect that depends on params.manualMode()/autoDetect()
@@ -203,6 +209,7 @@ export function createAudioProcessor(params: AudioProcessorParams) {
     capturedImages = [img, ...capturedImages]
     isDecoding = false
     silenceMs = 0
+    visConfirmed = false
 
     if (params.autoDetect()) {
       visDetector?.reset()
@@ -259,6 +266,7 @@ export function createAudioProcessor(params: AudioProcessorParams) {
         silenceMs = 0
         lastProgressLine = 0
         lastProgressAt = Date.now()
+        visConfirmed = detectedVia === 'VIS'
 
         decoder = new SSTVDecoder(sampleRate, detectedMode, params.autoSlant())
         decoder.start()
@@ -293,26 +301,36 @@ export function createAudioProcessor(params: AudioProcessorParams) {
         return
       }
 
-      if (stats.currentLine > lastProgressLine) {
-        lastProgressLine = stats.currentLine
-        lastProgressAt = now
-      } else if (now - lastProgressAt >= STALL_TIMEOUT_MS) {
-        // Backstop independent of the silence heuristic below — whatever the
-        // reason (transmission ended and went undetected, a new unrelated
-        // transmission started, signal dropped out), no line progress for
-        // this long means we're not usefully decoding anymore.
-        captureCurrentImage(sampleRate)
-        return
-      }
-
-      if (isChunkSilent(inputData, sampleRate)) {
-        silenceMs += chunkMs
-        if (silenceMs >= SILENCE_DURATION_MS) {
+      // Both heuristics below are guesses at "the transmission is over" from
+      // indirect signs (no line progress, no tone energy) — appropriate when
+      // the mode was only inferred from sync timing, but moot once VIS has
+      // told us exactly how long this decode should run: a fade or a quiet
+      // gap mid-image isn't "done," and cutting it off early is exactly the
+      // premature-capture behavior the known-duration deadline above exists
+      // to avoid. Skip them for VIS-confirmed decodes and let the deadline
+      // (or the hard line-count-complete check) be the only way out.
+      if (!visConfirmed) {
+        if (stats.currentLine > lastProgressLine) {
+          lastProgressLine = stats.currentLine
+          lastProgressAt = now
+        } else if (now - lastProgressAt >= STALL_TIMEOUT_MS) {
+          // Backstop independent of the silence heuristic below — whatever the
+          // reason (transmission ended and went undetected, a new unrelated
+          // transmission started, signal dropped out), no line progress for
+          // this long means we're not usefully decoding anymore.
           captureCurrentImage(sampleRate)
           return
         }
-      } else {
-        silenceMs = 0
+
+        if (isChunkSilent(inputData, sampleRate)) {
+          silenceMs += chunkMs
+          if (silenceMs >= SILENCE_DURATION_MS) {
+            captureCurrentImage(sampleRate)
+            return
+          }
+        } else {
+          silenceMs = 0
+        }
       }
 
       const snr = calculateSNRFromAnalyser(analyser, audioContext)
