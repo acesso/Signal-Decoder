@@ -444,7 +444,7 @@ function SSTVTxSummaryChip(props: { s: SSTVTxStatus | null }): JSX.Element {
         />
         <span style={{ color: SSTV_TX_STATUS_COLOR[props.s!.phase] }}>{SSTV_TX_STATUS_LABEL[props.s!.phase]}</span>
         <Show when={props.s!.phase === 'playing'}>
-          <span class="text-[#8b949e]">{Math.round(props.s!.progress * 100)}% · {props.s!.remainingSec}s left</span>
+          <span class="text-[#8b949e]">{props.s!.remainingSec}s left</span>
         </Show>
       </span>
     </Show>

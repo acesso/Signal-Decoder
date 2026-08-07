@@ -1,5 +1,6 @@
 import { isChunkSilent, expectedDurationMs } from '../audioProcessor'
 import { SSTV_MODES } from '../constants'
+import { transmittedLines } from '../encoder'
 
 const SAMPLE_RATE = 44100
 const CHUNK_SIZE = 4096
@@ -67,10 +68,15 @@ describe('isChunkSilent', () => {
 })
 
 describe('expectedDurationMs', () => {
-  test('matches height * scanTime with a tolerance margin, for every mode', () => {
-    for (const [name, cfg] of Object.entries(SSTV_MODES)) {
-      const raw = cfg.height * cfg.scanTime
-      const expected = expectedDurationMs(name as keyof typeof SSTV_MODES)
+  test('matches transmittedLines * scanTime with a tolerance margin, for every mode', () => {
+    // transmittedLines, not raw height, is the number of sync intervals a
+    // mode actually sends — PD modes pack 2 image rows per scan line, so
+    // using height there would make the deadline 2x too long. Must stay in
+    // lockstep with encoder.ts's own duration estimate (estimateEncodedSeconds).
+    for (const name of Object.keys(SSTV_MODES)) {
+      const mode = name as keyof typeof SSTV_MODES
+      const raw = transmittedLines(mode) * SSTV_MODES[mode].scanTime
+      const expected = expectedDurationMs(mode)
       expect(expected).toBeGreaterThanOrEqual(raw)
       // Tolerance margin should be modest — enough to absorb slant/clock
       // drift, not so much that a real dead transmission gets decoded as
@@ -83,5 +89,15 @@ describe('expectedDurationMs', () => {
     const ms = expectedDurationMs('ROBOT36')
     expect(ms).toBeGreaterThan(35_000)
     expect(ms).toBeLessThan(45_000)
+  })
+
+  test('PD120 deadline reflects height/2 transmitted lines, not raw height', () => {
+    // Regression pin: PD120 is 640x496, scanTime ~508.48ms, but each scan
+    // line/sync interval carries 2 image rows, so only 248 lines are
+    // actually transmitted (~126s), not 496 (~252s). Using raw height here
+    // previously made the auto-detect deadline 2x too long for every PD mode.
+    const ms = expectedDurationMs('PD120')
+    expect(ms).toBeGreaterThan(120_000)
+    expect(ms).toBeLessThan(150_000)
   })
 })

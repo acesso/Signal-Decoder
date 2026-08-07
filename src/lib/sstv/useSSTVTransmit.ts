@@ -18,12 +18,23 @@ export interface SSTVTxState {
   txGain: number;
   sinkIdSupported: boolean;
   autoPTT: boolean;
+  preKeyMs: number;
 }
 
 const LS_OUTPUT = 'sstv_tx_output_device';
 const LS_GAIN = 'sstv_tx_gain';
 const LS_AUTOPTT = 'sstv_tx_auto_ptt';
+const LS_PREKEY = 'sstv_tx_prekey_ms';
 const DEFAULT_GAIN = Math.pow(10, -12 / 20); // -12 dB — SSTV audio is played back at near-line level, not the deep attenuation FT8 uses for a shared TX chain
+// Pre-key (warm-up) delay between PTT keying on and audio starting, same
+// mechanism/rationale as useFTTransmit.ts's preKeyMs: an external PA/relay
+// (or the rig's own PTT-to-TX switchover) can take tens-to-hundreds of ms to
+// settle, and starting audio right at the PTT edge clips the VIS leader
+// tone's first ms(s) — which is exactly what stops a receiver from ever
+// catching the VIS header. Only meaningful with Auto-PTT actually wired up.
+// Default 0 (off), matching FT's default — most setups (audio-only, VOX,
+// solid-state PAs) don't need it.
+const MAX_PREKEY_MS = 2000;
 
 function loadOutputDevice(): string {
   return loadString(LS_OUTPUT, '', ['']);
@@ -72,6 +83,7 @@ export function createSSTVTransmit(getOnSetPTT?: () => ((tx: boolean) => Promise
     txGain: loadNumber(LS_GAIN, DEFAULT_GAIN),
     sinkIdSupported: typeof AudioContext !== 'undefined' && 'setSinkId' in AudioContext.prototype,
     autoPTT: loadBoolean(LS_AUTOPTT, false),
+    preKeyMs: loadNumber(LS_PREKEY, 0),
   });
 
   let audioCtx: AudioContext | null = null;
@@ -80,6 +92,7 @@ export function createSSTVTransmit(getOnSetPTT?: () => ((tx: boolean) => Promise
   let outputDevice = loadOutputDevice();
   let gain = loadNumber(LS_GAIN, DEFAULT_GAIN);
   let autoPTTOn = loadBoolean(LS_AUTOPTT, false);
+  let preKeyMs = loadNumber(LS_PREKEY, 0);
   let currentSource: AudioBufferSourceNode | null = null;
   let stopped = false;
 
@@ -131,6 +144,17 @@ export function createSSTVTransmit(getOnSetPTT?: () => ((tx: boolean) => Promise
           pttOn = true;
         } catch { /* CAT not connected or timed out */ }
       }
+
+      // Pre-key (warm-up) hold: give an external PA/relay (or the rig's own
+      // PTT-to-TX switchover) time to settle before the VIS leader tone
+      // starts, same mechanism as useFTTransmit.ts. Gated on autoPTTOn &&
+      // onSetPTT (not pttOn) to match FT's convention — the delay is about
+      // giving the hardware time regardless of whether the CAT call itself
+      // reported success.
+      if (preKeyMs > 0 && autoPTTOn && onSetPTT) {
+        await new Promise<void>((r) => setTimeout(r, preKeyMs));
+      }
+      if (stopped) return;
 
       await new Promise<void>((resolve) => {
         const src = ctx.createBufferSource();
@@ -190,6 +214,13 @@ export function createSSTVTransmit(getOnSetPTT?: () => ((tx: boolean) => Promise
     setState((prev) => ({ ...prev, autoPTT: v }));
   }
 
+  function setPreKeyMs(v: number) {
+    const clamped = Math.max(0, Math.min(MAX_PREKEY_MS, Math.round(v)));
+    preKeyMs = clamped;
+    saveNumber(LS_PREKEY, clamped);
+    setState((prev) => ({ ...prev, preKeyMs: clamped }));
+  }
+
   function setOutputDevice(deviceId: string) {
     outputDevice = deviceId;
     saveString(LS_OUTPUT, deviceId);
@@ -220,6 +251,7 @@ export function createSSTVTransmit(getOnSetPTT?: () => ((tx: boolean) => Promise
     setOutputDevice,
     setTxGain,
     setAutoPTT,
+    setPreKeyMs,
     destroy,
   };
 }

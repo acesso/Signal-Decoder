@@ -97,7 +97,18 @@ export class SyncDetector {
 
     // Sync pulse detection thresholds
     this.syncPulseFrequencyValue = this.normalizeFrequency(SyncDetector.SYNC_PULSE_FREQ);
-    this.syncPulseFrequencyTolerance = (50 * 2) / this.scanLineBandwidth;
+    // ±50Hz was too tight against a real recording with a ~45Hz receive
+    // tuning offset (a completely ordinary SSB BFO/tuning error, not a
+    // degraded signal) — FM-demodulation noise pushed the *measured* value
+    // over that edge intermittently, rejecting otherwise-valid sync pulses.
+    // frequencyOffset is already measured per-pulse and applied downstream
+    // (decodeLine → lineDecoder.decodeScanLine in decoder.ts) once a pulse
+    // clears this gate, so this only needs to be wide enough to let a
+    // realistically-tuned real signal's pulses through in the first place.
+    // 100Hz leaves 200Hz of headroom before the 1300Hz Schmitt-trigger
+    // high threshold and 300Hz before the 1500Hz porch tone — comfortable
+    // margin against confusing sync with an adjacent tone.
+    this.syncPulseFrequencyTolerance = (100 * 2) / this.scanLineBandwidth;
 
     const syncPorchFrequency = 1500;
     const syncHighFrequency = (SyncDetector.SYNC_PULSE_FREQ + syncPorchFrequency) / 2;
