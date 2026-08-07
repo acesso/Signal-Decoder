@@ -12,6 +12,17 @@ them into a version section when cutting a release.
 
 ## [Unreleased]
 
+## [0.11.3] - 2026-08-07
+
+### Fixed
+
+- uSDX BLACK_BRICK firmware (4.02b → 4.02c): fixed an AGC gain ratchet with no ceiling or decay that caused a rising RX noise floor over several minutes on a quiet band.
+- Fixed a CAT command buffer off-by-one overflow reachable by any exactly-32-byte command.
+- Fixed an out-of-bounds array write in the frequency auto-save path when operating on 160m or 6m.
+- Fixed a TX drive integer overflow that could momentarily zero out output on loud audio peaks.
+- Reduced EEPROM wear by using update-if-changed semantics instead of unconditional writes.
+- Reset AGC and CIC-filter internal state on every TX→RX transition (a separate, still-unresolved "foggy" noise floor appearing right after TX is suspected hardware-side — see firmware README).
+
 ## [0.11.2] - 2026-08-06
 
 ### Changed
