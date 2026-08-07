@@ -12,6 +12,19 @@ them into a version section when cutting a release.
 
 ## [Unreleased]
 
+## [0.11.5] - 2026-08-07
+
+### Fixed
+
+- SSTV VIS detection no longer requires a pristine signal: tolerates real HF noise and hard-silence dropouts in the leader/break tones, calibrates for receiver frequency/tuning offset, and fixed a bit-timing bug that could misdecode the VIS header even on a clean signal.
+- SSTV decoder recovers from a stale sync lock after an extended noisy stretch instead of stalling permanently for the rest of the transmission.
+- SSTV scan-line sync now tolerates a real receiver's frequency offset and a compressed (shorter-than-nominal) sync pulse width.
+
+### Added
+
+- SSTV transmit: pre-key delay setting (Composer, next to Auto-PTT) — holds PTT before starting audio so the VIS leader tone's start isn't clipped by the rig's PTT/ALC settling time.
+- SSTV transmit: a horizontal scanline overlay sweeps down the preview image during playback, and the collapsed-panel summary chip now shows a plain countdown instead of a redundant percentage + countdown pair.
+
 ## [0.11.4] - 2026-08-07
 
 ### Fixed

@@ -223,16 +223,24 @@ const MARTIN_LIKE_MODES = new Set(['MARTIN_M1', 'MARTIN_M2', 'WRAASE_SC2_180']);
 const PD_MODES = new Set(['PD50', 'PD90', 'PD120', 'PD160', 'PD180', 'PD240', 'PD290']);
 
 // VIS header: leader(0.3) + break(0.01) + leader(0.3) + start(0.03) + 8 data/parity bits(0.03 each) + stop(0.03)
-const VIS_HEADER_SECONDS = 0.3 + 0.01 + 0.3 + 0.03 + 8 * 0.03 + 0.03;
+export const VIS_HEADER_SECONDS = 0.3 + 0.01 + 0.3 + 0.03 + 8 * 0.03 + 0.03;
+
+/** Number of sync pulses/scan lines a mode actually transmits. PD modes pack
+ *  2 image rows into each transmitted scan line (Y-even + shared chroma +
+ *  Y-odd), so it's mode.height/2 there; every other mode sends one sync per
+ *  image row. Shared by estimateEncodedSeconds below and by the decoder
+ *  side's expected-duration deadline (audioProcessor.ts) — both must agree
+ *  on how long a transmission actually takes on the air. */
+export function transmittedLines(modeName: keyof typeof SSTV_MODES): number {
+  const mode = SSTV_MODES[modeName];
+  return PD_MODES.has(modeName) ? mode.height / 2 : mode.height;
+}
 
 /** Exact transmit duration for a mode, without running the (expensive)
- *  synthesis — used for UI display. PD modes pack 2 image rows into each
- *  transmitted scan line (Y-even + shared chroma + Y-odd), so scanTime there
- *  covers height/2 lines, not height. */
+ *  synthesis — used for UI display. */
 export function estimateEncodedSeconds(modeName: keyof typeof SSTV_MODES): number {
   const mode = SSTV_MODES[modeName];
-  const transmittedLines = PD_MODES.has(modeName) ? mode.height / 2 : mode.height;
-  return VIS_HEADER_SECONDS + (mode.scanTime * transmittedLines) / 1000;
+  return VIS_HEADER_SECONDS + (mode.scanTime * transmittedLines(modeName)) / 1000;
 }
 
 /**

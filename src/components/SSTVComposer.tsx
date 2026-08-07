@@ -5,6 +5,7 @@
 import { createEffect, createMemo, createSignal, For, Index, onCleanup, onMount, Show, type JSX } from 'solid-js'
 import TextField from './TextField'
 import TextAreaField from './TextAreaField'
+import NumberField from './NumberField'
 import { SSTV_MODES } from '$decoder-lib/sstv/constants'
 import { resizeImageData, estimateEncodedSeconds } from '$decoder-lib/sstv/encoder'
 import { createSSTVTransmit } from '$decoder-lib/sstv/useSSTVTransmit'
@@ -663,15 +664,29 @@ export default function SSTVComposer(props: SSTVComposerProps): JSX.Element {
               justReplied() ? 'border-[#58a6ff] shadow-[0_0_0_3px_rgba(88,166,255,0.4)]' : 'border-[#30363d]'
             } bg-[#0d1117]`}
           >
-            <canvas
-              ref={canvasEl}
-              width={modeCfg().width}
-              height={modeCfg().height}
-              style={{ 'max-width': '100%', height: 'auto', 'image-rendering': 'pixelated', cursor: layers().length > 0 || replyBoxes().length > 0 ? 'move' : 'default' }}
-              onPointerDown={handleCanvasPointerDown}
-              onPointerMove={handleCanvasPointerMove}
-              onPointerUp={handleCanvasPointerUp}
-            />
+            <div class="relative inline-block">
+              <canvas
+                ref={canvasEl}
+                width={modeCfg().width}
+                height={modeCfg().height}
+                style={{ 'max-width': '100%', height: 'auto', 'image-rendering': 'pixelated', cursor: layers().length > 0 || replyBoxes().length > 0 ? 'move' : 'default' }}
+                onPointerDown={handleCanvasPointerDown}
+                onPointerMove={handleCanvasPointerMove}
+                onPointerUp={handleCanvasPointerUp}
+              />
+              {/* Transmit scanline — purely visual, tracks txProgress() top to
+                  bottom over the image while playing. SSTV modes scan
+                  top-to-bottom over the transmission's duration, so overall
+                  progress fraction is a reasonable stand-in for "how far down
+                  the image the transmitter currently is" without needing to
+                  model each mode's actual line timing. */}
+              <Show when={txPhase() === 'playing'}>
+                <div
+                  class="pointer-events-none absolute inset-x-0 h-0.5 bg-[#2ea043] shadow-[0_0_6px_2px_rgba(46,160,67,0.8)]"
+                  style={{ top: `${Math.min(100, txProgress() * 100)}%` }}
+                />
+              </Show>
+            </div>
           </div>
           <Show when={justReplied()}>
             <p class="text-center text-[10px] text-[#58a6ff]">↑ Received image inset in the bottom-right corner — drop your own photo above to reply.</p>
@@ -911,6 +926,25 @@ export default function SSTVComposer(props: SSTVComposerProps): JSX.Element {
                   }`}
                 />
               </button>
+            </label>
+
+            <label
+              class={`flex items-center justify-between text-xs text-[#8b949e] ${!tx.state().autoPTT ? 'opacity-40' : ''}`}
+              title="Key PTT this many ms before the VIS leader tone starts, to let the rig's PTT relay/ALC (or an external PA) settle — a receiver that misses the very start of the leader tone can fail to catch the VIS header at all"
+            >
+              Pre-key
+              <span class="flex items-center gap-1">
+                <NumberField
+                  value={tx.state().preKeyMs}
+                  onCommit={tx.setPreKeyMs}
+                  disabled={!tx.state().autoPTT}
+                  min={0}
+                  max={2000}
+                  step={10}
+                  class="w-14 rounded border border-[#30363d] bg-[#0d1117] px-1.5 py-0.5 text-right font-mono text-[#c9d1d9] focus:border-[#388bfd] focus:outline-none disabled:cursor-not-allowed"
+                />
+                <span class="text-[10px]">ms</span>
+              </span>
             </label>
 
             <Show

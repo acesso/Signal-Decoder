@@ -54,6 +54,10 @@ export class SSTVDecoder {
   // Line boundaries detected by sync pulses
   private lastSyncPos: number = -1;
   private lastSyncWidth: SyncPulseWidth | null = null;
+  // Absolute (non-wrapping) sample position of the last accepted sync —
+  // used only to detect a stale lastSyncPos (see isValidLineSync's resync
+  // branch below), independent of the circular buffer's wraparound.
+  private lastSyncAbsolutePos: number = -1;
 
   // Frequency calibration
   private frequencyOffset: number = 0;
@@ -63,6 +67,24 @@ export class SSTVDecoder {
 
   // Auto slant correction
   private autoSlant: boolean;
+  // A single line's corrFactor (measured/expected sample count) is trusted
+  // on its own whenever it's within the resampling tolerance — that's real
+  // per-line data, and correcting each line against its own measurement is
+  // what actually cancels a genuine sustained clock-rate mismatch (every
+  // line reports a similar corrFactor, so per-line correction already
+  // fixes each one). This running EMA exists only for the line-by-line
+  // exception: a corrFactor that falls outside the ±10% tolerance, which
+  // previously meant "give up, don't correct this line at all." Falling
+  // back to the trend's own estimate there is still an approximation, but
+  // closer to right than leaving that one line's full timing error in the
+  // image untouched. See applySlantCorrection for how it's actually used.
+  private driftEstimate: number = 1.0;
+  private driftSamples: number = 0;
+  private static readonly DRIFT_EMA_ALPHA = 0.05;
+  // Below this many observations the EMA hasn't converged enough to trust —
+  // fall back to pure per-line correction so early lines aren't skewed by a
+  // drift estimate still dominated by its 1.0 seed.
+  private static readonly DRIFT_MIN_SAMPLES = 8;
 
   constructor(sampleRate: number = SAMPLE_RATE, modeName: keyof typeof SSTV_MODES = 'ROBOT36', autoSlant: boolean = true) {
     this.sampleRate = sampleRate;
@@ -174,26 +196,76 @@ export class SSTVDecoder {
       // Martin M1/M2 use a 4.862ms sync pulse, Wraase SC2-180 uses 5.5225ms — both classified as FiveMilliSeconds
       const isMartinMode = this.modeName === 'MARTIN_M1' || this.modeName === 'MARTIN_M2';
       const isShortSyncMode = isMartinMode || this.modeName === 'WRAASE_SC2_180';
+      // A real 9ms/20ms line sync can measure short enough to fall into the
+      // 5ms bucket on a degraded real signal — verified against a real
+      // recording where mid-transmission sync pulses (well after VIS, on an
+      // otherwise still-decoding-cleanly signal) consistently measured ~5ms
+      // instead of 9ms. The 5ms bucket's boundary (SyncDetector's midpoint
+      // between 5ms and 9ms) has no margin for that kind of real-world
+      // timing compression. Rather than widening the bucket itself — which
+      // is shared by every mode and would also make a genuine VIS-code tone
+      // (also ~5ms) more likely to be mistaken for a line sync right where
+      // it's expected — only accept it here, using context SyncDetector
+      // doesn't have: we're already mid-transmission (lastSyncPos set) and
+      // this pulse arrived at roughly one scanTime after the last accepted
+      // sync, exactly where a real line sync (and nothing else) belongs.
+      const scanTimeSamples = Math.round(this.mode.scanTime * this.sampleRate / 1000);
+      const isPlausibleLineInterval =
+        this.lastSyncPos !== -1 &&
+        Math.abs(this.distanceInBuffer(this.lastSyncPos, syncEndPos) - scanTimeSamples) < scanTimeSamples * 0.3;
+      // lastSyncPos can only ever be re-anchored by an *accepted* sync — a
+      // rejected one never updates it. On a real recording with a long
+      // enough stretch of degraded signal, this is a real deadlock: once
+      // one real sync gets missed/misclassified badly enough that the next
+      // detection's distance from lastSyncPos no longer looks like "one
+      // line late", every subsequent detection measures an even larger,
+      // still-implausible distance from that same stale anchor — the gap
+      // can only grow, never shrink, so isPlausibleLineInterval can never
+      // become true again on its own. Verified against a real recording:
+      // decode permanently stalled ~14s before the file ended despite
+      // SyncDetector continuing to report pulses the whole time. If it's
+      // been so long since the last accepted sync that even decodeLineSpan's
+      // own reconstruction ceiling (bufferSize * 0.9 — see its comments)
+      // couldn't have recovered the gap reliably, this clearly isn't
+      // "several missed lines" (which reconstruction already handles well,
+      // verified on this same file) but "we lost the thread entirely" —
+      // treat the next sync-shaped pulse as a fresh anchor rather than
+      // another rejection, even though we have no way to know how many
+      // lines were actually missed in between. Deliberately set above
+      // reconstruction's own ceiling, not some smaller multiple of
+      // scanTime, so this never fires for a gap reconstruction could still
+      // have handled — it's a backstop for the case reconstruction can't
+      // reach, not a competing, more eager alternative to it.
+      const samplesSinceLastSync = this.lastSyncAbsolutePos === -1
+        ? Infinity
+        : this.absoluteSamplePosition - this.lastSyncAbsolutePos;
+      const lastSyncIsStale = samplesSinceLastSync > this.bufferSize * 0.95;
       const isValidLineSync =
         result.width === SyncPulseWidth.NineMilliSeconds ||
         result.width === SyncPulseWidth.TwentyMilliSeconds ||
-        (isShortSyncMode && result.width === SyncPulseWidth.FiveMilliSeconds);
+        (isShortSyncMode && result.width === SyncPulseWidth.FiveMilliSeconds) ||
+        (!isShortSyncMode && result.width === SyncPulseWidth.FiveMilliSeconds && (isPlausibleLineInterval || lastSyncIsStale));
 
       if (isValidLineSync &&
-          (this.lastSyncPos === -1 || this.distanceInBuffer(this.lastSyncPos, syncEndPos) > this.sampleRate * 0.1)) {
+          (this.lastSyncPos === -1 || lastSyncIsStale || this.distanceInBuffer(this.lastSyncPos, syncEndPos) > this.sampleRate * 0.1)) {
 
         // Update frequency calibration
         this.frequencyOffset = result.frequencyOffset;
 
-        // If we have a previous sync, decode the line between them
-        if (this.lastSyncPos !== -1) {
+        // If we have a previous sync, decode the line(s) between them —
+        // unless lastSyncPos is stale, in which case the "distance" is a
+        // meaningless multi-second gap, not a real span to reconstruct from.
+        if (this.lastSyncPos !== -1 && !lastSyncIsStale) {
           const distance = this.distanceInBuffer(this.lastSyncPos, syncEndPos);
           console.log(`📏 Decoding line between syncs: distance=${distance} samples (${(distance/this.sampleRate*1000).toFixed(1)}ms)`);
-          this.decodeLine(this.lastSyncPos, syncEndPos);
+          this.decodeLineSpan(this.lastSyncPos, syncEndPos, distance);
+        } else if (lastSyncIsStale) {
+          console.log(`🔄 Resyncing after a stale gap (${(samplesSinceLastSync/this.sampleRate).toFixed(1)}s since last accepted sync) — some line loss is unrecoverable here`);
         }
 
         this.lastSyncPos = syncEndPos;
         this.lastSyncWidth = result.width;
+        this.lastSyncAbsolutePos = this.absoluteSamplePosition;
       } else if (result.width === SyncPulseWidth.FiveMilliSeconds && !isShortSyncMode) {
         console.log(`⏭️ Skipping 5ms sync (VIS code)`);
       } else {
@@ -212,6 +284,59 @@ export class SSTVDecoder {
       return end - start;
     } else {
       return (this.bufferSize - start) + end;
+    }
+  }
+
+  /**
+   * Decode the span between two consecutive detected sync pulses. On a weak
+   * or noisy signal a sync pulse can be missed entirely (rejected by the
+   * Schmitt trigger / frequency-tolerance check in SyncDetector), in which
+   * case this span covers more than one line's worth of audio. Decoding that
+   * whole span as a single oversized line — the previous behavior — throws
+   * away every missed line's content and shifts everything after it upward,
+   * flattening/compressing the image. Instead, split the span into
+   * scanTime-sized chunks (one per apparent line, including missed ones) and
+   * decode each independently: a weak-signal chunk still produces a noisy
+   * line rather than no line at all, which is what actually happened on the
+   * air, so preserving it beats collapsing rows or leaving them black.
+   * Negative-timing decoders (Scottie) size their own extraction window from
+   * the sync position and don't have a "distance between syncs" concept in
+   * the same sense, so they're left as single-segment (no interlace/Scottie
+   * mode has been observed to fire this reconstruction; skipped syncs there
+   * fall back to the pre-existing stall/silence backstops).
+   */
+  private decodeLineSpan(startPos: number, endPos: number, distance: number): void {
+    const hasNegativeTiming = 'getBeginSamples' in this.lineDecoder;
+    const expectedSamples = Math.round(this.mode.scanTime * this.sampleRate / 1000);
+    const rawApparentLines = hasNegativeTiming ? 1 : Math.max(1, Math.round(distance / expectedSamples));
+    // The ring buffer only holds 7s of audio (constructor comment) — a span
+    // approaching that means most of it has already been overwritten and
+    // distance itself may be wrapped/wrong, not just "many missed lines".
+    // Cap reconstruction short of that so we're never decoding from stale or
+    // wrapped buffer content; the remainder of the gap is simply not
+    // recoverable and is left as-is (currentLine will lag, which the
+    // expected-duration deadline in audioProcessor already tolerates).
+    const maxRecoverableLines = Math.max(1, Math.floor((this.bufferSize * 0.9) / expectedSamples));
+
+    if (rawApparentLines <= 1) {
+      this.decodeLine(startPos, endPos);
+      return;
+    }
+
+    // When the gap is too large to fully recover from the ring buffer, only
+    // the tail end (closest to endPos, most recently written) is still
+    // intact — reconstruct that many scanTime-sized lines anchored to
+    // endPos rather than stretching fewer, over-length segments across the
+    // whole (partially stale) distance.
+    const apparentLines = Math.min(rawApparentLines, maxRecoverableLines);
+    const spanSamples = apparentLines * expectedSamples;
+    const spanStart = (endPos - spanSamples + this.bufferSize * 2) % this.bufferSize;
+
+    console.log(`⚠️ Missed ~${rawApparentLines - 1} sync pulse(s) — reconstructing ${apparentLines} line(s) from the ${(spanSamples/this.sampleRate*1000).toFixed(0)}ms closest to the new sync`);
+    for (let i = 0; i < apparentLines; i++) {
+      const segStart = (spanStart + i * expectedSamples + this.bufferSize) % this.bufferSize;
+      const segEnd = (spanStart + (i + 1) * expectedSamples + this.bufferSize) % this.bufferSize;
+      this.decodeLine(segStart, segEnd);
     }
   }
 
@@ -286,17 +411,52 @@ export class SSTVDecoder {
 
   /**
    * Resample line buffer to expected length to correct for clock skew (slant).
-   * Only applied when the correction factor is within ±10% of 1.0.
+   *
+   * Each line's own corrFactor (measured/expected sample count) is trusted
+   * first — it's a real, accurate measurement of that line's timing, and
+   * reacting to it directly is what actually cancels genuine per-line
+   * variation (a real clock-rate mismatch shows up as *every* line
+   * measuring a bit long/short, so correcting each one individually already
+   * corrects the whole image; no smoothing needed there). The EMA in
+   * this.driftEstimate exists for the case per-line correction can't
+   * handle: a line whose corrFactor falls outside the ±10% band — the
+   * previous behavior returned it completely uncorrected, letting that
+   * one line's full timing error bleed into the image. A sustained trend
+   * (real drift or sync-detector phase creep) makes this happen repeatedly
+   * in the same direction, so instead of giving up, fall back to the
+   * trend's own estimate for that one line — still an approximation, but
+   * closer to correct than applying no correction at all.
    */
   private applySlantCorrection(samples: Float32Array, measuredSamples: number): Float32Array {
     const expectedSamples = Math.round(this.mode.scanTime * this.sampleRate / 1000);
     const corrFactor = measuredSamples / expectedSamples;
-    if (Math.abs(corrFactor - 1.0) < 0.0005 || corrFactor < 0.9 || corrFactor > 1.1) {
+
+    // Update the running drift estimate with every line's measurement,
+    // valid or not — a line that's out of bounds below is still useful
+    // signal for the trend itself.
+    if (this.driftSamples === 0) {
+      this.driftEstimate = corrFactor;
+    } else {
+      this.driftEstimate += SSTVDecoder.DRIFT_EMA_ALPHA * (corrFactor - this.driftEstimate);
+    }
+    this.driftSamples++;
+
+    const corrFactorInBounds = Math.abs(corrFactor - 1.0) >= 0.0005 && corrFactor >= 0.9 && corrFactor <= 1.1;
+    const haveTrend = this.driftSamples >= SSTVDecoder.DRIFT_MIN_SAMPLES;
+    const trendInBounds = Math.abs(this.driftEstimate - 1.0) >= 0.0005 && this.driftEstimate >= 0.9 && this.driftEstimate <= 1.1;
+
+    let effectiveFactor: number;
+    if (corrFactorInBounds) {
+      effectiveFactor = corrFactor;
+    } else if (haveTrend && trendInBounds) {
+      effectiveFactor = this.driftEstimate;
+    } else {
       return samples;
     }
+
     const resampled = new Float32Array(expectedSamples);
     for (let i = 0; i < expectedSamples; i++) {
-      const srcF = i * corrFactor;
+      const srcF = i * effectiveFactor;
       const srcI = Math.floor(srcF);
       const frac = srcF - srcI;
       resampled[i] = samples[srcI] * (1 - frac) + samples[Math.min(srcI + 1, samples.length - 1)] * frac;
@@ -345,10 +505,13 @@ export class SSTVDecoder {
     this.bufferWritePos = 0;
     this.lastSyncPos = -1;
     this.lastSyncWidth = null;
+    this.lastSyncAbsolutePos = -1;
     this.frequencyOffset = 0;
     this.sampleCounter = 0;
     this.lastLogTime = 0;
     this.absoluteSamplePosition = 0;
+    this.driftEstimate = 1.0;
+    this.driftSamples = 0;
 
     // Reset sync detector state
     this.syncDetector.reset();

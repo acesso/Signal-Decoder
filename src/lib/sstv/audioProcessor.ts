@@ -4,6 +4,7 @@ import { SSTVDecoder, type DecoderStats } from '$decoder-lib/sstv/decoder'
 import { VISDetector } from '$decoder-lib/sstv/vis-detector'
 import { SyncIntervalDetector } from '$decoder-lib/sstv/sync-interval-detector'
 import { SSTV_MODES } from '$decoder-lib/sstv/constants'
+import { transmittedLines } from '$decoder-lib/sstv/encoder'
 import { createCaptureNode, type CaptureNode } from '$decoder-lib/audio/captureNode'
 import { estimateSignalReport, type SignalReport } from '$decoder-lib/sstv/signalReport'
 import { GoertzelFilter } from '$decoder-lib/sstv/dsp'
@@ -43,20 +44,27 @@ const SILENCE_DURATION_MS = 2500
 // modes (PD290 ≈ 1.2s/line) plus the silence timeout itself.
 const STALL_TIMEOUT_MS = 6000
 // A VIS header (unlike a sync-timing-only lock) tells us the mode directly,
-// so the transmission's total length is fully predictable: height * scanTime.
-// A VIS-confirmed decode is therefore a known-duration event, not something
+// so the transmission's total length is fully predictable: scanTime *
+// transmittedLines(mode) — see encoder.ts, shared so this can't drift out of
+// sync with the encoder's own duration estimate again (it previously used
+// raw `height`, which is exactly 2x too long for PD modes: they pack two
+// image rows into every transmitted scan line/sync interval). A
+// VIS-confirmed decode is therefore a known-duration event, not something
 // that needs guessing at when it's over — auto-detect scanning (VIS + sync
 // timing) has no business running again until that deadline passes, and once
 // it does pass the decode should be considered finished regardless of how
 // many lines actually landed (line-count/slant errors, dropped sync pulses,
 // etc. can leave currentLine short of totalLines even on a clean signal).
 // A tolerance margin absorbs modest clock drift/slant between transmitter
-// and receiver without cutting off a still-legitimately-finishing image.
+// and receiver without cutting off a still-legitimately-finishing image;
+// decodingStart is stamped right as VIS/sync-timing detection completes
+// (after the leader/header), so this intentionally excludes VIS header time
+// — it only covers the scan lines.
 const EXPECTED_DURATION_TOLERANCE = 1.15
 
 export function expectedDurationMs(mode: SSTVMode): number {
   const cfg = SSTV_MODES[mode]
-  return cfg.height * cfg.scanTime * EXPECTED_DURATION_TOLERANCE
+  return transmittedLines(mode) * cfg.scanTime * EXPECTED_DURATION_TOLERANCE
 }
 // Raw RMS amplitude is a poor silence proxy on a real radio: a weak/noisy
 // signal (e.g. -80dBm+ HF, fading, AGC pumping) can dip under any fixed
@@ -289,16 +297,27 @@ export function createAudioProcessor(params: AudioProcessorParams) {
       }
 
       const now = Date.now()
+      const madeProgress = stats.currentLine > lastProgressLine
+      if (madeProgress) {
+        lastProgressLine = stats.currentLine
+        lastProgressAt = now
+      }
 
       if (params.autoDetect() && now - decodingStart >= expectedDurationMs(activeMode)) {
         // The mode's full expected length (known from VIS/scanTime, not a
-        // guess) has elapsed — the transmission is over regardless of how
-        // many lines actually landed. This is the primary way an auto-
-        // detected decode ends; stall/silence below only cover decodes that
-        // never get this far (e.g. the signal drops out long before the
-        // mode's natural length would even be reached).
-        captureCurrentImage(sampleRate)
-        return
+        // guess) has elapsed — normally the transmission is over regardless
+        // of how many lines actually landed, and this is the primary way an
+        // auto-detected decode ends. But a VIS-confirmed decode that is still
+        // visibly advancing right at the deadline (e.g. it spent real
+        // wall-clock time reconstructing missed-sync lines on a weak signal,
+        // see decodeLineSpan in decoder.ts) is not actually done — only treat
+        // silence/no-progress at the deadline as "finished"; a live decode
+        // gets bounded extensions (via the stall timeout below) instead of
+        // being cut off mid-image.
+        if (!visConfirmed || now - lastProgressAt >= STALL_TIMEOUT_MS) {
+          captureCurrentImage(sampleRate)
+          return
+        }
       }
 
       // Both heuristics below are guesses at "the transmission is over" from
@@ -310,10 +329,7 @@ export function createAudioProcessor(params: AudioProcessorParams) {
       // to avoid. Skip them for VIS-confirmed decodes and let the deadline
       // (or the hard line-count-complete check) be the only way out.
       if (!visConfirmed) {
-        if (stats.currentLine > lastProgressLine) {
-          lastProgressLine = stats.currentLine
-          lastProgressAt = now
-        } else if (now - lastProgressAt >= STALL_TIMEOUT_MS) {
+        if (!madeProgress && now - lastProgressAt >= STALL_TIMEOUT_MS) {
           // Backstop independent of the silence heuristic below — whatever the
           // reason (transmission ended and went undetected, a new unrelated
           // transmission started, signal dropped out), no line progress for
