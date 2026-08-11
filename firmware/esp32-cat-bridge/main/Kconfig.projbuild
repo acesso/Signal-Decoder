@@ -24,4 +24,22 @@ menu "CAT Bridge Config"
             runtime later via a WS control message if needed; for now this
             is the boot-time default.
 
+    config BRIDGE_AP_SSID
+        string "Fallback AP SSID"
+        default "usdx-bridge-setup"
+        help
+            SSID the bridge broadcasts on its own access point when it
+            can't join BRIDGE_WIFI_SSID (see wifi_net.c's AP-fallback
+            state). Fixed at build time, not user-editable via the control
+            page or NVS — this is a recovery mechanism for when the normal
+            network is unreachable, not a normal setting.
+
+    config BRIDGE_AP_PASSWORD
+        string "Fallback AP password"
+        default "usdxbridge"
+        help
+            WPA2-PSK password for BRIDGE_AP_SSID. Must be empty (open
+            network) or at least 8 characters — esp_wifi rejects shorter
+            WPA2 passwords at esp_wifi_set_config() time.
+
 endmenu

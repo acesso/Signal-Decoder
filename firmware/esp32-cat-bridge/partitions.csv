@@ -1,0 +1,11 @@
+# Name,     Type, SubType, Offset,   Size
+# Custom table (replaces the default "single app" table) to carve out a
+# small SPIFFS partition for the standalone control-page UI (see
+# main/control_page.c) alongside the existing single OTA-less app slot.
+# 4MB flash total; app currently ~870KB — 1.5MB leaves headroom for the
+# planned audio/WebRTC feature without needing another partition-table
+# change later. nvs/phy sizes match ESP-IDF's own default single-app table.
+nvs,        data, nvs,     0x9000,   0x6000,
+phy_init,   data, phy,     0xf000,   0x1000,
+factory,    app,  factory, 0x10000,  1500K,
+storage,    data, spiffs,  ,         256K,

@@ -7,8 +7,7 @@ idf_component_register(
         "cat_bridge.c"
         "ws_server.c"
         "http_control.c"
-        "lcd_pcd8544.c"
-        "status_display.c"
+        "control_page.c"
     INCLUDE_DIRS "."
     REQUIRES
         esp_wifi
@@ -17,9 +16,14 @@ idf_component_register(
         esp_system
         nvs_flash
         driver
-        esp_driver_ledc
         mdns
         esp_http_server
         esp_timer
         freertos
+        spiffs
 )
+
+# Bakes spiffs_data/ (the standalone control page's HTML/CSS/JS) into a
+# SPIFFS image fitted to the "storage" partition in partitions.csv, flashed
+# alongside the app under `idf.py flash`. See main/control_page.c.
+spiffs_create_partition_image(storage ../spiffs_data FLASH_IN_PROJECT)

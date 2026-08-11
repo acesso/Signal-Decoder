@@ -56,7 +56,7 @@ export interface CATConnectionConfig {
    *  unaffected). 'websocket' requires wsUrl. */
   transport?: CATTransportKind;
   /** ws:// URL of the ESP32 CAT bridge's /cat endpoint, e.g.
-   *  "ws://usdx-bridge.local:8765/cat". Only used when transport is 'websocket'. */
+   *  "ws://usdx-bridge.local/cat". Only used when transport is 'websocket'. */
   wsUrl?: string;
 }
 

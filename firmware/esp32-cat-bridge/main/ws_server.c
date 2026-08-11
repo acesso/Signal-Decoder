@@ -185,11 +185,25 @@ void ws_server_start(void) {
 
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = WS_SERVER_PORT;
+    // Default is 4096 — too tight once /wifi-scan's handler chain
+    // (wifi_scan_handler's on-stack result/body buffers calling into
+    // wifi_net_scan's own wifi_ap_record_t[32] buffer, ~3.2KB alone) is
+    // layered on top of esp_http_server's own per-request stack usage —
+    // discovered as a LoadStoreAlignment panic (stack overflow corrupting
+    // the call frame) on real hardware when /wifi-scan was first added.
+    config.stack_size = 6144;
     // +1 for handshake overlap on the WS route, +1 more headroom for a
     // short-lived /status or /reset request landing alongside all WS_MAX_CLIENTS
     // already-open CAT sockets.
     config.max_open_sockets = WS_MAX_CLIENTS + 2;
     config.close_fn = on_client_close;
+    // Default is 8 — this server now registers 9 URI handlers (/cat, /status,
+    // /info, /reset, /wifi-config, /* OPTIONS, plus control_page's /,
+    // /style.css, /app.js), so the default silently overflows
+    // (ESP_ERR_HTTPD_HANDLERS_FULL, discovered as a boot-loop on real
+    // hardware once control_page.c was added). Rounded up with headroom for
+    // one or two more routes before this needs revisiting again.
+    config.max_uri_handlers = 12;
     // Wildcard matching so http_control.c can register a single "/*" OPTIONS
     // handler for CORS preflight instead of one per concrete route — exact
     // routes (/cat, /status, /reset) still match themselves first under this
