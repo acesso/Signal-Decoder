@@ -12,6 +12,8 @@
 #pragma once
 
 #include "driver/gpio.h"
+#include "driver/i2c_master.h"
+#include "driver/i2s_std.h"
 #include "driver/uart.h"
 
 // ── Bridge firmware version + capabilities ──────────────────────────────────
@@ -59,6 +61,42 @@
 // two people fought over one physical knob).
 #define WS_SERVER_PORT          80
 #define WS_MAX_CLIENTS          4
+
+// ── Audio codec (ES8388, onboard) ───────────────────────────────────────────
+// Pin map + I2C address cross-verified against community A1S v2.2 board
+// support files (ESP-ADF forks, arduino-audiokit) — Espressif's own esp-adf
+// repo no longer ships a board file for this exact board, so no primary
+// source could be checked. PA polarity (ES8388_PA_REVERTED) is the one
+// unconfirmed value — no source gave an explicit active-high/active-low
+// statement, only circumstantial evidence pointing to active-high (false).
+// Revisit if the amp turns out to be permanently on or permanently silent.
+#define ES8388_I2C_PORT         I2C_NUM_0
+#define ES8388_I2C_SDA_PIN      GPIO_NUM_33
+#define ES8388_I2C_SCL_PIN      GPIO_NUM_32
+#define ES8388_I2C_ADDR         0x20            // 8-bit form; esp_codec_dev right-shifts internally
+#define ES8388_I2S_PORT         I2S_NUM_0
+#define ES8388_I2S_MCLK_PIN     GPIO_NUM_0
+#define ES8388_I2S_BCLK_PIN     GPIO_NUM_27
+#define ES8388_I2S_WS_PIN       GPIO_NUM_25
+#define ES8388_I2S_DOUT_PIN     GPIO_NUM_26     // ESP32 -> codec DAC (audio out)
+#define ES8388_I2S_DIN_PIN      GPIO_NUM_35     // codec ADC -> ESP32 (audio in)
+#define ES8388_PA_ENABLE_PIN    GPIO_NUM_21
+#define ES8388_PA_REVERTED      false           // unconfirmed — see note above
+#define ES8388_SAMPLE_RATE_HZ   16000           // enough for level metering, not hi-fi playback
+#define ES8388_MASTER_MODE      true            // ESP32 drives I2S clocks, ES8388 is I2S slave
+
+// ── Status LEDs (onboard, shared with buttons — see wiring notes in the
+// README) ───────────────────────────────────────────────────────────────────
+// GPIO22 is an independent pin; GPIO19 doubles as the KEY3 button input, so
+// driving it as an output here means KEY3 can no longer be read (acceptable
+// — nothing in this firmware reads any onboard button). Normal operation
+// shows one LED per audio direction (brightness ~ RMS level); Wi-Fi
+// connecting/AP-fallback/no-CAT states borrow the same two LEDs with
+// distinct blink patterns — see led_status.c for the priority order.
+#define LED_AUDIO_IN_PIN        GPIO_NUM_22
+#define LED_AUDIO_OUT_PIN       GPIO_NUM_19
+#define LED_PWM_FREQ_HZ         2000
+#define LED_PWM_RESOLUTION      LEDC_TIMER_8_BIT
 
 // ── Task placement ───────────────────────────────────────────────────────────
 // Wi-Fi/lwIP/httpd's own internal tasks are explicitly pinned to core 0 via

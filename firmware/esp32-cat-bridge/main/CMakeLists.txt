@@ -8,6 +8,8 @@ idf_component_register(
         "ws_server.c"
         "http_control.c"
         "control_page.c"
+        "led_status.c"
+        "audio_monitor.c"
     INCLUDE_DIRS "."
     REQUIRES
         esp_wifi
@@ -21,6 +23,7 @@ idf_component_register(
         esp_timer
         freertos
         spiffs
+        esp_codec_dev
 )
 
 # Bakes spiffs_data/ (the standalone control page's HTML/CSS/JS) into a
