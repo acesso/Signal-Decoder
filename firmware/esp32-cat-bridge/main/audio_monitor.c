@@ -10,6 +10,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
+#include "audio_ws.h"
 #include "bridge_config.h"
 #include "led_status.h"
 
@@ -17,17 +18,21 @@ static const char *TAG = "audio_monitor";
 
 // Read in ~50ms windows — fine RMS resolution for a status LED (not audio
 // quality), matches led_status's own 50ms tick so every read produces a
-// fresh brightness update with no wasted work.
-#define READ_SAMPLES 800 // 16000 Hz * 0.05s
+// fresh brightness update with no wasted work. Also the unit the /audio
+// WebSocket broadcasts in — 400 samples * 2 bytes = 800-byte binary frames,
+// small enough not to fragment on a typical Wi-Fi MTU.
+#define READ_SAMPLES 400 // 8000 Hz * 0.05s
 
 static esp_codec_dev_handle_t s_codec_dev = NULL;
 
-// Last computed "in" LED level, shared between audio_task (the sole
-// writer) and audio_monitor_report_out_samples() (a reader, so it can push
-// a combined {in, out} pair to led_status_set_audio_levels() without
-// clobbering whatever audio_task last measured for "in"). Plain atomic,
-// not a lock — a one-tick-stale read here is invisible on a status LED.
-static _Atomic uint8_t s_last_in_level = 0;
+// "in" is written by audio_task (the sole in-direction producer) and read
+// by nothing else; "out" is written by audio_rx_callback (called from
+// whichever httpd worker owns a given /audio client's socket — NOT
+// audio_task's own task) and never read back here. Plain atomics, not a
+// lock: each field has exactly one writer, and led_status_set_audio_levels
+// tolerates a one-tick-stale read on either side — invisible on a status LED.
+static _Atomic uint8_t s_level_in = 0;
+static _Atomic uint8_t s_level_out = 0;
 
 // Maps a 16-bit PCM RMS value to an LED brightness curve. Linear RMS->duty
 // would make the LED look "always half-on" for typical speech/audio levels
@@ -50,11 +55,31 @@ static float compute_rms(const int16_t *samples, size_t count) {
     return (float)sqrt(sum_sq / (double)count);
 }
 
-void audio_monitor_report_out_samples(const int16_t *samples, size_t count) {
-    float rms = compute_rms(samples, count);
-    led_status_set_audio_levels(atomic_load(&s_last_in_level), rms_to_led_level(rms));
+// Browser -> radio: called by audio_ws whenever a /audio client sends a
+// binary frame (remote operator's mic, already resampled to
+// ES8388_SAMPLE_RATE_HZ by the browser — see the web app's audio hook).
+// Writes straight to the DAC; if no client is actually sending anything,
+// this simply never gets called and the DAC just carries whatever silence
+// esp_codec_dev/I2S underruns to on its own.
+static void audio_rx_callback(const int16_t *samples, size_t count) {
+    if (count == 0) return;
+    int ret = esp_codec_dev_write(s_codec_dev, (void *)samples, count * sizeof(int16_t));
+    if (ret != ESP_CODEC_DEV_OK) {
+        ESP_LOGW(TAG, "codec write failed (%d)", ret);
+    }
+    atomic_store(&s_level_out, rms_to_led_level(compute_rms(samples, count)));
+    led_status_set_audio_levels(atomic_load(&s_level_in), atomic_load(&s_level_out));
 }
 
+void audio_monitor_report_out_samples(const int16_t *samples, size_t count) {
+    // Kept as a thin alias — a future in-firmware playback source (rather
+    // than the /audio WebSocket) could feed the same level/LED pipeline
+    // this way without needing to know about audio_rx_callback at all.
+    audio_rx_callback(samples, count);
+}
+
+// Radio -> browser: continuously reads the ADC, updates the "in" LED level,
+// and broadcasts the raw samples to every connected /audio client.
 static void audio_task(void *arg) {
     int16_t *buf = malloc(READ_SAMPLES * sizeof(int16_t));
     if (!buf) {
@@ -70,14 +95,10 @@ static void audio_task(void *arg) {
             vTaskDelay(pdMS_TO_TICKS(200));
             continue;
         }
-        float rms = compute_rms(buf, READ_SAMPLES);
-        uint8_t level = rms_to_led_level(rms);
-        atomic_store(&s_last_in_level, level);
-        // "out" is fed exclusively by audio_monitor_report_out_samples()
-        // (nothing calls it yet — see audio_monitor.h) — reads back 0 here
-        // until that exists, so the out LED just stays off, which is
-        // correct: there's genuinely no audio-out signal to show yet.
-        led_status_set_audio_levels(level, 0);
+        uint8_t level = rms_to_led_level(compute_rms(buf, READ_SAMPLES));
+        atomic_store(&s_level_in, level);
+        led_status_set_audio_levels(level, atomic_load(&s_level_out));
+        audio_ws_send_to_clients(buf, READ_SAMPLES);
     }
 }
 
@@ -173,6 +194,7 @@ void audio_monitor_start(void) {
         return;
     }
 
+    audio_ws_set_rx_callback(audio_rx_callback);
     xTaskCreate(audio_task, "audio_monitor", 4096, NULL, tskIDLE_PRIORITY + 3, NULL);
-    ESP_LOGI(TAG, "ES8388 audio monitor started (in=ADC, out=idle until a playback feature feeds it)");
+    ESP_LOGI(TAG, "ES8388 audio monitor started (in=ADC -> /audio broadcast, out=/audio rx -> DAC)");
 }

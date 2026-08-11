@@ -20,12 +20,11 @@
 static const char *TAG = "http_control";
 
 // Additive-only capability list — see the versioning note in bridge_config.h.
-// "audio" is deliberately NOT listed yet: no WebRTC/audio firmware exists,
-// and the web app treats an absent flag as "not supported", so there is
-// nothing to reserve here beyond this comment. Add the string literally
-// once real audio support ships.
+// "audio" means: /audio WebSocket exists, carrying raw 16-bit PCM mono at
+// ES8388_SAMPLE_RATE_HZ in both directions (see audio_ws.h/audio_monitor.h)
+// — the web app should gate its audio UI on this rather than assuming it.
 static const char *const BRIDGE_FEATURES[] = {
-    "cat", "wifi_config", "wifi_scan", "reset",
+    "cat", "wifi_config", "wifi_scan", "reset", "audio",
 };
 #define BRIDGE_FEATURES_COUNT (sizeof(BRIDGE_FEATURES) / sizeof(BRIDGE_FEATURES[0]))
 

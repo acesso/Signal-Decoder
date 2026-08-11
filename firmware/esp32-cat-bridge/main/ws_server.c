@@ -8,6 +8,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 
+#include "audio_ws.h"
 #include "bridge_config.h"
 #include "bridge_state.h"
 #include "cat_bridge.h"
@@ -170,11 +171,15 @@ static esp_err_t cat_ws_handler(httpd_req_t *req) {
 
 // httpd_close_func_t returns void — httpd itself always closes the socket
 // after calling this hook, so we only need to clear our own bookkeeping.
+// This is the ONLY close_fn httpd supports per server instance — since
+// /audio shares this httpd instance with /cat, this hook also untracks the
+// closed fd from audio_ws's client set (a no-op if it was never one).
 static void on_client_close(httpd_handle_t hd, int sockfd) {
     xSemaphoreTake(s_client_mutex, portMAX_DELAY);
     remove_client_locked(sockfd);
     publish_client_count_locked();
     xSemaphoreGive(s_client_mutex);
+    audio_ws_on_client_close(sockfd);
     ESP_LOGI(TAG, "CAT client socket closed (fd=%d)", sockfd);
     close(sockfd);
 }
@@ -192,18 +197,18 @@ void ws_server_start(void) {
     // discovered as a LoadStoreAlignment panic (stack overflow corrupting
     // the call frame) on real hardware when /wifi-scan was first added.
     config.stack_size = 6144;
-    // +1 for handshake overlap on the WS route, +1 more headroom for a
-    // short-lived /status or /reset request landing alongside all WS_MAX_CLIENTS
-    // already-open CAT sockets.
-    config.max_open_sockets = WS_MAX_CLIENTS + 2;
+    // +2 headroom for a short-lived /status/etc request landing alongside
+    // every already-open CAT AND audio socket at once (both routes share
+    // this one httpd instance/socket pool).
+    config.max_open_sockets = WS_MAX_CLIENTS + AUDIO_WS_MAX_CLIENTS + 2;
     config.close_fn = on_client_close;
-    // Default is 8 — this server now registers 9 URI handlers (/cat, /status,
-    // /info, /reset, /wifi-config, /* OPTIONS, plus control_page's /,
-    // /style.css, /app.js), so the default silently overflows
-    // (ESP_ERR_HTTPD_HANDLERS_FULL, discovered as a boot-loop on real
-    // hardware once control_page.c was added). Rounded up with headroom for
-    // one or two more routes before this needs revisiting again.
-    config.max_uri_handlers = 12;
+    // Default is 8 — this server now registers 10 URI handlers (/cat, /audio,
+    // /status, /info, /wifi-scan, /reset, /wifi-config, /* OPTIONS, plus
+    // control_page's /, /style.css, /app.js), so the default silently
+    // overflows (ESP_ERR_HTTPD_HANDLERS_FULL, discovered as a boot-loop on
+    // real hardware once control_page.c was added). Rounded up well past
+    // the current count for headroom before this needs revisiting again.
+    config.max_uri_handlers = 16;
     // Wildcard matching so http_control.c can register a single "/*" OPTIONS
     // handler for CORS preflight instead of one per concrete route — exact
     // routes (/cat, /status, /reset) still match themselves first under this

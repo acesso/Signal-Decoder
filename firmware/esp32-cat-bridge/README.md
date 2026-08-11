@@ -13,11 +13,11 @@ below, unused by this firmware). Only 7 header GPIOs are free (0, 5, 18, 19,
 21, 22, 23) and every one already drives an onboard button, LED, or the
 amplifier-enable line — this firmware claims 2 of them (18, 23) for the CAT
 UART and 1 more (22, plus 19 which doubles as a button) for the two status
-LEDs, leaving the rest alone. The onboard codec is brought up far enough to
-meter its ADC input for the status LEDs (see below) — there is no real
-audio-out pipeline yet (that's a future audio/WebRTC feature: RX/TX audio
-streamed over the same link instead of a USB sound-card interface, plus any
-other small radio controls that make sense to add once the bridge exists).
+LEDs, leaving the rest alone. The onboard codec streams both directions —
+radio speaker audio out to the browser, browser mic audio into the radio's
+mic input — over a second WebSocket (see Audio bridge below); any other
+small radio controls that make sense to add now that both CAT and audio
+exist are open for later.
 
 An earlier revision of this firmware targeted a bare ESP32-WROOM-32 board
 with a PCD8544 LCD status display — that hardware is no longer in use; the
@@ -90,12 +90,14 @@ Radio  <----------------------------->  ESP32  <--------------------------------
 - **`bridge_state`** is a small mutex-guarded struct that the above modules
   write to and `http_control` reads from for `GET /status` — the only
   shared state in the firmware.
-- **`audio_monitor`** brings up the onboard ES8388 codec (I2C control +
-  I2S audio) far enough to read its ADC continuously and compute an RMS
-  level for the status LEDs below. No audio-out pipeline exists yet —
-  `audio_monitor_report_out_samples()` is the hook a future playback
-  feature will call, but nothing does today, so the "out" LED just stays
-  off (a real absence of signal, not a bug).
+- **`audio_monitor`** brings up the onboard ES8388 codec (I2C control + I2S
+  audio) and bridges it bidirectionally to `audio_ws`: reads the ADC
+  continuously, computes an RMS level for the status LEDs, and broadcasts
+  the raw samples to every `/audio` client; writes whatever a client sends
+  straight to the DAC, with its own RMS feeding the other LED.
+- **`audio_ws`** is `/audio`'s WebSocket route — the same "byte-transparent,
+  no framing beyond the raw payload" philosophy as `/cat`, just carrying
+  16-bit PCM samples instead of ASCII CAT commands. See Audio bridge below.
 - **`led_status`** drives the board's two status LEDs via LEDC PWM — see
   the LED legend below for what each state looks like.
 
@@ -112,9 +114,30 @@ output here costs nothing) show, in priority order (highest wins):
 | No CAT traffic (>3s) | Both LEDs pulse together slowly (2s); live audio still shows as brightness riding on top of the pulse |
 | Normal               | LED1 (GPIO22) = audio-in level, LED2 (GPIO19) = audio-out level, plain brightness, no blink           |
 
-Audio-out currently always reads silent (see `audio_monitor` above) —
-that LED effectively stays off during "Normal" until a real audio-out
-feature ships.
+### Audio bridge
+
+`GET /audio` upgrades to a WebSocket carrying raw 16-bit signed PCM, mono,
+`ES8388_SAMPLE_RATE_HZ` (8000 Hz — plenty for SSB voice, ~2.7kHz bandwidth),
+in both directions:
+
+- **bridge → browser**: radio speaker audio, read continuously from the
+  ES8388 ADC and broadcast to every connected `/audio` client
+  (`AUDIO_WS_MAX_CLIENTS` in `bridge_config.h` — deliberately small, each
+  open session is real continuous UART/I2S-competing work, unlike `/cat`'s
+  near-idle text frames)
+- **browser → bridge**: a remote operator's mic, written straight to the
+  ES8388 DAC (feeding the radio's mic input through the board's own
+  transformer/RC filtering on that physical path)
+
+Deliberately **not real WebRTC** — there is no mature, maintained WebRTC
+library for bare ESP-IDF (no ICE/DTLS-SRTP stack), so this reuses the same
+WebSocket infrastructure already proven working for `/cat`, at the cost of
+somewhat higher latency than true peer-to-peer RTP would have. Acceptable
+for voice on a local network; revisit if this ever needs to leave the LAN.
+
+No compression — raw PCM at 8kHz is ~128kbit/s, trivial for Wi-Fi, and
+avoids running any codec math on the ESP32 (G.711/Opus were considered and
+explicitly not used — see the Known Limitations note on this choice).
 
 ### Core placement
 
@@ -211,10 +234,9 @@ for `spiffs_data/`. `idf.py flash` writes both; editing anything under
   still counts toward `WS_MAX_CLIENTS` even though nothing's really there.
 - **Static-file hosting is SPIFFS-only, for the control page alone.** The
   ESP32 does not serve the Signal-Decoder web app's own `dist/` —
-  deliberately deferred until the audio feature's flash/RAM budget is
-  known. `partitions.csv`'s `storage` partition (256KB) has room to spare
-  if that's wanted later, but a full app bundle is a different order of
-  size than the control page's few KB.
+  `partitions.csv`'s `storage` partition (256KB) has room to spare if
+  that's wanted later, but a full app bundle is a different order of size
+  than the control page's few KB.
 - **Baud rate is boot-time only.** `cat_bridge_set_baud()` exists for a
   future runtime control message but nothing calls it yet — changing baud
   today means editing Kconfig and reflashing.
@@ -234,14 +256,22 @@ for `spiffs_data/`. `idf.py flash` writes both; editing anything under
   value is a best guess based on circumstantial evidence. If the amp turns
   out permanently on, permanently silenced, or audio_monitor's level
   readings look inverted/wrong, this is the first thing to check.
-- **Audio-out level metering is wired up but always reads silent.** There's
-  no audio-out pipeline yet — `audio_monitor_report_out_samples()` exists
-  for a future playback feature to call, but nothing does today, so the
-  "out" status LED stays off during normal operation. Not a bug: there's
-  genuinely no signal to show.
-- **Audio sample rate is fixed at 16kHz mono, sized for level metering, not
-  audio quality.** `ES8388_SAMPLE_RATE_HZ` in `bridge_config.h` — revisit
-  once a real audio-out/WebRTC feature needs a different rate.
+- **No compression on `/audio`.** Raw PCM was a deliberate choice (see Audio
+  bridge above) — trivial bitrate at 8kHz on a home LAN, zero codec CPU cost
+  on the ESP32. G.711 (halves bandwidth, negligible CPU) and Opus (much
+  better quality/compression, real CPU + flash cost, WebRTC-grade) were both
+  considered; revisit if this bridge ever needs to run over a link where
+  128kbit/s actually matters.
+- **`/audio` has no per-client mixing.** If more than one browser sends mic
+  audio at once, whichever `esp_codec_dev_write()` call lands last on a
+  given ~50ms window wins — same "last command on the wire" model `/cat`
+  already uses for CAT commands, just applied to audio instead. Fine for
+  the expected one-remote-operator-at-a-time use case; would need real
+  mixing if that assumption ever changes.
+- **Audio sample rate is fixed at 8kHz mono.** `ES8388_SAMPLE_RATE_HZ` in
+  `bridge_config.h` — plenty for SSB voice (~2.7kHz bandwidth) and keeps
+  `/audio`'s bitrate trivial; revisit only if a future mode needs wider
+  audio bandwidth than voice.
 
 ## Web app integration
 
@@ -257,3 +287,14 @@ read-loop plumbing at the bottom of `useRadioCAT.ts` differs per transport.
 The web app's Bridge panel (in the Radio CAT settings) also exposes the
 `http_control` endpoints above — status, restart, Wi-Fi network change —
 gated on whatever `GET /info` reports the connected bridge supports.
+
+`src/lib/cat/useAudioBridge.ts` (also gated on `GET /info`'s `"audio"`
+feature) opens the `/audio` WebSocket, plays received samples via Web Audio
+(back-to-back `AudioBufferSourceNode`s, since there's no "append to an
+ongoing stream" primitive), and captures the browser's mic through the
+same `createCaptureNode` AudioWorklet the app's decoders use, linearly
+resampled to `ES8388_SAMPLE_RATE_HZ` before sending. The standalone control
+page (`spiffs_data/app.js`) implements the same protocol independently in
+plain JS (`ScriptProcessorNode` instead of an AudioWorklet module, since
+that page has no bundler) — useful for debugging the audio path directly
+from the bridge itself, without the web app in the loop at all.
