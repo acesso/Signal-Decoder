@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>uSDX CAT bridge</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<h1>uSDX CAT bridge</h1>
+
+<section id="status-card" class="card">
+  <h2>Status</h2>
+  <dl id="status-list">
+    <dt>Wi-Fi</dt><dd id="s-wifi">&hellip;</dd>
+    <dt>IP address</dt><dd id="s-ip">&hellip;</dd>
+    <dt>Signal</dt><dd id="s-rssi">&hellip;</dd>
+    <dt>Radio link</dt><dd id="s-radio">&hellip;</dd>
+    <dt>WebSocket clients</dt><dd id="s-clients">&hellip;</dd>
+    <dt>Uptime</dt><dd id="s-uptime">&hellip;</dd>
+    <dt>Firmware</dt><dd id="s-fw">&hellip;</dd>
+  </dl>
+  <button id="refresh-btn" type="button">Refresh</button>
+</section>
+
+<section id="wifi-card" class="card">
+  <h2>Wi-Fi network</h2>
+  <form id="wifi-form">
+    <label for="wifi-ssid">SSID</label>
+    <div class="row">
+      <select id="wifi-ssid" name="ssid" required></select>
+      <button id="scan-btn" type="button" class="icon-btn" title="Scan for networks" aria-label="Scan for networks"><span class="icon-glyph">&#x21bb;</span></button>
+    </div>
+    <label for="wifi-pass">Password</label>
+    <input id="wifi-pass" name="password" type="password" autocomplete="off">
+    <button type="submit">Save &amp; reboot</button>
+  </form>
+  <p class="hint">Saves to the bridge's own storage and reboots to join the
+  new network. You'll need to reconnect at the new address (or
+  <code>usdx-bridge.local</code> once mDNS updates). If the new network
+  can't be reached, the bridge falls back to broadcasting its own
+  "<code>usdx-bridge-setup</code>"-style access point at
+  <code>192.168.4.1</code> so you can fix it here again.</p>
+</section>
+
+<section id="reset-card" class="card">
+  <h2>Restart bridge</h2>
+  <button id="reset-btn" type="button" class="danger">Restart now</button>
+</section>
+
+<p id="msg" role="status"></p>
+
+<script src="/app.js"></script>
+</body>
+</html>

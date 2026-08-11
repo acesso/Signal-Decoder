@@ -23,8 +23,12 @@ static EventGroupHandle_t s_wifi_event_group;
 
 static int s_retry_count = 0;
 static bool s_mdns_started = false;
+static bool s_ap_fallback_active = false;
+static esp_netif_t *s_ap_netif = NULL;
 
 static void start_mdns(void);
+static void start_ap_fallback(void);
+static void stop_ap_fallback(void);
 
 // bridge_state_update() mutator callbacks — plain static functions (not
 // nested functions) so this builds with any standard C compiler and never
@@ -72,19 +76,25 @@ static void event_handler(void *arg, esp_event_base_t event_base,
         set_wifi_state(BRIDGE_WIFI_CONNECTING);
         esp_wifi_connect();
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
-        set_wifi_state(s_retry_count < BRIDGE_WIFI_MAXIMUM_RETRY
-            ? BRIDGE_WIFI_CONNECTING : BRIDGE_WIFI_DISCONNECTED);
         // Unattended device: always keep retrying so it self-heals from a
         // router reboot or a temporary outage. The retry counter only
         // gates how long the initial xEventGroupWaitBits() in
-        // wifi_net_start() blocks boot — past BRIDGE_WIFI_MAXIMUM_RETRY we
-        // signal WIFI_FAIL_BIT once (to unblock startup) but keep calling
-        // esp_wifi_connect() on every disconnect event forever after.
+        // wifi_net_start() blocks boot, AND when AP fallback kicks in —
+        // past BRIDGE_WIFI_MAXIMUM_RETRY we signal WIFI_FAIL_BIT once (to
+        // unblock startup) and start broadcasting our own AP, but keep
+        // calling esp_wifi_connect() on every disconnect event forever
+        // after so it drops the fallback AP the moment the real network
+        // comes back.
         if (s_retry_count < BRIDGE_WIFI_MAXIMUM_RETRY) {
             s_retry_count++;
+            set_wifi_state(BRIDGE_WIFI_CONNECTING);
             ESP_LOGW(TAG, "retry connecting to AP (%d/%d)", s_retry_count, BRIDGE_WIFI_MAXIMUM_RETRY);
         } else {
             xEventGroupSetBits(s_wifi_event_group, WIFI_FAIL_BIT);
+            if (!s_ap_fallback_active) {
+                start_ap_fallback();
+            }
+            set_wifi_state(BRIDGE_WIFI_AP_FALLBACK);
             ESP_LOGW(TAG, "still retrying connection to AP in the background");
         }
         esp_wifi_connect();
@@ -95,6 +105,9 @@ static void event_handler(void *arg, esp_event_base_t event_base,
         set_wifi_ip(&event->ip_info.ip);
         set_wifi_state(BRIDGE_WIFI_CONNECTED);
         update_rssi();
+        if (s_ap_fallback_active) {
+            stop_ap_fallback();
+        }
         if (!s_mdns_started) {
             start_mdns();
             s_mdns_started = true;
@@ -103,13 +116,48 @@ static void event_handler(void *arg, esp_event_base_t event_base,
     }
 }
 
+// Broadcasts BRIDGE_AP_SSID (WIFI_MODE_APSTA — STA keeps retrying the real
+// network underneath) so the control page stays reachable at the AP's
+// fixed IP (192.168.4.1, esp_netif's default for a soft-AP) even when the
+// configured home network is unreachable. Left running until
+// IP_EVENT_STA_GOT_IP fires (see stop_ap_fallback()) — there is no separate
+// timeout for the AP itself, since leaving it up costs nothing but a
+// little extra RF/RAM and the alternative (silently giving up) would strand
+// the device.
+static void start_ap_fallback(void) {
+    if (!s_ap_netif) {
+        s_ap_netif = esp_netif_create_default_wifi_ap();
+    }
+
+    wifi_config_t ap_config = { 0 };
+    strncpy((char *)ap_config.ap.ssid, CONFIG_BRIDGE_AP_SSID, sizeof(ap_config.ap.ssid) - 1);
+    ap_config.ap.ssid_len = strlen(CONFIG_BRIDGE_AP_SSID);
+    strncpy((char *)ap_config.ap.password, CONFIG_BRIDGE_AP_PASSWORD, sizeof(ap_config.ap.password) - 1);
+    ap_config.ap.channel = 1;
+    ap_config.ap.max_connection = 4;
+    ap_config.ap.authmode = strlen(CONFIG_BRIDGE_AP_PASSWORD) == 0 ? WIFI_AUTH_OPEN : WIFI_AUTH_WPA2_PSK;
+
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap_config));
+    s_ap_fallback_active = true;
+    ESP_LOGW(TAG, "AP fallback active: broadcasting \"%s\" at 192.168.4.1 "
+                   "(control page reachable there while retrying the real network)",
+              CONFIG_BRIDGE_AP_SSID);
+}
+
+static void stop_ap_fallback(void) {
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    s_ap_fallback_active = false;
+    ESP_LOGI(TAG, "reconnected to home network — AP fallback dropped");
+}
+
 static void start_mdns(void) {
     ESP_ERROR_CHECK(mdns_init());
     ESP_ERROR_CHECK(mdns_hostname_set(BRIDGE_HOSTNAME));
     ESP_ERROR_CHECK(mdns_instance_name_set("uSDX CAT Bridge"));
 
     mdns_txt_item_t txt[] = {
-        { "board",   "esp32-wroom-32" },
+        { "board",   "esp32-a1s" },
         { "service", "cat" },
     };
     ESP_ERROR_CHECK(mdns_service_add("uSDX CAT Bridge", "_cat-bridge", "_tcp",
@@ -173,4 +221,63 @@ void wifi_net_start(void) {
                        "in the background (event_handler retries unboundedly "
                        "past the initial fast-retry counter)");
     }
+}
+
+int wifi_net_scan(wifi_net_scan_result_t *out, int max_results) {
+    // block=true: simplest for a request/response HTTP handler — the
+    // caller (http_control's /wifi-scan) is already off the Wi-Fi/lwIP
+    // core-0 tasks (httpd worker), so blocking here doesn't contend with
+    // CAT UART on core 1, and a synchronous "scan done, here are the
+    // results" response is easier to reason about than a two-step
+    // start/poll API for something the control page only calls when the
+    // user clicks refresh.
+    wifi_scan_config_t scan_config = { 0 };
+    esp_err_t err = esp_wifi_scan_start(&scan_config, true);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "scan failed: %s", esp_err_to_name(err));
+        return -1;
+    }
+
+    uint16_t found = 0;
+    esp_wifi_scan_get_ap_num(&found);
+    if (found == 0) return 0;
+
+    // Static, not stack-local: wifi_ap_record_t is ~90 bytes, so a [32]
+    // array is ~2.9KB — layered on top of the caller's own httpd-worker
+    // stack usage, that overflowed the httpd worker's stack and corrupted
+    // the call frame (LoadStoreAlignment panic) the first time this ran on
+    // real hardware. wifi_net_scan() is only ever called synchronously
+    // from one HTTP request at a time (the control page's single refresh
+    // button), so a shared static buffer is safe — no concurrent scan can
+    // be in flight to race it.
+    static wifi_ap_record_t records[32];
+    uint16_t to_fetch = found < 32 ? found : 32;
+    err = esp_wifi_scan_get_ap_records(&to_fetch, records);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "failed to fetch scan results: %s", esp_err_to_name(err));
+        return -1;
+    }
+
+    // Dedup by SSID, keeping the strongest RSSI — the same home network
+    // is often visible on multiple APs/channels (mesh systems, repeaters),
+    // and a select box listing "MyWiFi" three times is just confusing.
+    int count = 0;
+    for (uint16_t i = 0; i < to_fetch && count < max_results; i++) {
+        const char *ssid = (const char *)records[i].ssid;
+        if (ssid[0] == '\0') continue; // hidden network, nothing to show/select
+
+        int existing = -1;
+        for (int j = 0; j < count; j++) {
+            if (strcmp(out[j].ssid, ssid) == 0) { existing = j; break; }
+        }
+        if (existing >= 0) {
+            if (records[i].rssi > out[existing].rssi) out[existing].rssi = records[i].rssi;
+            continue;
+        }
+        strncpy(out[count].ssid, ssid, sizeof(out[count].ssid) - 1);
+        out[count].ssid[sizeof(out[count].ssid) - 1] = '\0';
+        out[count].rssi = records[i].rssi;
+        count++;
+    }
+    return count;
 }

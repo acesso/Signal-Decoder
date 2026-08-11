@@ -16,8 +16,6 @@ static const char *TAG = "bridge_settings";
 #define NVS_NAMESPACE "bridge_cfg"
 #define NVS_KEY_SSID     "wifi_ssid"
 #define NVS_KEY_PASSWORD "wifi_pass"
-#define NVS_KEY_BACKLIGHT "backlight"
-#define NVS_KEY_CONTRAST "contrast"
 
 // nvs_flash_init() is already called once by wifi_net_start() (Wi-Fi driver
 // requires it) — but bridge_settings_init() runs first in app_main, before
@@ -64,42 +62,4 @@ bool bridge_settings_set_wifi(const char *ssid, const char *password) {
     bool ok = e1 == ESP_OK && e2 == ESP_OK && e3 == ESP_OK;
     ESP_LOGI(TAG, "saved new Wi-Fi credentials to NVS (ssid=%s): %s", ssid, ok ? "ok" : "FAILED");
     return ok;
-}
-
-uint8_t bridge_settings_get_backlight(void) {
-    nvs_handle_t h;
-    uint8_t duty = LCD_BACKLIGHT_DEFAULT_DUTY;
-    if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &h) == ESP_OK) {
-        nvs_get_u8(h, NVS_KEY_BACKLIGHT, &duty); // leaves `duty` untouched on any failure
-        nvs_close(h);
-    }
-    return duty;
-}
-
-bool bridge_settings_set_backlight(uint8_t duty) {
-    nvs_handle_t h;
-    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h) != ESP_OK) return false;
-    esp_err_t e1 = nvs_set_u8(h, NVS_KEY_BACKLIGHT, duty);
-    esp_err_t e2 = nvs_commit(h);
-    nvs_close(h);
-    return e1 == ESP_OK && e2 == ESP_OK;
-}
-
-uint8_t bridge_settings_get_contrast(void) {
-    nvs_handle_t h;
-    uint8_t vop = LCD_CONTRAST_DEFAULT_VOP;
-    if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &h) == ESP_OK) {
-        nvs_get_u8(h, NVS_KEY_CONTRAST, &vop); // leaves `vop` untouched on any failure
-        nvs_close(h);
-    }
-    return vop;
-}
-
-bool bridge_settings_set_contrast(uint8_t vop) {
-    nvs_handle_t h;
-    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h) != ESP_OK) return false;
-    esp_err_t e1 = nvs_set_u8(h, NVS_KEY_CONTRAST, vop);
-    esp_err_t e2 = nvs_commit(h);
-    nvs_close(h);
-    return e1 == ESP_OK && e2 == ESP_OK;
 }

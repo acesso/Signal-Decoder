@@ -14,7 +14,6 @@
 #include "bridge_config.h"
 #include "bridge_settings.h"
 #include "bridge_state.h"
-#include "lcd_pcd8544.h"
 #include "ws_server.h"
 #include "wifi_net.h"
 
@@ -26,7 +25,7 @@ static const char *TAG = "http_control";
 // nothing to reserve here beyond this comment. Add the string literally
 // once real audio support ships.
 static const char *const BRIDGE_FEATURES[] = {
-    "cat", "backlight", "wifi_config", "reset", "contrast",
+    "cat", "wifi_config", "wifi_scan", "reset",
 };
 #define BRIDGE_FEATURES_COUNT (sizeof(BRIDGE_FEATURES) / sizeof(BRIDGE_FEATURES[0]))
 
@@ -34,6 +33,7 @@ static const char *wifi_state_str(bridge_wifi_state_t s) {
     switch (s) {
         case BRIDGE_WIFI_CONNECTED:    return "connected";
         case BRIDGE_WIFI_CONNECTING:   return "connecting";
+        case BRIDGE_WIFI_AP_FALLBACK:  return "ap_fallback";
         case BRIDGE_WIFI_DISCONNECTED:
         default:                      return "disconnected";
     }
@@ -126,6 +126,43 @@ static esp_err_t info_handler(httpd_req_t *req) {
     return httpd_resp_send(req, body, o);
 }
 
+// GET /wifi-scan — blocking active scan for the control page's network
+// select box. Deduped/sorted-by-nothing-in-particular list straight from
+// wifi_net_scan(); the browser doesn't need anything smarter than "here are
+// the networks currently in range."
+static esp_err_t wifi_scan_handler(httpd_req_t *req) {
+    wifi_net_scan_result_t results[WIFI_NET_SCAN_MAX_RESULTS];
+    int count = wifi_net_scan(results, WIFI_NET_SCAN_MAX_RESULTS);
+    if (count < 0) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "scan failed");
+        return ESP_FAIL;
+    }
+
+    char body[WIFI_NET_SCAN_MAX_RESULTS * 48 + 32];
+    size_t o = (size_t)snprintf(body, sizeof(body), "{\"networks\":[");
+    for (int i = 0; i < count && o < sizeof(body); i++) {
+        char ssid_escaped[64];
+        json_escape(ssid_escaped, sizeof(ssid_escaped), results[i].ssid);
+        int n = snprintf(body + o, sizeof(body) - o, "%s{\"ssid\":\"%s\",\"rssi\":%d}",
+                          i ? "," : "", ssid_escaped, (int)results[i].rssi);
+        if (n < 0 || (size_t)n >= sizeof(body) - o) {
+            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "scan body truncated");
+            return ESP_FAIL;
+        }
+        o += (size_t)n;
+    }
+    int tail = snprintf(body + o, sizeof(body) - o, "]}");
+    if (tail < 0 || (size_t)tail >= sizeof(body) - o) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "scan body truncated");
+        return ESP_FAIL;
+    }
+    o += (size_t)tail;
+
+    httpd_resp_set_type(req, "application/json");
+    set_cors(req);
+    return httpd_resp_send(req, body, o);
+}
+
 static void restart_task(void *arg) {
     // Give the HTTP response time to actually leave the socket before the
     // reboot tears everything down under it.
@@ -142,10 +179,10 @@ static esp_err_t reset_handler(httpd_req_t *req) {
     return ESP_OK;
 }
 
-// Shared small-body reader for the two POST handlers below — both bodies
-// are tiny (a couple of short strings or one integer as JSON), so a single
-// bounded recv into a stack buffer is enough; anything larger than the
-// buffer is rejected rather than looped/accumulated.
+// Shared small-body reader for the POST handlers below — bodies are tiny
+// (a couple of short strings), so a single bounded recv into a stack
+// buffer is enough; anything larger than the buffer is rejected rather
+// than looped/accumulated.
 static esp_err_t read_request_body(httpd_req_t *req, char *buf, size_t buf_sz) {
     if (req->content_len >= buf_sz) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "body too large");
@@ -214,71 +251,6 @@ static esp_err_t wifi_config_handler(httpd_req_t *req) {
     return ESP_OK;
 }
 
-// POST /backlight — body: {"duty":N} where N is 0..LCD_BACKLIGHT_MAX_DUTY.
-// Applies immediately (no reboot needed) and persists as the new boot default.
-static esp_err_t backlight_handler(httpd_req_t *req) {
-    char body[32];
-    if (read_request_body(req, body, sizeof(body)) != ESP_OK) return ESP_FAIL;
-
-    const char *p = strstr(body, "\"duty\"");
-    if (!p) {
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "missing \"duty\"");
-        return ESP_FAIL;
-    }
-    p = strchr(p, ':');
-    if (!p) {
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "malformed \"duty\"");
-        return ESP_FAIL;
-    }
-    int duty = atoi(p + 1);
-    if (duty < 0 || duty > LCD_BACKLIGHT_MAX_DUTY) {
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "duty out of range");
-        return ESP_FAIL;
-    }
-
-    lcd_pcd8544_set_backlight((uint8_t)duty);
-    bool saved = bridge_settings_set_backlight((uint8_t)duty);
-
-    httpd_resp_set_type(req, "application/json");
-    set_cors(req);
-    char resp[48];
-    int n = snprintf(resp, sizeof(resp), "{\"duty\":%d,\"saved\":%s}", duty, saved ? "true" : "false");
-    return httpd_resp_send(req, resp, n);
-}
-
-// POST /contrast — body: {"vop":N} where N is 0..LCD_CONTRAST_MAX. Applies
-// immediately (no reboot needed, no extra hardware — same SPI bus already
-// driving the framebuffer) and persists as the new boot default.
-static esp_err_t contrast_handler(httpd_req_t *req) {
-    char body[32];
-    if (read_request_body(req, body, sizeof(body)) != ESP_OK) return ESP_FAIL;
-
-    const char *p = strstr(body, "\"vop\"");
-    if (!p) {
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "missing \"vop\"");
-        return ESP_FAIL;
-    }
-    p = strchr(p, ':');
-    if (!p) {
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "malformed \"vop\"");
-        return ESP_FAIL;
-    }
-    int vop = atoi(p + 1);
-    if (vop < 0 || vop > LCD_CONTRAST_MAX) {
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "vop out of range");
-        return ESP_FAIL;
-    }
-
-    lcd_pcd8544_set_contrast((uint8_t)vop);
-    bool saved = bridge_settings_set_contrast((uint8_t)vop);
-
-    httpd_resp_set_type(req, "application/json");
-    set_cors(req);
-    char resp[48];
-    int n = snprintf(resp, sizeof(resp), "{\"vop\":%d,\"saved\":%s}", vop, saved ? "true" : "false");
-    return httpd_resp_send(req, resp, n);
-}
-
 // Browsers preflight cross-origin POST with OPTIONS — answer it so the web
 // app's fetch() to any POST route doesn't fail the preflight before the
 // real request.
@@ -299,19 +271,16 @@ void http_control_start(void) {
 
     httpd_uri_t status_uri       = { .uri = "/status",      .method = HTTP_GET,     .handler = status_handler };
     httpd_uri_t info_uri         = { .uri = "/info",        .method = HTTP_GET,     .handler = info_handler };
+    httpd_uri_t wifi_scan_uri    = { .uri = "/wifi-scan",   .method = HTTP_GET,     .handler = wifi_scan_handler };
     httpd_uri_t reset_uri        = { .uri = "/reset",       .method = HTTP_POST,    .handler = reset_handler };
     httpd_uri_t wifi_config_uri  = { .uri = "/wifi-config", .method = HTTP_POST,    .handler = wifi_config_handler };
-    httpd_uri_t backlight_uri    = { .uri = "/backlight",   .method = HTTP_POST,    .handler = backlight_handler };
-    httpd_uri_t contrast_uri     = { .uri = "/contrast",    .method = HTTP_POST,    .handler = contrast_handler };
     httpd_uri_t options_uri      = { .uri = "/*",           .method = HTTP_OPTIONS, .handler = options_handler };
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &status_uri));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &info_uri));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &wifi_scan_uri));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &reset_uri));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &wifi_config_uri));
-    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &backlight_uri));
-    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &contrast_uri));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &options_uri));
 
-    ESP_LOGI(TAG, "control endpoints ready: GET /status, GET /info, POST /reset, "
-                  "POST /wifi-config, POST /backlight, POST /contrast");
+    ESP_LOGI(TAG, "control endpoints ready: GET /status, GET /info, GET /wifi-scan, POST /reset, POST /wifi-config");
 }

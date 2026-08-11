@@ -356,7 +356,7 @@ function SettingsPanel(props: {
               type="text"
               value={props.config.wsUrl ?? ''}
               onChange={(e) => props.onConfigChange({ ...props.config, wsUrl: e.currentTarget.value })}
-              placeholder="ws://usdx-bridge.local:8765/cat"
+              placeholder="ws://usdx-bridge.local/cat"
               class="bg-[#0d1117] border border-[#30363d] text-[#c9d1d9] text-xs rounded px-2 py-1.5 focus:outline-none focus:border-[#388bfd] font-mono"
             />
             <p class="text-[10px] text-[#8b949e]">
@@ -1201,7 +1201,7 @@ const DEFAULT_CONFIG: CATConnectionConfig & { presetIdx: number } = {
   baudRate: 38400, dataBits: 8, stopBits: 1, parity: 'none',
   timeoutMs: 200, pollIntervalMs: 500, debug: false,
   rigProfile: RADIO_PRESETS[0].rigProfile,
-  transport: 'serial', wsUrl: 'ws://usdx-bridge.local:8765/cat',
+  transport: 'serial', wsUrl: 'ws://usdx-bridge.local/cat',
 }
 
 // Restores presetIdx/transport/wsUrl from localStorage, but re-derives

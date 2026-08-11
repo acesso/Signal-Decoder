@@ -1,0 +1,88 @@
+:root {
+  color-scheme: light dark;
+  --fg: #1a1a1a;
+  --bg: #f5f5f5;
+  --card-bg: #ffffff;
+  --border: #d0d0d0;
+  --accent: #2a6fdb;
+  --danger: #c0392b;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --fg: #e8e8e8;
+    --bg: #16181c;
+    --card-bg: #22252b;
+    --border: #3a3d44;
+  }
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  padding: 1.25rem;
+  max-width: 32rem;
+  margin-inline: auto;
+  font-family: system-ui, -apple-system, sans-serif;
+  color: var(--fg);
+  background: var(--bg);
+}
+h1 { font-size: 1.3rem; margin: 0 0 1rem; }
+h2 { font-size: 1rem; margin: 0 0 0.75rem; }
+.card {
+  background: var(--card-bg);
+  border: 1px solid var(--border);
+  border-radius: 0.5rem;
+  padding: 1rem;
+  margin-bottom: 1rem;
+}
+dl#status-list {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 0.25rem 0.75rem;
+  margin: 0 0 0.75rem;
+}
+dt { color: color-mix(in srgb, var(--fg) 60%, transparent); }
+dd { margin: 0; text-align: right; }
+form { display: flex; flex-direction: column; gap: 0.5rem; }
+label { font-size: 0.85rem; }
+.row { display: flex; gap: 0.5rem; }
+input, select {
+  padding: 0.5rem;
+  border: 1px solid var(--border);
+  border-radius: 0.35rem;
+  background: var(--bg);
+  color: var(--fg);
+  font-size: 1rem;
+}
+select { flex: 1; min-width: 0; }
+button {
+  padding: 0.55rem 1rem;
+  border: none;
+  border-radius: 0.35rem;
+  background: var(--accent);
+  color: #fff;
+  font-size: 0.95rem;
+  cursor: pointer;
+}
+button.danger { background: var(--danger); }
+button.icon-btn {
+  flex: 0 0 auto;
+  padding: 0.55rem 0.7rem;
+  font-size: 1.1rem;
+  line-height: 1;
+}
+.icon-glyph { display: inline-block; }
+button.icon-btn.spinning .icon-glyph { animation: spin 0.8s linear infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }
+button:active { opacity: 0.85; }
+button:disabled { opacity: 0.5; cursor: default; }
+.hint {
+  font-size: 0.8rem;
+  color: color-mix(in srgb, var(--fg) 60%, transparent);
+  margin: 0.5rem 0 0;
+}
+#msg {
+  min-height: 1.2rem;
+  font-size: 0.9rem;
+}
+#msg[data-kind="error"] { color: var(--danger); }
+#msg[data-kind="ok"] { color: #2e7d32; }

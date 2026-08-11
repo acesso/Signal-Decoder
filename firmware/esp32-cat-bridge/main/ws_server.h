@@ -1,4 +1,4 @@
-// Browser-facing transport: one WebSocket endpoint (ws://usdx-bridge.local:8765/cat)
+// Browser-facing transport: one WebSocket endpoint (ws://usdx-bridge.local/cat)
 // carrying the raw CAT byte stream in both directions as binary frames.
 // Deliberately no framing/parsing of the Kenwood protocol here — this module
 // only moves bytes between cat_bridge and every connected browser tab (up to

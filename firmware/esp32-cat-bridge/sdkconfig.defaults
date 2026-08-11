@@ -7,14 +7,26 @@
 
 CONFIG_IDF_TARGET="esp32"
 
+# Target board: AI-Thinker ESP32-A1S Audio Kit — 4MB flash (the ESP-IDF
+# default assumes 2MB, which is wrong for this board and would make
+# esptool misjudge the flash layout). DIO flash mode is compatible either
+# way; not switching to QIO since this firmware doesn't enable PSRAM
+# support (CONFIG_SPIRAM) — nothing here needs it yet, and enabling PSRAM
+# support without actually using it just costs RAM to the allocator's
+# bookkeeping for no benefit.
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+
 # esp_http_server + mdns + wifi together need more than the default 4KB
 # main-task stack during init (mdns_init/httpd_start allocate on the
 # calling task's stack in places).
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
 
-# Bridge-only for now (see firmware README) — no SPIFFS/LittleFS partition
-# needed yet, default partition table is fine.
-CONFIG_PARTITION_TABLE_SINGLE_APP=y
+# Custom table (partitions.csv) — carries a "storage" SPIFFS partition for
+# the standalone control page (see main/control_page.c) alongside a single
+# 1.5MB app slot (no OTA, same as the single-app default, just resized to
+# make room for SPIFFS on the same 4MB flash).
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 
 CONFIG_LOG_DEFAULT_LEVEL_INFO=y
 

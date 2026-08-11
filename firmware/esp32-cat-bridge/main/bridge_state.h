@@ -11,6 +11,11 @@ typedef enum {
     BRIDGE_WIFI_DISCONNECTED = 0,
     BRIDGE_WIFI_CONNECTING,
     BRIDGE_WIFI_CONNECTED,
+    // Couldn't join BRIDGE_WIFI_SSID after BRIDGE_WIFI_MAXIMUM_RETRY tries —
+    // now broadcasting its own AP (see wifi_net.c) so the control page is
+    // still reachable to fix the Wi-Fi settings, while STA keeps retrying
+    // the real network in the background and drops the AP once it reconnects.
+    BRIDGE_WIFI_AP_FALLBACK,
 } bridge_wifi_state_t;
 
 typedef struct {
