@@ -10,6 +10,7 @@
 #include "freertos/task.h"
 
 #include "bridge_config.h"
+#include "bridge_settings.h"
 #include "bridge_state.h"
 
 static const char *TAG = "cat_bridge";
@@ -233,7 +234,7 @@ void cat_bridge_start(cat_bridge_rx_cb_t rx_cb) {
 
     ESP_ERROR_CHECK(uart_driver_install(CAT_UART_PORT, CAT_UART_RX_BUF_SIZE,
                                          CAT_UART_TX_BUF_SIZE, 0, NULL, 0));
-    uart_open(CONFIG_BRIDGE_CAT_UART_BAUD);
+    uart_open(bridge_settings_get_cat_baud());
 
     xTaskCreatePinnedToCore(uart_reader_task, "cat_uart_rx", 4096, NULL,
                              CAT_BRIDGE_TASK_PRIO, NULL, CAT_BRIDGE_TASK_CORE);

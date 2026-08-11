@@ -1131,6 +1131,7 @@ function BridgeStatusPanel(props: {
   setBridgeBacklight: (wsUrl: string, duty: number) => Promise<{ duty: number; saved: boolean } | null>
   setBridgeContrast: (wsUrl: string, vop: number) => Promise<{ vop: number; saved: boolean } | null>
   setBridgeWifiConfig: (wsUrl: string, ssid: string, password: string) => Promise<boolean>
+  setBridgeCatBaud: (wsUrl: string, baud: number) => Promise<{ baud: number; saved: boolean } | null>
 }) {
   const [status, setStatus] = createSignal<BridgeStatus | null>(null)
   const [info, setInfo] = createSignal<BridgeInfo | null>(null)
@@ -1142,6 +1143,8 @@ function BridgeStatusPanel(props: {
   const [contrastBusy, setContrastBusy] = createSignal(false)
   const [contrastVop, setContrastVop] = createSignal(0x3F) // matches LCD_CONTRAST_DEFAULT_VOP
   const [wifiConfigBusy, setWifiConfigBusy] = createSignal(false)
+  const [catBaudBusy, setCatBaudBusy] = createSignal(false)
+  const [catBaudDraft, setCatBaudDraft] = createSignal(38400)
   let loadSeq = 0
 
   const hasFeature = (name: string) => info()?.features.includes(name) ?? false
@@ -1157,7 +1160,9 @@ function BridgeStatusPanel(props: {
     // Neither backlight nor contrast has a readback in GET /status — the
     // panel starts both sliders at a reasonable default (mid-range) rather
     // than lying about the bridge's actual current values, which this
-    // endpoint doesn't report.
+    // endpoint doesn't report. cat_baud IS reported, though, so that select
+    // reflects the bridge's real current setting.
+    if (s?.catBaud) setCatBaudDraft(s.catBaud)
   }
 
   load()
@@ -1193,6 +1198,13 @@ function BridgeStatusPanel(props: {
     // Same reasoning as restart: the bridge is about to drop off this
     // network entirely, so there's nothing more to query here.
     setWifiConfigBusy(false)
+  }
+
+  const handleCatBaudApply = async () => {
+    setCatBaudBusy(true)
+    const result = await props.setBridgeCatBaud(props.wsUrl, catBaudDraft())
+    if (result) setCatBaudDraft(result.baud)
+    setCatBaudBusy(false)
   }
 
   const rssiQuality = (rssi: number): string =>
@@ -1236,6 +1248,8 @@ function BridgeStatusPanel(props: {
             </span>
             <span class="text-[#8b949e]">Connected clients</span>
             <span class="text-[#c9d1d9]">{s().wsClients} / {s().wsMaxClients}</span>
+            <span class="text-[#8b949e]">CAT baud</span>
+            <span class="text-[#c9d1d9]">{s().catBaud || '—'}</span>
             <span class="text-[#8b949e]">Uptime</span>
             <span class="text-[#c9d1d9]">{Math.floor(s().uptimeSeconds / 60)}m {s().uptimeSeconds % 60}s</span>
           </div>
@@ -1251,6 +1265,35 @@ function BridgeStatusPanel(props: {
       <Show when={hasFeature('contrast')}>
         <div class="border-t border-[#21262d] pt-3">
           <BridgeSliderControl label="Contrast" value={contrastVop()} max={127} onCommit={(n) => void handleContrastCommit(n)} busy={contrastBusy()} />
+        </div>
+      </Show>
+
+      <Show when={hasFeature('cat_baud')}>
+        <div class="border-t border-[#21262d] pt-3 flex flex-col gap-1.5">
+          <div class="flex items-center gap-2">
+            <span class="text-[10px] font-semibold text-[#8b949e] whitespace-nowrap">CAT baud</span>
+            <select
+              value={catBaudDraft()}
+              disabled={catBaudBusy()}
+              onChange={(e) => setCatBaudDraft(Number(e.currentTarget.value))}
+              class="bg-[#0d1117] border border-[#30363d] text-[#c9d1d9] text-[11px] rounded px-2 py-1 disabled:opacity-50"
+            >
+              <option value={9600}>9600</option>
+              <option value={19200}>19200</option>
+              <option value={38400}>38400</option>
+              <option value={57600}>57600</option>
+            </select>
+            <button
+              onClick={() => void handleCatBaudApply()}
+              disabled={catBaudBusy()}
+              class="text-[10px] font-semibold px-2.5 py-1.5 rounded bg-[#21262d] border border-[#30363d] text-[#8b949e] hover:text-[#c9d1d9] hover:border-[#8b949e] disabled:opacity-50"
+            >
+              {catBaudBusy() ? 'Applying…' : 'Apply'}
+            </button>
+          </div>
+          <p class="text-[10px] text-[#8b949e]">
+            There's no CAT command that reports or changes the radio's own baud — if you change it in the radio's menu, set it here too, or the CAT link will desync.
+          </p>
         </div>
       </Show>
 
@@ -1484,7 +1527,7 @@ export default function RadioCATPanel(props: { cat: RadioCATControls; collapsed?
           getBridgeStatus={cat.getBridgeStatus} resetBridge={cat.resetBridge}
           getBridgeInfo={cat.getBridgeInfo}
           setBridgeBacklight={cat.setBridgeBacklight} setBridgeContrast={cat.setBridgeContrast}
-          setBridgeWifiConfig={cat.setBridgeWifiConfig}
+          setBridgeWifiConfig={cat.setBridgeWifiConfig} setBridgeCatBaud={cat.setBridgeCatBaud}
         />
       </Show>
 

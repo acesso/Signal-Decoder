@@ -66,6 +66,9 @@ async function refreshStatus(silent) {
 
     ensureOption(ssidSelect, status.ssid);
     if (status.ssid) ssidSelect.value = status.ssid;
+
+    const catBaudSelectEl = document.getElementById('cat-baud-select');
+    if (status.cat_baud && catBaudSelectEl) catBaudSelectEl.value = String(status.cat_baud);
   } catch (err) {
     if (!silent) showMsg(`Failed to load status: ${err.message}`, 'error');
   }
@@ -341,6 +344,127 @@ micBtn.addEventListener('click', () => {
   if (micStream) stopMic();
   else void startMic();
 });
+
+// ── CAT monitor ───────────────────────────────────────────────────────────
+// Connects to the SAME /cat WebSocket the Signal-Decoder web app uses — this
+// is a plain observer + occasional sender, not a separate protocol. Frames
+// are split on ';' (Kenwood CAT frames are always ';'-terminated) and logged
+// with a direction arrow: green/left for radio->bridge, red/right for
+// bridge/browser->radio. Client-side only — the firmware doesn't buffer or
+// replay history, so reloading this page starts with an empty log (see the
+// README's note on why persistence wasn't worth the added firmware
+// complexity for what's meant to stay a live debug view).
+const CAT_LOG_MAX_LINES = 200;
+
+const catLog = document.getElementById('cat-log');
+const catLogPause = document.getElementById('cat-log-pause');
+const catSendForm = document.getElementById('cat-send-form');
+const catSendInput = document.getElementById('cat-send-input');
+const catBaudSelect = document.getElementById('cat-baud-select');
+const catBaudApplyBtn = document.getElementById('cat-baud-apply-btn');
+
+let catWs = null;
+let catRadioBuf = '';
+let catClientBuf = '';
+
+function appendCatFrame(direction, frame) {
+  if (catLogPause.checked) return;
+  const line = document.createElement('div');
+  line.className = 'cat-log-line';
+
+  const time = document.createElement('span');
+  time.className = 'cat-log-time';
+  time.textContent = new Date().toLocaleTimeString(undefined, { hour12: false });
+
+  const arrow = document.createElement('span');
+  arrow.className = `arrow arrow-${direction}`;
+  arrow.textContent = direction === 'in' ? '←' : '→';
+  arrow.title = direction === 'in' ? 'from radio' : 'to radio';
+
+  const text = document.createElement('span');
+  text.className = 'cat-log-frame';
+  text.textContent = frame;
+
+  line.append(time, arrow, text);
+  catLog.appendChild(line);
+
+  while (catLog.childElementCount > CAT_LOG_MAX_LINES) {
+    catLog.removeChild(catLog.firstChild);
+  }
+  catLog.scrollTop = catLog.scrollHeight;
+}
+
+// Splits a raw byte chunk on ';' into complete frames, carrying any partial
+// trailing frame over in `buf` for the next chunk — a WebSocket frame
+// doesn't necessarily align with a CAT frame boundary.
+function feedCatBuf(buf, chunk, direction) {
+  buf += chunk;
+  let start = 0;
+  for (let i = 0; i < buf.length; i++) {
+    if (buf[i] === ';') {
+      appendCatFrame(direction, buf.slice(start, i + 1));
+      start = i + 1;
+    }
+  }
+  return buf.slice(start);
+}
+
+function connectCatMonitor() {
+  const url = new URL('/cat', location.href);
+  url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
+  const ws = new WebSocket(url.toString());
+  ws.binaryType = 'arraybuffer';
+
+  ws.onopen = () => { catWs = ws; };
+  ws.onmessage = (ev) => {
+    const text = typeof ev.data === 'string' ? ev.data : new TextDecoder().decode(ev.data);
+    catRadioBuf = feedCatBuf(catRadioBuf, text, 'in');
+  };
+  ws.onclose = () => {
+    if (catWs === ws) catWs = null;
+    // Reconnect after a short delay — the CAT monitor is meant to stay
+    // open indefinitely as a debug view, so a dropped connection (bridge
+    // reboot, brief Wi-Fi hiccup) should recover on its own rather than
+    // leaving the log silently dead until a manual page reload.
+    setTimeout(connectCatMonitor, 2000);
+  };
+}
+
+catSendForm.addEventListener('submit', (ev) => {
+  ev.preventDefault();
+  const raw = catSendInput.value.trim();
+  if (!raw || !catWs || catWs.readyState !== WebSocket.OPEN) return;
+  // Frames sent from here go out exactly as typed — the operator is
+  // responsible for the trailing ';' and correct casing, same as typing
+  // into a terminal talking to the radio directly. A missing ';' just
+  // means the radio (and this page's own frame splitter) won't see it as
+  // complete until the next character arrives.
+  catWs.send(raw);
+  appendCatFrame('out', raw.endsWith(';') ? raw : raw + ';');
+  catSendInput.value = '';
+});
+
+document.getElementById('cat-log-clear-btn').addEventListener('click', () => {
+  catLog.innerHTML = '';
+});
+
+catBaudApplyBtn.addEventListener('click', async () => {
+  const baud = Number(catBaudSelect.value);
+  if (!confirm(`Set the bridge's CAT UART to ${baud} baud? This must match the radio's own CAT menu setting.`)) return;
+  try {
+    const res = await fetch('/cat-baud', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ baud }),
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    showMsg(`CAT baud set to ${baud}.`, 'ok');
+  } catch (err) {
+    showMsg(`Failed to set CAT baud: ${err.message}`, 'error');
+  }
+});
+
+connectCatMonitor();
 
 refreshStatus(true);
 scanNetworks();

@@ -9,66 +9,105 @@
 <body>
 <h1>uSDX CAT bridge</h1>
 
-<section id="status-card" class="card">
-  <h2>Status</h2>
-  <dl id="status-list">
-    <dt>Wi-Fi</dt><dd id="s-wifi">&hellip;</dd>
-    <dt>IP address</dt><dd id="s-ip">&hellip;</dd>
-    <dt>Signal</dt><dd id="s-rssi">&hellip;</dd>
-    <dt>Radio link</dt><dd id="s-radio">&hellip;</dd>
-    <dt>WebSocket clients</dt><dd id="s-clients">&hellip;</dd>
-    <dt>Uptime</dt><dd id="s-uptime">&hellip;</dd>
-    <dt>Firmware</dt><dd id="s-fw">&hellip;</dd>
-  </dl>
-  <button id="refresh-btn" type="button">Refresh</button>
-</section>
+<div class="layout">
+  <div class="col col-side">
+    <section id="status-card" class="card">
+      <h2>Status</h2>
+      <dl id="status-list">
+        <dt>Wi-Fi</dt><dd id="s-wifi">&hellip;</dd>
+        <dt>IP address</dt><dd id="s-ip">&hellip;</dd>
+        <dt>Signal</dt><dd id="s-rssi">&hellip;</dd>
+        <dt>Radio link</dt><dd id="s-radio">&hellip;</dd>
+        <dt>WebSocket clients</dt><dd id="s-clients">&hellip;</dd>
+        <dt>Uptime</dt><dd id="s-uptime">&hellip;</dd>
+        <dt>Firmware</dt><dd id="s-fw">&hellip;</dd>
+      </dl>
+      <button id="refresh-btn" type="button">Refresh</button>
+    </section>
 
-<section id="wifi-card" class="card">
-  <h2>Wi-Fi network</h2>
-  <form id="wifi-form">
-    <label for="wifi-ssid">SSID</label>
-    <div class="row">
-      <select id="wifi-ssid" name="ssid" required></select>
-      <button id="scan-btn" type="button" class="icon-btn" title="Scan for networks" aria-label="Scan for networks"><span class="icon-glyph">&#x21bb;</span></button>
-    </div>
-    <label for="wifi-pass">Password</label>
-    <input id="wifi-pass" name="password" type="password" autocomplete="off">
-    <button type="submit">Save &amp; reboot</button>
-  </form>
-  <p class="hint">Saves to the bridge's own storage and reboots to join the
-  new network. You'll need to reconnect at the new address (or
-  <code>usdx-bridge.local</code> once mDNS updates). If the new network
-  can't be reached, the bridge falls back to broadcasting its own
-  "<code>usdx-bridge-setup</code>"-style access point at
-  <code>192.168.4.1</code> so you can fix it here again.</p>
-</section>
+    <section id="wifi-card" class="card">
+      <h2>Wi-Fi network</h2>
+      <form id="wifi-form">
+        <label for="wifi-ssid">SSID</label>
+        <div class="row">
+          <select id="wifi-ssid" name="ssid" required></select>
+          <button id="scan-btn" type="button" class="icon-btn" title="Scan for networks" aria-label="Scan for networks"><span class="icon-glyph">&#x21bb;</span></button>
+        </div>
+        <label for="wifi-pass">Password</label>
+        <input id="wifi-pass" name="password" type="password" autocomplete="off">
+        <button type="submit">Save &amp; reboot</button>
+      </form>
+      <p class="hint">Saves to the bridge's own storage and reboots to join the
+      new network. You'll need to reconnect at the new address (or
+      <code>usdx-bridge.local</code> once mDNS updates). If the new network
+      can't be reached, the bridge falls back to broadcasting its own
+      "<code>usdx-bridge-setup</code>"-style access point at
+      <code>192.168.4.1</code> so you can fix it here again.</p>
+    </section>
 
-<section id="audio-card" class="card">
-  <h2>Audio</h2>
-  <div class="meter-row">
-    <span class="meter-label">Speaker</span>
-    <div class="meter-track"><div id="meter-in" class="meter-fill"></div></div>
-    <span id="meter-in-pct" class="meter-pct">&mdash;</span>
-  </div>
-  <div class="meter-row">
-    <span class="meter-label">Mic</span>
-    <div class="meter-track"><div id="meter-out" class="meter-fill"></div></div>
-    <span id="meter-out-pct" class="meter-pct">&mdash;</span>
-  </div>
-  <div class="audio-buttons">
-    <button id="audio-listen-btn" type="button">Listen to Radio</button>
-    <button id="audio-mic-btn" type="button" disabled>Send Mic to Radio</button>
-  </div>
-  <p class="hint">Streams raw audio over a second WebSocket
-  (<code>/audio</code>), independent of the CAT connection &mdash; useful for
-  debugging the audio path directly from this page, without the
-  Signal-Decoder web app.</p>
-</section>
+    <section id="audio-card" class="card">
+      <h2>Audio</h2>
+      <div class="meter-row">
+        <span class="meter-label">Speaker</span>
+        <div class="meter-track"><div id="meter-in" class="meter-fill"></div></div>
+        <span id="meter-in-pct" class="meter-pct">&mdash;</span>
+      </div>
+      <div class="meter-row">
+        <span class="meter-label">Mic</span>
+        <div class="meter-track"><div id="meter-out" class="meter-fill"></div></div>
+        <span id="meter-out-pct" class="meter-pct">&mdash;</span>
+      </div>
+      <div class="audio-buttons">
+        <button id="audio-listen-btn" type="button">Listen to Radio</button>
+        <button id="audio-mic-btn" type="button" disabled>Send Mic to Radio</button>
+      </div>
+      <p class="hint">Streams raw audio over a second WebSocket
+      (<code>/audio</code>), independent of the CAT connection &mdash; useful for
+      debugging the audio path directly from this page, without the
+      Signal-Decoder web app.</p>
+    </section>
 
-<section id="reset-card" class="card">
-  <h2>Restart bridge</h2>
-  <button id="reset-btn" type="button" class="danger">Restart now</button>
-</section>
+    <section id="reset-card" class="card">
+      <h2>Restart bridge</h2>
+      <button id="reset-btn" type="button" class="danger">Restart now</button>
+    </section>
+  </div>
+
+  <div class="col col-main">
+    <section id="cat-card" class="card">
+      <div class="cat-header">
+        <h2>CAT monitor</h2>
+        <div class="cat-header-controls">
+          <label for="cat-baud-select" class="cat-baud-label">Baud</label>
+          <select id="cat-baud-select">
+            <option value="9600">9600</option>
+            <option value="19200">19200</option>
+            <option value="38400" selected>38400</option>
+            <option value="57600">57600</option>
+          </select>
+          <button id="cat-baud-apply-btn" type="button">Apply</button>
+          <button id="cat-log-clear-btn" type="button" class="secondary">Clear</button>
+          <label class="cat-pause-label">
+            <input id="cat-log-pause" type="checkbox">
+            Pause
+          </label>
+        </div>
+      </div>
+      <div id="cat-log" class="cat-log" role="log" aria-live="polite"></div>
+      <form id="cat-send-form" class="row cat-send-row">
+        <input id="cat-send-input" type="text" placeholder="FA;" autocomplete="off" spellcheck="false">
+        <button type="submit">Send</button>
+      </form>
+      <p class="hint">Live sniff of every CAT frame crossing the bridge in
+      either direction &mdash; <span class="arrow arrow-in">&#x2190;</span> from
+      the radio, <span class="arrow arrow-out">&#x2192;</span> to the radio.
+      Connects to the same <code>/cat</code> WebSocket the web app uses, so
+      this is exactly what it sees. The baud rate here must match the
+      radio's own CAT menu setting (there's no CAT command that reports or
+      changes it, so if you change it on the radio, change it here too).</p>
+    </section>
+  </div>
+</div>
 
 <p id="msg" role="status"></p>
 

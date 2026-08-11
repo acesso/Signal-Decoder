@@ -228,13 +228,24 @@ export interface RadioCATControls {
    *  if getBridgeInfo().features includes "contrast". Resolves the vop the
    *  bridge confirmed and whether the save to flash succeeded, or null on failure. */
   setBridgeContrast: (wsUrl: string, vop: number) => Promise<{ vop: number; saved: boolean } | null>;
+  /** POST /cat-baud — sets the bridge's CAT UART baud rate (one of
+   *  9600/19200/38400/57600) immediately, no reboot needed, AND persists it
+   *  to the bridge's NVS as the new boot default. There's no CAT command
+   *  that reports or changes the radio's own baud (it's a local-menu-only
+   *  setting there), so this exists purely for the operator to keep the
+   *  bridge in sync by hand after changing it on the radio. Only meaningful
+   *  if getBridgeInfo().features includes "cat_baud". */
+  setBridgeCatBaud: (wsUrl: string, baud: number) => Promise<{ baud: number; saved: boolean } | null>;
 }
 
 /** Snapshot of the ESP32 CAT bridge's own status — distinct from RadioState,
  *  which is the radio's state as seen through the bridge. Sourced from the
  *  bridge's GET /status (see firmware/esp32-cat-bridge/main/http_control.c). */
 export interface BridgeStatus {
-  wifiState: 'connected' | 'connecting' | 'disconnected';
+  /** 'ap_fallback' means the bridge couldn't join its configured Wi-Fi
+   *  network and is now broadcasting its own recovery AP at 192.168.4.1
+   *  (see wifi_net.c) — join that AP directly to fix the settings. */
+  wifiState: 'connected' | 'connecting' | 'disconnected' | 'ap_fallback';
   ssid: string;
   /** Live RSSI in dBm, refreshed at request time by the bridge (not a stale poll). */
   rssi: number;
@@ -244,6 +255,10 @@ export interface BridgeStatus {
   /** Whether the bridge has heard from the radio itself recently — the same
    *  "RIG:link/silent" signal shown on the bridge's own LCD. */
   radioLinked: boolean;
+  /** Current CAT UART baud rate — one of 9600/19200/38400/57600 (the uSDX
+   *  firmware's own CAT_BAUD menu options). Only meaningful if
+   *  getBridgeInfo().features includes "cat_baud". */
+  catBaud: number;
   uptimeSeconds: number;
 }
 
@@ -1333,7 +1348,8 @@ export function useRadioCAT(): RadioCATControls {
         wifiState: j.wifi_state, ssid: String(j.ssid ?? ''), rssi: j.rssi,
         ip: String(j.ip ?? ''), wsClients: Number(j.ws_clients) || 0,
         wsMaxClients: Number(j.ws_max_clients) || 0,
-        radioLinked: j.radio_linked === true, uptimeSeconds: Number(j.uptime_s) || 0,
+        radioLinked: j.radio_linked === true, catBaud: Number(j.cat_baud) || 0,
+        uptimeSeconds: Number(j.uptime_s) || 0,
       };
     } catch (err) {
       log('warn', 'getBridgeStatus failed:', err);
@@ -1427,6 +1443,30 @@ export function useRadioCAT(): RadioCATControls {
     }
   };
 
+  // POST /cat-baud — no reboot, unlike setBridgeWifiConfig: the radio's own
+  // baud is a local-menu-only setting with no CAT command to announce a
+  // change (see the firmware README), so this must apply live the moment
+  // you've changed it on the radio, not after a restart.
+  const setBridgeCatBaud = async (wsUrl: string, baud: number): Promise<{ baud: number; saved: boolean } | null> => {
+    const base = bridgeHttpBase(wsUrl);
+    if (!base) return null;
+    log('info', 'setBridgeCatBaud →', baud);
+    try {
+      const resp = await fetch(base + '/cat-baud', {
+        method: 'POST', signal: AbortSignal.timeout(5000),
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ baud }),
+      });
+      if (!resp.ok) return null;
+      const j = await resp.json();
+      if (typeof j.baud !== 'number') return null;
+      return { baud: j.baud, saved: j.saved === true };
+    } catch (err) {
+      log('warn', 'setBridgeCatBaud failed:', err);
+      return null;
+    }
+  };
+
   onCleanup(() => { disconnect(); });
 
   return {
@@ -1435,5 +1475,6 @@ export function useRadioCAT(): RadioCATControls {
     setBacklight, getPABias, setPABias, getTxTimeout, setTxTimeout, resetRadio,
     getFactoryDefaults, factoryResetRadio, getRefFreq, setRefFreq,
     getBridgeStatus, resetBridge, getBridgeInfo, setBridgeBacklight, setBridgeWifiConfig, setBridgeContrast,
+    setBridgeCatBaud,
   };
 }
