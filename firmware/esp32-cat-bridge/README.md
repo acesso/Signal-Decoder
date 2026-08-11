@@ -11,12 +11,13 @@ broken out to the header) with an onboard ES8388 audio codec and an onboard
 SD card slot (SDMMC on GPIO2/4/12/13 — disjoint from the CAT UART pins
 below, unused by this firmware). Only 7 header GPIOs are free (0, 5, 18, 19,
 21, 22, 23) and every one already drives an onboard button, LED, or the
-amplifier-enable line — this firmware claims just 2 of them (18, 23) for
-the CAT UART and leaves the rest alone. The onboard codec is reserved for a
-future audio/WebRTC feature, not used yet — this is the first of a planned
-pair of features on this hardware: CAT now, audio in/out later (RX/TX audio
-streamed over the same link instead of a USB sound-card interface), plus
-any other small radio controls that make sense to add once the bridge exists.
+amplifier-enable line — this firmware claims 2 of them (18, 23) for the CAT
+UART and 1 more (22, plus 19 which doubles as a button) for the two status
+LEDs, leaving the rest alone. The onboard codec is brought up far enough to
+meter its ADC input for the status LEDs (see below) — there is no real
+audio-out pipeline yet (that's a future audio/WebRTC feature: RX/TX audio
+streamed over the same link instead of a USB sound-card interface, plus any
+other small radio controls that make sense to add once the bridge exists).
 
 An earlier revision of this firmware targeted a bare ESP32-WROOM-32 board
 with a PCD8544 LCD status display — that hardware is no longer in use; the
@@ -89,6 +90,31 @@ Radio  <----------------------------->  ESP32  <--------------------------------
 - **`bridge_state`** is a small mutex-guarded struct that the above modules
   write to and `http_control` reads from for `GET /status` — the only
   shared state in the firmware.
+- **`audio_monitor`** brings up the onboard ES8388 codec (I2C control +
+  I2S audio) far enough to read its ADC continuously and compute an RMS
+  level for the status LEDs below. No audio-out pipeline exists yet —
+  `audio_monitor_report_out_samples()` is the hook a future playback
+  feature will call, but nothing does today, so the "out" LED just stays
+  off (a real absence of signal, not a bug).
+- **`led_status`** drives the board's two status LEDs via LEDC PWM — see
+  the LED legend below for what each state looks like.
+
+### Status LEDs
+
+Two onboard LEDs (GPIO22 and GPIO19 — the latter doubles as the KEY3
+button input, unused elsewhere in this firmware, so claiming it as an
+output here costs nothing) show, in priority order (highest wins):
+
+| State                | LED behavior                                                                                          |
+|----------------------|-------------------------------------------------------------------------------------------------------|
+| AP fallback          | Both LEDs blink together, fast (~300ms) — network needs fixing                                        |
+| Wi-Fi connecting     | LEDs alternate (~400ms) — joining, not stuck yet                                                      |
+| No CAT traffic (>3s) | Both LEDs pulse together slowly (2s); live audio still shows as brightness riding on top of the pulse |
+| Normal               | LED1 (GPIO22) = audio-in level, LED2 (GPIO19) = audio-out level, plain brightness, no blink           |
+
+Audio-out currently always reads silent (see `audio_monitor` above) —
+that LED effectively stays off during "Normal" until a real audio-out
+feature ships.
 
 ### Core placement
 
@@ -112,11 +138,30 @@ streaming is added, but costs nothing to set up now.
 
 GPIO18/23 were picked deliberately over the board's other 5 free header
 pins: GPIO0 is a boot-strap pin (risky to also drive from an external
-UART), GPIO21 drives the onboard PA-enable, and GPIO5/19/22 cost the SAME
+UART, though it's also the codec's MCLK — see below, both uses are
+internal to the board, not exposed on the header, so no conflict),
+GPIO21 drives the onboard PA-enable, and GPIO5/19/22 cost the SAME
 onboard button/LED functions 18/23 do anyway — no advantage to picking them
 instead. This leaves UART0 (GPIO1/3, wired to the board's own USB-serial
 chip on its "UART" micro-USB port) completely free for flashing/`ESP_LOG`
 output the whole time the CAT cable is connected.
+
+Everything below this point is **onboard, not header wiring** — nothing to
+physically connect, listed here only because it's not obvious from the
+schematic which pins the firmware actually uses:
+
+| Signal           | ESP32 GPIO | Notes                                                   |
+|------------------|------------|---------------------------------------------------------|
+| Status LED (in)  | GPIO22     | audio-in level (see Status LEDs above)                  |
+| Status LED (out) | GPIO19     | audio-out level; doubles as the KEY3 button pin         |
+| Codec I2C SDA    | GPIO33     | ES8388 control                                          |
+| Codec I2C SCL    | GPIO32     | ES8388 control                                          |
+| Codec PA enable  | GPIO21     | amplifier power, polarity unconfirmed — see limitations |
+| Codec I2S MCLK   | GPIO0      | shares the boot-strap pin, internal-only use            |
+| Codec I2S BCLK   | GPIO27     |                                                         |
+| Codec I2S WS     | GPIO25     |                                                         |
+| Codec I2S DOUT   | GPIO26     | ESP32 → codec DAC                                       |
+| Codec I2S DIN    | GPIO35     | codec ADC → ESP32                                       |
 
 The board has **two micro-USB ports** — one labeled power, one labeled
 UART. Flash and monitor over the UART port; the power port is for
@@ -183,6 +228,20 @@ for `spiffs_data/`. `idf.py flash` writes both; editing anything under
   look before ever exposing this bridge beyond a trusted network, and worth
   remembering that the fallback AP's password is a fixed Kconfig default,
   not something the control page lets you change.
+- **ES8388 PA-enable polarity (`ES8388_PA_REVERTED` in `bridge_config.h`) is
+  unconfirmed.** Cross-referenced community sources for this exact board
+  (v2.2) didn't give an explicit active-high/active-low statement — current
+  value is a best guess based on circumstantial evidence. If the amp turns
+  out permanently on, permanently silenced, or audio_monitor's level
+  readings look inverted/wrong, this is the first thing to check.
+- **Audio-out level metering is wired up but always reads silent.** There's
+  no audio-out pipeline yet — `audio_monitor_report_out_samples()` exists
+  for a future playback feature to call, but nothing does today, so the
+  "out" status LED stays off during normal operation. Not a bug: there's
+  genuinely no signal to show.
+- **Audio sample rate is fixed at 16kHz mono, sized for level metering, not
+  audio quality.** `ES8388_SAMPLE_RATE_HZ` in `bridge_config.h` — revisit
+  once a real audio-out/WebRTC feature needs a different rate.
 
 ## Web app integration
 

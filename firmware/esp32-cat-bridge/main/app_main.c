@@ -11,11 +11,13 @@
 // notes), so radio I/O timing is never contended with network stack activity.
 #include "esp_log.h"
 
+#include "audio_monitor.h"
 #include "bridge_settings.h"
 #include "bridge_state.h"
 #include "cat_bridge.h"
 #include "control_page.h"
 #include "http_control.h"
+#include "led_status.h"
 #include "wifi_net.h"
 #include "ws_server.h"
 
@@ -26,11 +28,13 @@ void app_main(void) {
 
     bridge_settings_init();   // NVS init — must run before anything reads persisted settings
     bridge_state_init();
+    led_status_start();       // no ordering dependency — wifi_net/cat_bridge feed it state after
     wifi_net_start();
     ws_server_start();
     http_control_start();     // needs ws_server's httpd handle — after ws_server_start()
     control_page_start();     // standalone control UI — same httpd instance
     cat_bridge_start(ws_server_send_to_client);
+    audio_monitor_start();
 
     ESP_LOGI(TAG, "bridge running");
 }

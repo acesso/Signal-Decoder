@@ -14,6 +14,7 @@
 #include "bridge_config.h"
 #include "bridge_settings.h"
 #include "bridge_state.h"
+#include "led_status.h"
 
 static const char *TAG = "wifi_net";
 
@@ -74,6 +75,7 @@ static void event_handler(void *arg, esp_event_base_t event_base,
                            int32_t event_id, void *event_data) {
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
         set_wifi_state(BRIDGE_WIFI_CONNECTING);
+        led_status_set_wifi_connecting(true);
         esp_wifi_connect();
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
         // Unattended device: always keep retrying so it self-heals from a
@@ -88,6 +90,7 @@ static void event_handler(void *arg, esp_event_base_t event_base,
         if (s_retry_count < BRIDGE_WIFI_MAXIMUM_RETRY) {
             s_retry_count++;
             set_wifi_state(BRIDGE_WIFI_CONNECTING);
+            led_status_set_wifi_connecting(true);
             ESP_LOGW(TAG, "retry connecting to AP (%d/%d)", s_retry_count, BRIDGE_WIFI_MAXIMUM_RETRY);
         } else {
             xEventGroupSetBits(s_wifi_event_group, WIFI_FAIL_BIT);
@@ -95,6 +98,8 @@ static void event_handler(void *arg, esp_event_base_t event_base,
                 start_ap_fallback();
             }
             set_wifi_state(BRIDGE_WIFI_AP_FALLBACK);
+            led_status_set_wifi_connecting(false);
+            led_status_set_ap_fallback(true);
             ESP_LOGW(TAG, "still retrying connection to AP in the background");
         }
         esp_wifi_connect();
@@ -104,6 +109,8 @@ static void event_handler(void *arg, esp_event_base_t event_base,
         s_retry_count = 0;
         set_wifi_ip(&event->ip_info.ip);
         set_wifi_state(BRIDGE_WIFI_CONNECTED);
+        led_status_set_wifi_connecting(false);
+        led_status_set_ap_fallback(false);
         update_rssi();
         if (s_ap_fallback_active) {
             stop_ap_fallback();
