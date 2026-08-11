@@ -14,6 +14,7 @@
 #include "bridge_config.h"
 #include "bridge_settings.h"
 #include "bridge_state.h"
+#include "cat_bridge.h"
 #include "ws_server.h"
 #include "wifi_net.h"
 
@@ -23,9 +24,24 @@ static const char *TAG = "http_control";
 // "audio" means: /audio WebSocket exists, carrying raw 16-bit PCM mono at
 // ES8388_SAMPLE_RATE_HZ in both directions (see audio_ws.h/audio_monitor.h)
 // — the web app should gate its audio UI on this rather than assuming it.
+// "cat_baud" means: POST /cat-baud exists (see cat_baud_handler below).
 static const char *const BRIDGE_FEATURES[] = {
-    "cat", "wifi_config", "wifi_scan", "reset", "audio",
+    "cat", "wifi_config", "wifi_scan", "reset", "audio", "cat_baud",
 };
+
+// The uSDX firmware's own CAT_BAUD menu setting (usdxBLACKBRICK.ino) only
+// offers these four — validated against on POST /cat-baud so a typo/garbage
+// value can't wedge the UART into a rate the radio could never actually be
+// running at.
+static const int SUPPORTED_CAT_BAUDS[] = { 9600, 19200, 38400, 57600 };
+#define SUPPORTED_CAT_BAUDS_COUNT (sizeof(SUPPORTED_CAT_BAUDS) / sizeof(SUPPORTED_CAT_BAUDS[0]))
+
+static bool is_supported_cat_baud(int baud) {
+    for (size_t i = 0; i < SUPPORTED_CAT_BAUDS_COUNT; i++) {
+        if (SUPPORTED_CAT_BAUDS[i] == baud) return true;
+    }
+    return false;
+}
 #define BRIDGE_FEATURES_COUNT (sizeof(BRIDGE_FEATURES) / sizeof(BRIDGE_FEATURES[0]))
 
 static const char *wifi_state_str(bridge_wifi_state_t s) {
@@ -78,11 +94,12 @@ static esp_err_t status_handler(httpd_req_t *req) {
     int n = snprintf(body, sizeof(body),
         "{\"wifi_state\":\"%s\",\"ssid\":\"%s\",\"rssi\":%d,\"ip\":\"%s\","
         "\"ws_clients\":%u,\"ws_max_clients\":%d,\"radio_linked\":%s,"
-        "\"uptime_s\":%lld}",
+        "\"cat_baud\":%d,\"uptime_s\":%lld}",
         wifi_state_str(st.wifi_state), ssid_escaped, (int)live_rssi,
         st.ip_addr[0] ? st.ip_addr : "",
         (unsigned)st.ws_client_count, WS_MAX_CLIENTS,
         (esp_timer_get_time() - st.last_radio_rx_us) <= 3000000 ? "true" : "false",
+        bridge_settings_get_cat_baud(),
         (long long)uptime_s);
     if (n < 0 || (size_t)n >= sizeof(body)) {
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "status body truncated");
@@ -221,6 +238,26 @@ static bool extract_json_string(const char *json, const char *key, char *out, si
     return true;
 }
 
+// Extracts the integer value of a top-level "key":123 pair — same "just
+// enough for this endpoint's own fixed shape" scope as extract_json_string
+// above, not a general JSON parser. Returns false if the key isn't found or
+// its value isn't a plain (optionally signed) integer.
+static bool extract_json_int(const char *json, const char *key, int *out) {
+    char pattern[32];
+    snprintf(pattern, sizeof(pattern), "\"%s\"", key);
+    const char *p = strstr(json, pattern);
+    if (!p) return false;
+    p = strchr(p + strlen(pattern), ':');
+    if (!p) return false;
+    p++;
+    while (*p == ' ') p++;
+    char *end;
+    long v = strtol(p, &end, 10);
+    if (end == p) return false; // no digits consumed — not a number
+    *out = (int)v;
+    return true;
+}
+
 // POST /wifi-config — body: {"ssid":"...","password":"..."}. Persists to
 // NVS and reboots to apply (same pattern as most consumer Wi-Fi devices —
 // there's no clean way to tear down and rejoin a different AP without
@@ -250,6 +287,33 @@ static esp_err_t wifi_config_handler(httpd_req_t *req) {
     return ESP_OK;
 }
 
+// POST /cat-baud — body: {"baud":38400}. Applied immediately (no reboot —
+// see the doc comment in http_control.h for why this differs from
+// /wifi-config) AND persisted to NVS.
+static esp_err_t cat_baud_handler(httpd_req_t *req) {
+    char body[64];
+    if (read_request_body(req, body, sizeof(body)) != ESP_OK) return ESP_FAIL;
+
+    int baud = 0;
+    if (!extract_json_int(body, "baud", &baud)) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "missing or invalid \"baud\"");
+        return ESP_FAIL;
+    }
+    if (!is_supported_cat_baud(baud)) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "unsupported baud — must be 9600/19200/38400/57600");
+        return ESP_FAIL;
+    }
+
+    cat_bridge_set_baud(baud);
+    bool saved = bridge_settings_set_cat_baud(baud);
+
+    httpd_resp_set_type(req, "application/json");
+    set_cors(req);
+    char resp_body[64];
+    int n = snprintf(resp_body, sizeof(resp_body), "{\"baud\":%d,\"saved\":%s}", baud, saved ? "true" : "false");
+    return httpd_resp_send(req, resp_body, n);
+}
+
 // Browsers preflight cross-origin POST with OPTIONS — answer it so the web
 // app's fetch() to any POST route doesn't fail the preflight before the
 // real request.
@@ -273,13 +337,16 @@ void http_control_start(void) {
     httpd_uri_t wifi_scan_uri    = { .uri = "/wifi-scan",   .method = HTTP_GET,     .handler = wifi_scan_handler };
     httpd_uri_t reset_uri        = { .uri = "/reset",       .method = HTTP_POST,    .handler = reset_handler };
     httpd_uri_t wifi_config_uri  = { .uri = "/wifi-config", .method = HTTP_POST,    .handler = wifi_config_handler };
+    httpd_uri_t cat_baud_uri     = { .uri = "/cat-baud",    .method = HTTP_POST,    .handler = cat_baud_handler };
     httpd_uri_t options_uri      = { .uri = "/*",           .method = HTTP_OPTIONS, .handler = options_handler };
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &status_uri));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &info_uri));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &wifi_scan_uri));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &reset_uri));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &wifi_config_uri));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &cat_baud_uri));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &options_uri));
 
-    ESP_LOGI(TAG, "control endpoints ready: GET /status, GET /info, GET /wifi-scan, POST /reset, POST /wifi-config");
+    ESP_LOGI(TAG, "control endpoints ready: GET /status, GET /info, GET /wifi-scan, POST /reset, "
+                   "POST /wifi-config, POST /cat-baud");
 }

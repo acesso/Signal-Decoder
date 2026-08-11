@@ -61,14 +61,17 @@ Radio  <----------------------------->  ESP32  <--------------------------------
   UI on "does this bridge support X"), `POST /reset` (reboot), and
   `POST /wifi-config` (change the Wi-Fi network, persisted to NVS, reboots
   to apply).
-- **`control_page`** serves a small standalone status/Wi-Fi/restart page at
-  `GET /` (plus `/style.css`, `/app.js`), so the bridge can be managed
-  directly from any browser on the LAN without going through the
-  Signal-Decoder web app at all. The page is static HTML/CSS/JS (source in
-  `spiffs_data/`) that just calls the same `http_control` endpoints above —
-  it has no logic of its own beyond that. Files are baked into a SPIFFS
-  image at build time onto the `storage` partition (see `partitions.csv`)
-  and flashed alongside the app.
+- **`control_page`** serves a small standalone status/Wi-Fi/restart/audio/CAT
+  monitor page at `GET /` (plus `/style.css`, `/app.js`), so the bridge can
+  be managed and debugged directly from any browser on the LAN without
+  going through the Signal-Decoder web app at all. The page is static
+  HTML/CSS/JS (source in `spiffs_data/`) that calls the same `http_control`
+  endpoints above plus the `/cat` and `/audio` WebSockets directly — it has
+  no logic of its own beyond that. Files are baked into a SPIFFS image at
+  build time onto the `storage` partition (see `partitions.csv`) and
+  flashed alongside the app. Laid out as two responsive columns (a narrow
+  sidebar for the short cards, a wide main column for the CAT monitor's
+  log) that stack single-column below a 56rem breakpoint.
 - **`wifi_net`** joins your home Wi-Fi in station mode (credentials via
   `idf.py menuconfig` → "CAT Bridge Config", overridable at runtime via
   `POST /wifi-config` once NVS has a saved value) and advertises the device
@@ -139,6 +142,36 @@ No compression — raw PCM at 8kHz is ~128kbit/s, trivial for Wi-Fi, and
 avoids running any codec math on the ESP32 (G.711/Opus were considered and
 explicitly not used — see the Known Limitations note on this choice).
 
+### CAT baud rate
+
+The uSDX firmware's `CAT_BAUD` menu setting (9600/19200/38400/57600) is
+**local-menu-only on the radio** — there is no CAT command that reports or
+changes it, so the bridge has no way to detect a change automatically.
+Changing it on the radio breaks the UART link immediately (garbled bytes,
+no announcement frame possible), so the bridge's own baud has to be updated
+by hand to match:
+
+- `POST /cat-baud` (body `{"baud":38400}`) applies the new rate immediately
+  via `cat_bridge_set_baud()` — no reboot, unlike `/wifi-config` — and
+  persists it to NVS (`bridge_settings.c`) so a later reboot doesn't revert
+  to a stale value that no longer matches the radio.
+- The standalone control page's CAT monitor card (see below) has this as a
+  dropdown + Apply button. The web app's Bridge panel has the same control,
+  gated on `GET /info`'s `"cat_baud"` feature.
+
+### CAT monitor (control page)
+
+The standalone control page's CAT monitor card connects to the same `/cat`
+WebSocket the Signal-Decoder web app uses — a plain observer (plus an
+optional manual send box), not a separate protocol or firmware endpoint.
+Frames are split client-side on `;` and logged with a direction arrow
+(green/left = radio → bridge, red/right = bridge/browser → radio) — useful
+for confirming what's actually crossing the wire without needing the full
+web app open. Client-side only: the firmware doesn't buffer or replay
+history, so the log starts empty on every page load (a small in-firmware
+ring buffer was considered and explicitly skipped — this is meant to stay a
+live debug view, not a persistent log).
+
 ### Core placement
 
 ESP-IDF's Wi-Fi driver task defaults to core 0
@@ -148,8 +181,7 @@ pinned there too (`CONFIG_LWIP_TCPIP_TASK_AFFINITY_CPU0=y`, see
 otherwise let network activity drift onto core 1. The CAT UART reader is
 pinned exclusively to core 1 (`CAT_BRIDGE_TASK_CORE` in `bridge_config.h`)
 — nothing else this firmware creates runs there, so radio I/O timing is
-never contended by network stack activity. This matters more once audio
-streaming is added, but costs nothing to set up now.
+never contended by network stack activity.
 
 ## Wiring (see `main/bridge_config.h` to change)
 
@@ -285,8 +317,13 @@ parsing/queueing logic (frame prefixes, batched queries, poll loop,
 auto-report handling) is identical either way; only the `connect`/`write`/
 read-loop plumbing at the bottom of `useRadioCAT.ts` differs per transport.
 The web app's Bridge panel (in the Radio CAT settings) also exposes the
-`http_control` endpoints above — status, restart, Wi-Fi network change —
-gated on whatever `GET /info` reports the connected bridge supports.
+`http_control` endpoints above — status, restart, Wi-Fi network change, CAT
+baud rate — gated on whatever `GET /info` reports the connected bridge
+supports. The web app itself doesn't have a CAT frame monitor/log — that's
+only on the standalone control page (see CAT monitor above); the web app's
+own `useRadioCAT.ts` already parses every frame it needs for its own UI, so
+a raw log there would just duplicate what the control page already covers
+for debugging.
 
 `src/lib/cat/useAudioBridge.ts` (also gated on `GET /info`'s `"audio"`
 feature) opens the `/audio` WebSocket, plays received samples via Web Audio

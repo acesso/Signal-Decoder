@@ -1,5 +1,6 @@
 #include "bridge_settings.h"
 
+#include <inttypes.h>
 #include <string.h>
 
 #include "esp_log.h"
@@ -16,6 +17,7 @@ static const char *TAG = "bridge_settings";
 #define NVS_NAMESPACE "bridge_cfg"
 #define NVS_KEY_SSID     "wifi_ssid"
 #define NVS_KEY_PASSWORD "wifi_pass"
+#define NVS_KEY_CAT_BAUD "cat_baud"
 
 // nvs_flash_init() is already called once by wifi_net_start() (Wi-Fi driver
 // requires it) — but bridge_settings_init() runs first in app_main, before
@@ -61,5 +63,29 @@ bool bridge_settings_set_wifi(const char *ssid, const char *password) {
     nvs_close(h);
     bool ok = e1 == ESP_OK && e2 == ESP_OK && e3 == ESP_OK;
     ESP_LOGI(TAG, "saved new Wi-Fi credentials to NVS (ssid=%s): %s", ssid, ok ? "ok" : "FAILED");
+    return ok;
+}
+
+int bridge_settings_get_cat_baud(void) {
+    nvs_handle_t h;
+    int32_t baud = 0;
+    bool have_baud = false;
+    if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &h) == ESP_OK) {
+        have_baud = nvs_get_i32(h, NVS_KEY_CAT_BAUD, &baud) == ESP_OK;
+        nvs_close(h);
+    }
+    if (!have_baud) baud = CONFIG_BRIDGE_CAT_UART_BAUD;
+    ESP_LOGI(TAG, "CAT baud source: %s (%" PRId32 ")", have_baud ? "NVS" : "Kconfig default", baud);
+    return (int)baud;
+}
+
+bool bridge_settings_set_cat_baud(int baud) {
+    nvs_handle_t h;
+    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h) != ESP_OK) return false;
+    esp_err_t e1 = nvs_set_i32(h, NVS_KEY_CAT_BAUD, (int32_t)baud);
+    esp_err_t e2 = nvs_commit(h);
+    nvs_close(h);
+    bool ok = e1 == ESP_OK && e2 == ESP_OK;
+    ESP_LOGI(TAG, "saved new CAT baud to NVS (%d): %s", baud, ok ? "ok" : "FAILED");
     return ok;
 }
