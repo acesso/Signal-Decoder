@@ -6,6 +6,7 @@
   --border: #d0d0d0;
   --accent: #2a6fdb;
   --danger: #c0392b;
+  --meter: #2e7d32;
 }
 @media (prefers-color-scheme: dark) {
   :root {
@@ -80,6 +81,46 @@ button:disabled { opacity: 0.5; cursor: default; }
   color: color-mix(in srgb, var(--fg) 60%, transparent);
   margin: 0.5rem 0 0;
 }
+.meter-row {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-bottom: 0.5rem;
+}
+.meter-label {
+  font-size: 0.8rem;
+  font-weight: 600;
+  width: 4rem;
+  flex: 0 0 auto;
+}
+.meter-track {
+  flex: 1;
+  height: 0.5rem;
+  border-radius: 0.25rem;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  overflow: hidden;
+}
+.meter-fill {
+  height: 100%;
+  width: 0%;
+  background: var(--meter);
+  transition: width 75ms linear;
+}
+.meter-pct {
+  font-size: 0.75rem;
+  font-family: monospace;
+  width: 2.5rem;
+  text-align: right;
+  flex: 0 0 auto;
+}
+.audio-buttons {
+  display: flex;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+  margin: 0.5rem 0;
+}
+.audio-buttons button { flex: 1; min-width: 8rem; }
 #msg {
   min-height: 1.2rem;
   font-size: 0.9rem;

@@ -42,3 +42,10 @@ CONFIG_HTTPD_WS_SUPPORT=y
 # otherwise land on core 1 and contend with the CAT UART reader for CPU
 # time. Pin it to core 0 explicitly to close that gap.
 CONFIG_LWIP_TCPIP_TASK_AFFINITY_CPU0=y
+
+# Default (10) wasn't enough once /audio joined /cat on the same httpd
+# instance — httpd_start() reserves 3 sockets internally, so
+# ws_server.c's max_open_sockets (WS_MAX_CLIENTS + AUDIO_WS_MAX_CLIENTS + 2
+# = 8) needs LWIP_MAX_SOCKETS >= 11. Discovered as an ESP_ERR_INVALID_ARG
+# abort() boot-loop on real hardware. Rounded up for headroom.
+CONFIG_LWIP_MAX_SOCKETS=16

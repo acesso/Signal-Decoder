@@ -161,6 +161,187 @@ document.getElementById('reset-btn').addEventListener('click', async () => {
   }
 });
 
+// ── Audio bridge ─────────────────────────────────────────────────────────
+// Debug-only audio path direct from this page: a second WebSocket (/audio,
+// separate from the CAT-command relay) carrying raw 16-bit PCM mono at
+// BRIDGE_AUDIO_SAMPLE_RATE in both directions. Not real WebRTC — see the
+// firmware's audio_ws.h for why. Uses ScriptProcessorNode rather than a
+// separate AudioWorklet module file: this page has no bundler, and pulling
+// in a second .js module (with its own SPIFFS entry + fetch) isn't worth it
+// for what's meant to stay a lightweight debug tool, not the main app.
+const BRIDGE_AUDIO_SAMPLE_RATE = 8000; // must match ES8388_SAMPLE_RATE_HZ in bridge_config.h
+
+const meterIn = document.getElementById('meter-in');
+const meterInPct = document.getElementById('meter-in-pct');
+const meterOut = document.getElementById('meter-out');
+const meterOutPct = document.getElementById('meter-out-pct');
+const listenBtn = document.getElementById('audio-listen-btn');
+const micBtn = document.getElementById('audio-mic-btn');
+
+let audioWs = null;
+let playCtx = null;
+let nextPlayTime = 0;
+let micCtx = null;
+let micStream = null;
+let micProcessor = null;
+
+function resampleLinear(input, fromRate, toRate) {
+  if (fromRate === toRate) return input;
+  const ratio = fromRate / toRate;
+  const outLength = Math.round(input.length / ratio);
+  const out = new Float32Array(outLength);
+  for (let i = 0; i < outLength; i++) {
+    const srcPos = i * ratio;
+    const i0 = Math.floor(srcPos);
+    const i1 = Math.min(i0 + 1, input.length - 1);
+    const frac = srcPos - i0;
+    out[i] = input[i0] * (1 - frac) + input[i1] * frac;
+  }
+  return out;
+}
+
+function floatToInt16(samples) {
+  const out = new Int16Array(samples.length);
+  for (let i = 0; i < samples.length; i++) {
+    const clamped = Math.max(-1, Math.min(1, samples[i]));
+    out[i] = clamped < 0 ? clamped * 0x8000 : clamped * 0x7fff;
+  }
+  return out;
+}
+
+function int16ToFloat(samples) {
+  const out = new Float32Array(samples.length);
+  for (let i = 0; i < samples.length; i++) {
+    out[i] = samples[i] / (samples[i] < 0 ? 0x8000 : 0x7fff);
+  }
+  return out;
+}
+
+// sqrt-compressed 0-1 — matches the firmware's own LED brightness curve
+// (audio_monitor.c's rms_to_led_level) so this page's meters and the
+// physical LEDs "agree" on what a given signal looks like.
+function rmsLevel(samples) {
+  if (samples.length === 0) return 0;
+  let sumSq = 0;
+  for (let i = 0; i < samples.length; i++) sumSq += samples[i] * samples[i];
+  return Math.sqrt(Math.min(1, Math.sqrt(sumSq / samples.length)));
+}
+
+function setMeter(fillEl, pctEl, level, active) {
+  const pct = active ? Math.round(level * 100) : 0;
+  fillEl.style.width = `${pct}%`;
+  pctEl.textContent = active ? `${pct}%` : '—';
+}
+
+function playFrame(int16) {
+  if (!playCtx) return;
+  const floatSamples = int16ToFloat(int16);
+  const resampled = resampleLinear(floatSamples, BRIDGE_AUDIO_SAMPLE_RATE, playCtx.sampleRate);
+
+  const buffer = playCtx.createBuffer(1, resampled.length, playCtx.sampleRate);
+  buffer.copyToChannel(resampled, 0);
+
+  const source = playCtx.createBufferSource();
+  source.buffer = buffer;
+  source.connect(playCtx.destination);
+
+  const startAt = Math.max(nextPlayTime, playCtx.currentTime);
+  source.start(startAt);
+  nextPlayTime = startAt + buffer.duration;
+
+  setMeter(meterIn, meterInPct, rmsLevel(floatSamples), true);
+}
+
+function stopMic() {
+  if (micProcessor) { micProcessor.disconnect(); micProcessor.onaudioprocess = null; micProcessor = null; }
+  if (micStream) { micStream.getTracks().forEach((t) => t.stop()); micStream = null; }
+  if (micCtx) { micCtx.close(); micCtx = null; }
+  micBtn.textContent = 'Send Mic to Radio';
+  micBtn.disabled = !audioWs;
+  setMeter(meterOut, meterOutPct, 0, false);
+}
+
+function disconnectAudio() {
+  if (audioWs) { audioWs.close(); audioWs = null; }
+  stopMic();
+  if (playCtx) { playCtx.close(); playCtx = null; }
+  nextPlayTime = 0;
+  listenBtn.textContent = 'Listen to Radio';
+  micBtn.disabled = true;
+  setMeter(meterIn, meterInPct, 0, false);
+}
+
+function connectAudio() {
+  const url = new URL('/audio', location.href);
+  url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
+
+  playCtx = new AudioContext();
+  nextPlayTime = 0;
+
+  const ws = new WebSocket(url.toString());
+  ws.binaryType = 'arraybuffer';
+  ws.onopen = () => {
+    audioWs = ws;
+    listenBtn.textContent = 'Stop Listening';
+    micBtn.disabled = false;
+    showMsg('Audio connected.', 'ok');
+  };
+  ws.onmessage = (ev) => {
+    if (!(ev.data instanceof ArrayBuffer)) return;
+    playFrame(new Int16Array(ev.data));
+  };
+  ws.onerror = () => showMsg('Audio connection failed.', 'error');
+  ws.onclose = () => { if (audioWs === ws) disconnectAudio(); };
+}
+
+async function startMic() {
+  if (!audioWs || audioWs.readyState !== WebSocket.OPEN) return;
+  try {
+    micStream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false },
+    });
+    micCtx = new AudioContext();
+    const source = micCtx.createMediaStreamSource(micStream);
+    // 4096-sample buffer: large enough that ScriptProcessorNode's main-thread
+    // callback overhead is negligible relative to buffer duration, small
+    // enough to keep mic->radio latency reasonable for a debug tool (this
+    // isn't the primary UI's carefully-tuned AudioWorklet capture path).
+    micProcessor = micCtx.createScriptProcessor(4096, 1, 1);
+    micProcessor.onaudioprocess = (ev) => {
+      if (!audioWs || audioWs.readyState !== WebSocket.OPEN) return;
+      const input = ev.inputBuffer.getChannelData(0);
+      const resampled = resampleLinear(input, micCtx.sampleRate, BRIDGE_AUDIO_SAMPLE_RATE);
+      const int16 = floatToInt16(resampled);
+      audioWs.send(int16.buffer);
+      setMeter(meterOut, meterOutPct, rmsLevel(resampled), true);
+    };
+    source.connect(micProcessor);
+    // ScriptProcessorNode only fires onaudioprocess while connected into the
+    // graph all the way to a destination — a silent gain keeps it running
+    // without actually putting the mic signal on the speakers (that would
+    // be a feedback loop, not a debug tool).
+    const silencer = micCtx.createGain();
+    silencer.gain.value = 0;
+    micProcessor.connect(silencer);
+    silencer.connect(micCtx.destination);
+
+    micBtn.textContent = 'Stop Mic';
+  } catch (err) {
+    showMsg(`Microphone access failed: ${err.message}`, 'error');
+    stopMic();
+  }
+}
+
+listenBtn.addEventListener('click', () => {
+  if (audioWs) disconnectAudio();
+  else connectAudio();
+});
+
+micBtn.addEventListener('click', () => {
+  if (micStream) stopMic();
+  else void startMic();
+});
+
 refreshStatus(true);
 scanNetworks();
 startStatusAutoRefresh();

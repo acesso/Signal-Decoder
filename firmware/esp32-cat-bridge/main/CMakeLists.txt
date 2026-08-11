@@ -10,6 +10,7 @@ idf_component_register(
         "control_page.c"
         "led_status.c"
         "audio_monitor.c"
+        "audio_ws.c"
     INCLUDE_DIRS "."
     REQUIRES
         esp_wifi

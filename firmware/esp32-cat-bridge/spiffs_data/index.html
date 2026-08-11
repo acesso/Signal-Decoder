@@ -43,6 +43,28 @@
   <code>192.168.4.1</code> so you can fix it here again.</p>
 </section>
 
+<section id="audio-card" class="card">
+  <h2>Audio</h2>
+  <div class="meter-row">
+    <span class="meter-label">Speaker</span>
+    <div class="meter-track"><div id="meter-in" class="meter-fill"></div></div>
+    <span id="meter-in-pct" class="meter-pct">&mdash;</span>
+  </div>
+  <div class="meter-row">
+    <span class="meter-label">Mic</span>
+    <div class="meter-track"><div id="meter-out" class="meter-fill"></div></div>
+    <span id="meter-out-pct" class="meter-pct">&mdash;</span>
+  </div>
+  <div class="audio-buttons">
+    <button id="audio-listen-btn" type="button">Listen to Radio</button>
+    <button id="audio-mic-btn" type="button" disabled>Send Mic to Radio</button>
+  </div>
+  <p class="hint">Streams raw audio over a second WebSocket
+  (<code>/audio</code>), independent of the CAT connection &mdash; useful for
+  debugging the audio path directly from this page, without the
+  Signal-Decoder web app.</p>
+</section>
+
 <section id="reset-card" class="card">
   <h2>Restart bridge</h2>
   <button id="reset-btn" type="button" class="danger">Restart now</button>

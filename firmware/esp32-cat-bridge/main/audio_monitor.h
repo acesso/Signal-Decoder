@@ -1,30 +1,27 @@
 // Brings up the onboard ES8388 codec (see ES8388_* pins in bridge_config.h)
-// just far enough to read its ADC continuously and compute a running RMS
-// level for the "audio in" status LED (see led_status.h). Line 4 of a
-// planned pair of features on this board: CAT bridging, this level
-// metering, and — not yet built — an actual audio-out pipeline (WebRTC or
-// similar) once that exists.
-//
-// There is no audio-out pipeline yet, so audio_monitor_report_out_samples()
-// exists as the intended hook for that future feature but nothing calls it
-// today — the "audio out" LED will show 0/off until it does. This is
-// deliberate scope, not a bug: this module's job right now is level
-// metering for whatever's real (the ADC input), not inventing a fake
-// signal to make the second LED light up.
+// and bridges it bidirectionally to the /audio WebSocket (see audio_ws.h):
+//   radio speaker (ADC) -> RMS for the "in" status LED -> broadcast to browsers
+//   browser mic (via /audio) -> RMS for the "out" status LED -> radio mic (DAC)
+// Line 4 of a planned pair of features on this board: CAT bridging and this
+// audio bridge, plus any other small radio controls that make sense once
+// both exist.
 #pragma once
 
 #include <stddef.h>
 #include <stdint.h>
 
-// Brings up I2C + I2S + the ES8388 codec, opens it in ADC+DAC mode, and
-// starts a background task that reads the ADC continuously, computes RMS
-// over short windows, and feeds led_status_set_audio_levels(). Safe to call
-// even if no microphone/line-in is actually wired — reads back silence
-// (near-zero RMS) in that case, same as a real quiet input would.
+// Brings up I2C + I2S + the ES8388 codec, opens it in ADC+DAC mode, registers
+// its /audio rx callback (see audio_ws_set_rx_callback), and starts the
+// background task that reads the ADC continuously, computes RMS, feeds
+// led_status_set_audio_levels(), and broadcasts samples to /audio clients.
+// Call after audio_ws_start() — needs its rx-callback slot already available.
+// Safe to call even if no microphone/line-in is actually wired — reads back
+// silence (near-zero RMS) in that case, same as a real quiet input would.
 void audio_monitor_start(void);
 
-// Feeds a block of already-computed audio-out samples (16-bit signed PCM,
-// mono, ES8388_SAMPLE_RATE_HZ) into the same RMS/LED pipeline the ADC input
-// uses. Intended for a future playback feature to call as it queues audio
-// for the DAC — not called anywhere yet.
+// Feeds a block of samples (16-bit signed PCM, mono, ES8388_SAMPLE_RATE_HZ)
+// into the same DAC-write/RMS/LED pipeline the /audio WebSocket's rx
+// callback uses. A thin alias kept for any future in-firmware playback
+// source that isn't the WebSocket itself (e.g. a locally-generated tone)
+// — nothing calls it today, /audio's rx callback is the only real producer.
 void audio_monitor_report_out_samples(const int16_t *samples, size_t count);

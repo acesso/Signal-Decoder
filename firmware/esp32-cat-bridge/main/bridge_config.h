@@ -26,7 +26,7 @@
 // capability lands (e.g. "audio" once WebRTC firmware exists) — features are
 // additive and never removed once shipped, so an older web app talking to a
 // newer bridge just ignores flags it doesn't recognize.
-#define BRIDGE_FIRMWARE_VERSION "0.2.0"
+#define BRIDGE_FIRMWARE_VERSION "0.3.0"
 
 // ── Wi-Fi (station mode) ────────────────────────────────────────────────────
 // Credentials come from Kconfig (idf.py menuconfig -> "CAT Bridge Config"),
@@ -62,6 +62,14 @@
 #define WS_SERVER_PORT          80
 #define WS_MAX_CLIENTS          4
 
+// Separate route/client set from /cat (WS_MAX_CLIENTS above) — a browser
+// tab debugging CAT doesn't necessarily want an open mic/speaker session,
+// and vice versa. Same httpd instance/port, just a different URI.
+// AUDIO_WS_MAX_CLIENTS is deliberately small: each open audio session
+// means real, continuous UART/I2S-competing work (RMS + WS framing on
+// every ~50ms buffer), unlike /cat's near-idle text frames.
+#define AUDIO_WS_MAX_CLIENTS    2
+
 // ── Audio codec (ES8388, onboard) ───────────────────────────────────────────
 // Pin map + I2C address cross-verified against community A1S v2.2 board
 // support files (ESP-ADF forks, arduino-audiokit) — Espressif's own esp-adf
@@ -82,7 +90,10 @@
 #define ES8388_I2S_DIN_PIN      GPIO_NUM_35     // codec ADC -> ESP32 (audio in)
 #define ES8388_PA_ENABLE_PIN    GPIO_NUM_21
 #define ES8388_PA_REVERTED      false           // unconfirmed — see note above
-#define ES8388_SAMPLE_RATE_HZ   16000           // enough for level metering, not hi-fi playback
+#define ES8388_SAMPLE_RATE_HZ   8000            // plenty for SSB voice (~2.7kHz bandwidth); keeps
+                                                 // the /audio WebSocket's bitrate trivial (128kbit/s
+                                                 // raw PCM) and CPU cost near zero (no resampling
+                                                 // or codec math on the ESP32 side)
 #define ES8388_MASTER_MODE      true            // ESP32 drives I2S clocks, ES8388 is I2S slave
 
 // ── Status LEDs (onboard, shared with buttons — see wiring notes in the

@@ -11,6 +11,7 @@ import {
   type BridgeStatus,
   type BridgeInfo,
 } from '../lib/cat/useRadioCAT'
+import { useAudioBridge } from '../lib/cat/useAudioBridge'
 import CalibrationWizard from './CalibrationWizard'
 import NumberField from './NumberField'
 import { loadObject, saveObject } from '../lib/storage'
@@ -1023,6 +1024,90 @@ function BridgeWifiConfigForm(props: {
   )
 }
 
+// ── BridgeAudioControl ────────────────────────────────────────────────────────
+// Live audio bridge to the ESP32's onboard codec (see useAudioBridge.ts) —
+// two level meters (radio speaker -> browser, browser mic -> radio mic) plus
+// play/mic toggles. Not real WebRTC (no ICE/DTLS-SRTP on bare ESP-IDF); a
+// second WebSocket (/audio) carrying raw PCM, same infra as /cat.
+
+function AudioMeter(props: { label: string; level: number; active: boolean }) {
+  const pct = () => Math.round(props.level * 100)
+  return (
+    <div class="flex items-center gap-2">
+      <span class="text-[10px] font-semibold text-[#8b949e] whitespace-nowrap w-16">{props.label}</span>
+      <div class="flex-1 h-2 rounded bg-[#0d1117] border border-[#30363d] overflow-hidden">
+        <div
+          class="h-full bg-[#3fb950] transition-[width] duration-75"
+          style={{ width: `${props.active ? pct() : 0}%` }}
+        />
+      </div>
+      <span class="text-[10px] text-[#8b949e] font-mono w-8 text-right">{props.active ? `${pct()}%` : '—'}</span>
+    </div>
+  )
+}
+
+function BridgeAudioControl(props: { wsUrl: string }) {
+  const audio = useAudioBridge()
+  const [busy, setBusy] = createSignal(false)
+
+  const handlePlayToggle = async () => {
+    setBusy(true)
+    if (audio.state().connected) {
+      audio.disconnect()
+    } else {
+      await audio.connect(props.wsUrl)
+    }
+    setBusy(false)
+  }
+
+  const handleMicToggle = async () => {
+    setBusy(true)
+    if (audio.state().micActive) {
+      audio.stopMic()
+    } else {
+      await audio.startMic()
+    }
+    setBusy(false)
+  }
+
+  return (
+    <div class="flex flex-col gap-2">
+      <AudioMeter label="Speaker" level={audio.state().levelIn} active={audio.state().playbackActive} />
+      <AudioMeter label="Mic" level={audio.state().levelOut} active={audio.state().micActive} />
+      <div class="flex items-center gap-2 flex-wrap">
+        <button
+          onClick={() => void handlePlayToggle()}
+          disabled={busy()}
+          class={`text-[10px] font-semibold px-2.5 py-1.5 rounded border transition-colors whitespace-nowrap disabled:opacity-50
+            ${audio.state().connected
+              ? 'bg-[#21262d] border-[#f0883e] text-[#f0883e] hover:bg-[#bd561d] hover:text-white'
+              : 'bg-[#238636] border-[#238636] text-white hover:bg-[#2ea043]'
+            }`}
+        >
+          {audio.state().connected ? 'Stop Listening' : 'Listen to Radio'}
+        </button>
+        <button
+          onClick={() => void handleMicToggle()}
+          disabled={busy() || !audio.state().connected}
+          class={`text-[10px] font-semibold px-2.5 py-1.5 rounded border transition-colors whitespace-nowrap disabled:opacity-50
+            ${audio.state().micActive
+              ? 'bg-[#21262d] border-[#f0883e] text-[#f0883e] hover:bg-[#bd561d] hover:text-white'
+              : 'bg-[#21262d] border-[#30363d] text-[#8b949e] hover:text-[#c9d1d9] hover:border-[#8b949e]'
+            }`}
+        >
+          {audio.state().micActive ? 'Stop Mic' : 'Send Mic to Radio'}
+        </button>
+      </div>
+      <Show when={audio.state().error}>
+        <p class="text-[10px] text-[#f0883e]">{audio.state().error}</p>
+      </Show>
+      <p class="text-[10px] text-[#8b949e]">
+        Streams raw audio over a second WebSocket ({'/audio'}), not the CAT connection — independent of the radio's own PTT state.
+      </p>
+    </div>
+  )
+}
+
 // ── BridgeStatusPanel ─────────────────────────────────────────────────────────
 // On-demand ESP32 CAT bridge status (Wi-Fi RSSI/SSID/IP, connected client
 // count, radio-link, uptime) plus firmware version/capabilities and
@@ -1188,8 +1273,11 @@ function BridgeStatusPanel(props: {
         </div>
       </Show>
 
-      {/* Future: audio in/out (WebRTC) once hardware exists — gated the
-          same way, on info()?.features.includes('audio'), not built yet. */}
+      <Show when={hasFeature('audio')}>
+        <div class="border-t border-[#21262d] pt-3">
+          <BridgeAudioControl wsUrl={props.wsUrl} />
+        </div>
+      </Show>
     </div>
   )
 }
