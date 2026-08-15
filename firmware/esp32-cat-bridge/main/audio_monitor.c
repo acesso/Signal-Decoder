@@ -195,6 +195,10 @@ void audio_monitor_start(void) {
     }
 
     audio_ws_set_rx_callback(audio_rx_callback);
-    xTaskCreate(audio_task, "audio_monitor", 4096, NULL, tskIDLE_PRIORITY + 3, NULL);
+    // Pinned to RELAY_TASK_CORE alongside the CAT UART reader (higher
+    // priority, so it always wins contention) and the PA watchdog — see
+    // bridge_config.h's Task placement notes for the full reasoning.
+    xTaskCreatePinnedToCore(audio_task, "audio_monitor", 4096, NULL,
+                             AUDIO_MONITOR_TASK_PRIO, NULL, AUDIO_MONITOR_TASK_CORE);
     ESP_LOGI(TAG, "ES8388 audio monitor started (in=ADC -> /audio broadcast, out=/audio rx -> DAC)");
 }

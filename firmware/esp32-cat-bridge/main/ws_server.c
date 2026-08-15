@@ -190,6 +190,16 @@ void ws_server_start(void) {
 
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = WS_SERVER_PORT;
+    // Default is tskNO_AFFINITY — explicitly pinned to core 0 instead
+    // (Wi-Fi/network/control's core, see bridge_config.h's Task placement
+    // notes) so this task can never drift onto core 1 and contend with the
+    // CAT UART reader/audio codec I/O/PA watchdog pinned there. This
+    // matters here specifically because httpd's own worker task is what
+    // actually calls httpd_ws_send_frame_async() for every /cat and
+    // /audio broadcast (queued via httpd_queue_work from cat_bridge's and
+    // audio_monitor's core-1 tasks) — if it ran on core 1 too, it would be
+    // competing directly with the very tasks core-1 isolation exists to protect.
+    config.core_id = 0;
     // Default is 4096 — too tight once /wifi-scan's handler chain
     // (wifi_scan_handler's on-stack result/body buffers calling into
     // wifi_net_scan's own wifi_ap_record_t[32] buffer, ~3.2KB alone) is

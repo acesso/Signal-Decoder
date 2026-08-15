@@ -273,14 +273,33 @@ sources in `main/doc/PA_WATCHDOG_DESIGN.md` — summary:
 
 ### Core placement
 
-ESP-IDF's Wi-Fi driver task defaults to core 0
-(`CONFIG_ESP_WIFI_TASK_PINNED_TO_CORE_0`); lwIP's TCPIP task is explicitly
-pinned there too (`CONFIG_LWIP_TCPIP_TASK_AFFINITY_CPU0=y`, see
-`sdkconfig.defaults`) rather than left at "no affinity", which could
-otherwise let network activity drift onto core 1. The CAT UART reader is
-pinned exclusively to core 1 (`CAT_BRIDGE_TASK_CORE` in `bridge_config.h`)
-— nothing else this firmware creates runs there, so radio I/O timing is
-never contended by network stack activity.
+Two-core split along "what this bridge fundamentally does" lines — full
+reasoning in `bridge_config.h`'s Task placement comment:
+
+- **Core 0 — Wi-Fi/network/control.** ESP-IDF's Wi-Fi driver task defaults
+  here (`CONFIG_ESP_WIFI_TASK_PINNED_TO_CORE_0`); lwIP's TCPIP task is
+  explicitly pinned too (`CONFIG_LWIP_TCPIP_TASK_AFFINITY_CPU0=y`, see
+  `sdkconfig.defaults`) rather than left at "no affinity". The httpd
+  worker task is explicitly pinned here as well (`ws_server.c`'s
+  `config.core_id = 0`) — it's what actually sends every `/cat` and
+  `/audio` broadcast frame (queued via `httpd_queue_work` from the core-1
+  tasks below), so leaving it unpinned could let it drift onto core 1 and
+  contend directly with the tasks core-1 isolation exists to protect.
+  `led_status` (purely cosmetic, no timing requirement) is left unpinned,
+  which in practice means it shares core 0.
+- **Core 1 — the relay itself.** CAT UART reader (`CAT_BRIDGE_TASK_CORE`),
+  the audio codec I/O (`AUDIO_MONITOR_TASK_CORE`), and the PA watchdog's
+  polling (`PA_WATCHDOG_TASK_CORE`) — all pinned here, all in
+  `bridge_config.h`, so none of the bridge's real-time relay work is ever
+  contended by Wi-Fi/network activity. Priority order (highest wins): CAT
+  UART (protocol correctness — a dropped/garbled CAT byte breaks the whole
+  session) > PA watchdog (safety-critical timing, but genuinely light —
+  one GPIO read per 100ms) > audio (a dropped buffer is a barely
+  perceptible glitch, most tolerant of the three). All three block with a
+  timeout under the hood (`uart_read_bytes`' own 20ms timeout,
+  `esp_codec_dev`'s DMA-backed I2S, GPIO polling's `vTaskDelay`) rather
+  than busy-waiting, so this is normal FreeRTOS preemption between real
+  tasks sharing a core, not a starvation risk.
 
 ## Wiring (see `main/bridge_config.h` to change)
 
