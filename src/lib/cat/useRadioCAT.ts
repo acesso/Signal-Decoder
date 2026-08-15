@@ -236,6 +236,14 @@ export interface RadioCATControls {
    *  bridge in sync by hand after changing it on the radio. Only meaningful
    *  if getBridgeInfo().features includes "cat_baud". */
   setBridgeCatBaud: (wsUrl: string, baud: number) => Promise<{ baud: number; saved: boolean } | null>;
+  /** POST /pa-emergency-clear — un-trips a latched PA safety cutoff (see
+   *  the firmware's pa_watchdog.h). No auto-recovery exists on the bridge
+   *  side, so this is the only way to restore the PA after a trip; the
+   *  caller is responsible for having confirmed by eye/ear that it's
+   *  actually safe to re-enable before calling this. Only meaningful if
+   *  getBridgeInfo().features includes "pa_watchdog". Resolves the
+   *  resulting tripped state (false on success), or null on failure. */
+  clearBridgePaEmergency: (wsUrl: string) => Promise<boolean | null>;
 }
 
 /** Snapshot of the ESP32 CAT bridge's own status — distinct from RadioState,
@@ -259,6 +267,15 @@ export interface BridgeStatus {
    *  firmware's own CAT_BAUD menu options). Only meaningful if
    *  getBridgeInfo().features includes "cat_baud". */
   catBaud: number;
+  /** Live reading of the PA safety watchdog's sense line — true means the
+   *  external miniPA70 amplifier is currently confirmed energized (ground
+   *  truth from the interface board, not just "radio commanded PA-on").
+   *  Only meaningful if getBridgeInfo().features includes "pa_watchdog". */
+  paSense: boolean;
+  /** True once the watchdog has forced the PA off after PA_MAX_ON_SECONDS
+   *  of continuous paSense — LATCHED until clearBridgePaEmergency()
+   *  succeeds, regardless of what paSense does in the meantime. */
+  paEmergencyTripped: boolean;
   uptimeSeconds: number;
 }
 
@@ -1349,6 +1366,7 @@ export function useRadioCAT(): RadioCATControls {
         ip: String(j.ip ?? ''), wsClients: Number(j.ws_clients) || 0,
         wsMaxClients: Number(j.ws_max_clients) || 0,
         radioLinked: j.radio_linked === true, catBaud: Number(j.cat_baud) || 0,
+        paSense: j.pa_sense === true, paEmergencyTripped: j.pa_emergency_tripped === true,
         uptimeSeconds: Number(j.uptime_s) || 0,
       };
     } catch (err) {
@@ -1467,6 +1485,27 @@ export function useRadioCAT(): RadioCATControls {
     }
   };
 
+  // POST /pa-emergency-clear — no body, no auto-recovery on the firmware
+  // side (see pa_watchdog.h), so this is the only way to restore the PA
+  // after a trip. The caller (the Bridge panel's Clear button) is
+  // responsible for confirming with the operator first.
+  const clearBridgePaEmergency = async (wsUrl: string): Promise<boolean | null> => {
+    const base = bridgeHttpBase(wsUrl);
+    if (!base) return null;
+    log('info', 'clearBridgePaEmergency →', base + '/pa-emergency-clear');
+    try {
+      const resp = await fetch(base + '/pa-emergency-clear', {
+        method: 'POST', signal: AbortSignal.timeout(5000),
+      });
+      if (!resp.ok) return null;
+      const j = await resp.json();
+      return j.pa_emergency_tripped === true;
+    } catch (err) {
+      log('warn', 'clearBridgePaEmergency failed:', err);
+      return null;
+    }
+  };
+
   onCleanup(() => { disconnect(); });
 
   return {
@@ -1475,6 +1514,6 @@ export function useRadioCAT(): RadioCATControls {
     setBacklight, getPABias, setPABias, getTxTimeout, setTxTimeout, resetRadio,
     getFactoryDefaults, factoryResetRadio, getRefFreq, setRefFreq,
     getBridgeStatus, resetBridge, getBridgeInfo, setBridgeBacklight, setBridgeWifiConfig, setBridgeContrast,
-    setBridgeCatBaud,
+    setBridgeCatBaud, clearBridgePaEmergency,
   };
 }

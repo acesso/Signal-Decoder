@@ -69,10 +69,43 @@ async function refreshStatus(silent) {
 
     const catBaudSelectEl = document.getElementById('cat-baud-select');
     if (status.cat_baud && catBaudSelectEl) catBaudSelectEl.value = String(status.cat_baud);
+
+    updatePaCard(status.pa_sense, status.pa_emergency_tripped);
   } catch (err) {
     if (!silent) showMsg(`Failed to load status: ${err.message}`, 'error');
   }
 }
+
+// ── PA safety watchdog ────────────────────────────────────────────────────
+// Purely a status readout + manual clear — the actual watchdog (sensing,
+// timeout, latching) lives entirely in the firmware (pa_watchdog.c); this
+// page has no logic of its own beyond displaying GET /status's pa_sense/
+// pa_emergency_tripped fields and calling POST /pa-emergency-clear.
+const paCard = document.getElementById('pa-card');
+const paClearBtn = document.getElementById('pa-clear-btn');
+
+function updatePaCard(paSense, tripped) {
+  document.getElementById('pa-sense').textContent =
+    paSense === undefined ? '—' : (paSense ? 'energized' : 'off');
+  document.getElementById('pa-emergency').textContent =
+    tripped === undefined ? '—' : (tripped ? 'TRIPPED — PA disabled' : 'clear');
+  paCard.classList.toggle('pa-tripped', tripped === true);
+  paClearBtn.disabled = tripped !== true;
+}
+
+paClearBtn.addEventListener('click', async () => {
+  if (!confirm('Clear the PA emergency cutoff? Only do this if you have confirmed by eye/ear that the amplifier is actually safe to re-enable.')) return;
+  try {
+    const res = await fetch('/pa-emergency-clear', { method: 'POST' });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const { pa_emergency_tripped } = await res.json();
+    showMsg(pa_emergency_tripped ? 'Failed to clear — still tripped.' : 'PA emergency cutoff cleared.',
+            pa_emergency_tripped ? 'error' : 'ok');
+    void refreshStatus(true);
+  } catch (err) {
+    showMsg(`Failed to clear PA emergency: ${err.message}`, 'error');
+  }
+});
 
 async function scanNetworks() {
   scanBtn.disabled = true;
