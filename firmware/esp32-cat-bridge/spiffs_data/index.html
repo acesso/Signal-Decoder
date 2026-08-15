@@ -89,6 +89,54 @@
   </div>
 
   <div class="col col-main">
+    <section id="audio-quality-card" class="card">
+      <div class="cat-header">
+        <h2>Audio quality</h2>
+        <label class="cat-pause-label">
+          <input id="quality-toggle" type="checkbox">
+          Show
+        </label>
+      </div>
+      <div id="quality-view" class="quality-view" hidden>
+        <div class="quality-channel">
+          <div class="quality-channel-header">
+            <span class="quality-channel-label">Speaker (in)</span>
+            <span id="quality-in-readout" class="quality-readout">inactive</span>
+          </div>
+          <canvas id="quality-in-bars" width="480" height="70" class="quality-canvas"></canvas>
+          <canvas id="quality-in-waterfall" width="480" height="70" class="quality-canvas"></canvas>
+          <canvas id="quality-in-scope" width="480" height="60" class="quality-canvas"></canvas>
+          <div class="quality-stats">
+            <span>Cutoff (~-6dB)</span><span id="quality-in-cutoff">&mdash;</span>
+            <span>Noise floor</span><span id="quality-in-floor">&mdash;</span>
+            <span>DC offset</span><span id="quality-in-dc">&mdash;</span>
+            <span>Clips (10s)</span><span id="quality-in-clips">0</span>
+          </div>
+        </div>
+        <div class="quality-channel">
+          <div class="quality-channel-header">
+            <span class="quality-channel-label">Mic (out)</span>
+            <span id="quality-out-readout" class="quality-readout">inactive</span>
+          </div>
+          <canvas id="quality-out-bars" width="480" height="70" class="quality-canvas"></canvas>
+          <canvas id="quality-out-waterfall" width="480" height="70" class="quality-canvas"></canvas>
+          <canvas id="quality-out-scope" width="480" height="60" class="quality-canvas"></canvas>
+          <div class="quality-stats">
+            <span>Cutoff (~-6dB)</span><span id="quality-out-cutoff">&mdash;</span>
+            <span>Noise floor</span><span id="quality-out-floor">&mdash;</span>
+            <span>DC offset</span><span id="quality-out-dc">&mdash;</span>
+            <span>Clips (10s)</span><span id="quality-out-clips">0</span>
+          </div>
+        </div>
+      </div>
+      <p class="hint">For tuning the interface board's audio-in/audio-out RC
+      filter trimpots by eye &mdash; the blue dashed line marks the estimated
+      passband rolloff (~-6dB point); watch it move as you adjust each
+      trimpot. Requires "Listen to Radio"/"Send Mic to Radio" active in the
+      Audio card. Rendered only while shown (unchecking "Show" stops the
+      per-frame canvas work).</p>
+    </section>
+
     <section id="cat-card" class="card">
       <div class="cat-header">
         <h2>CAT monitor</h2>

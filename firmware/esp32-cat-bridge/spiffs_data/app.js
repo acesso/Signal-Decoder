@@ -216,9 +216,11 @@ const micBtn = document.getElementById('audio-mic-btn');
 
 let audioWs = null;
 let playCtx = null;
+let playAnalyserNode = null;
 let nextPlayTime = 0;
 let micCtx = null;
 let micStream = null;
+let micAnalyserNode = null;
 let micProcessor = null;
 
 function resampleLinear(input, fromRate, toRate) {
@@ -279,7 +281,10 @@ function playFrame(int16) {
 
   const source = playCtx.createBufferSource();
   source.buffer = buffer;
-  source.connect(playCtx.destination);
+  // Routed through the shared analyser (created once in connectAudio(),
+  // already wired to destination there) so the quality view can read from
+  // one persistent node instead of a new analyser per short-lived frame.
+  source.connect(playAnalyserNode || playCtx.destination);
 
   const startAt = Math.max(nextPlayTime, playCtx.currentTime);
   source.start(startAt);
@@ -290,6 +295,7 @@ function playFrame(int16) {
 
 function stopMic() {
   if (micProcessor) { micProcessor.disconnect(); micProcessor.onaudioprocess = null; micProcessor = null; }
+  micAnalyserNode = null;
   if (micStream) { micStream.getTracks().forEach((t) => t.stop()); micStream = null; }
   if (micCtx) { micCtx.close(); micCtx = null; }
   micBtn.textContent = 'Send Mic to Radio';
@@ -301,6 +307,7 @@ function disconnectAudio() {
   if (audioWs) { audioWs.close(); audioWs = null; }
   stopMic();
   if (playCtx) { playCtx.close(); playCtx = null; }
+  playAnalyserNode = null;
   nextPlayTime = 0;
   listenBtn.textContent = 'Listen to Radio';
   micBtn.disabled = true;
@@ -313,6 +320,9 @@ function connectAudio() {
 
   playCtx = new AudioContext();
   nextPlayTime = 0;
+  playAnalyserNode = playCtx.createAnalyser();
+  playAnalyserNode.fftSize = 2048;
+  playAnalyserNode.connect(playCtx.destination);
 
   const ws = new WebSocket(url.toString());
   ws.binaryType = 'arraybuffer';
@@ -338,6 +348,14 @@ async function startMic() {
     });
     micCtx = new AudioContext();
     const source = micCtx.createMediaStreamSource(micStream);
+
+    // AnalyserNode doesn't need a destination connection to be readable —
+    // it just needs to sit in the signal path, so tapping it here doesn't
+    // change the fact that the mic is never routed to local speakers.
+    micAnalyserNode = micCtx.createAnalyser();
+    micAnalyserNode.fftSize = 2048;
+    source.connect(micAnalyserNode);
+
     // 4096-sample buffer: large enough that ScriptProcessorNode's main-thread
     // callback overhead is negligible relative to buffer duration, small
     // enough to keep mic->radio latency reasonable for a debug tool (this
@@ -498,6 +516,270 @@ catBaudApplyBtn.addEventListener('click', async () => {
 });
 
 connectCatMonitor();
+
+// ── Audio quality view ───────────────────────────────────────────────────
+// For tuning the interface board's audio-in/audio-out RC filter trimpots by
+// eye instead of by ear. Runs entirely in this browser tab (real CPU/GPU
+// budget here, unlike the ESP32) — deliberately more than a bare meter:
+// bar spectrum + a simple scrolling waterfall + oscilloscope, plus several
+// automated "notice this" readouts (estimated filter cutoff, clip events,
+// DC offset, noise floor), same analyses as the Signal-Decoder web app's
+// AudioQualityPanel.tsx, ported to plain JS since this page has no
+// bundler/component framework. Only ticks while "Show" is checked AND the
+// corresponding audio direction is actually active — no point spending
+// canvas-redraw work on a hidden or inactive view.
+const CLIP_THRESHOLD = 0.98; // fraction of full-scale (Web Audio's -1..1 float range)
+const CLIP_WINDOW_MS = 10000; // rolling window for the "N clips in the last 10s" counter
+const CLIP_FLASH_MS = 250;
+const NOISE_FLOOR_WINDOW_MS = 4000;
+const DC_OFFSET_WARN = 0.03; // ~3% of full-scale
+
+const qualityToggle = document.getElementById('quality-toggle');
+const qualityView = document.getElementById('quality-view');
+
+function makeChannelState(prefix) {
+  return {
+    prefix,
+    barCanvas: document.getElementById(`quality-${prefix}-bars`),
+    waterfallCanvas: document.getElementById(`quality-${prefix}-waterfall`),
+    scopeCanvas: document.getElementById(`quality-${prefix}-scope`),
+    readoutEl: document.getElementById(`quality-${prefix}-readout`),
+    cutoffEl: document.getElementById(`quality-${prefix}-cutoff`),
+    floorEl: document.getElementById(`quality-${prefix}-floor`),
+    dcEl: document.getElementById(`quality-${prefix}-dc`),
+    clipsEl: document.getElementById(`quality-${prefix}-clips`),
+    channelEl: document.getElementById(`quality-${prefix}-bars`).closest('.quality-channel'),
+    freqData: null,
+    timeDataFloat: null,
+    timeDataByte: null,
+    clipEvents: [],
+    lastClipFlashAt: 0,
+    noiseFloorMin: Infinity,
+    noiseFloorWindowStart: 0,
+    waterfallImage: null, // ImageData scratch row, built lazily once canvas size is known
+  };
+}
+
+const qualityIn = makeChannelState('in');
+const qualityOut = makeChannelState('out');
+
+// Same -6dB-relative-to-peak rolloff estimate as the web app's
+// AudioQualityPanel.tsx — see that file for the full reasoning (a simple,
+// robust threshold on 8-bit log-mapped analyser data beats trying to
+// reconstruct a true -3dB point from this resolution).
+function estimateRolloffBin(data) {
+  let peak = 0, peakIdx = 0;
+  for (let i = 0; i < data.length; i++) {
+    if (data[i] > peak) { peak = data[i]; peakIdx = i; }
+  }
+  if (peak < 40) return null;
+  const halfPeak = peak / 2;
+  let belowRun = 0;
+  for (let i = peakIdx; i < data.length; i++) {
+    if (data[i] < halfPeak) {
+      belowRun++;
+      if (belowRun >= 3) return i - 2;
+    } else {
+      belowRun = 0;
+    }
+  }
+  return null;
+}
+
+function drawBarSpectrum(canvas, data, cutoffFrac) {
+  const ctx = canvas.getContext('2d');
+  const w = canvas.width, h = canvas.height;
+  ctx.fillStyle = '#0a0a0a';
+  ctx.fillRect(0, 0, w, h);
+  const barW = w / data.length;
+  for (let i = 0; i < data.length; i++) {
+    const v = data[i] / 255;
+    const barH = v * h;
+    ctx.fillStyle = v > 0.85 ? '#f85149' : v > 0.6 ? '#e3b341' : '#2ea043';
+    ctx.fillRect(i * barW, h - barH, Math.max(1, barW - 1), barH);
+  }
+  if (cutoffFrac != null && cutoffFrac >= 0 && cutoffFrac <= 1) {
+    const x = cutoffFrac * w;
+    ctx.save();
+    ctx.strokeStyle = '#58a6ff';
+    ctx.shadowColor = '#58a6ff';
+    ctx.shadowBlur = 6;
+    ctx.lineWidth = 1.5;
+    ctx.setLineDash([4, 3]);
+    ctx.beginPath();
+    ctx.moveTo(x, 0);
+    ctx.lineTo(x, h);
+    ctx.stroke();
+    ctx.restore();
+  }
+}
+
+// Simple scrolling waterfall: shift the existing image left by 1px each
+// frame edge-in via drawImage-of-self, then paint one new column of pixels
+// on the right from the current spectrum. Column-wise (not row-wise like
+// GLSpectrogram's texture) since that's the cheap direction for a plain
+// 2D canvas — shifting whole-canvas pixel data via getImageData/putImageData
+// every frame would be far more main-thread work than this page needs.
+function drawWaterfallColumn(canvas, data) {
+  const ctx = canvas.getContext('2d');
+  const w = canvas.width, h = canvas.height;
+  ctx.drawImage(canvas, 1, 0, w - 1, h, 0, 0, w - 1, h);
+  for (let y = 0; y < h; y++) {
+    const bf = (1 - y / h) * (data.length - 1);
+    const b0 = Math.floor(bf), b1 = Math.min(b0 + 1, data.length - 1);
+    const v = (data[b0] * (1 - (bf - b0)) + data[b1] * (bf - b0)) / 255;
+    // turbo-ish cheap gradient: dark blue -> green -> yellow -> red
+    const r = Math.round(Math.min(255, Math.max(0, 510 * (v - 0.5))));
+    const g = Math.round(Math.min(255, Math.max(0, 510 * Math.min(v, 1 - v) + 60)));
+    const b = Math.round(Math.min(255, Math.max(0, 255 - 510 * v)));
+    ctx.fillStyle = `rgb(${r},${g},${b})`;
+    ctx.fillRect(w - 1, y, 1, 1);
+  }
+}
+
+function drawScope(canvas, data, clipping, dcOffsetFrac) {
+  const ctx = canvas.getContext('2d');
+  const w = canvas.width, h = canvas.height;
+  ctx.fillStyle = '#0a0a0a';
+  ctx.fillRect(0, 0, w, h);
+  ctx.strokeStyle = '#3d444d';
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(0, h / 2);
+  ctx.lineTo(w, h / 2);
+  ctx.stroke();
+
+  if (Math.abs(dcOffsetFrac) >= DC_OFFSET_WARN) {
+    const dcY = h / 2 - dcOffsetFrac * (h / 2) * 0.95;
+    ctx.strokeStyle = '#e3b341';
+    ctx.lineWidth = 1;
+    ctx.setLineDash([3, 3]);
+    ctx.beginPath();
+    ctx.moveTo(0, dcY);
+    ctx.lineTo(w, dcY);
+    ctx.stroke();
+    ctx.setLineDash([]);
+  }
+
+  ctx.strokeStyle = clipping ? '#f85149' : '#2ea043';
+  ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  const step = w / data.length;
+  for (let i = 0; i < data.length; i++) {
+    const v = (data[i] - 128) / 128;
+    const y = h / 2 - v * (h / 2) * 0.95;
+    i === 0 ? ctx.moveTo(0, y) : ctx.lineTo(i * step, y);
+  }
+  ctx.stroke();
+
+  if (clipping) {
+    ctx.fillStyle = '#f85149';
+    for (let i = 0; i < data.length; i++) {
+      const v = (data[i] - 128) / 128;
+      if (Math.abs(v) >= CLIP_THRESHOLD) {
+        const x = i * step;
+        ctx.fillRect(x, 0, 2, 4);
+        ctx.fillRect(x, h - 4, 2, 4);
+      }
+    }
+  }
+}
+
+function tickQualityChannel(st, analyser, active, now) {
+  if (!active || !analyser) {
+    st.channelEl.classList.remove('clip-flash');
+    st.readoutEl.textContent = 'inactive';
+    st.readoutEl.classList.remove('clipping');
+    st.cutoffEl.textContent = '—';
+    st.floorEl.textContent = '—';
+    st.dcEl.textContent = '—';
+    st.clipsEl.textContent = '0';
+    st.clipsEl.classList.remove('danger');
+    return;
+  }
+
+  const bc = analyser.frequencyBinCount;
+  if (!st.freqData || st.freqData.length !== bc) st.freqData = new Uint8Array(bc);
+  analyser.getByteFrequencyData(st.freqData);
+
+  const rolloffBin = estimateRolloffBin(st.freqData);
+  if (rolloffBin != null) {
+    const nyquist = analyser.context.sampleRate / 2;
+    st.cutoffEl.textContent = `${Math.round((rolloffBin / bc) * nyquist)} Hz`;
+  } else {
+    st.cutoffEl.textContent = '—';
+  }
+  drawBarSpectrum(st.barCanvas, st.freqData, rolloffBin != null ? rolloffBin / bc : null);
+  drawWaterfallColumn(st.waterfallCanvas, st.freqData);
+
+  let avgLevel = 0;
+  for (let i = 0; i < st.freqData.length; i++) avgLevel += st.freqData[i];
+  avgLevel /= st.freqData.length;
+  if (now - st.noiseFloorWindowStart > NOISE_FLOOR_WINDOW_MS) {
+    st.noiseFloorWindowStart = now;
+    st.noiseFloorMin = avgLevel;
+  } else if (avgLevel < st.noiseFloorMin) {
+    st.noiseFloorMin = avgLevel;
+  }
+  st.floorEl.textContent = `${Math.round((st.noiseFloorMin / 255) * 100)}%`;
+
+  if (!st.timeDataFloat || st.timeDataFloat.length !== analyser.fftSize) {
+    st.timeDataFloat = new Float32Array(analyser.fftSize);
+    st.timeDataByte = new Uint8Array(analyser.fftSize);
+  }
+  analyser.getFloatTimeDomainData(st.timeDataFloat);
+  let peak = 0, sum = 0;
+  for (let i = 0; i < st.timeDataFloat.length; i++) {
+    const s = st.timeDataFloat[i];
+    sum += s;
+    const a = Math.abs(s);
+    if (a > peak) peak = a;
+  }
+  const dcOffset = sum / st.timeDataFloat.length;
+  const dcOffsetPct = Math.round(dcOffset * 1000) / 10;
+  st.dcEl.textContent = `${dcOffsetPct}%${Math.abs(dcOffsetPct) / 100 >= DC_OFFSET_WARN ? ' ⚠' : ''}`;
+  st.dcEl.classList.toggle('warn', Math.abs(dcOffsetPct) / 100 >= DC_OFFSET_WARN);
+
+  const isClipping = peak >= CLIP_THRESHOLD;
+  st.readoutEl.textContent = `peak ${Math.round(Math.min(1, peak) * 100)}%${isClipping ? ' — CLIPPING' : ''}`;
+  st.readoutEl.classList.toggle('clipping', isClipping);
+  if (isClipping) {
+    st.clipEvents.push(now);
+    if (now - st.lastClipFlashAt > CLIP_FLASH_MS) {
+      st.lastClipFlashAt = now;
+      st.channelEl.classList.add('clip-flash');
+      setTimeout(() => st.channelEl.classList.remove('clip-flash'), CLIP_FLASH_MS);
+    }
+  }
+  while (st.clipEvents.length > 0 && now - st.clipEvents[0] > CLIP_WINDOW_MS) st.clipEvents.shift();
+  st.clipsEl.textContent = String(st.clipEvents.length);
+  st.clipsEl.classList.toggle('danger', st.clipEvents.length > 0);
+
+  analyser.getByteTimeDomainData(st.timeDataByte);
+  drawScope(st.scopeCanvas, st.timeDataByte, isClipping, dcOffset);
+}
+
+let qualityRafId = null;
+function qualityTick(now) {
+  tickQualityChannel(qualityIn, playAnalyserNode, !!audioWs, now);
+  tickQualityChannel(qualityOut, micAnalyserNode, !!micStream, now);
+  qualityRafId = requestAnimationFrame(qualityTick);
+}
+
+function startQualityView() {
+  if (qualityRafId != null) return;
+  qualityRafId = requestAnimationFrame(qualityTick);
+}
+function stopQualityView() {
+  if (qualityRafId != null) cancelAnimationFrame(qualityRafId);
+  qualityRafId = null;
+}
+
+qualityToggle.addEventListener('change', () => {
+  qualityView.hidden = !qualityToggle.checked;
+  if (qualityToggle.checked) startQualityView();
+  else stopQualityView();
+});
 
 refreshStatus(true);
 scanNetworks();

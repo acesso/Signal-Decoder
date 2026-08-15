@@ -88,10 +88,15 @@ static void led_task(void *arg) {
         } else if (!cat_currently_linked()) {
             // Slow synced pulse as a base layer — audio levels (if any)
             // still ride on top as brightness, so a live audio signal
-            // during a CAT dropout is still visible, not hidden.
+            // during a CAT dropout is still visible, not hidden. Floors at
+            // PULSE_MIN_DUTY rather than 0 — a full dim-to-off pulse reads
+            // as "flickering/off" at a glance rather than "gently
+            // breathing," which is the intended feel for "still alive,
+            // just no CAT traffic right now."
+            #define PULSE_MIN_DUTY (LED_DUTY_MAX / 6)
             uint32_t phase = tick % 40; // 2s period at 50ms ticks
             uint32_t pulse = phase < 20 ? phase : (40 - phase); // 0..20..0 triangle
-            uint8_t pulse_level = (uint8_t)((pulse * LED_DUTY_MAX) / 20);
+            uint8_t pulse_level = (uint8_t)(PULSE_MIN_DUTY + (pulse * (LED_DUTY_MAX - PULSE_MIN_DUTY)) / 20);
             uint8_t in_level = atomic_load(&s_level_in);
             uint8_t out_level = atomic_load(&s_level_out);
             set_duty(LED_IN_CHANNEL, pulse_level > in_level ? pulse_level : in_level);
