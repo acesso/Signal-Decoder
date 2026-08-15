@@ -71,12 +71,16 @@ Radio  <----------------------------->  ESP32  <--------------------------------
   be managed and debugged directly from any browser on the LAN without
   going through the Signal-Decoder web app at all. The page is static
   HTML/CSS/JS (source in `spiffs_data/`) that calls the same `http_control`
-  endpoints above plus the `/cat` and `/audio` WebSockets directly — it has
-  no logic of its own beyond that. Files are baked into a SPIFFS image at
+  endpoints above plus the `/cat` and `/audio` WebSockets directly — most of
+  it is thin display logic, except the audio-quality view (see Audio
+  quality visualization above), which does real client-side signal
+  analysis (spectrum, rolloff estimate, clip/DC/noise-floor detection) on
+  the raw PCM crossing `/audio`. Files are baked into a SPIFFS image at
   build time onto the `storage` partition (see `partitions.csv`) and
   flashed alongside the app. Laid out as two responsive columns (a narrow
   sidebar for the short cards, a wide main column for the CAT monitor's
-  log) that stack single-column below a 56rem breakpoint.
+  log and the audio-quality view) that stack single-column below a 56rem
+  breakpoint.
 - **`wifi_net`** joins your home Wi-Fi in station mode (credentials via
   `idf.py menuconfig` → "CAT Bridge Config", overridable at runtime via
   `POST /wifi-config` once NVS has a saved value) and advertises the device
@@ -117,13 +121,13 @@ Two onboard LEDs (GPIO22 and GPIO19 — the latter doubles as the KEY3
 button input, unused elsewhere in this firmware, so claiming it as an
 output here costs nothing) show, in priority order (highest wins):
 
-| State                | LED behavior                                                                                          |
-|----------------------|-------------------------------------------------------------------------------------------------------|
-| PA emergency         | Both LEDs strobe VERY fast (~100ms) — hardware safety fault, outranks everything below                |
-| AP fallback          | Both LEDs blink together, fast (~300ms) — network needs fixing                                        |
-| Wi-Fi connecting     | LEDs alternate (~400ms) — joining, not stuck yet                                                      |
-| No CAT traffic (>3s) | Both LEDs pulse together slowly (2s); live audio still shows as brightness riding on top of the pulse |
-| Normal               | LED1 (GPIO22) = audio-in level, LED2 (GPIO19) = audio-out level, plain brightness, no blink           |
+| State                | LED behavior                                                                                    |
+|----------------------|-------------------------------------------------------------------------------------------------|
+| PA emergency         | Both LEDs strobe VERY fast (~100ms) — hardware safety fault, outranks everything below          |
+| AP fallback          | Both LEDs blink together, fast (~300ms) — network needs fixing                                  |
+| Wi-Fi connecting     | LEDs alternate (~400ms) — joining, not stuck yet                                                |
+| No CAT traffic (>3s) | Both LEDs pulse dim-to-bright-to-dim (2s, floors at ~17% not 0%); live audio still rides on top |
+| Normal               | LED1 (GPIO22) = audio-in level, LED2 (GPIO19) = audio-out level, plain brightness, no blink     |
 
 ### Audio bridge
 
@@ -149,6 +153,51 @@ for voice on a local network; revisit if this ever needs to leave the LAN.
 No compression — raw PCM at 8kHz is ~128kbit/s, trivial for Wi-Fi, and
 avoids running any codec math on the ESP32 (G.711/Opus were considered and
 explicitly not used — see the Known Limitations note on this choice).
+
+### Audio quality visualization (browser-side)
+
+The interface board has manual RC filter trimpots for both audio
+directions (radio → browser and browser → radio) — tuned by eye, not by
+ear, since "does this sound right" isn't reliable enough for that
+adjustment. Both the web app (`AudioQualityPanel.tsx`, shown/hidden via a
+"Show Signal Quality" button in the Bridge panel's Audio section) and the
+standalone control page (a "Show" checkbox in its own Audio quality card)
+render the same analysis, driven entirely client-side from an
+`AnalyserNode` tapped onto the existing playback/capture Web Audio graphs
+— **zero firmware involvement**, this is pure browser-side processing of
+the raw PCM already crossing `/audio`. Deliberately more than a bare VU
+meter, since a trimpot problem can be easy to miss just eyeballing a
+constantly-moving trace:
+
+- **Bar spectrum** — the filter's passband shape/cutoff slope/ripple
+  directly, updating live as a trimpot turns.
+- **Estimated rolloff marker** — a blue dashed line + Hz readout at the
+  point the spectrum drops to roughly half its peak magnitude (a simple,
+  robust ~-6dB-relative-to-peak threshold, not a true -3dB reconstruction
+  — 8-bit log-mapped analyser data doesn't have the resolution for that
+  level of precision, and this is plenty to watch move as you tune).
+- **Waterfall** — scrolling spectrum history (the web app reuses
+  `GLSpectrogram`, the same GPU component the decoders use; the control
+  page has no bundler, so it's a simple canvas-2D scrolling column
+  instead), so an intermittent issue is visible over time, not just the
+  current instant.
+- **Oscilloscope** — a spectrum alone can't show clipping (it looks like
+  broadband harmonic energy in the frequency domain); the time-domain
+  trace shows the actual flat-topped waveform directly.
+- **Clip events** — a bold flash + ring around the channel the instant a
+  sample crosses ~98% of full-scale, plus a rolling "N clips in the last
+  10s" counter — a trimpot set too hot clips only intermittently, easy to
+  miss on a 60fps scope trace but obvious as an accumulating count.
+- **DC offset** — a misadjusted analog stage can bias the signal off
+  zero, eating into headroom before anything even looks "loud"; flagged
+  once it's large enough to matter (≥3% of full-scale).
+- **Noise floor** — rolling minimum spectrum energy over the last few
+  seconds, so "is this trimpot position noisier" has a number instead of
+  just a vibe.
+
+All of this runs in the browser specifically because it has real CPU/GPU
+budget to spend that the ESP32 doesn't — deliberately not attempted in
+firmware.
 
 ### CAT baud rate
 
@@ -401,8 +450,13 @@ feature) opens the `/audio` WebSocket, plays received samples via Web Audio
 (back-to-back `AudioBufferSourceNode`s, since there's no "append to an
 ongoing stream" primitive), and captures the browser's mic through the
 same `createCaptureNode` AudioWorklet the app's decoders use, linearly
-resampled to `ES8388_SAMPLE_RATE_HZ` before sending. The standalone control
-page (`spiffs_data/app.js`) implements the same protocol independently in
-plain JS (`ScriptProcessorNode` instead of an AudioWorklet module, since
-that page has no bundler) — useful for debugging the audio path directly
-from the bridge itself, without the web app in the loop at all.
+resampled to `ES8388_SAMPLE_RATE_HZ` before sending. It also exposes an
+`AnalyserNode` per direction (tapped onto the existing playback/capture
+graphs) for `src/components/AudioQualityPanel.tsx` — see Audio quality
+visualization above. The standalone control page (`spiffs_data/app.js`)
+implements the same audio protocol AND the same quality-analysis logic
+independently in plain JS (`ScriptProcessorNode` instead of an AudioWorklet
+module, a hand-rolled canvas-2D scrolling waterfall instead of
+`GLSpectrogram`, since that page has no bundler) — useful for debugging the
+audio path directly from the bridge itself, without the web app in the
+loop at all.

@@ -12,6 +12,7 @@ import {
   type BridgeInfo,
 } from '../lib/cat/useRadioCAT'
 import { useAudioBridge } from '../lib/cat/useAudioBridge'
+import AudioQualityPanel from './AudioQualityPanel'
 import CalibrationWizard from './CalibrationWizard'
 import NumberField from './NumberField'
 import { loadObject, saveObject } from '../lib/storage'
@@ -1049,6 +1050,11 @@ function AudioMeter(props: { label: string; level: number; active: boolean }) {
 function BridgeAudioControl(props: { wsUrl: string }) {
   const audio = useAudioBridge()
   const [busy, setBusy] = createSignal(false)
+  // Quality view (spectrum/waterfall/scope) is opt-in, not always-rendered
+  // — it redraws canvases + a GL waterfall every animation frame per
+  // channel, real but unnecessary work when the operator just wants to
+  // confirm "is there audio" rather than actively tuning a trimpot.
+  const [showQuality, setShowQuality] = createSignal(false)
 
   const handlePlayToggle = async () => {
     setBusy(true)
@@ -1097,9 +1103,34 @@ function BridgeAudioControl(props: { wsUrl: string }) {
         >
           {audio.state().micActive ? 'Stop Mic' : 'Send Mic to Radio'}
         </button>
+        <button
+          onClick={() => setShowQuality((v) => !v)}
+          disabled={!audio.state().connected}
+          class={`text-[10px] font-semibold px-2.5 py-1.5 rounded border transition-colors whitespace-nowrap disabled:opacity-50
+            ${showQuality()
+              ? 'bg-[#1f6feb] border-[#1f6feb] text-white'
+              : 'bg-[#21262d] border-[#30363d] text-[#8b949e] hover:text-[#c9d1d9] hover:border-[#8b949e]'
+            }`}
+        >
+          {showQuality() ? 'Hide Signal Quality' : 'Show Signal Quality'}
+        </button>
       </div>
       <Show when={audio.state().error}>
         <p class="text-[10px] text-[#f0883e]">{audio.state().error}</p>
+      </Show>
+      <Show when={showQuality() && audio.state().connected}>
+        <div class="border-t border-[#21262d] pt-2">
+          <AudioQualityPanel
+            analyserIn={audio.analyserIn()}
+            analyserOut={audio.analyserOut()}
+            playbackActive={audio.state().playbackActive}
+            micActive={audio.state().micActive}
+          />
+          <p class="text-[10px] text-[#8b949e] mt-2">
+            For tuning the interface board's audio-in/audio-out RC filter trimpots by eye — the blue dashed line marks
+            the estimated passband rolloff (~-6dB point); watch it move as you adjust each trimpot.
+          </p>
+        </div>
       </Show>
       <p class="text-[10px] text-[#8b949e]">
         Streams raw audio over a second WebSocket ({'/audio'}), not the CAT connection — independent of the radio's own PTT state.

@@ -99,13 +99,22 @@ export function useAudioBridge() {
     levelOut: 0,
     error: null,
   })
+  // Exposed for a live spectrum/waterfall/scope view (see AudioQualityPanel)
+  // — filter-tuning by eye needs frequency-domain data an RMS number can't
+  // give. Plain signals, not part of AudioBridgeState: an AnalyserNode isn't
+  // serializable/comparable state, it's a live handle a consumer reads from
+  // directly every animation frame.
+  const [analyserIn, setAnalyserIn] = createSignal<AnalyserNode | null>(null)
+  const [analyserOut, setAnalyserOut] = createSignal<AnalyserNode | null>(null)
 
   let ws: WebSocket | null = null
   let playCtx: AudioContext | null = null
+  let playAnalyserNode: AnalyserNode | null = null
   let nextPlayTime = 0
   let micCtx: AudioContext | null = null
   let micStream: MediaStream | null = null
   let micSource: MediaStreamAudioSourceNode | null = null
+  let micAnalyserNode: AnalyserNode | null = null
   let micTap: CaptureNode | null = null
 
   function disconnect() {
@@ -114,7 +123,9 @@ export function useAudioBridge() {
     stopMic()
     playCtx?.close()
     playCtx = null
+    playAnalyserNode = null
     nextPlayTime = 0
+    setAnalyserIn(null)
     setState((s) => ({ ...s, connected: false, playbackActive: false, levelIn: 0 }))
   }
 
@@ -123,10 +134,12 @@ export function useAudioBridge() {
     micTap = null
     micSource?.disconnect()
     micSource = null
+    micAnalyserNode = null
     micStream?.getTracks().forEach((t) => t.stop())
     micStream = null
     micCtx?.close()
     micCtx = null
+    setAnalyserOut(null)
     setState((s) => ({ ...s, micActive: false, levelOut: 0 }))
   }
 
@@ -146,7 +159,11 @@ export function useAudioBridge() {
 
     const source = playCtx.createBufferSource()
     source.buffer = buffer
-    source.connect(playCtx.destination)
+    // Routed through the shared analyser (created once in connect(), already
+    // wired to destination there) rather than straight to destination — one
+    // AnalyserNode persists across every frame's own short-lived buffer
+    // source, so AudioQualityPanel can keep reading from the same node.
+    source.connect(playAnalyserNode ?? playCtx.destination)
 
     const startAt = Math.max(nextPlayTime, playCtx.currentTime)
     source.start(startAt)
@@ -166,6 +183,10 @@ export function useAudioBridge() {
     try {
       playCtx = new AudioContext()
       nextPlayTime = 0
+      playAnalyserNode = playCtx.createAnalyser()
+      playAnalyserNode.fftSize = 2048
+      playAnalyserNode.connect(playCtx.destination)
+      setAnalyserIn(playAnalyserNode)
     } catch (err) {
       setState((s) => ({ ...s, error: err instanceof Error ? err.message : 'AudioContext failed' }))
       return false
@@ -206,6 +227,15 @@ export function useAudioBridge() {
       micCtx = new AudioContext()
       micSource = micCtx.createMediaStreamSource(micStream)
 
+      // AnalyserNode doesn't need a destination connection to be readable —
+      // it just needs to sit in the signal path, so tapping it here doesn't
+      // change the fact that the mic is never routed to local speakers
+      // (that would be a feedback loop, not a tuning tool).
+      micAnalyserNode = micCtx.createAnalyser()
+      micAnalyserNode.fftSize = 2048
+      micSource.connect(micAnalyserNode)
+      setAnalyserOut(micAnalyserNode)
+
       // 400-sample chunks at the mic's native rate resample down to roughly
       // BRIDGE_AUDIO_SAMPLE_RATE-ish frame sizes — not exact (native rate
       // varies by device/browser), but that's fine, the bridge has no
@@ -231,5 +261,5 @@ export function useAudioBridge() {
 
   onCleanup(disconnect)
 
-  return { state, connect, disconnect, startMic, stopMic }
+  return { state, connect, disconnect, startMic, stopMic, analyserIn, analyserOut }
 }
