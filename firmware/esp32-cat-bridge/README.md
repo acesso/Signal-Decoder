@@ -8,16 +8,21 @@ components) — **not** the Arduino core.
 Target board: **AI-Thinker ESP32-A1S Audio Kit**. This is a WROVER-class
 module (8MB PSRAM — GPIO16/17 are internally reserved for it, not even
 broken out to the header) with an onboard ES8388 audio codec and an onboard
-SD card slot (SDMMC on GPIO2/4/12/13 — disjoint from the CAT UART pins
-below, unused by this firmware). Only 7 header GPIOs are free (0, 5, 18, 19,
-21, 22, 23) and every one already drives an onboard button, LED, or the
-amplifier-enable line — this firmware claims 2 of them (18, 23) for the CAT
-UART and 1 more (22, plus 19 which doubles as a button) for the two status
-LEDs, leaving the rest alone. The onboard codec streams both directions —
-radio speaker audio out to the browser, browser mic audio into the radio's
-mic input — over a second WebSocket (see Audio bridge below); any other
-small radio controls that make sense to add now that both CAT and audio
-exist are open for later.
+SD card slot (SDMMC on GPIO2/4/12/13). Only 7 header GPIOs are nominally
+"free" (0, 5, 18, 19, 21, 22, 23) and every one already drives an onboard
+button, LED, or the amplifier-enable line — this firmware claims 2 of them
+(18, 23) for the CAT UART and 1 more (22, plus 19 which doubles as a
+button) for the two status LEDs. The onboard codec streams both
+directions — radio speaker audio out to the browser, browser mic audio
+into the radio's mic input — over a second WebSocket (see Audio bridge
+below). Two more pins (GPIO2, GPIO4 — the SD card slot's unused DATA0/
+DATA1 lines, since the header itself was fully spoken for) drive a PA
+safety watchdog for an external amplifier (see PA safety watchdog below).
+
+Repurposing the SD card slot's pins means this firmware can never use the
+slot itself, but nothing here does — the alternative would have been
+sacrificing another onboard button/LED, which the PA watchdog's pins don't
+cost.
 
 An earlier revision of this firmware targeted a bare ESP32-WROOM-32 board
 with a PCD8544 LCD status display — that hardware is no longer in use; the
@@ -103,6 +108,8 @@ Radio  <----------------------------->  ESP32  <--------------------------------
   16-bit PCM samples instead of ASCII CAT commands. See Audio bridge below.
 - **`led_status`** drives the board's two status LEDs via LEDC PWM — see
   the LED legend below for what each state looks like.
+- **`pa_watchdog`** guards against the uSDX hanging with the external
+  amplifier still keyed — see PA safety watchdog below.
 
 ### Status LEDs
 
@@ -112,6 +119,7 @@ output here costs nothing) show, in priority order (highest wins):
 
 | State                | LED behavior                                                                                          |
 |----------------------|-------------------------------------------------------------------------------------------------------|
+| PA emergency         | Both LEDs strobe VERY fast (~100ms) — hardware safety fault, outranks everything below                |
 | AP fallback          | Both LEDs blink together, fast (~300ms) — network needs fixing                                        |
 | Wi-Fi connecting     | LEDs alternate (~400ms) — joining, not stuck yet                                                      |
 | No CAT traffic (>3s) | Both LEDs pulse together slowly (2s); live audio still shows as brightness riding on top of the pulse |
@@ -172,6 +180,48 @@ history, so the log starts empty on every page load (a small in-firmware
 ring buffer was considered and explicitly skipped — this is meant to stay a
 live debug view, not a persistent log).
 
+### PA safety watchdog
+
+Guards against the uSDX hanging with the external **miniPA70** amplifier's
+PTT still asserted. Full design rationale, alternatives considered, and
+sources in `main/doc/PA_WATCHDOG_DESIGN.md` — summary:
+
+- **`PA_SENSE_PIN` (GPIO2, input)** reads a signal the *user's own
+  interface board* derives from the miniPA70's actual energized 12V leg
+  (after their own level-shifting down to safe logic) — not the uSDX's
+  PA-send command line. The miniPA70 itself is a bare, undocumented kit
+  amp (two-pin PTT-in via a PNP-driven relay) with no feedback of its own,
+  so this is the only signal that proves the PA hardware is truly on,
+  independent of whether the uSDX's command line or the interface board's
+  own level-shifting are behaving correctly — that independence is the
+  entire point of a watchdog.
+- **`PA_EMERGENCY_PIN` (GPIO4, output)** is a permissive line in series
+  with the uSDX's PA-send path on the interface board: HIGH (idle) lets
+  the radio's own signal control the PA normally; pulled LOW once
+  `PA_MAX_ON_SECONDS` (default 300s — a placeholder, tune to the longest
+  realistic legitimate transmission for this station) of continuous
+  `PA_SENSE_PIN` HIGH has elapsed, forcing the PA off regardless of what
+  the radio is doing.
+- **Latches.** Once tripped, `PA_EMERGENCY_PIN` stays LOW even after
+  `PA_SENSE_PIN` drops back to LOW on its own — only
+  `POST /pa-emergency-clear` (or the control page's / web app's Clear
+  button) restores it. Deliberately no auto-recovery: a real hardware
+  fault should require a human to notice and clear it, not silently flap
+  the PA back on the moment the sense signal looks okay again.
+- Debounced in software (3 consecutive 100ms polls agreeing before a level
+  change is believed) — a raw digital input crossing a relay/PA switching
+  event is exactly the kind of line that can glitch for a poll or two.
+- GPIO2/GPIO4 were chosen because every other A1S header GPIO was already
+  claimed (see the intro above) — they're the SD card slot's DATA0/DATA1
+  lines, unused since this firmware never mounts the slot. Deliberately
+  NOT GPIO12 (also the MTDI strapping pin — risky to drive externally at
+  boot) or GPIO13 (DIP-switch-shared with KEY2 on this board).
+- **Not yet electrically verified against real hardware** — needs a
+  continuity/multimeter check for SD-slot pull resistors on GPIO2/4 and
+  confirmation of the interface board's actual output logic levels before
+  trusting this on a live PA, same caution already applied to
+  `ES8388_PA_REVERTED` elsewhere in this firmware.
+
 ### Core placement
 
 ESP-IDF's Wi-Fi driver task defaults to core 0
@@ -185,11 +235,13 @@ never contended by network stack activity.
 
 ## Wiring (see `main/bridge_config.h` to change)
 
-| Signal      | ESP32 GPIO | Notes                                  |
-|-------------|------------|----------------------------------------|
-| CAT UART TX | GPIO18     | to radio's CAT RX                      |
-| CAT UART RX | GPIO23     | to radio's CAT TX                      |
-| CAT ground  | —          | common ground with the radio, required |
+| Signal       | ESP32 GPIO | Notes                                             |
+|--------------|------------|---------------------------------------------------|
+| CAT UART TX  | GPIO18     | to radio's CAT RX                                 |
+| CAT UART RX  | GPIO23     | to radio's CAT TX                                 |
+| CAT ground   | —          | common ground with the radio, required            |
+| PA Sense in  | GPIO2      | from the interface board's PA-energized feedback  |
+| PA Emergency | GPIO4      | to the interface board's PA-send permissive input |
 
 GPIO18/23 were picked deliberately over the board's other 5 free header
 pins: GPIO0 is a boot-strap pin (risky to also drive from an external
@@ -200,6 +252,12 @@ onboard button/LED functions 18/23 do anyway — no advantage to picking them
 instead. This leaves UART0 (GPIO1/3, wired to the board's own USB-serial
 chip on its "UART" micro-USB port) completely free for flashing/`ESP_LOG`
 output the whole time the CAT cable is connected.
+
+GPIO2/GPIO4 (PA Sense/PA Emergency — see PA safety watchdog above) are the
+SD card slot's DATA0/DATA1 lines, repurposed since the header itself had
+nothing left free. **Not yet electrically verified** — check for SD-slot
+pull resistors and the interface board's actual output levels before
+wiring these up on real hardware.
 
 Everything below this point is **onboard, not header wiring** — nothing to
 physically connect, listed here only because it's not obvious from the
@@ -269,9 +327,19 @@ for `spiffs_data/`. `idf.py flash` writes both; editing anything under
   `partitions.csv`'s `storage` partition (256KB) has room to spare if
   that's wanted later, but a full app bundle is a different order of size
   than the control page's few KB.
-- **Baud rate is boot-time only.** `cat_bridge_set_baud()` exists for a
-  future runtime control message but nothing calls it yet — changing baud
-  today means editing Kconfig and reflashing.
+- **PA_MAX_ON_SECONDS (300s default) is a placeholder.** Should reflect the
+  longest realistic legitimate transmission for this station's actual use
+  (a long FT8 sequence, a ragchew on SSB, etc.) with real margin — not yet
+  tuned against any real-world usage pattern.
+- **PA Sense/Emergency wiring is not yet electrically verified.** GPIO2/
+  GPIO4 need a continuity/multimeter check against the real board (SD-slot
+  pull resistors, the interface board's actual output logic levels)
+  before trusting this on a live PA — see PA safety watchdog above.
+- **`/pa-emergency-clear` has no auth beyond reaching the bridge at all**
+  — same trust model as the rest of `http_control`'s LAN-only surface (see
+  the standalone-control-page no-auth note just below), but worth calling
+  out separately here since this one re-enables a safety-critical path
+  rather than just changing settings or restarting.
 - **PSRAM is present but unused.** `CONFIG_SPIRAM` is deliberately left
   disabled — nothing in this firmware needs it yet. Revisit once the audio
   feature needs the extra RAM for buffering.
@@ -318,8 +386,11 @@ auto-report handling) is identical either way; only the `connect`/`write`/
 read-loop plumbing at the bottom of `useRadioCAT.ts` differs per transport.
 The web app's Bridge panel (in the Radio CAT settings) also exposes the
 `http_control` endpoints above — status, restart, Wi-Fi network change, CAT
-baud rate — gated on whatever `GET /info` reports the connected bridge
-supports. The web app itself doesn't have a CAT frame monitor/log — that's
+baud rate, PA emergency clear — gated on whatever `GET /info` reports the
+connected bridge supports. A tripped PA emergency shows as a prominent red
+banner at the top of the Bridge panel (above the normal status grid),
+distinct from the panel's PA-sense status row further down. The web app
+itself doesn't have a CAT frame monitor/log — that's
 only on the standalone control page (see CAT monitor above); the web app's
 own `useRadioCAT.ts` already parses every frame it needs for its own UI, so
 a raw log there would just duplicate what the control page already covers

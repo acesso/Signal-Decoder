@@ -15,6 +15,7 @@
 #include "bridge_settings.h"
 #include "bridge_state.h"
 #include "cat_bridge.h"
+#include "pa_watchdog.h"
 #include "ws_server.h"
 #include "wifi_net.h"
 
@@ -25,8 +26,11 @@ static const char *TAG = "http_control";
 // ES8388_SAMPLE_RATE_HZ in both directions (see audio_ws.h/audio_monitor.h)
 // — the web app should gate its audio UI on this rather than assuming it.
 // "cat_baud" means: POST /cat-baud exists (see cat_baud_handler below).
+// "pa_watchdog" means: GET /status reports pa_sense/pa_emergency_tripped
+// and POST /pa-emergency-clear exists (see pa_watchdog.h for the full
+// safety design this backs).
 static const char *const BRIDGE_FEATURES[] = {
-    "cat", "wifi_config", "wifi_scan", "reset", "audio", "cat_baud",
+    "cat", "wifi_config", "wifi_scan", "reset", "audio", "cat_baud", "pa_watchdog",
 };
 
 // The uSDX firmware's own CAT_BAUD menu setting (usdxBLACKBRICK.ino) only
@@ -90,16 +94,19 @@ static esp_err_t status_handler(httpd_req_t *req) {
 
     int64_t uptime_s = esp_timer_get_time() / 1000000;
 
-    char body[320];
+    char body[380];
     int n = snprintf(body, sizeof(body),
         "{\"wifi_state\":\"%s\",\"ssid\":\"%s\",\"rssi\":%d,\"ip\":\"%s\","
         "\"ws_clients\":%u,\"ws_max_clients\":%d,\"radio_linked\":%s,"
-        "\"cat_baud\":%d,\"uptime_s\":%lld}",
+        "\"cat_baud\":%d,\"pa_sense\":%s,\"pa_emergency_tripped\":%s,"
+        "\"uptime_s\":%lld}",
         wifi_state_str(st.wifi_state), ssid_escaped, (int)live_rssi,
         st.ip_addr[0] ? st.ip_addr : "",
         (unsigned)st.ws_client_count, WS_MAX_CLIENTS,
         (esp_timer_get_time() - st.last_radio_rx_us) <= 3000000 ? "true" : "false",
         bridge_settings_get_cat_baud(),
+        st.pa_sense ? "true" : "false",
+        st.pa_emergency_tripped ? "true" : "false",
         (long long)uptime_s);
     if (n < 0 || (size_t)n >= sizeof(body)) {
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "status body truncated");
@@ -193,6 +200,23 @@ static esp_err_t reset_handler(httpd_req_t *req) {
     httpd_resp_sendstr(req, "restarting");
     xTaskCreate(restart_task, "bridge_restart", 2048, NULL, tskIDLE_PRIORITY + 1, NULL);
     return ESP_OK;
+}
+
+// POST /pa-emergency-clear — un-trips a latched PA safety cutoff (see
+// pa_watchdog.h). Deliberately does not require a request body or check
+// pa_sense first — the operator calling this is expected to have already
+// confirmed by eye/ear that it's actually safe to re-enable the PA, same
+// as clearing any other physical safety interlock. Always returns the
+// resulting state so the caller can confirm the clear actually took.
+static esp_err_t pa_emergency_clear_handler(httpd_req_t *req) {
+    pa_watchdog_clear();
+
+    httpd_resp_set_type(req, "application/json");
+    set_cors(req);
+    char body[64];
+    int n = snprintf(body, sizeof(body), "{\"pa_emergency_tripped\":%s}",
+                      pa_watchdog_emergency_tripped() ? "true" : "false");
+    return httpd_resp_send(req, body, n);
 }
 
 // Shared small-body reader for the POST handlers below — bodies are tiny
@@ -338,6 +362,7 @@ void http_control_start(void) {
     httpd_uri_t reset_uri        = { .uri = "/reset",       .method = HTTP_POST,    .handler = reset_handler };
     httpd_uri_t wifi_config_uri  = { .uri = "/wifi-config", .method = HTTP_POST,    .handler = wifi_config_handler };
     httpd_uri_t cat_baud_uri     = { .uri = "/cat-baud",    .method = HTTP_POST,    .handler = cat_baud_handler };
+    httpd_uri_t pa_clear_uri     = { .uri = "/pa-emergency-clear", .method = HTTP_POST, .handler = pa_emergency_clear_handler };
     httpd_uri_t options_uri      = { .uri = "/*",           .method = HTTP_OPTIONS, .handler = options_handler };
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &status_uri));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &info_uri));
@@ -345,8 +370,9 @@ void http_control_start(void) {
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &reset_uri));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &wifi_config_uri));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &cat_baud_uri));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &pa_clear_uri));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &options_uri));
 
     ESP_LOGI(TAG, "control endpoints ready: GET /status, GET /info, GET /wifi-scan, POST /reset, "
-                   "POST /wifi-config, POST /cat-baud");
+                   "POST /wifi-config, POST /cat-baud, POST /pa-emergency-clear");
 }

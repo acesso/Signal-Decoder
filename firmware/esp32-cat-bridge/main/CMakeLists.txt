@@ -11,6 +11,7 @@ idf_component_register(
         "led_status.c"
         "audio_monitor.c"
         "audio_ws.c"
+        "pa_watchdog.c"
     INCLUDE_DIRS "."
     REQUIRES
         esp_wifi

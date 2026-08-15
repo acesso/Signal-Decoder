@@ -5,16 +5,19 @@
 //
 // GET  /status      -> JSON: {"wifi_state":"connected","ssid":"...","rssi":-67,
 //                              "ip":"192.168.0.7","ws_clients":1,"ws_max_clients":4,
-//                              "radio_linked":true,"cat_baud":38400,"uptime_s":1234}
+//                              "radio_linked":true,"cat_baud":38400,
+//                              "pa_sense":false,"pa_emergency_tripped":false,
+//                              "uptime_s":1234}
 //                       wifi_state is one of "connected"/"connecting"/
 //                       "disconnected"/"ap_fallback" — the last one means
 //                       the bridge couldn't join its configured network
 //                       and is now broadcasting its own AP at 192.168.4.1
 //                       (see wifi_net.c) so it's still reachable to fix.
+//                       pa_sense/pa_emergency_tripped — see pa_watchdog.h.
 // GET  /info        -> JSON: {"firmware_version":"0.2.0","features":["cat",
 //                              "wifi_config","wifi_scan","reset","audio",
-//                              "cat_baud"]} — see the versioning note in
-//                       bridge_config.h.
+//                              "cat_baud","pa_watchdog"]} — see the
+//                       versioning note in bridge_config.h.
 // GET  /wifi-scan    -> JSON: {"networks":[{"ssid":"...","rssi":-58},...]}
 //                       Blocking active scan (~1-3s), deduped by SSID
 //                       (strongest RSSI kept). Safe to call in AP fallback
@@ -32,6 +35,12 @@
 //                       hand the moment the radio's own setting changes)
 //                       AND persisted to NVS so a later reboot doesn't
 //                       revert to a stale value.
+// POST /pa-emergency-clear -> JSON {"pa_emergency_tripped":false}; un-trips
+//                       a latched PA safety cutoff (see pa_watchdog.h) —
+//                       no body needed, no auto-recovery exists on the
+//                       firmware side, so this is the only way to restore
+//                       PA_EMERGENCY_PIN to its permissive HIGH default
+//                       after a trip.
 #pragma once
 
 // Registers all control routes on the already-running httpd instance. Call

@@ -4,11 +4,11 @@
 // Target board: AI-Thinker ESP32-A1S Audio Kit. This is a WROVER-class
 // module (8MB PSRAM — GPIO16/17 are internally reserved for it and not
 // even broken out to the header) with an onboard ES8388 audio codec
-// (I2C control on GPIO32/33, I2S audio on GPIO0/25/26/27/35 — reserved for
-// a future audio/WebRTC feature, not used yet). Only 7 header GPIOs are
-// free (0, 5, 18, 19, 21, 22, 23) and every one already drives an onboard
-// button, LED, or the PA-enable line — this firmware claims just 2 of them
-// (18, 23) for the CAT UART and leaves the rest alone.
+// (I2C control on GPIO32/33, I2S audio on GPIO0/25/26/27/35) and status
+// LEDs. Only 7 header GPIOs are nominally "free" (0, 5, 18, 19, 21, 22,
+// 23) and every one is already claimed by CAT UART, the status LEDs, or
+// the codec's PA-enable line — the PA safety watchdog below instead
+// repurposes the (unused on this firmware) SD card slot's GPIO2/GPIO4.
 #pragma once
 
 #include "driver/gpio.h"
@@ -108,6 +108,43 @@
 #define LED_AUDIO_OUT_PIN       GPIO_NUM_19
 #define LED_PWM_FREQ_HZ         2000
 #define LED_PWM_RESOLUTION      LEDC_TIMER_8_BIT
+
+// ── PA safety watchdog ───────────────────────────────────────────────────────
+// Guards against the uSDX hanging with the external miniPA70 amplifier's PTT
+// still asserted — see main/doc/PA_WATCHDOG_DESIGN.md for the full design
+// and the miniPA70/GPIO research it's based on. Two new pins, since every
+// one of the A1S's other free header GPIOs is already claimed by CAT/LEDs/
+// codec: GPIO2/GPIO4 are the (unused — this firmware never mounts the SD
+// slot) SD card DATA0/DATA1 lines. Deliberately NOT GPIO12 (SD DATA2, but
+// also the MTDI strapping pin — risky to drive externally at boot) or
+// GPIO13 (SD DATA3, DIP-switch-shared with KEY2 on this board).
+//
+// PA_SENSE_PIN reads a signal the user's own interface board derives from
+// the miniPA70's OWN energized 12V leg (after their level-shifting down to
+// safe logic) — not the uSDX's PA-send command line. The miniPA70 itself
+// (a bare, undocumented kit amp — two-pin PTT-in via a PNP-driven relay, no
+// feedback of its own) can't be sensed directly; this is the one signal
+// that proves the PA hardware is truly on, independent of whether the
+// uSDX's command line or the interface board's own level-shifting are
+// behaving correctly. That independence is the entire point of a watchdog.
+//
+// PA_EMERGENCY_PIN is a permissive line in series with the uSDX's PA-send
+// path on the interface board — HIGH (idle) lets the radio's own signal
+// control the PA normally; pulled LOW only once PA_MAX_ON_SECONDS of
+// continuous PA_SENSE_PIN=HIGH has elapsed, forcing the PA off regardless
+// of what the radio is doing. Latches LOW until manually cleared (see
+// POST /pa-emergency-clear) — deliberately does not auto-recover once
+// PA_SENSE_PIN drops, so a real hardware fault can't flap silently.
+//
+// Needs a hardware continuity/multimeter check against the real board
+// before wiring (SD-slot pull resistors, the interface board's actual
+// output logic levels) — not yet verified, same caution already applied to
+// ES8388_PA_REVERTED above.
+#define PA_SENSE_PIN            GPIO_NUM_2
+#define PA_EMERGENCY_PIN        GPIO_NUM_4
+#define PA_MAX_ON_SECONDS       300     // placeholder — tune to the longest
+                                        // realistic legitimate transmission
+                                        // for this station, with real margin
 
 // ── Task placement ───────────────────────────────────────────────────────────
 // Wi-Fi/lwIP/httpd's own internal tasks are explicitly pinned to core 0 via

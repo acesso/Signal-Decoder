@@ -6,12 +6,16 @@
 // need attention more urgently than "how loud is the audio right now".
 //
 // Priority order (highest wins, checked every tick by the internal timer):
-//   1. AP fallback     — both LEDs blink in sync, fast (network needs fixing)
-//   2. Wi-Fi connecting — both LEDs alternate (joining, not stuck yet)
-//   3. No CAT traffic   — both LEDs slow-pulse together as a base layer,
+//   1. PA emergency     — both LEDs strobe very fast (hardware safety fault
+//                         — see pa_watchdog.h — takes priority over
+//                         EVERYTHING else; this is the one state that must
+//                         never be visually confused with a mere network issue)
+//   2. AP fallback     — both LEDs blink in sync, fast (network needs fixing)
+//   3. Wi-Fi connecting — both LEDs alternate (joining, not stuck yet)
+//   4. No CAT traffic   — both LEDs slow-pulse together as a base layer,
 //                         audio levels (if any) still show as brightness
 //                         riding on top of the pulse
-//   4. Normal           — LED_AUDIO_IN = audio-in level, LED_AUDIO_OUT =
+//   5. Normal           — LED_AUDIO_IN = audio-in level, LED_AUDIO_OUT =
 //                         audio-out level, plain brightness, no blinking
 #pragma once
 
@@ -40,3 +44,8 @@ void led_status_set_audio_levels(uint8_t in_level, uint8_t out_level);
 // push is simpler than adding a third field to poll every tick.
 void led_status_set_wifi_connecting(bool connecting);
 void led_status_set_ap_fallback(bool active);
+
+// Highest-priority state — see pa_watchdog.c, which calls this the moment
+// PA_MAX_ON_SECONDS of continuous PA sense trips (or clears) the latched
+// emergency cutoff.
+void led_status_set_pa_emergency(bool tripped);

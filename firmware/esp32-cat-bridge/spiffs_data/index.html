@@ -11,6 +11,21 @@
 
 <div class="layout">
   <div class="col col-side">
+    <section id="pa-card" class="card pa-card">
+      <h2>PA safety</h2>
+      <dl id="pa-list">
+        <dt>PA sense</dt><dd id="pa-sense">&hellip;</dd>
+        <dt>Emergency cutoff</dt><dd id="pa-emergency">&hellip;</dd>
+      </dl>
+      <button id="pa-clear-btn" type="button" class="danger" disabled>Clear emergency cutoff</button>
+      <p class="hint">Watches the external miniPA70 amplifier via a
+      dedicated sense line &mdash; if it's continuously energized for too
+      long (the uSDX hanging with PTT stuck), the bridge forces it off and
+      <strong>latches</strong> that cutoff until manually cleared here.
+      Clearing does not check whether the PA is actually safe to
+      re-enable &mdash; confirm that yourself first.</p>
+    </section>
+
     <section id="status-card" class="card">
       <h2>Status</h2>
       <dl id="status-list">

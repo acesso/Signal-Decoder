@@ -201,3 +201,23 @@ button.secondary {
 .cat-log-frame { flex: 1; word-break: break-all; }
 .cat-send-row { margin-top: 0.5rem; }
 .cat-send-row input { flex: 1; font-family: ui-monospace, "SF Mono", Consolas, monospace; }
+
+dl#pa-list {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 0.25rem 0.75rem;
+  margin: 0 0 0.75rem;
+}
+.pa-card #pa-clear-btn { width: 100%; }
+/* Tripped state overrides the card's normal border/background so a
+   safety fault is visually unmistakable even at a glance, not just
+   readable in the text — same "can't be confused with anything else"
+   goal as the LED's dedicated fast-strobe pattern. */
+.pa-card.pa-tripped {
+  border-color: var(--danger);
+  background: color-mix(in srgb, var(--danger) 12%, var(--card-bg));
+}
+.pa-card.pa-tripped #pa-emergency {
+  color: var(--danger);
+  font-weight: 700;
+}

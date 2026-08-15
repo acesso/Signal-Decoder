@@ -30,6 +30,7 @@ static _Atomic uint8_t s_level_in = 0;
 static _Atomic uint8_t s_level_out = 0;
 static _Atomic bool s_wifi_connecting = false;
 static _Atomic bool s_ap_fallback = false;
+static _Atomic bool s_pa_emergency = false;
 
 // Same "traffic within the last 3s" threshold GET /status uses (see
 // status_handler in http_control.c) — kept as one named constant so the two
@@ -65,7 +66,15 @@ static void led_task(void *arg) {
     for (;;) {
         tick++;
 
-        if (atomic_load(&s_ap_fallback)) {
+        if (atomic_load(&s_pa_emergency)) {
+            // Very fast strobe — a hardware safety fault, the single most
+            // urgent thing this device can report. Deliberately faster
+            // than every other pattern below so it can never be mistaken
+            // for a mere network issue at a glance.
+            bool on = (tick % 2) < 1; // 100ms on/off at 50ms ticks
+            set_duty(LED_IN_CHANNEL, on ? LED_DUTY_MAX : 0);
+            set_duty(LED_OUT_CHANNEL, on ? LED_DUTY_MAX : 0);
+        } else if (atomic_load(&s_ap_fallback)) {
             // Fast sync blink — network needs attention now.
             bool on = (tick % 6) < 3; // 300ms on/off at 50ms ticks
             set_duty(LED_IN_CHANNEL, on ? LED_DUTY_MAX : 0);
@@ -144,4 +153,8 @@ void led_status_set_wifi_connecting(bool connecting) {
 
 void led_status_set_ap_fallback(bool active) {
     atomic_store(&s_ap_fallback, active);
+}
+
+void led_status_set_pa_emergency(bool tripped) {
+    atomic_store(&s_pa_emergency, tripped);
 }

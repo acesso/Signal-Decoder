@@ -1132,6 +1132,7 @@ function BridgeStatusPanel(props: {
   setBridgeContrast: (wsUrl: string, vop: number) => Promise<{ vop: number; saved: boolean } | null>
   setBridgeWifiConfig: (wsUrl: string, ssid: string, password: string) => Promise<boolean>
   setBridgeCatBaud: (wsUrl: string, baud: number) => Promise<{ baud: number; saved: boolean } | null>
+  clearBridgePaEmergency: (wsUrl: string) => Promise<boolean | null>
 }) {
   const [status, setStatus] = createSignal<BridgeStatus | null>(null)
   const [info, setInfo] = createSignal<BridgeInfo | null>(null)
@@ -1145,6 +1146,7 @@ function BridgeStatusPanel(props: {
   const [wifiConfigBusy, setWifiConfigBusy] = createSignal(false)
   const [catBaudBusy, setCatBaudBusy] = createSignal(false)
   const [catBaudDraft, setCatBaudDraft] = createSignal(38400)
+  const [paClearBusy, setPaClearBusy] = createSignal(false)
   let loadSeq = 0
 
   const hasFeature = (name: string) => info()?.features.includes(name) ?? false
@@ -1207,6 +1209,16 @@ function BridgeStatusPanel(props: {
     setCatBaudBusy(false)
   }
 
+  const handlePaEmergencyClear = async () => {
+    if (!window.confirm(
+      'Clear the PA emergency cutoff? Only do this if you have confirmed by eye/ear that the amplifier is actually safe to re-enable.'
+    )) return
+    setPaClearBusy(true)
+    const tripped = await props.clearBridgePaEmergency(props.wsUrl)
+    if (tripped === false) await load() // re-fetch so the panel reflects the cleared state immediately
+    setPaClearBusy(false)
+  }
+
   const rssiQuality = (rssi: number): string =>
     rssi >= -55 ? 'Excellent' : rssi >= -67 ? 'Good' : rssi >= -78 ? 'Weak' : 'Very weak'
 
@@ -1225,6 +1237,24 @@ function BridgeStatusPanel(props: {
           {loading() ? 'Loading…' : 'Refresh'}
         </button>
       </div>
+
+      <Show when={status()?.paEmergencyTripped}>
+        <div class="bg-[#3d1214] border border-[#f85149] rounded-md p-3 flex flex-col gap-2">
+          <p class="text-[11px] font-bold text-[#f85149]">
+            PA EMERGENCY CUTOFF TRIPPED — amplifier forced off, will not re-enable until cleared.
+          </p>
+          <p class="text-[10px] text-[#f0883e]">
+            Confirm by eye/ear that the amplifier is actually safe before clearing — this does not re-check anything itself.
+          </p>
+          <button
+            onClick={() => void handlePaEmergencyClear()}
+            disabled={paClearBusy()}
+            class="self-start text-[10px] font-semibold px-2.5 py-1.5 rounded bg-[#da3633] hover:bg-[#f85149] text-white disabled:opacity-50"
+          >
+            {paClearBusy() ? 'Clearing…' : 'Clear emergency cutoff'}
+          </button>
+        </div>
+      </Show>
 
       <Show
         when={status()}
@@ -1250,6 +1280,12 @@ function BridgeStatusPanel(props: {
             <span class="text-[#c9d1d9]">{s().wsClients} / {s().wsMaxClients}</span>
             <span class="text-[#8b949e]">CAT baud</span>
             <span class="text-[#c9d1d9]">{s().catBaud || '—'}</span>
+            <Show when={hasFeature('pa_watchdog')}>
+              <span class="text-[#8b949e]">PA sense</span>
+              <span class={s().paSense ? 'text-[#3fb950]' : 'text-[#8b949e]'}>
+                {s().paSense ? 'energized' : 'off'}
+              </span>
+            </Show>
             <span class="text-[#8b949e]">Uptime</span>
             <span class="text-[#c9d1d9]">{Math.floor(s().uptimeSeconds / 60)}m {s().uptimeSeconds % 60}s</span>
           </div>
@@ -1528,6 +1564,7 @@ export default function RadioCATPanel(props: { cat: RadioCATControls; collapsed?
           getBridgeInfo={cat.getBridgeInfo}
           setBridgeBacklight={cat.setBridgeBacklight} setBridgeContrast={cat.setBridgeContrast}
           setBridgeWifiConfig={cat.setBridgeWifiConfig} setBridgeCatBaud={cat.setBridgeCatBaud}
+          clearBridgePaEmergency={cat.clearBridgePaEmergency}
         />
       </Show>
 
