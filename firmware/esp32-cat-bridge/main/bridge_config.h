@@ -147,12 +147,34 @@
                                         // for this station, with real margin
 
 // ── Task placement ───────────────────────────────────────────────────────────
-// Wi-Fi/lwIP/httpd's own internal tasks are explicitly pinned to core 0 via
-// sdkconfig (CONFIG_ESP_WIFI_TASK_PINNED_TO_CORE_0, already the ESP-IDF
-// default; CONFIG_LWIP_TCPIP_TASK_AFFINITY_CPU0=y — see sdkconfig.defaults)
-// rather than left at "no affinity", which could otherwise let network
-// activity drift onto core 1 and contend with the CAT UART reader, which is
-// pinned there exclusively — nothing else this firmware creates runs on
-// core 1, so radio I/O timing is never contended.
-#define CAT_BRIDGE_TASK_CORE     1
+// Two-core split, deliberately along "what this bridge fundamentally does"
+// lines: core 0 owns Wi-Fi/network/control — the framework's own Wi-Fi/lwIP
+// tasks, pinned there by sdkconfig (CONFIG_ESP_WIFI_TASK_PINNED_TO_CORE_0
+// is the ESP-IDF default, CONFIG_LWIP_TCPIP_TASK_AFFINITY_CPU0=y makes lwIP
+// match it explicitly rather than floating); the httpd worker task,
+// EXPLICITLY pinned there too (ws_server.c's config.core_id = 0) since it's
+// what actually sends every /cat and /audio broadcast frame — if it drifted
+// onto core 1 it would contend directly with the tasks core-1 isolation
+// exists to protect; and led_status, purely cosmetic visual feedback with
+// no timing requirement core-sharing would ever break, left unpinned.
+// Core 1 owns every task that's actually the bridge's real-time "relay"
+// work — CAT UART, audio codec I/O, and the PA safety watchdog's polling —
+// grouped deliberately so none of it is ever contended by Wi-Fi/network activity.
+//
+// Priority order on RELAY_TASK_CORE (highest wins): CAT UART reader (radio
+// protocol correctness — a dropped/garbled CAT byte breaks the whole
+// session, the highest possible stakes here) > PA watchdog (safety-
+// critical timing, but genuinely light work — one GPIO read per 100ms) >
+// audio codec I/O (a dropped audio buffer is a barely-perceptible glitch,
+// tolerant of occasional scheduling jitter the other two aren't). All
+// three use blocking-with-timeout calls under the hood (uart_read_bytes'
+// own 20ms timeout, esp_codec_dev's DMA-backed I2S, GPIO polling's own
+// vTaskDelay) — none of them busy-wait, so this is normal FreeRTOS
+// preemption between real tasks, not a risk of one starving another.
+#define RELAY_TASK_CORE          1
+#define CAT_BRIDGE_TASK_CORE     RELAY_TASK_CORE
 #define CAT_BRIDGE_TASK_PRIO     10
+#define PA_WATCHDOG_TASK_CORE    RELAY_TASK_CORE
+#define PA_WATCHDOG_TASK_PRIO    4
+#define AUDIO_MONITOR_TASK_CORE  RELAY_TASK_CORE
+#define AUDIO_MONITOR_TASK_PRIO  3

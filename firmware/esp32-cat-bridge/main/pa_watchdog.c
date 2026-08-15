@@ -135,7 +135,14 @@ void pa_watchdog_start(void) {
     ESP_ERROR_CHECK(gpio_config(&emergency_cfg));
     gpio_set_level(PA_EMERGENCY_PIN, 1); // permissive default — set before anything can read it as low
 
-    xTaskCreate(watchdog_task, "pa_watchdog", 3072, NULL, tskIDLE_PRIORITY + 4, NULL);
+    // Pinned to RELAY_TASK_CORE — safety-critical timing belongs with the
+    // other real-time relay work, never contended by Wi-Fi/network
+    // activity. Below CAT UART's priority (protocol correctness always
+    // wins) but above audio (this task's own polling is far lighter than
+    // audio's I2S I/O, so it should never be starved by it) — see
+    // bridge_config.h's Task placement notes.
+    xTaskCreatePinnedToCore(watchdog_task, "pa_watchdog", 3072, NULL,
+                             PA_WATCHDOG_TASK_PRIO, NULL, PA_WATCHDOG_TASK_CORE);
     ESP_LOGI(TAG, "PA watchdog ready (sense=GPIO%d, emergency=GPIO%d, limit=%ds)",
              PA_SENSE_PIN, PA_EMERGENCY_PIN, PA_MAX_ON_SECONDS);
 }
