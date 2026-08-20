@@ -22,6 +22,8 @@ import FTContactsPanel from './FTContactsPanel'
 import FTWasmPanel from './FTWasmPanel'
 import VirtualList from './VirtualList'
 import { loadNumberArray, saveNumberArray, loadBoolean, saveBoolean } from '$decoder-lib/storage'
+import type { AudioBridge } from '$decoder-lib/cat/useAudioBridge'
+import type { AudioSourceKind } from '$decoder-lib/audio/audioSource'
 
 const DEFAULT_PANEL_WEIGHTS = [0.8, 0.6, 1.2]
 const LS_PANEL_WEIGHTS = 'ft_panel_weights'
@@ -319,10 +321,16 @@ interface Props {
   vfoFrequency?: number
   onStateChange?: (controls: DecoderControls) => void
   handle?: { current: DecoderControls | null }
+  audioBridge?: AudioBridge
 }
 
 export default function FTDecoder(props: Props): JSX.Element {
-  const processor = createFTProcessor(() => props.ftMode)
+  // Where decode input comes from — the ESP32 bridge's live radio audio
+  // whenever it's actually connected (matches globalAudio's own
+  // auto-detection in App.tsx's handleStart(), so both agree without a
+  // separate manual selector), falling back to the local mic otherwise.
+  const audioSourceKind = (): AudioSourceKind => (props.audioBridge?.state().playbackActive ? 'bridge' : 'microphone')
+  const processor = createFTProcessor(() => props.ftMode, audioSourceKind, () => props.audioBridge)
 
   createEffect((prevMode: FTMode | undefined) => {
     const mode = props.ftMode
@@ -776,6 +784,12 @@ export default function FTDecoder(props: Props): JSX.Element {
 
   return (
     <div class="space-y-3 sm:space-y-4">
+      <Show when={props.audioBridge && processor.state().isRecording}>
+        <p class="text-[10px] text-[#8b949e]">
+          Audio source: <span class="text-[#c9d1d9] font-semibold">{audioSourceKind() === 'bridge' ? 'ESP32 Bridge (radio audio)' : 'Local microphone'}</span>
+        </p>
+      </Show>
+
       {/* 3-panel layout — bounded height on lg so panel content scrolls instead of growing the page */}
       <div
         ref={containerEl}

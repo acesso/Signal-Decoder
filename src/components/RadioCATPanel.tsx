@@ -11,7 +11,7 @@ import {
   type BridgeStatus,
   type BridgeInfo,
 } from '../lib/cat/useRadioCAT'
-import { useAudioBridge } from '../lib/cat/useAudioBridge'
+import type { AudioBridge } from '../lib/cat/useAudioBridge'
 import AudioQualityPanel from './AudioQualityPanel'
 import CalibrationWizard from './CalibrationWizard'
 import NumberField from './NumberField'
@@ -238,6 +238,34 @@ function PTTButton(props: { ptt: boolean; onToggle: () => void; confirmAlarm?: b
   )
 }
 
+// Corrects the one mistake that's easy to make typing/pasting into the
+// CAT Bridge Address field: an http(s):// URL instead of ws(s)://. Both
+// useRadioCAT.ts's `new WebSocket(url)` and useAudioBridge.ts's own scheme
+// check (bridgeAudioWsUrl()) require a real ws:/wss: URL — the input field
+// itself never validated this, so a wrong scheme saved silently and the
+// symptom only showed up later as a confusing, unrelated-looking failure:
+// CAT itself could still connect (some browsers tolerate the wrong scheme
+// there), while bridge audio failed outright with "could not derive
+// /audio URL", with no obvious link back to this field.
+function normalizeBridgeWsUrl(raw: string): string {
+  const trimmed = raw.trim()
+  if (trimmed.startsWith('https://')) return 'wss://' + trimmed.slice('https://'.length)
+  if (trimmed.startsWith('http://')) return 'ws://' + trimmed.slice('http://'.length)
+  return trimmed
+}
+
+// Only ws://... or wss://... is ever valid here — anything else (a bare
+// hostname with no scheme, a typo'd scheme, etc.) would silently break
+// bridge audio exactly like the http(s) mistake above did, just without a
+// matching auto-correct rule. Empty is allowed through without a warning:
+// the field is optional (CAT can run over Web Serial instead), and an
+// empty CAT_CONFIG_STORAGE_KEY on first load shouldn't greet the operator
+// with an error before they've typed anything.
+function isValidBridgeWsUrl(value: string): boolean {
+  if (value === '') return true
+  return value.startsWith('ws://') || value.startsWith('wss://')
+}
+
 // ── SettingsPanel ─────────────────────────────────────────────────────────────
 
 function SettingsPanel(props: {
@@ -357,15 +385,27 @@ function SettingsPanel(props: {
             <input
               type="text"
               value={props.config.wsUrl ?? ''}
-              onChange={(e) => props.onConfigChange({ ...props.config, wsUrl: e.currentTarget.value })}
+              onChange={(e) => props.onConfigChange({ ...props.config, wsUrl: normalizeBridgeWsUrl(e.currentTarget.value) })}
               placeholder="ws://usdx-bridge.local/cat"
-              class="bg-[#0d1117] border border-[#30363d] text-[#c9d1d9] text-xs rounded px-2 py-1.5 focus:outline-none focus:border-[#388bfd] font-mono"
+              class={`bg-[#0d1117] border text-[#c9d1d9] text-xs rounded px-2 py-1.5 focus:outline-none font-mono
+                ${isValidBridgeWsUrl(props.config.wsUrl ?? '') ? 'border-[#30363d] focus:border-[#388bfd]' : 'border-[#f85149] focus:border-[#f85149]'}`}
             />
-            <p class="text-[10px] text-[#8b949e]">
-              Address of the ESP32 CAT bridge's WebSocket endpoint — defaults to its mDNS name,{' '}
-              <code class="text-[#79c0ff]">usdx-bridge.local</code>, if your network resolves it;
-              otherwise use its IP address (shown on the bridge's LCD).
-            </p>
+            <Show
+              when={isValidBridgeWsUrl(props.config.wsUrl ?? '')}
+              fallback={
+                <p class="text-[10px] text-[#f85149]">
+                  Must start with <code class="font-mono">ws://</code> or <code class="font-mono">wss://</code> —
+                  a bridge address using <code class="font-mono">http(s)://</code> or missing a scheme will
+                  connect CAT but silently fail to bridge audio.
+                </p>
+              }
+            >
+              <p class="text-[10px] text-[#8b949e]">
+                Address of the ESP32 CAT bridge's WebSocket endpoint — defaults to its mDNS name,{' '}
+                <code class="text-[#79c0ff]">usdx-bridge.local</code>, if your network resolves it;
+                otherwise use its IP address (shown on the bridge's LCD).
+              </p>
+            </Show>
           </div>
         </Show>
 
@@ -1047,8 +1087,8 @@ function AudioMeter(props: { label: string; level: number; active: boolean }) {
   )
 }
 
-function BridgeAudioControl(props: { wsUrl: string }) {
-  const audio = useAudioBridge()
+function BridgeAudioControl(props: { wsUrl: string; audioBridge: AudioBridge }) {
+  const audio = props.audioBridge
   const [busy, setBusy] = createSignal(false)
   // Quality view (spectrum/waterfall/scope) is opt-in, not always-rendered
   // — it redraws canvases + a GL waterfall every animation frame per
@@ -1069,12 +1109,17 @@ function BridgeAudioControl(props: { wsUrl: string }) {
   const handleMicToggle = async () => {
     setBusy(true)
     if (audio.state().micActive) {
-      audio.stopMic()
+      audio.stopMic('manual')
     } else {
-      await audio.startMic()
+      await audio.startMic(undefined, 'manual')
     }
     setBusy(false)
   }
+
+  // FT8 TX's "ESP32 Bridge" output option claims this same mic-send session
+  // (see MicOwner in useAudioBridge.ts) — disable this button while that's
+  // holding it, rather than letting the two silently fight over ownership.
+  const micHeldByOther = () => audio.state().micActive && audio.state().micOwner !== 'manual'
 
   return (
     <div class="flex flex-col gap-2">
@@ -1094,7 +1139,8 @@ function BridgeAudioControl(props: { wsUrl: string }) {
         </button>
         <button
           onClick={() => void handleMicToggle()}
-          disabled={busy() || !audio.state().connected}
+          disabled={busy() || !audio.state().connected || micHeldByOther()}
+          title={micHeldByOther() ? 'In use by FT8 TX — stop that first' : undefined}
           class={`text-[10px] font-semibold px-2.5 py-1.5 rounded border transition-colors whitespace-nowrap disabled:opacity-50
             ${audio.state().micActive
               ? 'bg-[#21262d] border-[#f0883e] text-[#f0883e] hover:bg-[#bd561d] hover:text-white'
@@ -1156,6 +1202,7 @@ function BridgeAudioControl(props: { wsUrl: string }) {
 
 function BridgeStatusPanel(props: {
   wsUrl: string
+  audioBridge: AudioBridge
   getBridgeStatus: (wsUrl: string) => Promise<BridgeStatus | null>
   resetBridge: (wsUrl: string) => Promise<boolean>
   getBridgeInfo: (wsUrl: string) => Promise<BridgeInfo | null>
@@ -1205,9 +1252,27 @@ function BridgeStatusPanel(props: {
   const handleRestart = async () => {
     setResetBusy(true)
     await props.resetBridge(props.wsUrl)
-    // The bridge is rebooting — don't bother re-querying status right away,
-    // it won't answer for a few seconds. Leave the last-known status
-    // visible (stale-but-labeled) rather than blanking the panel.
+    // The bridge is rebooting — an immediate re-query would just fail (it
+    // won't answer for a few seconds while ESP-IDF boots + rejoins Wi-Fi),
+    // so poll every couple seconds until it actually answers again rather
+    // than leaving the pre-restart status/settings (e.g. RX slot, ADC
+    // input) visible indefinitely as if they were still current — a stale
+    // display here previously read as "the setting didn't survive the
+    // reboot" when actually the panel had just never asked again.
+    const seq = ++loadSeq
+    for (let attempt = 0; attempt < 15; attempt++) {
+      await new Promise((r) => setTimeout(r, 2000))
+      if (seq !== loadSeq) return // a newer load()/restart superseded this poll
+      const [s, i] = await Promise.all([props.getBridgeStatus(props.wsUrl), props.getBridgeInfo(props.wsUrl)])
+      if (seq !== loadSeq) return
+      if (s) {
+        setStatus(s)
+        setInfo(i)
+        setFailed(false)
+        if (s.catBaud) setCatBaudDraft(s.catBaud)
+        break
+      }
+    }
     setResetBusy(false)
   }
 
@@ -1385,7 +1450,7 @@ function BridgeStatusPanel(props: {
 
       <Show when={hasFeature('audio')}>
         <div class="border-t border-[#21262d] pt-3">
-          <BridgeAudioControl wsUrl={props.wsUrl} />
+          <BridgeAudioControl wsUrl={props.wsUrl} audioBridge={props.audioBridge} />
         </div>
       </Show>
     </div>
@@ -1422,7 +1487,16 @@ function loadInitialConfig(): CATConnectionConfig & { presetIdx: number } {
   }
 }
 
-export default function RadioCATPanel(props: { cat: RadioCATControls; collapsed?: boolean }): JSX.Element {
+export default function RadioCATPanel(props: {
+  cat: RadioCATControls
+  audioBridge: AudioBridge
+  collapsed?: boolean
+  // Reports the current CAT transport/wsUrl upward whenever either changes
+  // — App.tsx needs this to know whether "Start Decoding" can auto-connect
+  // the audio bridge (transport === 'websocket' + a wsUrl to open /audio
+  // against), without duplicating this panel's own connection-config state.
+  onWsUrlChange?: (wsUrl: string | undefined) => void
+}): JSX.Element {
   const cat = props.cat
   const state = () => cat.state()
 
@@ -1436,6 +1510,11 @@ export default function RadioCATPanel(props: { cat: RadioCATControls; collapsed?
   // but only presetIdx/transport/wsUrl (plus the re-derivable serial fields)
   // are meaningfully restored on the next load via loadInitialConfig().
   createEffect(() => { saveObject(CAT_CONFIG_STORAGE_KEY, config()) })
+
+  createEffect(() => {
+    const c = config()
+    props.onWsUrlChange?.(c.transport === 'websocket' ? c.wsUrl : undefined)
+  })
 
   const handleConnect    = () => { setShowSettings(false); cat.connect(config()).catch(() => {}) }
   const handleFreqCommit = (hz: number) => { cat.setFrequency(hz).catch(() => {}) }
@@ -1591,6 +1670,7 @@ export default function RadioCATPanel(props: { cat: RadioCATControls; collapsed?
       <Show when={!props.collapsed && showBridgeStatus() && config().transport === 'websocket' && config().wsUrl}>
         <BridgeStatusPanel
           wsUrl={config().wsUrl!}
+          audioBridge={props.audioBridge}
           getBridgeStatus={cat.getBridgeStatus} resetBridge={cat.resetBridge}
           getBridgeInfo={cat.getBridgeInfo}
           setBridgeBacklight={cat.setBridgeBacklight} setBridgeContrast={cat.setBridgeContrast}

@@ -8,21 +8,25 @@ components) — **not** the Arduino core.
 Target board: **AI-Thinker ESP32-A1S Audio Kit**. This is a WROVER-class
 module (8MB PSRAM — GPIO16/17 are internally reserved for it, not even
 broken out to the header) with an onboard ES8388 audio codec and an onboard
-SD card slot (SDMMC on GPIO2/4/12/13). Only 7 header GPIOs are nominally
-"free" (0, 5, 18, 19, 21, 22, 23) and every one already drives an onboard
-button, LED, or the amplifier-enable line — this firmware claims 2 of them
-(18, 23) for the CAT UART and 1 more (22, plus 19 which doubles as a
-button) for the two status LEDs. The onboard codec streams both
-directions — radio speaker audio out to the browser, browser mic audio
-into the radio's mic input — over a second WebSocket (see Audio bridge
-below). Two more pins (GPIO2, GPIO4 — the SD card slot's unused DATA0/
-DATA1 lines, since the header itself was fully spoken for) drive a PA
-safety watchdog for an external amplifier (see PA safety watchdog below).
+SD card slot (SDMMC on GPIO2/4/12/13, not used by this firmware). All 7
+header GPIOs that are nominally "free" (0, 5, 18, 19, 21, 22, 23) are
+claimed: 2 (18, 23) for the CAT UART, 1 (22) for the single status LED, 1
+(21) for the codec's onboard PA-enable line, and 2 more (19, 5) for a PA
+safety watchdog for an external amplifier (see PA safety watchdog below) —
+both real header pins, not the SD card slot. The onboard codec streams
+both directions — radio speaker audio out to the browser, browser mic
+audio into the radio's mic input — over a second WebSocket (see Audio
+bridge below).
 
-Repurposing the SD card slot's pins means this firmware can never use the
-slot itself, but nothing here does — the alternative would have been
-sacrificing another onboard button/LED, which the PA watchdog's pins don't
-cost.
+An earlier revision of the PA safety watchdog used the SD card slot's
+unused GPIO2/GPIO4 (and later GPIO13) pads instead of real header pins —
+abandoned after GPIO2 was found to read a permanent false HIGH from the
+board's own SD-bus pull-up, and because none of those pins have any
+header/pin access anyway (soldering to the SD slot directly was the only
+way to reach them). See main/doc/PA_WATCHDOG_DESIGN.md's pin-choice
+revision history for the full story. Freeing GPIO19 for the watchdog meant
+dropping the second status LED (this board originally had two, one per
+audio direction) — see Status LEDs below.
 
 An earlier revision of this firmware targeted a bare ESP32-WROOM-32 board
 with a PCD8544 LCD status display — that hardware is no longer in use; the
@@ -104,30 +108,34 @@ Radio  <----------------------------->  ESP32  <--------------------------------
   shared state in the firmware.
 - **`audio_monitor`** brings up the onboard ES8388 codec (I2C control + I2S
   audio) and bridges it bidirectionally to `audio_ws`: reads the ADC
-  continuously, computes an RMS level for the status LEDs, and broadcasts
-  the raw samples to every `/audio` client; writes whatever a client sends
-  straight to the DAC, with its own RMS feeding the other LED.
+  continuously and broadcasts the raw samples to every `/audio` client;
+  writes whatever a client sends straight to the DAC.
 - **`audio_ws`** is `/audio`'s WebSocket route — the same "byte-transparent,
   no framing beyond the raw payload" philosophy as `/cat`, just carrying
   16-bit PCM samples instead of ASCII CAT commands. See Audio bridge below.
-- **`led_status`** drives the board's two status LEDs via LEDC PWM — see
+- **`led_status`** drives the board's single status LED via LEDC PWM — see
   the LED legend below for what each state looks like.
 - **`pa_watchdog`** guards against the uSDX hanging with the external
   amplifier still keyed — see PA safety watchdog below.
 
-### Status LEDs
+### Status LED
 
-Two onboard LEDs (GPIO22 and GPIO19 — the latter doubles as the KEY3
-button input, unused elsewhere in this firmware, so claiming it as an
-output here costs nothing) show, in priority order (highest wins):
+One onboard LED (GPIO22) shows, in priority order (highest wins):
 
-| State                | LED behavior                                                                                    |
-|----------------------|-------------------------------------------------------------------------------------------------|
-| PA emergency         | Both LEDs strobe VERY fast (~100ms) — hardware safety fault, outranks everything below          |
-| AP fallback          | Both LEDs blink together, fast (~300ms) — network needs fixing                                  |
-| Wi-Fi connecting     | LEDs alternate (~400ms) — joining, not stuck yet                                                |
-| No CAT traffic (>3s) | Both LEDs pulse dim-to-bright-to-dim (2s, floors at ~17% not 0%); live audio still rides on top |
-| Normal               | LED1 (GPIO22) = audio-in level, LED2 (GPIO19) = audio-out level, plain brightness, no blink     |
+| State            | LED behavior                                                                  |
+|------------------|--------------------------------------------------------------------------------|
+| PA emergency     | Strobes VERY fast (~100ms) — hardware safety fault, outranks everything below |
+| AP fallback      | Blinks fast (~300ms) — network needs fixing                                   |
+| Wi-Fi connecting | Blinks (~400ms) — joining, not stuck yet                                     |
+| Normal           | Pulses dim-to-bright-to-dim (2s, floors at ~17% not 0%) — "still alive"       |
+
+The 2s pulse is a permanent "still alive" base layer, present whether or
+not CAT is linked. This board originally had two status LEDs (GPIO22 +
+GPIO19), one per audio direction, with real audio level riding on top of
+the pulse as extra brightness — GPIO19 was reclaimed for the PA safety
+watchdog's header wiring (see PA safety watchdog below), so audio-level
+display was dropped rather than trying to fold two independent levels onto
+the one remaining LED.
 
 ### Audio bridge
 
@@ -154,36 +162,100 @@ No compression — raw PCM at 8kHz is ~128kbit/s, trivial for Wi-Fi, and
 avoids running any codec math on the ESP32 (G.711/Opus were considered and
 explicitly not used — see the Known Limitations note on this choice).
 
+**Backpressure**: `/audio` and `/audio-mic-sniff` both broadcast on a fixed
+~50ms timer, and both share the bridge's ONE httpd worker task with `/cat`
+and every plain HTTP route (`GET /status`, etc — `httpd_queue_work()` just
+posts to that same task's control socket, there's no separate worker pool
+or queue depth). Broadcasting unconditionally on that timer, regardless of
+whether a client's previous frame has actually finished sending, was found
+on real hardware to starve the whole httpd instance once a Wi-Fi link
+degraded enough that sends stopped completing within 50ms: new work kept
+queuing faster than the one worker could drain it, and `/status` timed out
+for as long as the backlog persisted (the device stayed reachable over
+plain ICMP the entire time — this was never a Wi-Fi disconnect, just an
+httpd task buried in its own backlog). Fixed by tracking one
+"send-in-flight" flag per client in both `audio_ws.c` and `audio_sniff.c`:
+a broadcast simply skips a client that's still waiting on its prior frame
+instead of queueing another one behind it — sheds load exactly when the
+worker is falling behind, and self-heals the moment sends start completing
+again.
+
+### Mic → radio sniffer
+
+`/audio`'s browser→bridge direction (mic audio written straight to the
+ES8388 DAC, feeding the radio's mic input) has no return signal at all —
+once sent, there's no way to confirm the audio actually reached the radio,
+or what it sounded like once it got there. `GET /audio-mic-sniff` upgrades
+to a **read-only** WebSocket broadcasting a copy of the exact samples just
+written to the DAC (`audio_sniff.c`/`.h`), so an operator debugging their
+own transmitted signal has something to actually look at and listen to.
+
+Deliberately a fully separate endpoint from `/audio` rather than echoing
+through it: mixing a sniffed copy into `/audio`'s existing radio-speaker
+broadcast would make a listener unable to tell "this is what I just sent"
+apart from "this is what the radio is doing", and would add load/risk to
+a path (`/audio`) that's already had real reliability problems (see
+`audio_ws.c`'s zombie-client eviction history) for a debug feature that
+doesn't need to share it. Server → client only — closing or stalling a
+sniffer client can never affect the real mic-to-radio write it mirrors.
+
+On the standalone control page, "Start Sniffing" (with a "Play through
+speakers" option) replaces what used to be a "Send Mic to Radio" button —
+that button let the operator send their own computer's mic to the radio
+from this page, which had no real use case once the actual mic-send path
+lives in the Signal-Decoder web app itself; the sniffer is what's
+actually useful here, since it's the only way to inspect signal already
+in flight from that app. The sniffer feeds the same bar
+spectrum/waterfall/oscilloscope/stats quality view described below.
+
 ### Audio quality visualization (browser-side)
 
 The interface board has manual RC filter trimpots for both audio
 directions (radio → browser and browser → radio) — tuned by eye, not by
 ear, since "does this sound right" isn't reliable enough for that
-adjustment. Both the web app (`AudioQualityPanel.tsx`, shown/hidden via a
-"Show Signal Quality" button in the Bridge panel's Audio section) and the
-standalone control page (a "Show" checkbox in its own Audio quality card)
-render the same analysis, driven entirely client-side from an
-`AnalyserNode` tapped onto the existing playback/capture Web Audio graphs
-— **zero firmware involvement**, this is pure browser-side processing of
-the raw PCM already crossing `/audio`. Deliberately more than a bare VU
-meter, since a trimpot problem can be easy to miss just eyeballing a
+adjustment. The standalone control page's Audio card renders this
+analysis, driven entirely client-side from an `AnalyserNode` tapped onto
+the existing playback graph (radio → browser) and onto the mic → radio
+sniffer's own playback graph (see "Mic → radio sniffer" below) — **zero
+firmware involvement** beyond the sniffer's own read-only tap, this is
+pure browser-side processing of raw PCM already crossing `/audio` and
+`/audio-mic-sniff`. Always rendered (no show/hide toggle — the per-frame
+canvas work is cheap enough at this size not to bother hiding), and
+merged into the same card as the Listen/Sniff controls and level meters
+rather than a separate section, since operating the bridge and checking
+audio quality are the same task. Deliberately more than a bare VU meter,
+since a trimpot problem can be easy to miss just eyeballing a
 constantly-moving trace:
 
 - **Bar spectrum** — the filter's passband shape/cutoff slope/ripple
-  directly, updating live as a trimpot turns.
-- **Estimated rolloff marker** — a blue dashed line + Hz readout at the
-  point the spectrum drops to roughly half its peak magnitude (a simple,
-  robust ~-6dB-relative-to-peak threshold, not a true -3dB reconstruction
-  — 8-bit log-mapped analyser data doesn't have the resolution for that
-  level of precision, and this is plenty to watch move as you tune).
-- **Waterfall** — scrolling spectrum history (the web app reuses
-  `GLSpectrogram`, the same GPU component the decoders use; the control
-  page has no bundler, so it's a simple canvas-2D scrolling column
-  instead), so an intermittent issue is visible over time, not just the
-  current instant.
+  directly, updating live as a trimpot turns. Axis-labeled (Hz across the
+  bottom, dBFS up the side) and tuned for actual movement at typical
+  signal levels — `smoothingTimeConstant` 0.4 (not the default 0.8, which
+  reads as almost static) and a -90dBFS…-10dBFS range (not the default
+  -100…-30, which clipped most real signal into a narrow low band). A
+  **Max freq** slider (500Hz–4kHz, default 4kHz) crops both the bar
+  spectrum and waterfall's frequency axis to whatever span the operator's
+  actual signal occupies — the radio's own passband tops out well below
+  the full 0–Nyquist span these views default to, and cropping in gives a
+  bigger, more legible view of just that range.
+- **Estimated rolloff marker** — a blue dashed **horizontal** line +
+  Hz readout at the amplitude the spectrum drops to roughly half its peak
+  magnitude (a simple, robust ~-6dB-relative-to-peak threshold, not a
+  true -3dB reconstruction — 8-bit log-mapped analyser data doesn't have
+  the resolution for that level of precision, and this is plenty to watch
+  move as you tune). Drawn at that half-peak amplitude's position on the
+  dB axis, not at a frequency position, so it reads directly against the
+  bar spectrum's side axis.
+- **Waterfall** — scrolling spectrum history via a simple canvas-2D
+  scrolling column (this page has no bundler/GPU component), so an
+  intermittent issue is visible over time, not just the current instant.
+  Axis-labeled in Hz (respects the same Max freq slider as the bar
+  spectrum); a **Contrast** slider (gamma 0.2–3, default 1.2) controls
+  how aggressively faint signal is boosted into visible color.
 - **Oscilloscope** — a spectrum alone can't show clipping (it looks like
   broadband harmonic energy in the frequency domain); the time-domain
-  trace shows the actual flat-topped waveform directly.
+  trace shows the actual flat-topped waveform directly. Axis-labeled in
+  ms (time) and %FS (amplitude).
 - **Clip events** — a bold flash + ring around the channel the instant a
   sample crosses ~98% of full-scale, plus a rolling "N clips in the last
   10s" counter — a trimpot set too hot clips only intermittently, easy to
@@ -194,6 +266,17 @@ constantly-moving trace:
 - **Noise floor** — rolling minimum spectrum energy over the last few
   seconds, so "is this trimpot position noisier" has a number instead of
   just a vibe.
+
+"Listen to Radio" (`/audio`) and "Start Sniffing" (`/audio-mic-sniff`) are
+independent — either can be toggled without the other already running,
+and each has its own WebSocket/AudioContext (see "Mic → radio sniffer"
+below for why the sniffer deliberately isn't folded into `/audio`).
+
+The Signal-Decoder web app has its own separate, unrelated
+`AudioQualityPanel.tsx` implementing the same kind of analysis for its own
+Bridge panel — the two are intentionally independent UIs (this page lives
+on the ESP32 itself for zero-install LAN access; the web app is the full
+decoder application), not something this section's fixes apply to.
 
 All of this runs in the browser specifically because it has real CPU/GPU
 budget to spend that the ESP32 doesn't — deliberately not attempted in
@@ -235,7 +318,7 @@ Guards against the uSDX hanging with the external **miniPA70** amplifier's
 PTT still asserted. Full design rationale, alternatives considered, and
 sources in `main/doc/PA_WATCHDOG_DESIGN.md` — summary:
 
-- **`PA_SENSE_PIN` (GPIO2, input)** reads a signal the *user's own
+- **`PA_SENSE_PIN` (GPIO19, input)** reads a signal the *user's own
   interface board* derives from the miniPA70's actual energized 12V leg
   (after their own level-shifting down to safe logic) — not the uSDX's
   PA-send command line. The miniPA70 itself is a bare, undocumented kit
@@ -244,7 +327,7 @@ sources in `main/doc/PA_WATCHDOG_DESIGN.md` — summary:
   independent of whether the uSDX's command line or the interface board's
   own level-shifting are behaving correctly — that independence is the
   entire point of a watchdog.
-- **`PA_EMERGENCY_PIN` (GPIO4, output)** is a permissive line in series
+- **`PA_EMERGENCY_PIN` (GPIO5, output)** is a permissive line in series
   with the uSDX's PA-send path on the interface board: HIGH (idle) lets
   the radio's own signal control the PA normally; pulled LOW once
   `PA_MAX_ON_SECONDS` (default 300s — a placeholder, tune to the longest
@@ -260,13 +343,19 @@ sources in `main/doc/PA_WATCHDOG_DESIGN.md` — summary:
 - Debounced in software (3 consecutive 100ms polls agreeing before a level
   change is believed) — a raw digital input crossing a relay/PA switching
   event is exactly the kind of line that can glitch for a poll or two.
-- GPIO2/GPIO4 were chosen because every other A1S header GPIO was already
-  claimed (see the intro above) — they're the SD card slot's DATA0/DATA1
-  lines, unused since this firmware never mounts the slot. Deliberately
-  NOT GPIO12 (also the MTDI strapping pin — risky to drive externally at
-  boot) or GPIO13 (DIP-switch-shared with KEY2 on this board).
+- GPIO19/GPIO5 are real header pins, not the SD card slot — GPIO19 was
+  freed by dropping the second status LED (see Status LED above), GPIO5
+  was the one header GPIO left genuinely unclaimed. An earlier revision
+  used the SD card slot's GPIO2/GPIO4 (and later GPIO13) pads instead —
+  abandoned after GPIO2 was found to read a permanent false HIGH from the
+  board's own SD-bus pull-up, and because none of those pins have any
+  clean header/pin access anyway. See `main/doc/PA_WATCHDOG_DESIGN.md`'s
+  pin-choice revision history for the full story. Deliberately NOT GPIO12
+  (the MTDI strapping pin — risky to drive externally at boot).
 - **Not yet electrically verified against real hardware** — needs a
-  continuity/multimeter check for SD-slot pull resistors on GPIO2/4 and
+  continuity/multimeter check confirming GPIO19/GPIO5 read/drive as
+  expected with nothing else wired to the header (the exact check that
+  caught GPIO2's false-HIGH pull-up in the earlier revision) and
   confirmation of the interface board's actual output logic levels before
   trusting this on a live PA, same caution already applied to
   `ES8388_PA_REVERTED` elsewhere in this firmware.
@@ -308,41 +397,42 @@ reasoning in `bridge_config.h`'s Task placement comment:
 | CAT UART TX  | GPIO18     | to radio's CAT RX                                 |
 | CAT UART RX  | GPIO23     | to radio's CAT TX                                 |
 | CAT ground   | —          | common ground with the radio, required            |
-| PA Sense in  | GPIO2      | from the interface board's PA-energized feedback  |
-| PA Emergency | GPIO4      | to the interface board's PA-send permissive input |
+| PA Sense in  | GPIO19     | from the interface board's PA-energized feedback  |
+| PA Emergency | GPIO5      | to the interface board's PA-send permissive input |
 
-GPIO18/23 were picked deliberately over the board's other 5 free header
-pins: GPIO0 is a boot-strap pin (risky to also drive from an external
-UART, though it's also the codec's MCLK — see below, both uses are
-internal to the board, not exposed on the header, so no conflict),
-GPIO21 drives the onboard PA-enable, and GPIO5/19/22 cost the SAME
-onboard button/LED functions 18/23 do anyway — no advantage to picking them
-instead. This leaves UART0 (GPIO1/3, wired to the board's own USB-serial
-chip on its "UART" micro-USB port) completely free for flashing/`ESP_LOG`
-output the whole time the CAT cable is connected.
+All 7 of the header's nominally-free GPIOs (0, 5, 18, 19, 21, 22, 23) are
+now claimed. GPIO18/23 were picked for CAT deliberately over the
+alternatives: GPIO0 is a boot-strap pin (risky to also drive from an
+external UART, though it's also the codec's MCLK — see below, both uses
+are internal to the board, not exposed on the header, so no conflict),
+GPIO21 drives the onboard PA-enable, GPIO22 drives the status LED, and
+GPIO5/19 are claimed by the PA watchdog below — no advantage to picking
+any of them instead. This leaves UART0 (GPIO1/3, wired to the board's own
+USB-serial chip on its "UART" micro-USB port) completely free for
+flashing/`ESP_LOG` output the whole time the CAT cable is connected.
 
-GPIO2/GPIO4 (PA Sense/PA Emergency — see PA safety watchdog above) are the
-SD card slot's DATA0/DATA1 lines, repurposed since the header itself had
-nothing left free. **Not yet electrically verified** — check for SD-slot
-pull resistors and the interface board's actual output levels before
-wiring these up on real hardware.
+GPIO19/GPIO5 (PA Sense/PA Emergency — see PA safety watchdog above) are
+real header pins: GPIO19 was freed by dropping the second status LED,
+GPIO5 was the one header GPIO left genuinely unclaimed. **Not yet
+electrically verified** — check that both read/drive as expected with
+nothing else wired to the header, and confirm the interface board's
+actual output levels, before wiring these up on real hardware.
 
 Everything below this point is **onboard, not header wiring** — nothing to
 physically connect, listed here only because it's not obvious from the
 schematic which pins the firmware actually uses:
 
-| Signal           | ESP32 GPIO | Notes                                                   |
-|------------------|------------|---------------------------------------------------------|
-| Status LED (in)  | GPIO22     | audio-in level (see Status LEDs above)                  |
-| Status LED (out) | GPIO19     | audio-out level; doubles as the KEY3 button pin         |
-| Codec I2C SDA    | GPIO33     | ES8388 control                                          |
-| Codec I2C SCL    | GPIO32     | ES8388 control                                          |
-| Codec PA enable  | GPIO21     | amplifier power, polarity unconfirmed — see limitations |
-| Codec I2S MCLK   | GPIO0      | shares the boot-strap pin, internal-only use            |
-| Codec I2S BCLK   | GPIO27     |                                                         |
-| Codec I2S WS     | GPIO25     |                                                         |
-| Codec I2S DOUT   | GPIO26     | ESP32 → codec DAC                                       |
-| Codec I2S DIN    | GPIO35     | codec ADC → ESP32                                       |
+| Signal          | ESP32 GPIO | Notes                                                   |
+|-----------------|------------|----------------------------------------------------------|
+| Status LED      | GPIO22     | see Status LED above                                    |
+| Codec I2C SDA   | GPIO33     | ES8388 control                                          |
+| Codec I2C SCL   | GPIO32     | ES8388 control                                          |
+| Codec PA enable | GPIO21     | amplifier power, polarity unconfirmed — see limitations |
+| Codec I2S MCLK  | GPIO0      | shares the boot-strap pin, internal-only use            |
+| Codec I2S BCLK  | GPIO27     |                                                          |
+| Codec I2S WS    | GPIO25     |                                                          |
+| Codec I2S DOUT  | GPIO26     | ESP32 → codec DAC                                       |
+| Codec I2S DIN   | GPIO35     | codec ADC → ESP32                                       |
 
 The board has **two micro-USB ports** — one labeled power, one labeled
 UART. Flash and monitor over the UART port; the power port is for
@@ -399,9 +489,10 @@ for `spiffs_data/`. `idf.py flash` writes both; editing anything under
   longest realistic legitimate transmission for this station's actual use
   (a long FT8 sequence, a ragchew on SSB, etc.) with real margin — not yet
   tuned against any real-world usage pattern.
-- **PA Sense/Emergency wiring is not yet electrically verified.** GPIO2/
-  GPIO4 need a continuity/multimeter check against the real board (SD-slot
-  pull resistors, the interface board's actual output logic levels)
+- **PA Sense/Emergency wiring is not yet electrically verified.** GPIO19/
+  GPIO5 need a continuity/multimeter check against the real board (confirm
+  neither carries a surprise pull resistor the way GPIO2 did in an earlier
+  revision, and confirm the interface board's actual output logic levels)
   before trusting this on a live PA — see PA safety watchdog above.
 - **`/pa-emergency-clear` has no auth beyond reaching the bridge at all**
   — same trust model as the rest of `http_control`'s LAN-only surface (see

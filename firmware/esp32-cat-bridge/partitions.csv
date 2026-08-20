@@ -9,3 +9,14 @@ nvs,        data, nvs,     0x9000,   0x6000,
 phy_init,   data, phy,     0xf000,   0x1000,
 factory,    app,  factory, 0x10000,  1500K,
 storage,    data, spiffs,  ,         256K,
+# Raw partition (NOT a filesystem) for cat_log.c's persistent CAT-traffic
+# ring buffer — see that file for the full design. Deliberately sized far
+# larger than the ~40KB of "live" data 1000 fixed-size records actually
+# need: sequential-append-then-wrap across many more sectors than the live
+# data requires spreads flash erase/write wear thin (each individual 4KB
+# sector is only reclaimed once every ~13,000 log lines at this size,
+# instead of every ~100 lines a naive same-sector ring buffer would cause)
+# — see the flash-endurance research this size was chosen from. Custom
+# subtype 0x40 is inside the 0x40-0xFE "user-defined" range reserved for
+# non-standard data partitions, per ESP-IDF's partition table docs.
+catlog,     data, 0x40,    ,         512K,

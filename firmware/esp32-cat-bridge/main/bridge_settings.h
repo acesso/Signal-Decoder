@@ -35,3 +35,67 @@ bool bridge_settings_set_wifi(const char *ssid, const char *password);
 // matches the radio's actual menu setting.
 int bridge_settings_get_cat_baud(void);
 bool bridge_settings_set_cat_baud(int baud);
+
+// ES8388 ADC input selection — one of "lin1"/"lin2"/"mic1"/"mic2"/"diff"
+// (see audio_monitor.h's ADC_INPUT_OPTIONS). See the ADCCONTROL2 comment in
+// audio_monitor.c for why this exists as a runtime-switchable setting at
+// all — real-hardware testing showed the assumed onboard-mic-vs-P2-jack
+// mapping had no effect, so this now sweeps every option the chip supports.
+// Defaults to "lin2" if nothing has been saved yet (this bridge's original
+// intended input — an external mic/line-in from the interface board, not
+// the onboard mic) — unlike cat_baud, there's no Kconfig fallback for this,
+// it's a firmware-specific default rather than something the radio's own
+// menu dictates. out_sz is the caller's buffer size including room for the
+// NUL terminator (the longest name, "diff", needs 5 bytes).
+void bridge_settings_get_adc_input_name(char *name_out, size_t out_sz);
+bool bridge_settings_set_adc_input_name(const char *name);
+
+// I2S RX slot (which ADC channel — left/right — the capture side keeps) —
+// see audio_monitor_set_rx_slot()'s comment for why this is a separate
+// axis from adc_input above. Defaults to true (right) once real-hardware
+// testing on this board confirmed the P2 jack's tip signal lands on the
+// right ADC channel, not left (I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG's mono
+// default) — a board-wiring fact, not a Kconfig-level choice.
+bool bridge_settings_get_rx_slot_is_right(void);
+bool bridge_settings_set_rx_slot_is_right(bool use_right);
+
+// ES8388 MIC preamp (PGA) gain in dB — see audio_monitor_set_mic_gain_db().
+// Defaults to 0.0 dB, the ES8388's own PGA default (unity gain) — a higher
+// value was tried earlier to fight onboard-mic bleed-through, but that
+// bleed turned out to be a board-wiring issue no gain setting fixes, so
+// there's no reason to default away from unity.
+float bridge_settings_get_mic_gain_db(void);
+bool bridge_settings_set_mic_gain_db(float db_value);
+
+// WiFi max TX power in quarter-dBm units (see wifi_net_set_tx_power_quarter_dbm()
+// for the full range/units explanation). Defaults to 84 (21.0 dBm, the
+// driver's own maximum) — this control exists purely as a diagnostic for
+// whether the radio's own transmit activity couples noise into the analog
+// audio path, not because a lower default is known to help.
+int8_t bridge_settings_get_wifi_tx_power_quarter_dbm(void);
+bool bridge_settings_set_wifi_tx_power_quarter_dbm(int8_t quarter_dbm);
+
+// The /audio WebSocket's wire rate, which IS the ES8388/I2S hardware's
+// actual sample rate too (see bridge_config.h — no oversampling layer).
+// Defaults to 48000 Hz, matching a typical laptop sound card/browser
+// AudioContext's own native device rate (new AudioContext() with no
+// explicit sampleRate option gets whatever the OS's default output device
+// rate is, which is 48000 Hz on effectively every modern system) — chosen
+// as the default specifically so an A/B comparison between this bridge
+// and a direct sound-card capture isn't ALSO comparing two different
+// sample rates on top of whatever else differs. Changing this requires a
+// reboot to take effect (see POST /sample-rate) — deliberately not a live
+// reconfig, same reasoning as the RX-slot/ADC-input settings that already
+// get re-applied at boot rather than switched underneath a running codec.
+uint32_t bridge_settings_get_sample_rate_hz(void);
+bool bridge_settings_set_sample_rate_hz(uint32_t rate_hz);
+
+// Whether the persistent CAT-frame log (cat_log.h) should be running at
+// all — a debug feature, defaults to OFF (see bridge_settings.c's default
+// comment for why: its boot-time flash-recovery scan grows with the log's
+// own record count and was found to cause a real crash-loop once it grew
+// close to the 5s task-watchdog timeout). Read once at boot by
+// cat_log_init(); changing it takes effect on the next reboot, same
+// pattern as sample_rate_hz above.
+bool bridge_settings_get_cat_log_enabled(void);
+bool bridge_settings_set_cat_log_enabled(bool enabled);

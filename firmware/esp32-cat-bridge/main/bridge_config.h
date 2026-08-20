@@ -6,9 +6,11 @@
 // even broken out to the header) with an onboard ES8388 audio codec
 // (I2C control on GPIO32/33, I2S audio on GPIO0/25/26/27/35) and status
 // LEDs. Only 7 header GPIOs are nominally "free" (0, 5, 18, 19, 21, 22,
-// 23) and every one is already claimed by CAT UART, the status LEDs, or
-// the codec's PA-enable line — the PA safety watchdog below instead
-// repurposes the (unused on this firmware) SD card slot's GPIO2/GPIO4.
+// 23) and all 7 are claimed: CAT UART (18/23), the codec's PA-enable line
+// (21), the status LED (22), I2S MCLK (0), and — as of the PA safety
+// watchdog below — PA_SENSE_PIN/PA_EMERGENCY_PIN (19/5), freed up from an
+// earlier design that used the SD card slot's GPIO2/GPIO4/GPIO13 instead
+// (no clean header/pin access there).
 #pragma once
 
 #include "driver/gpio.h"
@@ -39,13 +41,13 @@
 // adapter. Kenwood TS-480-style ASCII protocol, semicolon-terminated frames,
 // baud is configurable at the radio (menu) — the bridge just has to match it.
 //
-// GPIO18 (TX) / GPIO23 (RX) — chosen deliberately over the other 5 free
+// GPIO18 (TX) / GPIO23 (RX) — chosen deliberately over the other free
 // header pins: GPIO0 is a boot-strap pin (risky to also drive from an
-// external UART), GPIO21 drives the onboard PA-enable, and GPIO5/19/22 cost
-// the SAME onboard button/LED functions 18/23 do anyway — no advantage to
-// picking them instead. This leaves UART0 (GPIO1/3, wired to the onboard
-// USB-serial chip) completely free for flashing/ESP_LOG the whole time the
-// CAT cable is connected.
+// external UART), GPIO21 drives the onboard PA-enable, GPIO22 drives the
+// status LED, and GPIO5/19 are now claimed by the PA safety watchdog below
+// — no advantage to picking any of them instead. This leaves UART0
+// (GPIO1/3, wired to the onboard USB-serial chip) completely free for
+// flashing/ESP_LOG the whole time the CAT cable is connected.
 #define CAT_UART_TX_PIN        GPIO_NUM_18
 #define CAT_UART_RX_PIN        GPIO_NUM_23
 #define CAT_UART_PORT          UART_NUM_2
@@ -90,34 +92,44 @@
 #define ES8388_I2S_DIN_PIN      GPIO_NUM_35     // codec ADC -> ESP32 (audio in)
 #define ES8388_PA_ENABLE_PIN    GPIO_NUM_21
 #define ES8388_PA_REVERTED      false           // unconfirmed — see note above
-#define ES8388_SAMPLE_RATE_HZ   8000            // plenty for SSB voice (~2.7kHz bandwidth); keeps
-                                                 // the /audio WebSocket's bitrate trivial (128kbit/s
-                                                 // raw PCM) and CPU cost near zero (no resampling
-                                                 // or codec math on the ESP32 side)
+// The /audio WebSocket's wire rate IS the codec/I2S hardware's actual
+// rate — no oversampling layer (an earlier 4x-fixed-oversample design was
+// tried and then dropped: A/B testing on real hardware showed the
+// averaging-vs-naive-decimation toggle it enabled made no audible/visible
+// difference, so it was pure complexity for no measured benefit — see
+// bridge_settings.h's sample-rate comment for what actually mattered).
+// Live-switchable via POST /sample-rate, but NOT reconfigured on the fly:
+// changing it persists the new rate to NVS and reboots the bridge, same
+// pattern as changing WiFi credentials — a live I2S/codec reclock was
+// deliberately avoided after discovering esp_codec_dev_open() silently
+// resets other state on every call (see audio_monitor.c's RX-slot
+// re-apply comment for that history); rebooting sidesteps repeating that
+// class of bug rather than trying to reconfigure this exact hardware path
+// live a third time. This #define is only the FIRST-BOOT fallback (no
+// Kconfig-level default exists for this any more than for WiFi
+// credentials) — see bridge_settings_get_sample_rate_hz() for the actual
+// value used once anything has been saved.
+#define ES8388_SAMPLE_RATE_HZ   8000
+#define ES8388_MASTER_MODE      true            // ESP32 drives I2S clocks, ES8388 is I2S slave
 #define ES8388_MASTER_MODE      true            // ESP32 drives I2S clocks, ES8388 is I2S slave
 
-// ── Status LEDs (onboard, shared with buttons — see wiring notes in the
+// ── Status LED (onboard, shared with a button — see wiring notes in the
 // README) ───────────────────────────────────────────────────────────────────
-// GPIO22 is an independent pin; GPIO19 doubles as the KEY3 button input, so
-// driving it as an output here means KEY3 can no longer be read (acceptable
-// — nothing in this firmware reads any onboard button). Normal operation
-// shows one LED per audio direction (brightness ~ RMS level); Wi-Fi
-// connecting/AP-fallback/no-CAT states borrow the same two LEDs with
-// distinct blink patterns — see led_status.c for the priority order.
-#define LED_AUDIO_IN_PIN        GPIO_NUM_22
-#define LED_AUDIO_OUT_PIN       GPIO_NUM_19
+// Single LED on GPIO22 (an independent pin, not shared with any button).
+// Used to be two LEDs (GPIO22 in + GPIO19 out, showing per-direction audio
+// RMS level) — GPIO19 was freed to give the PA safety watchdog below a
+// real header pin instead of the SD-card pads, so audio-level display was
+// dropped rather than trying to fold two independent levels onto one LED.
+// Wi-Fi connecting/AP-fallback/PA-emergency states still show as distinct
+// blink patterns on this one LED — see led_status.c for the priority order.
+#define LED_STATUS_PIN          GPIO_NUM_22
 #define LED_PWM_FREQ_HZ         2000
 #define LED_PWM_RESOLUTION      LEDC_TIMER_8_BIT
 
 // ── PA safety watchdog ───────────────────────────────────────────────────────
 // Guards against the uSDX hanging with the external miniPA70 amplifier's PTT
 // still asserted — see main/doc/PA_WATCHDOG_DESIGN.md for the full design
-// and the miniPA70/GPIO research it's based on. Two new pins, since every
-// one of the A1S's other free header GPIOs is already claimed by CAT/LEDs/
-// codec: GPIO2/GPIO4 are the (unused — this firmware never mounts the SD
-// slot) SD card DATA0/DATA1 lines. Deliberately NOT GPIO12 (SD DATA2, but
-// also the MTDI strapping pin — risky to drive externally at boot) or
-// GPIO13 (SD DATA3, DIP-switch-shared with KEY2 on this board).
+// and the miniPA70/GPIO research it's based on.
 //
 // PA_SENSE_PIN reads a signal the user's own interface board derives from
 // the miniPA70's OWN energized 12V leg (after their level-shifting down to
@@ -136,12 +148,18 @@
 // POST /pa-emergency-clear) — deliberately does not auto-recover once
 // PA_SENSE_PIN drops, so a real hardware fault can't flap silently.
 //
-// Needs a hardware continuity/multimeter check against the real board
-// before wiring (SD-slot pull resistors, the interface board's actual
-// output logic levels) — not yet verified, same caution already applied to
-// ES8388_PA_REVERTED above.
-#define PA_SENSE_PIN            GPIO_NUM_2
-#define PA_EMERGENCY_PIN        GPIO_NUM_4
+// Both pins are now on the main header, not the SD-card pads — GPIO19 (was
+// LED_AUDIO_OUT_PIN, freed above) for PA_SENSE_PIN, GPIO5 (previously the
+// one genuinely unused header pin) for PA_EMERGENCY_PIN. This replaces an
+// earlier design that used GPIO13/GPIO2/GPIO4 (all SD-card pads, with no
+// clean header/pin access) — see git history for that design's own
+// hard-won pull-up findings (GPIO2 in particular reads a permanent false
+// HIGH from the board's own SD-bus pull-up) if these header pins ever turn
+// out to have similar surprises. NEITHER of these header pins has been
+// bench-verified yet with the real interface board wired up — confirm both
+// read/drive as expected before trusting the watchdog on real hardware.
+#define PA_SENSE_PIN            GPIO_NUM_19
+#define PA_EMERGENCY_PIN        GPIO_NUM_5
 #define PA_MAX_ON_SECONDS       300     // placeholder — tune to the longest
                                         // realistic legitimate transmission
                                         // for this station, with real margin

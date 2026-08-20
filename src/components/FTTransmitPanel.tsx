@@ -13,6 +13,8 @@ import { callsignCountry } from '$decoder-lib/ft/prefixes'
 import { FT_WINDOW_SECONDS, DEFAULT_DECODER_PARAMS, type FTMode } from '$decoder-lib/ft/decoder'
 import { fmtAbsHz } from '$decoder-lib/formatFreq'
 import NumberField from './NumberField'
+import type { AudioBridge } from '$decoder-lib/cat/useAudioBridge'
+import type { AudioSinkKind } from '$decoder-lib/audio/audioSource'
 
 // rAF-driven countdown: seconds until next window boundary, updated at ~4 Hz.
 // Uses epoch time (not Date.getSeconds()) so it matches useFTTransmit's own
@@ -405,6 +407,7 @@ interface FTTransmitPanelProps {
   mode: FTMode;
   contacts: Map<string, Contact>;
   vfoFrequency?: number;
+  audioBridge?: AudioBridge;
   onMyCallChange?: (call: string) => void;
   onMyGridChange?: (grid: string) => void;
   onSetPTT?: (tx: boolean) => Promise<void>;
@@ -431,11 +434,39 @@ export default function FTTransmitPanel(props: FTTransmitPanelProps): JSX.Elemen
 
   const vfoFrequency = () => props.vfoFrequency ?? 0
 
+  // Where TX audio actually plays: the local speaker, or out through the
+  // ESP32 bridge's mic-send path (so the radio itself transmits it, no
+  // local sound card/PA cabling needed). Only offered when a bridge
+  // instance was actually passed in (App.tsx wires this up once
+  // useRadioCAT/useAudioBridge are both lifted) — see audioSource.ts.
+  const [audioSinkKind, setAudioSinkKind] = createSignal<AudioSinkKind>('speaker')
+  // Auto-picks 'bridge' the moment the bridge's audio connects, same
+  // principle as App.tsx's handleStart() auto-connecting bridge audio for
+  // decode — if CAT is set up to use the bridge, TX should go out through
+  // the radio by default too, not silently play out the browser's own
+  // speakers while the operator assumes it went out over the air. Only
+  // fires on the transition into "connected" (not on every render/re-check
+  // of playbackActive), so an operator who deliberately switches back to
+  // "Local speaker" mid-session doesn't get overridden the next time some
+  // other unrelated state change re-runs this effect.
+  let sawBridgeConnected = false
+  createEffect(() => {
+    const connected = props.audioBridge?.state().playbackActive ?? false
+    if (connected && !sawBridgeConnected) setAudioSinkKind('bridge')
+    sawBridgeConnected = connected
+  })
+  const micHeldByManual = () => {
+    const s = props.audioBridge?.state()
+    return !!s && s.micActive && s.micOwner === 'manual'
+  }
+
   const tx = createFTTransmit(
     () => props.mode,
     baseFreq,
     vfoFrequency,
     () => props.onSetPTT,
+    audioSinkKind,
+    () => props.audioBridge,
   )
 
   // Keep the auto-CQ cache in sync with mode/baseFreq changes. Debounced:
@@ -830,7 +861,32 @@ export default function FTTransmitPanel(props: FTTransmitPanelProps): JSX.Elemen
         {/* Output device */}
         <div class="flex flex-col gap-1">
           <label class="text-[#8b949e] text-[10px] font-semibold tracking-wide">Output</label>
-          <OutputSelector value={tx.state().outputDeviceId} onChange={tx.setOutputDevice} supported={tx.state().sinkIdSupported} />
+          <Show when={props.audioBridge}>
+            {/* The Bridge panel's own "Send Mic to Radio" and this TX sink both
+                claim the SAME underlying bridge mic-send session (one bridge
+                connection, one useAudioBridge instance) — whichever one stops
+                first would otherwise silently kill the other's audio path.
+                Block picking "ESP32 Bridge" here while the MANUAL session
+                (not our own TX sink) already holds it, rather than letting
+                them fight over it. */}
+            <select
+              value={audioSinkKind()}
+              onChange={(e) => setAudioSinkKind(e.currentTarget.value as AudioSinkKind)}
+              disabled={audioSinkKind() === 'speaker' && micHeldByManual()}
+              class="bg-[#0d1117] border border-[#30363d] rounded px-2 py-1 text-xs text-[#c9d1d9] font-mono focus:outline-none focus:border-[#388bfd] mb-1 disabled:opacity-50"
+            >
+              <option value="speaker">Local speaker</option>
+              <option value="bridge">ESP32 Bridge (radio mic-in)</option>
+            </select>
+            <Show when={audioSinkKind() === 'speaker' && micHeldByManual()}>
+              <p class="text-[9px] text-[#f0883e] max-w-[14rem]">
+                "Send Mic to Radio" is active in the Bridge panel &mdash; stop it there first to free up the bridge's mic-send session for TX.
+              </p>
+            </Show>
+          </Show>
+          <div class={audioSinkKind() === 'bridge' ? 'opacity-40 pointer-events-none' : ''}>
+            <OutputSelector value={tx.state().outputDeviceId} onChange={tx.setOutputDevice} supported={tx.state().sinkIdSupported} />
+          </div>
         </div>
 
         {/* TX Engine + all toggles — grouped together */}

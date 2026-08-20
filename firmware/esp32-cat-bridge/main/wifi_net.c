@@ -215,6 +215,35 @@ void wifi_net_start(void) {
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
     ESP_ERROR_CHECK(esp_wifi_start());
 
+    // esp_wifi_start() leaves the driver at its own default station
+    // power-save mode, WIFI_PS_MIN_MODEM (confirmed by the "wifi:pm start,
+    // type: 1" boot log line — type 1 IS WIFI_PS_MIN_MODEM) — the radio
+    // sleeps between DTIM beacons and only wakes to receive the AP's
+    // buffered frame. That's the documented cause of exactly the symptom
+    // reported on this bridge: the /cat and /audio WebSockets randomly
+    // stall for seconds at a time while ICMP ping still gets through with
+    // elevated latency (ping replies ride the next DTIM wake window; an
+    // active WS connection with data queued mid-sleep-interval has to wait
+    // for it too, and any packet loss or AP-side buffering hiccup at this
+    // board's borderline RSSI (-70 to -72 dBm) compounds that into a
+    // multi-second-or-longer stall that either recovers on the next good
+    // wake or doesn't). This bridge is mains-powered, not battery, so
+    // there's no tradeoff to weigh — disabling power-save entirely trades a
+    // few hundred mA for eliminating the sleep-window stalls outright.
+    esp_err_t ps_err = esp_wifi_set_ps(WIFI_PS_NONE);
+    if (ps_err != ESP_OK) {
+        ESP_LOGW(TAG, "esp_wifi_set_ps(WIFI_PS_NONE) failed: %s — modem sleep may still be active", esp_err_to_name(ps_err));
+    }
+
+    // esp_wifi_set_max_tx_power() requires WiFi already started (see
+    // wifi_net.h) — applied here, once, right after esp_wifi_start(), so a
+    // previously-persisted experiment survives a reboot instead of silently
+    // reverting to the driver's own power-on default.
+    int8_t saved_tx_power = bridge_settings_get_wifi_tx_power_quarter_dbm();
+    if (!wifi_net_set_tx_power_quarter_dbm(saved_tx_power)) {
+        ESP_LOGW(TAG, "failed to apply saved TX power (%d quarter-dBm) at boot", (int)saved_tx_power);
+    }
+
     ESP_LOGI(TAG, "connecting to SSID:%s", ssid);
 
     EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group,
@@ -287,4 +316,31 @@ int wifi_net_scan(wifi_net_scan_result_t *out, int max_results) {
         count++;
     }
     return count;
+}
+
+#define WIFI_TX_POWER_MIN_QUARTER_DBM 8
+#define WIFI_TX_POWER_MAX_QUARTER_DBM 84
+
+bool wifi_net_set_tx_power_quarter_dbm(int8_t quarter_dbm) {
+    if (quarter_dbm < WIFI_TX_POWER_MIN_QUARTER_DBM || quarter_dbm > WIFI_TX_POWER_MAX_QUARTER_DBM) {
+        ESP_LOGW(TAG, "TX power %d out of range [%d,%d] quarter-dBm",
+                 (int)quarter_dbm, WIFI_TX_POWER_MIN_QUARTER_DBM, WIFI_TX_POWER_MAX_QUARTER_DBM);
+        return false;
+    }
+    esp_err_t err = esp_wifi_set_max_tx_power(quarter_dbm);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "esp_wifi_set_max_tx_power(%d) failed: %s", (int)quarter_dbm, esp_err_to_name(err));
+        return false;
+    }
+    ESP_LOGI(TAG, "TX power set to %d quarter-dBm (%.1f dBm)", (int)quarter_dbm, quarter_dbm * 0.25f);
+    return true;
+}
+
+bool wifi_net_get_tx_power_quarter_dbm(int8_t *quarter_dbm) {
+    esp_err_t err = esp_wifi_get_max_tx_power(quarter_dbm);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "esp_wifi_get_max_tx_power failed: %s", esp_err_to_name(err));
+        return false;
+    }
+    return true;
 }

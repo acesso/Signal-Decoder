@@ -12,6 +12,7 @@ import MFSKDecoder from './components/MFSKDecoder'
 import FTTransmitPanel, { type TxStatus } from './components/FTTransmitPanel'
 import type { RTTYConfig } from '$decoder-lib/rtty/decoder'
 import RadioCATPanel, { useRadioCAT } from './components/RadioCATPanel'
+import { useAudioBridge } from './lib/cat/useAudioBridge'
 import PWAInstallPrompt from './components/PWAInstallPrompt'
 import UpdateAvailablePrompt from './components/UpdateAvailablePrompt'
 import { globalAudio } from './lib/audio/globalAudio'
@@ -504,6 +505,24 @@ function App(): JSX.Element {
   const cat = useRadioCAT()
   const vfoFrequency = createMemo(() => (cat.state().connected ? (cat.state().frequency ?? undefined) : undefined))
 
+  // ── Bridge audio — lifted here (same reasoning as `cat` above) so a
+  // decoder's audio source/sink can be "the bridge's live radio audio"
+  // instead of only the local mic/speaker — see src/lib/audio/audioSource.ts.
+  // One shared connection rather than each consumer (RadioCATPanel, FTDecoder,
+  // FTTransmitPanel) opening its own /audio WebSocket.
+  const audioBridge = useAudioBridge()
+  // Reported by RadioCATPanel whenever its CAT transport/wsUrl changes —
+  // undefined unless transport is 'websocket'. Lets handleStart() below
+  // decide whether "Start Decoding" can auto-connect the bridge instead of
+  // always prompting for a local mic.
+  const [bridgeWsUrl, setBridgeWsUrl] = createSignal<string | undefined>(undefined)
+  // Set by handleStart() below when the bridge's audio WebSocket fails to
+  // connect during the "Start Decoding" auto-connect and it falls back to
+  // the local microphone — otherwise that fallback was silent (no console
+  // output, no UI indication), so an operator who thought they were
+  // decoding the radio's own audio had no way to know they weren't.
+  const [bridgeAudioFallbackWarning, setBridgeAudioFallbackWarning] = createSignal<string | null>(null)
+
   // ── Global audio — single shared AudioContext + AnalyserNode ─────────────
   const isRecording = createMemo(() => globalAudio.state().isRecording)
   const isSupported = createMemo(() => globalAudio.state().isSupported)
@@ -540,6 +559,29 @@ function App(): JSX.Element {
   // ── Unified start / stop ─────────────────────────────────────────────────
 
   async function handleStart() {
+    // If the CAT connection is over the ESP32 bridge, decode from the
+    // bridge's own live radio audio instead of always prompting for a
+    // local mic — auto-opening the /audio connection here (same as
+    // clicking "Listen to Radio" in the Bridge panel) rather than making
+    // that a separate required step; connecting the bridge at all should
+    // be enough for decoding to just work.
+    const wsUrl = bridgeWsUrl()
+    setBridgeAudioFallbackWarning(null)
+    if (wsUrl && !audioBridge.state().playbackActive) {
+      await audioBridge.connect(wsUrl)
+      // connect() failing used to fall through to the microphone with no
+      // visible sign anything had gone wrong — a bridge/network hiccup on
+      // JUST the /audio socket (the CAT /cat connection can be perfectly
+      // healthy at the same time, they're independent sockets) silently
+      // turned into an unexplained mic permission prompt. Surface it.
+      if (!audioBridge.state().playbackActive) {
+        setBridgeAudioFallbackWarning(
+          `Could not connect to the bridge's audio (${audioBridge.state().error ?? 'unknown error'}) — falling back to the microphone.`
+        )
+      }
+    }
+    globalAudio.configureSource(wsUrl && audioBridge.state().playbackActive ? 'bridge' : 'microphone', audioBridge)
+
     const node = await globalAudio.start()
     if (node) {
       await activeHandle().current?.start()
@@ -581,7 +623,7 @@ function App(): JSX.Element {
   const globalControls = createMemo<DecoderControls>(() => ({
     isRecording: isRecording(),
     isSupported: isSupported(),
-    error: recordingError(),
+    error: bridgeAudioFallbackWarning() ?? recordingError(),
     start: handleStart,
     stop: handleStop,
     reset: handleReset,
@@ -629,7 +671,7 @@ function App(): JSX.Element {
         {/* CAT radio control panel — sticky: stays visible while scrolling,
             collapsing to just its main bar so it doesn't eat too much space. */}
         <div class="sticky top-0 z-10 bg-[#0d1117] pb-3">
-          <RadioCATPanel cat={cat} collapsed={catCollapsed()} />
+          <RadioCATPanel cat={cat} audioBridge={audioBridge} collapsed={catCollapsed()} onWsUrlChange={setBridgeWsUrl} />
         </div>
 
         {/* FT Transmit panel — only shown when FT mode is active */}
@@ -647,6 +689,7 @@ function App(): JSX.Element {
                   mode={ftMode()}
                   contacts={ftContacts()}
                   vfoFrequency={vfoFrequency()}
+                  audioBridge={audioBridge}
                   onMyCallChange={setFtMyCall}
                   onMyGridChange={setFtMyGrid}
                   onSetPTT={cat.state().connected ? cat.setPTT : undefined}
@@ -737,6 +780,7 @@ function App(): JSX.Element {
             vfoFrequency={vfoFrequency()}
             txAudioHz={txAudioHz()}
             onTxAudioHzChange={(hz) => setTxBaseFreq?.(hz)}
+            audioBridge={audioBridge}
           />
         </div>
       </div>

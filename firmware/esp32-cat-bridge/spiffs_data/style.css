@@ -51,12 +51,28 @@ h2 { font-size: 1rem; margin: 0 0 0.75rem; }
   .col-side { flex: 0 0 22rem; }
   .col-main { flex: 1; min-width: 0; }
 }
-dl#status-list {
+dl#status-list, dl#cpu-stats-list {
   display: grid;
   grid-template-columns: auto 1fr;
   gap: 0.25rem 0.75rem;
   margin: 0 0 0.75rem;
 }
+dl#cpu-stats-list { margin-top: 0.75rem; }
+.cpu-task-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.8rem;
+  margin-top: 0.25rem;
+}
+.cpu-task-table th, .cpu-task-table td {
+  text-align: left;
+  padding: 0.2rem 0.4rem;
+  border-bottom: 1px solid var(--border);
+}
+.cpu-task-table th:not(:first-child), .cpu-task-table td:not(:first-child) {
+  text-align: right;
+}
+.cpu-task-table th { color: color-mix(in srgb, var(--fg) 60%, transparent); font-weight: 600; }
 dt { color: color-mix(in srgb, var(--fg) 60%, transparent); }
 dd { margin: 0; text-align: right; }
 form { display: flex; flex-direction: column; gap: 0.5rem; }
@@ -137,6 +153,38 @@ button:disabled { opacity: 0.5; cursor: default; }
   margin: 0.5rem 0;
 }
 .audio-buttons button { flex: 1; min-width: 8rem; }
+.audio-input-row {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  margin-bottom: 0.25rem;
+  flex-wrap: wrap;
+}
+.audio-input-label {
+  font-size: 0.8rem;
+  font-weight: 600;
+  color: color-mix(in srgb, var(--fg) 70%, transparent);
+}
+.audio-input-toggle {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+}
+.audio-input-option {
+  padding: 0.35rem 0.75rem;
+  font-size: 0.8rem;
+  border-radius: 0.35rem;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--fg);
+}
+.audio-input-option.active {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+.audio-gain-slider { flex: 1; min-width: 8rem; max-width: 16rem; }
+.audio-input-hint { margin-top: 0; margin-bottom: 0.5rem; }
 #msg {
   min-height: 1.2rem;
   font-size: 0.9rem;
@@ -152,7 +200,8 @@ button:disabled { opacity: 0.5; cursor: default; }
   gap: 0.5rem;
   margin-bottom: 0.75rem;
 }
-.cat-header h2 { margin: 0; }
+.cat-header h2, .cat-header h3 { margin: 0; }
+.cat-header + .cat-header { margin-top: 1rem; }
 .cat-header-controls {
   display: flex;
   align-items: center;
@@ -188,7 +237,6 @@ button.secondary {
 .cat-log-line {
   display: flex;
   gap: 0.5rem;
-  white-space: pre-wrap;
   word-break: break-all;
 }
 .cat-log-time {
@@ -198,7 +246,23 @@ button.secondary {
 .arrow { font-weight: 700; flex: 0 0 auto; }
 .arrow-in { color: #2e7d32; }   /* radio -> bridge/browser */
 .arrow-out { color: #c0392b; } /* browser/bridge -> radio */
-.cat-log-frame { flex: 1; word-break: break-all; }
+/* Holds every command from one batch (one WebSocket message/query — see
+   appendCatFrame's own comment) as a run of individual .cat-log-cmd
+   pills, wrapping onto further lines as needed rather than each command
+   getting its own full log row — a 12-command batched poll used to read
+   as 12 stacked lines, burying the "these all went out together" fact
+   the grouping itself is trying to show. */
+.cat-log-frame {
+  flex: 1;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+}
+.cat-log-cmd {
+  background: color-mix(in srgb, var(--fg) 8%, transparent);
+  border-radius: 0.25rem;
+  padding: 0 0.3rem;
+}
 .cat-send-row { margin-top: 0.5rem; }
 .cat-send-row input { flex: 1; font-family: ui-monospace, "SF Mono", Consolas, monospace; }
 
@@ -231,6 +295,17 @@ dl#pa-list {
   .quality-view { flex-direction: row; }
   .quality-channel { flex: 1; min-width: 0; }
 }
+.audio-listen-sniff-row {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  margin-bottom: 0.75rem;
+}
+@media (min-width: 40rem) {
+  .audio-listen-sniff-row { flex-direction: row; }
+  .audio-listen-sniff-col { flex: 1; min-width: 0; }
+}
+.audio-listen-sniff-col .audio-buttons { margin: 0; }
 .quality-channel {
   display: flex;
   flex-direction: column;
@@ -282,3 +357,58 @@ dl#pa-list {
 .quality-stats span:nth-child(even) { text-align: right; }
 .quality-stats span.warn { color: #e3b341; font-weight: 700; }
 .quality-stats span.danger { color: var(--danger); font-weight: 700; }
+
+.quality-canvas-row {
+  display: flex;
+  gap: 0.35rem;
+  align-items: stretch;
+}
+.quality-canvas-row .quality-canvas { flex: 1; min-width: 0; }
+.quality-axis-amp {
+  flex: 0 0 auto;
+  width: 2.6rem;
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  font-size: 0.6rem;
+  font-family: monospace;
+  color: color-mix(in srgb, var(--fg) 45%, transparent);
+  text-align: right;
+  padding: 0.1rem 0;
+}
+.quality-axis {
+  display: flex;
+  justify-content: space-between;
+  font-size: 0.6rem;
+  font-family: monospace;
+  color: color-mix(in srgb, var(--fg) 45%, transparent);
+  margin-top: 0.1rem;
+}
+.quality-axis-indent { margin-left: calc(2.6rem + 0.35rem); }
+.quality-waterfall-row { flex: 1; min-width: 0; }
+.quality-waterfall-row .quality-canvas { display: block; width: 100%; }
+.quality-contrast-label {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-size: 0.7rem;
+  color: color-mix(in srgb, var(--fg) 60%, transparent);
+  margin: 0.1rem 0;
+}
+.quality-contrast-label input[type="range"] { flex: 1; }
+.quality-scale-row {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  margin: 0.1rem 0;
+}
+.quality-auto-label {
+  display: flex;
+  align-items: center;
+  gap: 0.3rem;
+  font-size: 0.7rem;
+  color: color-mix(in srgb, var(--fg) 60%, transparent);
+  flex: 0 0 auto;
+  white-space: nowrap;
+}
+.quality-scale-row .quality-contrast-label { flex: 1; margin: 0; }

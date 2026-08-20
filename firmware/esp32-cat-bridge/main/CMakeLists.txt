@@ -11,7 +11,10 @@ idf_component_register(
         "led_status.c"
         "audio_monitor.c"
         "audio_ws.c"
+        "audio_sniff.c"
         "pa_watchdog.c"
+        "cpu_monitor.c"
+        "cat_log.c"
     INCLUDE_DIRS "."
     REQUIRES
         esp_wifi
@@ -26,6 +29,9 @@ idf_component_register(
         freertos
         spiffs
         esp_codec_dev
+        esp_pm
+        heap
+        esp_partition
 )
 
 # Bakes spiffs_data/ (the standalone control page's HTML/CSS/JS) into a

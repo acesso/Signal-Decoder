@@ -12,6 +12,24 @@ them into a version section when cutting a release.
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed a periodic click/buzz in audio sent to the radio over the ESP32 bridge (FT8 TX and manual mic-send): the browser-side resampler treated every capture chunk as an independent buffer, discarding the fractional sample position and true next sample at each chunk boundary — now carries that state across the whole session.
+- Fixed the ESP32 bridge locking up after several minutes of audio streaming (`/status` and all other requests timing out while the device stayed reachable): `/audio` and `/audio-mic-sniff` broadcasts queued a new send to the shared httpd worker task every 50ms per client with no backpressure, and a degraded Wi-Fi link let that backlog grow faster than the single worker could drain it. Broadcasts now skip a client whose previous frame hasn't finished sending instead of piling on more work.
+- Fixed the ESP32 bridge's persistent CAT log crash-looping on boot once it grew large enough that its flash-scan recovery starved the task watchdog.
+- Fixed a client-slot leak on `/cat` and `/audio`: a plain HTTP GET (not a real WebSocket handshake) permanently occupied a client slot.
+- Fixed CAT frames sent from one browser tab not being broadcast to other connected tabs.
+- Fixed the web app's TX audio defaulting to the local speaker instead of the ESP32 bridge even when the bridge was connected.
+- Fixed a reconnect storm on weak Wi-Fi: the CAT and audio bridge sockets now back off exponentially (2s–30s) instead of retrying every 2s indefinitely.
+- Fixed `GET /cat-log` failing once the log filled, due to a single large heap allocation for the response.
+
+### Added
+
+- ESP32 bridge: a read-only mic→radio audio sniffer (`/audio-mic-sniff`) so the operator can hear and visually inspect the exact audio just written to the radio's mic input — the web app's mic-send path has no return signal otherwise.
+- ESP32 bridge control page: the sniffer replaces the previous "Send Mic to Radio" button, with the same spectrum/waterfall/oscilloscope/stats quality view as the "Listen to Radio" channel, including an operator-adjustable max-frequency slider on both channels and a horizontal (rather than frequency-position) rolloff marker.
+- ESP32 bridge: an on/off toggle for the persistent CAT log (`POST /cat-log-enable`), default off since it's a debug feature.
+- ESP32 bridge: PA sense/emergency-cutoff wiring moved from SD-card pads to header pins (GPIO19/GPIO5), consolidating the two status LEDs into one.
+
 ## [0.11.5] - 2026-08-07
 
 ### Fixed

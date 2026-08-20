@@ -49,3 +49,51 @@ CONFIG_LWIP_TCPIP_TASK_AFFINITY_CPU0=y
 # = 8) needs LWIP_MAX_SOCKETS >= 11. Discovered as an ESP_ERR_INVALID_ARG
 # abort() boot-loop on real hardware. Rounded up for headroom.
 CONFIG_LWIP_MAX_SOCKETS=16
+
+# Enables esp_pm_configure() so main/cpu_monitor.c can live-set the CPU
+# frequency from the control page (POST /cpu-freq) — a diagnostic tool for
+# an audio-noise investigation (whether digital switching activity is
+# coupling into the analog input path), not something this firmware
+# otherwise needs power management for. main/app_main.c always calls
+# esp_pm_configure() with min_freq_mhz == max_freq_mhz at boot (both pinned
+# to the same value) specifically so no ACTUAL dynamic scaling ever
+# happens on its own — only an explicit POST /cpu-freq call ever changes
+# the pinned frequency. Light-sleep automatic entry (the other half of
+# ESP-IDF's PM subsystem) is left at its default (off) below.
+CONFIG_PM_ENABLE=y
+# Tickless idle needs to stay off — enabling it here would let FreeRTOS
+# actually enter light-sleep during idle periods, which is real, additional
+# switching behavior this investigation does NOT want to introduce (the
+# whole point is a single fixed, unchanging frequency, not "usually X MHz
+# except during a sleep/wake cycle").
+# CONFIG_FREERTOS_USE_TICKLESS_IDLE is not set
+
+# Per-task CPU usage stats for the same control-page diagnostics panel (see
+# cpu_monitor.c) — auto-selects FREERTOS_USE_TRACE_FACILITY. Left on the
+# default esp_timer clock source (not the CPU clock) deliberately: the CPU
+# clock's own tick rate would skew these stats every time POST /cpu-freq
+# changes the pinned frequency, since esp_timer runs independently of it.
+CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS=y
+
+# Reports which core (0/1) each task is pinned to alongside its CPU% —
+# genuinely useful on THIS firmware specifically, since bridge_config.h's
+# whole task-placement design (core 0 = Wi-Fi/httpd, core 1 = CAT/audio/PA
+# watchdog) is deliberate isolation the diagnostics panel should be able
+# to actually show, not just per-task % with no core context.
+CONFIG_FREERTOS_VTASKLIST_INCLUDE_COREID=y
+
+# Task watchdog (CONFIG_ESP_TASK_WDT_EN, already on by default) was
+# previously left at ITS OWN default of log-only on trip
+# (CONFIG_ESP_TASK_WDT_PANIC unset) — meaning if some task ever genuinely
+# starves the CPU for CONFIG_ESP_TASK_WDT_TIMEOUT_S (5s), the bridge just
+# logs a warning and keeps limping in whatever wedged state caused the
+# starvation, rather than recovering. That's indistinguishable from a full
+# hang to anyone not watching the serial console — and matches a real
+# report of the bridge going completely unresponsive after the PA emergency
+# watchdog fired, requiring a manual power-cycle to clear (see
+# pa_watchdog.c's PA_SENSE_PIN pull-down comment — the leading suspect there
+# is a floating sense pin reading noise, not this, but this is a
+# worthwhile safety net regardless of root cause). Panicking on a genuine
+# task-starvation hang reboots automatically instead of requiring a human
+# to notice and power-cycle it.
+CONFIG_ESP_TASK_WDT_PANIC=y

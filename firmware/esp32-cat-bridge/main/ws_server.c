@@ -8,6 +8,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 
+#include "audio_sniff.h"
 #include "audio_ws.h"
 #include "bridge_config.h"
 #include "bridge_state.h"
@@ -24,7 +25,20 @@ static httpd_handle_t s_server = NULL;
 // task on connect/disconnect, read from cat_bridge's UART reader task (via
 // ws_server_send_to_client) to broadcast radio->browser bytes.
 static int s_client_fds[WS_MAX_CLIENTS];
+// Consecutive send-failure count per tracked client — see audio_ws.c's
+// identical mechanism for the full reasoning (a client whose TCP receive
+// window is permanently stuck full — weak/dead WiFi, or a tab that
+// stopped reading without a clean WS close — was found on real hardware
+// to fail sends forever with nothing ever evicting it; TCP keepalive
+// doesn't help since the failure is flow-control EAGAIN, not a
+// keepalive-detectable dead connection). This CAT socket carries actual
+// radio commands, so a stuck client here is worse than on /audio: it's
+// silently eating CPU/queue-work slots on the shared httpd worker
+// indefinitely, not just a muted audio stream.
+static int s_send_fail_count[WS_MAX_CLIENTS];
 static SemaphoreHandle_t s_client_mutex;
+
+#define MAX_CONSECUTIVE_SEND_FAILURES 8
 
 static void mutate_client_count(bridge_state_t *state, void *ctx) {
     state->ws_client_count = *(uint8_t *)ctx;
@@ -43,7 +57,7 @@ static bool add_client_locked(int fd) {
         if (s_client_fds[i] == fd) return true; // already tracked (shouldn't happen, but idempotent)
     }
     for (int i = 0; i < WS_MAX_CLIENTS; i++) {
-        if (s_client_fds[i] < 0) { s_client_fds[i] = fd; return true; }
+        if (s_client_fds[i] < 0) { s_client_fds[i] = fd; s_send_fail_count[i] = 0; return true; }
     }
     return false; // full — caller logs and lets the connection through anyway;
                   // httpd's own max_open_sockets is the real backstop
@@ -51,8 +65,19 @@ static bool add_client_locked(int fd) {
 
 static void remove_client_locked(int fd) {
     for (int i = 0; i < WS_MAX_CLIENTS; i++) {
-        if (s_client_fds[i] == fd) { s_client_fds[i] = -1; return; }
+        if (s_client_fds[i] == fd) { s_client_fds[i] = -1; s_send_fail_count[i] = 0; return; }
     }
+}
+
+// Returns the new failure count for fd (0 if fd isn't currently tracked).
+static int record_send_result_locked(int fd, bool ok) {
+    for (int i = 0; i < WS_MAX_CLIENTS; i++) {
+        if (s_client_fds[i] == fd) {
+            s_send_fail_count[i] = ok ? 0 : s_send_fail_count[i] + 1;
+            return s_send_fail_count[i];
+        }
+    }
+    return 0;
 }
 
 // Async-send trampoline: httpd_ws_send_frame() may only be called from the
@@ -78,19 +103,41 @@ static void async_send_frame(void *arg) {
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "send_frame_async failed (fd=%d): %s", ctx->fd, esp_err_to_name(err));
     }
+
+    xSemaphoreTake(s_client_mutex, portMAX_DELAY);
+    int fail_count = record_send_result_locked(ctx->fd, err == ESP_OK);
+    xSemaphoreGive(s_client_mutex);
+    // Safe from any task per httpd_sess_trigger_close()'s own docs — this
+    // runs on the httpd worker task anyway (only ever invoked via
+    // httpd_queue_work). remove_client_locked()/publish_client_count_locked()
+    // aren't called here directly: on_client_close() (this file's own
+    // close_fn) runs once the triggered close actually completes, same
+    // untracking path a normal disconnect already uses.
+    if (fail_count >= MAX_CONSECUTIVE_SEND_FAILURES) {
+        ESP_LOGW(TAG, "CAT client (fd=%d) failed %d consecutive sends — forcing close (likely a stuck/dead connection)",
+                 ctx->fd, fail_count);
+        httpd_sess_trigger_close(s_server, ctx->fd);
+    }
+
     free(ctx->data);
     free(ctx);
 }
 
-void ws_server_send_to_client(const uint8_t *data, size_t len) {
+// Shared by ws_server_send_to_client() (no exclusion — the radio->browser
+// direction has no "sender" among the browser clients) and the browser->
+// radio handler below (excludes the sender's own fd — see that call site's
+// comment for why). exclude_fd < 0 means "exclude nothing."
+static void broadcast_excluding_locked(int exclude_fd, const uint8_t *data, size_t len) {
     if (!s_server || len == 0) return;
 
     int fds[WS_MAX_CLIENTS];
     int n = 0;
     xSemaphoreTake(s_client_mutex, portMAX_DELAY);
-    for (int i = 0; i < WS_MAX_CLIENTS; i++) if (s_client_fds[i] >= 0) fds[n++] = s_client_fds[i];
+    for (int i = 0; i < WS_MAX_CLIENTS; i++) {
+        if (s_client_fds[i] >= 0 && s_client_fds[i] != exclude_fd) fds[n++] = s_client_fds[i];
+    }
     xSemaphoreGive(s_client_mutex);
-    if (n == 0) return; // no client connected — drop silently, radio keeps running
+    if (n == 0) return; // no (other) client connected — drop silently, radio keeps running
 
     for (int i = 0; i < n; i++) {
         async_send_ctx_t *ctx = malloc(sizeof(async_send_ctx_t));
@@ -109,10 +156,32 @@ void ws_server_send_to_client(const uint8_t *data, size_t len) {
     }
 }
 
+void ws_server_send_to_client(const uint8_t *data, size_t len) {
+    broadcast_excluding_locked(-1, data, len);
+}
+
 static esp_err_t cat_ws_handler(httpd_req_t *req) {
     if (req->method == HTTP_GET) {
-        // Initial handshake — add this fd to the active-client set.
+        // Initial handshake — but ONLY track this fd if httpd actually
+        // completed a real WebSocket upgrade (Upgrade: websocket headers,
+        // the Sec-WebSocket-Key exchange, etc). A plain HTTP GET to this
+        // URI (curl, a browser navigated here directly, anything that
+        // doesn't speak the WS handshake) still reaches this branch —
+        // is_websocket=true on the URI registration doesn't reject those
+        // outright — and httpd_ws_get_fd_info() is the only reliable way
+        // to tell them apart. Without this check, such a client
+        // permanently occupied a WS_MAX_CLIENTS slot: on_client_close()
+        // only fires once httpd's own close_fn runs, which a plain HTTP
+        // client that just hangs/times out (rather than sending a real WS
+        // close frame) may never trigger — confirmed on real hardware,
+        // where a single `curl http://.../cat` call alone was enough to
+        // wedge one of only 4 slots until the bridge was rebooted.
         int fd = httpd_req_to_sockfd(req);
+        if (httpd_ws_get_fd_info(s_server, fd) != HTTPD_WS_CLIENT_WEBSOCKET) {
+            ESP_LOGW(TAG, "GET /cat from fd=%d without a completed WebSocket handshake — not tracking as a client", fd);
+            return ESP_OK;
+        }
+
         xSemaphoreTake(s_client_mutex, portMAX_DELAY);
         bool added = add_client_locked(fd);
         publish_client_count_locked();
@@ -163,6 +232,18 @@ static esp_err_t cat_ws_handler(httpd_req_t *req) {
         // is byte-transparent so that logic doesn't need to change, only
         // the underlying I/O call.
         cat_bridge_write(frame.payload, frame.len);
+        // Also broadcast this outgoing frame to every OTHER connected /cat
+        // client — without this, a second viewer (e.g. the standalone
+        // control page's own CAT monitor, or any other browser tab) never
+        // sees traffic sent by a DIFFERENT client at all, only the radio's
+        // own replies. Excludes the sender's own fd: every client already
+        // renders its own just-sent frame locally the instant it calls
+        // ws.send() (app.js's appendCatFrame('out', ...) right after
+        // catWs.send(raw)) — echoing it back would make the sender see its
+        // own frame twice, the second time mislabeled as "from radio"
+        // (ws.onmessage has no way to tell "my own echo" from "a real
+        // reply" apart, since both arrive as an ordinary incoming frame).
+        broadcast_excluding_locked(httpd_req_to_sockfd(req), frame.payload, frame.len);
     }
 
     free(buf);
@@ -172,14 +253,16 @@ static esp_err_t cat_ws_handler(httpd_req_t *req) {
 // httpd_close_func_t returns void — httpd itself always closes the socket
 // after calling this hook, so we only need to clear our own bookkeeping.
 // This is the ONLY close_fn httpd supports per server instance — since
-// /audio shares this httpd instance with /cat, this hook also untracks the
-// closed fd from audio_ws's client set (a no-op if it was never one).
+// /audio and /audio-mic-sniff share this httpd instance with /cat, this
+// hook also untracks the closed fd from both of their client sets (a
+// no-op if it was never one of theirs either).
 static void on_client_close(httpd_handle_t hd, int sockfd) {
     xSemaphoreTake(s_client_mutex, portMAX_DELAY);
     remove_client_locked(sockfd);
     publish_client_count_locked();
     xSemaphoreGive(s_client_mutex);
     audio_ws_on_client_close(sockfd);
+    audio_sniff_on_client_close(sockfd);
     ESP_LOGI(TAG, "CAT client socket closed (fd=%d)", sockfd);
     close(sockfd);
 }
@@ -206,19 +289,54 @@ void ws_server_start(void) {
     // layered on top of esp_http_server's own per-request stack usage —
     // discovered as a LoadStoreAlignment panic (stack overflow corrupting
     // the call frame) on real hardware when /wifi-scan was first added.
-    config.stack_size = 6144;
+    // Bumped again from 6144: GET /system-stats's live task-list snapshot
+    // showed only 364 bytes free on this task even at 32000 Hz — this
+    // same httpd worker task is also what runs httpd_ws_send_frame_async()
+    // for every /audio broadcast frame (queued from audio_monitor's core-1
+    // task via httpd_queue_work), and that per-frame payload now scales
+    // with the configured sample rate (800 bytes at 8000 Hz -> 4800 bytes
+    // at 48000 Hz, see audio_monitor.c's READ_WINDOW_MS comment) — a
+    // near-empty stack margin here, on the one task that also serves every
+    // control-page /status poll, matches a real report of the control
+    // page going unresponsive specifically at higher configured sample
+    // rates. Doubled to give real headroom rather than inching it up by a
+    // few hundred bytes and risking hitting this exact wall again at the
+    // next feature added to this httpd instance.
+    config.stack_size = 12288;
     // +2 headroom for a short-lived /status/etc request landing alongside
     // every already-open CAT AND audio socket at once (both routes share
     // this one httpd instance/socket pool).
     config.max_open_sockets = WS_MAX_CLIENTS + AUDIO_WS_MAX_CLIENTS + 2;
     config.close_fn = on_client_close;
-    // Default is 8 — this server now registers 10 URI handlers (/cat, /audio,
-    // /status, /info, /wifi-scan, /reset, /wifi-config, /* OPTIONS, plus
-    // control_page's /, /style.css, /app.js), so the default silently
-    // overflows (ESP_ERR_HTTPD_HANDLERS_FULL, discovered as a boot-loop on
-    // real hardware once control_page.c was added). Rounded up well past
-    // the current count for headroom before this needs revisiting again.
-    config.max_uri_handlers = 16;
+    // Default is disabled — there's no WS-level ping/pong anywhere in this
+    // server either, so without this a socket whose peer vanished without a
+    // clean FIN (laptop WiFi roam/sleep, router NAT table timeout) would sit
+    // as a silent zombie: this side sees no error and keeps trying to write
+    // to it, only for the OS's own default TCP retransmit timeout — which
+    // can be many minutes — to eventually notice. TCP-level keepalive here
+    // is the cheap fix: after 5s idle, probe every 5s, give up (and let
+    // close_fn/on_client_close reap it) after 3 missed probes — long enough
+    // to not fire during ordinary CAT-poll gaps, short enough to reclaim a
+    // dead socket in well under a minute instead of waiting on OS defaults.
+    config.keep_alive_enable = true;
+    config.keep_alive_idle = 5;
+    config.keep_alive_interval = 5;
+    config.keep_alive_count = 3;
+    // Default is 8 — this server now registers 24 URI handlers (/cat,
+    // /audio, /status, /info, /wifi-scan, /reset, /wifi-config, /cat-baud,
+    // /pa-emergency-clear, /audio-input, /mic-gain, /wifi-tx-power,
+    // /rx-slot, /led-enable, /alc, /noise-gate, /cpu-freq, /system-stats,
+    // /adc-hpf, /adc-oversample, /* OPTIONS, plus control_page's /,
+    // /style.css, /app.js), so the default silently overflows
+    // (ESP_ERR_HTTPD_HANDLERS_FULL, a boot-loop on real hardware — this
+    // cap has now been hit and bumped THREE times: first when
+    // control_page.c was added, again when the audio-input/mic-gain/rx-
+    // slot/led-enable diagnostics landed, again for alc/noise-gate/cpu-
+    // freq/system-stats). The 40 headroom chosen back then still covers
+    // this addition (/adc-hpf, /adc-oversample) with room to spare —
+    // cheap insurance (this only costs a bit of static handler-table
+    // memory, not a scarce resource worth rationing tightly).
+    config.max_uri_handlers = 40;
     // Wildcard matching so http_control.c can register a single "/*" OPTIONS
     // handler for CORS preflight instead of one per concrete route — exact
     // routes (/cat, /status, /reset) still match themselves first under this

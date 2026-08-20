@@ -60,81 +60,320 @@
       <code>192.168.4.1</code> so you can fix it here again.</p>
     </section>
 
-    <section id="audio-card" class="card">
-      <h2>Audio</h2>
-      <div class="meter-row">
-        <span class="meter-label">Speaker</span>
-        <div class="meter-track"><div id="meter-in" class="meter-fill"></div></div>
-        <span id="meter-in-pct" class="meter-pct">&mdash;</span>
-      </div>
-      <div class="meter-row">
-        <span class="meter-label">Mic</span>
-        <div class="meter-track"><div id="meter-out" class="meter-fill"></div></div>
-        <span id="meter-out-pct" class="meter-pct">&mdash;</span>
-      </div>
-      <div class="audio-buttons">
-        <button id="audio-listen-btn" type="button">Listen to Radio</button>
-        <button id="audio-mic-btn" type="button" disabled>Send Mic to Radio</button>
-      </div>
-      <p class="hint">Streams raw audio over a second WebSocket
-      (<code>/audio</code>), independent of the CAT connection &mdash; useful for
-      debugging the audio path directly from this page, without the
-      Signal-Decoder web app.</p>
-    </section>
-
     <section id="reset-card" class="card">
       <h2>Restart bridge</h2>
       <button id="reset-btn" type="button" class="danger">Restart now</button>
+    </section>
+
+    <section id="system-card" class="card">
+      <h2>System</h2>
+      <div class="audio-input-row">
+        <span class="audio-input-label">ALC</span>
+        <div class="audio-input-toggle">
+          <button data-alc-enable="true" type="button" class="audio-input-option">On</button>
+          <button data-alc-enable="false" type="button" class="audio-input-option">Off</button>
+        </div>
+      </div>
+      <p class="hint audio-input-hint">The ES8388's Automatic Level Control &mdash; confirmed off by the chip's own
+      power-on-reset default and never touched by firmware, but exposed here as a checkable diagnostic. Not
+      persisted; resets to Off after a reboot regardless.</p>
+      <div class="audio-input-row">
+        <span class="audio-input-label">Noise gate</span>
+        <div class="audio-input-toggle">
+          <button data-noise-gate-enable="true" type="button" class="audio-input-option">On</button>
+          <button data-noise-gate-enable="false" type="button" class="audio-input-option">Off</button>
+        </div>
+      </div>
+      <p class="hint audio-input-hint">Part of the ALC block above &mdash; only has an audible effect while ALC
+      itself is also on. Same off-by-default, not-persisted caveats.</p>
+      <div class="audio-input-row">
+        <span class="audio-input-label">CPU frequency</span>
+        <div class="audio-input-toggle">
+          <button data-cpu-freq="80" type="button" class="audio-input-option">80 MHz</button>
+          <button data-cpu-freq="160" type="button" class="audio-input-option">160 MHz</button>
+          <button data-cpu-freq="240" type="button" class="audio-input-option">240 MHz</button>
+        </div>
+      </div>
+      <p class="hint audio-input-hint">Pins the ESP32's CPU clock (no dynamic scaling either way) &mdash; a
+      low-confidence experiment for whether digital switching activity couples into the analog audio path. Not
+      persisted; reverts to 160 MHz after a reboot.</p>
+      <div class="audio-input-row">
+        <span class="audio-input-label">WiFi TX power</span>
+        <div class="audio-input-toggle">
+          <button data-wifi-tx-power="8" type="button" class="audio-input-option">2 dBm</button>
+          <button data-wifi-tx-power="34" type="button" class="audio-input-option">8 dBm</button>
+          <button data-wifi-tx-power="52" type="button" class="audio-input-option">13 dBm</button>
+          <button data-wifi-tx-power="68" type="button" class="audio-input-option">17 dBm</button>
+          <button data-wifi-tx-power="84" type="button" class="audio-input-option">21 dBm (max)</button>
+        </div>
+      </div>
+      <p class="hint audio-input-hint">Live-sets the WiFi radio's max transmit power &mdash; a low-confidence
+      experiment for whether the radio's own transmit activity couples noise into the analog audio path.
+      Applied immediately AND persisted to NVS &mdash; lowering it may weaken WiFi range/reliability, so raise
+      it back if the connection gets flaky.</p>
+      <dl id="cpu-stats-list">
+        <dt>Heap free</dt><dd id="cpu-heap-free">&hellip;</dd>
+        <dt>Heap min free</dt><dd id="cpu-heap-min">&hellip;</dd>
+        <dt>Heap total</dt><dd id="cpu-heap-total">&hellip;</dd>
+      </dl>
+      <table id="cpu-task-table" class="cpu-task-table">
+        <thead>
+          <tr><th>Task</th><th>CPU%</th><th>Core</th><th>Stack free</th></tr>
+        </thead>
+        <tbody id="cpu-task-body"></tbody>
+      </table>
+      <p class="hint">Per-task CPU% is a delta since this panel's last refresh, not a since-boot average.
+      Refreshes automatically while this page is open.</p>
     </section>
   </div>
 
   <div class="col col-main">
     <section id="audio-quality-card" class="card">
       <div class="cat-header">
-        <h2>Audio quality</h2>
-        <label class="cat-pause-label">
-          <input id="quality-toggle" type="checkbox">
-          Show
-        </label>
+        <h2>Audio</h2>
       </div>
-      <div id="quality-view" class="quality-view" hidden>
+      <div class="audio-listen-sniff-row">
+        <div class="audio-listen-sniff-col">
+          <div class="audio-buttons">
+            <button id="audio-listen-btn" type="button">Listen to Radio</button>
+          </div>
+        </div>
+        <div class="audio-listen-sniff-col">
+          <div class="audio-buttons">
+            <button id="mic-sniff-btn" type="button">Start Sniffing</button>
+          </div>
+          <label class="cat-pause-label">
+            <input id="mic-sniff-play" type="checkbox" checked>
+            Play through speakers
+          </label>
+        </div>
+      </div>
+      <div id="quality-view" class="quality-view">
         <div class="quality-channel">
           <div class="quality-channel-header">
             <span class="quality-channel-label">Speaker (in)</span>
             <span id="quality-in-readout" class="quality-readout">inactive</span>
           </div>
-          <canvas id="quality-in-bars" width="480" height="70" class="quality-canvas"></canvas>
-          <canvas id="quality-in-waterfall" width="480" height="70" class="quality-canvas"></canvas>
-          <canvas id="quality-in-scope" width="480" height="60" class="quality-canvas"></canvas>
+          <div class="quality-canvas-row">
+            <div class="quality-axis-amp"><span>0dB</span><span>-40dB</span><span>-90dB</span></div>
+            <canvas id="quality-in-bars" width="480" height="70" class="quality-canvas"></canvas>
+          </div>
+          <div class="quality-axis quality-axis-freq quality-axis-indent">
+            <span>0</span><span id="quality-in-freq-mid1">&mdash;</span><span id="quality-in-freq-mid2">&mdash;</span><span id="quality-in-freq-mid3">&mdash;</span><span id="quality-in-freq-max">&mdash;</span>
+          </div>
+          <div class="quality-canvas-row">
+            <div class="quality-axis-amp"><span id="quality-in-freq-max-amp">&mdash;</span><span id="quality-in-freq-mid-amp">&mdash;</span><span>0</span></div>
+            <div class="quality-waterfall-row">
+              <canvas id="quality-in-waterfall" width="480" height="70" class="quality-canvas"></canvas>
+            </div>
+          </div>
+          <div class="quality-axis quality-axis-time quality-axis-indent">
+            <span>&larr; older</span><span>newer &rarr;</span>
+          </div>
+          <label class="quality-contrast-label">
+            Max freq
+            <input id="quality-in-freq-range" type="range" min="500" max="4000" step="100" value="4000">
+            <span id="quality-in-freq-range-val">4000 Hz</span>
+          </label>
+          <label class="quality-contrast-label">
+            Contrast
+            <input id="quality-in-contrast" type="range" min="0.1" max="1.5" step="0.05" value="0.5">
+          </label>
+          <div class="quality-scale-row">
+            <label class="quality-auto-label">
+              <input id="quality-in-scope-auto" type="checkbox" checked>
+              Auto
+            </label>
+            <label class="quality-contrast-label">
+              Scale
+              <input id="quality-in-scope-scale" type="range" min="1" max="40" step="1" value="10" disabled>
+            </label>
+          </div>
+          <div class="quality-scale-row">
+            <label class="quality-contrast-label">
+              Zoom
+              <input id="quality-in-scope-zoom" type="range" min="1" max="100" step="1" value="20">
+            </label>
+          </div>
+          <div class="quality-canvas-row">
+            <div class="quality-axis-amp"><span>peak</span><span>0</span><span>-peak</span></div>
+            <canvas id="quality-in-scope" width="480" height="110" class="quality-canvas"></canvas>
+          </div>
+          <div class="quality-axis quality-axis-time quality-axis-indent">
+            <span>0</span><span id="quality-in-scope-window">&mdash;</span>
+          </div>
           <div class="quality-stats">
             <span>Cutoff (~-6dB)</span><span id="quality-in-cutoff">&mdash;</span>
             <span>Noise floor</span><span id="quality-in-floor">&mdash;</span>
             <span>DC offset</span><span id="quality-in-dc">&mdash;</span>
             <span>Clips (10s)</span><span id="quality-in-clips">0</span>
+            <span>Scope gain</span><span id="quality-in-gain">&mdash;</span>
           </div>
         </div>
         <div class="quality-channel">
           <div class="quality-channel-header">
-            <span class="quality-channel-label">Mic (out)</span>
+            <span class="quality-channel-label">Mic &rarr; Radio (sniffed)</span>
             <span id="quality-out-readout" class="quality-readout">inactive</span>
           </div>
-          <canvas id="quality-out-bars" width="480" height="70" class="quality-canvas"></canvas>
-          <canvas id="quality-out-waterfall" width="480" height="70" class="quality-canvas"></canvas>
-          <canvas id="quality-out-scope" width="480" height="60" class="quality-canvas"></canvas>
+          <div class="quality-canvas-row">
+            <div class="quality-axis-amp"><span>0dB</span><span>-40dB</span><span>-90dB</span></div>
+            <canvas id="quality-out-bars" width="480" height="70" class="quality-canvas"></canvas>
+          </div>
+          <div class="quality-axis quality-axis-freq quality-axis-indent">
+            <span>0</span><span id="quality-out-freq-mid1">&mdash;</span><span id="quality-out-freq-mid2">&mdash;</span><span id="quality-out-freq-mid3">&mdash;</span><span id="quality-out-freq-max">&mdash;</span>
+          </div>
+          <div class="quality-canvas-row">
+            <div class="quality-axis-amp"><span id="quality-out-freq-max-amp">&mdash;</span><span id="quality-out-freq-mid-amp">&mdash;</span><span>0</span></div>
+            <div class="quality-waterfall-row">
+              <canvas id="quality-out-waterfall" width="480" height="70" class="quality-canvas"></canvas>
+            </div>
+          </div>
+          <div class="quality-axis quality-axis-time quality-axis-indent">
+            <span>&larr; older</span><span>newer &rarr;</span>
+          </div>
+          <label class="quality-contrast-label">
+            Max freq
+            <input id="quality-out-freq-range" type="range" min="500" max="4000" step="100" value="4000">
+            <span id="quality-out-freq-range-val">4000 Hz</span>
+          </label>
+          <label class="quality-contrast-label">
+            Contrast
+            <input id="quality-out-contrast" type="range" min="0.1" max="1.5" step="0.05" value="0.5">
+          </label>
+          <div class="quality-scale-row">
+            <label class="quality-auto-label">
+              <input id="quality-out-scope-auto" type="checkbox" checked>
+              Auto
+            </label>
+            <label class="quality-contrast-label">
+              Scale
+              <input id="quality-out-scope-scale" type="range" min="1" max="40" step="1" value="10" disabled>
+            </label>
+          </div>
+          <div class="quality-scale-row">
+            <label class="quality-contrast-label">
+              Zoom
+              <input id="quality-out-scope-zoom" type="range" min="1" max="100" step="1" value="20">
+            </label>
+          </div>
+          <div class="quality-canvas-row">
+            <div class="quality-axis-amp"><span>peak</span><span>0</span><span>-peak</span></div>
+            <canvas id="quality-out-scope" width="480" height="110" class="quality-canvas"></canvas>
+          </div>
+          <div class="quality-axis quality-axis-time quality-axis-indent">
+            <span>0</span><span id="quality-out-scope-window">&mdash;</span>
+          </div>
           <div class="quality-stats">
             <span>Cutoff (~-6dB)</span><span id="quality-out-cutoff">&mdash;</span>
             <span>Noise floor</span><span id="quality-out-floor">&mdash;</span>
             <span>DC offset</span><span id="quality-out-dc">&mdash;</span>
             <span>Clips (10s)</span><span id="quality-out-clips">0</span>
+            <span>Scope gain</span><span id="quality-out-gain">&mdash;</span>
           </div>
         </div>
       </div>
-      <p class="hint">For tuning the interface board's audio-in/audio-out RC
-      filter trimpots by eye &mdash; the blue dashed line marks the estimated
-      passband rolloff (~-6dB point); watch it move as you adjust each
-      trimpot. Requires "Listen to Radio"/"Send Mic to Radio" active in the
-      Audio card. Rendered only while shown (unchecking "Show" stops the
-      per-frame canvas work).</p>
+      <p class="hint">"Speaker" streams raw audio over a second WebSocket
+      (<code>/audio</code>), independent of the CAT connection. "Mic &rarr;
+      Radio" is a read-only tap on the exact samples the bridge just wrote to
+      the radio's mic input (<code>/audio-mic-sniff</code>) &mdash; since the
+      web app's mic-send path has no return signal at all, this is the only
+      way to confirm audio actually reached the radio and hear/see what it
+      sounded like. Both are independent and can be on or off in any
+      combination; the sniffer can never affect or slow down the real
+      mic-send path. For tuning the interface board's audio-in/audio-out RC
+      filter trimpots by eye &mdash; the horizontal blue dashed line marks the
+      estimated passband rolloff amplitude (~-6dB below peak); watch it move
+      as you adjust each trimpot.</p>
+      <div class="audio-input-row">
+        <span class="audio-input-label">ADC input</span>
+        <div class="audio-input-toggle">
+          <button data-adc-input="lin1" type="button" class="audio-input-option">LIN1</button>
+          <button data-adc-input="lin2" type="button" class="audio-input-option">LIN2 (P2 jack)</button>
+          <button data-adc-input="mic1" type="button" class="audio-input-option">MIC1 (onboard)</button>
+          <button data-adc-input="mic2" type="button" class="audio-input-option">MIC2 (onboard)</button>
+          <button data-adc-input="diff" type="button" class="audio-input-option">Diff</button>
+        </div>
+      </div>
+      <p class="hint audio-input-hint">Which physical input path the ES8388 codec reads from. Confirmed via a
+      known-good phone line-out test: LIN2 is the P2 jack and sounds best of the 5 &mdash; the others are mostly
+      for reference/comparison now.</p>
+      <div class="audio-input-row">
+        <span class="audio-input-label">ADC RX channel</span>
+        <div class="audio-input-toggle">
+          <button data-rx-slot="left" type="button" class="audio-input-option">Left</button>
+          <button data-rx-slot="right" type="button" class="audio-input-option">Right</button>
+        </div>
+      </div>
+      <p class="hint audio-input-hint">A SEPARATE axis from ADC input above &mdash; once a physical input is
+      selected, this picks which of its two ADC channels (left/right) the ESP32 actually keeps. A jack's tip
+      signal can land on either one depending on board wiring. Switching pauses capture briefly.</p>
+      <div class="audio-input-row">
+        <span class="audio-input-label">MIC PGA gain</span>
+        <input id="mic-gain-slider" type="range" min="-6" max="24" step="3" value="0" class="audio-gain-slider">
+        <span id="mic-gain-readout" class="audio-input-label">0 dB</span>
+      </div>
+      <p class="hint audio-input-hint">0dB (unity gain) is the ES8388's own PGA default. The onboard mic capsule was
+      found bleeding audibly into every ADC input mode (a board-wiring issue, not fixable by any register here)
+      &mdash; raising or lowering this won't fix that bleed, only the overall input level.</p>
+      <div class="audio-input-row">
+        <span class="audio-input-label">Status LEDs</span>
+        <div class="audio-input-toggle">
+          <button data-led-enable="true" type="button" class="audio-input-option">On</button>
+          <button data-led-enable="false" type="button" class="audio-input-option">Off</button>
+        </div>
+      </div>
+      <p class="hint audio-input-hint">One-time reversible test: does the LEDs' own PWM switching (right next to
+      the codec on this board) inject noise into the audio path too? Toggle off, listen for a change, toggle back
+      &mdash; not persisted, resets to On after a reboot regardless.</p>
+      <div class="audio-input-row">
+        <span class="audio-input-label">ADC high-pass filter</span>
+        <div class="audio-input-toggle">
+          <button data-adc-hpf-enable="true" type="button" class="audio-input-option">On</button>
+          <button data-adc-hpf-enable="false" type="button" class="audio-input-option">Off</button>
+        </div>
+      </div>
+      <p class="hint audio-input-hint">On (removing DC offset) is the ES8388's own power-on-reset default &mdash;
+      unlike ALC/noise gate above, this one starts ON, not off. Exposed so it can be turned off to compare while
+      chasing a reported broadband noise floor that shows up even on a clean sine wave from a known-clean source.</p>
+      <div class="audio-input-row">
+        <span class="audio-input-label">Speaker amp (NS4150)</span>
+        <div class="audio-input-toggle">
+          <button data-speaker-amp-enable="true" type="button" class="audio-input-option">On</button>
+          <button data-speaker-amp-enable="false" type="button" class="audio-input-option">Off</button>
+        </div>
+      </div>
+      <p class="hint audio-input-hint">Forces the onboard NS4150 speaker amp's own enable/shutdown GPIO directly,
+      bypassing the codec driver. A class-D amp has its own free-running switching oscillator &mdash; a real
+      on-board noise source. The enable pin's polarity was only ever a guess, never confirmed &mdash; toggle both
+      ways and listen/measure to see which one actually silences it, and whether it changes the line-in noise
+      floor at all. Not persisted; resets to On after a reboot regardless.</p>
+      <div class="audio-input-row">
+        <span class="audio-input-label">Sample rate</span>
+        <div class="audio-input-toggle">
+          <button data-sample-rate="8000" type="button" class="audio-input-option">8k</button>
+          <button data-sample-rate="16000" type="button" class="audio-input-option">16k</button>
+          <button data-sample-rate="22050" type="button" class="audio-input-option">22.05k</button>
+          <button data-sample-rate="32000" type="button" class="audio-input-option">32k</button>
+          <button data-sample-rate="44100" type="button" class="audio-input-option">44.1k</button>
+          <button data-sample-rate="48000" type="button" class="audio-input-option">48k</button>
+        </div>
+      </div>
+      <p class="hint audio-input-hint">The /audio WebSocket's wire rate, which IS the codec/I2S hardware's own
+      sample rate too. Defaults to 48kHz to match a typical laptop sound card, so A/B comparisons against a direct
+      sound-card capture aren't also comparing two different rates. <strong>Changing this saves and reboots the
+      bridge</strong> to apply &mdash; not a live switch, unlike the other controls on this page.</p>
+      <p class="hint">"Listen to Radio" streams raw audio over a second
+      WebSocket (<code>/audio</code>), independent of the CAT connection.
+      "Start Sniffing" is a read-only tap on the exact samples the bridge
+      just wrote to the radio's mic input (<code>/audio-mic-sniff</code>)
+      &mdash; since the web app's mic-send path has no return signal at
+      all, this is the only way to confirm audio actually reached the radio
+      and hear/see what it sounded like. Both are independent and can be on
+      or off in any combination; the sniffer can never affect or slow down
+      the real mic-send path. For tuning the interface board's
+      audio-in/audio-out RC filter trimpots by eye &mdash; the horizontal
+      blue dashed line marks the estimated passband rolloff amplitude
+      (~-6dB below peak); watch it move as you adjust each trimpot.</p>
     </section>
 
     <section id="cat-card" class="card">
@@ -168,6 +407,30 @@
       this is exactly what it sees. The baud rate here must match the
       radio's own CAT menu setting (there's no CAT command that reports or
       changes it, so if you change it on the radio, change it here too).</p>
+
+      <div class="cat-header">
+        <h3>Persisted log</h3>
+        <div class="cat-header-controls">
+          <button id="cat-log-persisted-load-btn" type="button">Load</button>
+          <button id="cat-log-persisted-clear-btn" type="button" class="secondary">Clear persisted log</button>
+        </div>
+      </div>
+      <div id="cat-log-persisted" class="cat-log" role="log" aria-live="polite"></div>
+      <p class="hint">Survives reboots &mdash; a flash-backed ring buffer of
+      the most recent 1000 frames, unlike the live log above which is lost
+      the moment this tab closes or the bridge restarts. Meant for
+      answering "what was the radio doing right before a restart";
+      "Load" fetches it on demand rather than auto-refreshing.</p>
+      <div class="audio-input-row">
+        <span class="audio-input-label">Persisted log enabled</span>
+        <div class="audio-input-toggle">
+          <button data-cat-log-enable="true" type="button" class="audio-input-option">On</button>
+          <button data-cat-log-enable="false" type="button" class="audio-input-option">Off</button>
+        </div>
+      </div>
+      <p class="hint audio-input-hint">Off by default &mdash; a debug feature. Its boot-time flash-recovery scan
+      grows with the log's own record count and was found to push the bridge's boot past the 5s task-watchdog
+      timeout on real hardware, causing a crash-loop. Changing this saves the setting and reboots the bridge.</p>
     </section>
   </div>
 </div>

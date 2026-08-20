@@ -39,3 +39,22 @@ typedef struct {
 // call in STA, AP, or APSTA mode. Returns the number of results written to
 // `out` (up to WIFI_NET_SCAN_MAX_RESULTS), or -1 on scan failure.
 int wifi_net_scan(wifi_net_scan_result_t *out, int max_results);
+
+// Live-sets the WiFi radio's max TX power via esp_wifi_set_max_tx_power() —
+// units are quarter-dBm (raw value 78 == 19.5 dBm), valid range [8,84]
+// (2..21 dBm); the driver snaps to its own nearest-supported step internally,
+// it isn't a continuous scale. A cheap, low-confidence experiment for
+// whether the WiFi radio's own transmit activity couples noise into the
+// analog audio path, same reasoning as cpu_monitor.h's CPU-frequency knob.
+// Must be called after wifi_net_start() (esp_wifi_start() already ran) —
+// returns false otherwise, or if the value is out of range, or the
+// underlying esp_wifi call failed. NOT persisted itself — see
+// bridge_settings_set_wifi_tx_power_quarter_dbm() for that; wifi_net_start()
+// applies the persisted value once at boot.
+bool wifi_net_set_tx_power_quarter_dbm(int8_t quarter_dbm);
+
+// Current max TX power in quarter-dBm, read back live from the driver
+// (esp_wifi_get_max_tx_power()) rather than cached — for GET /status to
+// report the value actually in effect. Returns false (value left untouched)
+// if WiFi hasn't started yet or the underlying call failed.
+bool wifi_net_get_tx_power_quarter_dbm(int8_t *quarter_dbm);

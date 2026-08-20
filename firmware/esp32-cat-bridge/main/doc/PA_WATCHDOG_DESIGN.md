@@ -29,35 +29,55 @@ circuitry (already built by the user, just needs a GPIO) is worth it.
 
 ## Signals
 
-| Name         | Direction | GPIO (proposed) | Idle state | Meaning |
+| Name         | Direction | GPIO (current) | Idle state | Meaning |
 |--------------|-----------|------------------|------------|---------|
-| PA Sense     | input     | GPIO2            | n/a        | HIGH = PA hardware confirmed energized (already level-shifted to safe logic by the user's board — plain digital read, no ADC) |
-| PA Emergency | output    | GPIO4            | HIGH       | Permissive line, in series with the uSDX's own PA-send path — HIGH lets the radio's own signal control the PA normally; LOW forcibly cuts it regardless of what the radio is doing |
+| PA Sense     | input     | GPIO19           | n/a        | HIGH = PA hardware confirmed energized (already level-shifted to safe logic by the user's board — plain digital read, no ADC) |
+| PA Emergency | output    | GPIO5            | HIGH       | Permissive line, in series with the uSDX's own PA-send path — HIGH lets the radio's own signal control the PA normally; LOW forcibly cuts it regardless of what the radio is doing |
 
-### Pin choice
+### Pin choice — revision history
 
-Every one of the "7 free" A1S header GPIOs (0, 5, 18, 19, 21, 22, 23) is
-already claimed by this firmware (CAT UART, status LEDs, codec PA-enable).
-GPIO2 and GPIO4 are the SD-card slot's DATA0/DATA1 lines — wired to a
-peripheral this firmware never uses, rather than sharing a live
-button/LED/codec function. Confirmed via cross-checked A1S board
-documentation (NuttX board file, community ESP-ADF board definitions).
+**v1 (GPIO2/GPIO4, SD-card DATA0/DATA1):** the original choice, reasoning
+being that these were wired to a peripheral this firmware never uses,
+rather than sharing a live button/LED/codec function. Abandoned after
+confirming ON REAL HARDWARE (nothing wired to the header, software
+pull-down enabled) that GPIO2 reads a steady, non-flickering HIGH — the
+A1S board has a fixed, always-populated pull-up on that line for SD-bus
+compliance (per Espressif's own SD pull-up guidance) that trivially
+overpowers the ESP32's weak internal pull-down. Every PA-emergency trip
+seen with this wiring was almost certainly a false 300s timeout against a
+permanently-"energized"-reading pin, not a real stuck PA.
 
-Explicitly avoided:
+**v2 (GPIO13/GPIO4, SD-card DATA3/DATA1):** GPIO13 was substituted for
+GPIO2 as the next SD-pad fallback — still not a real header pin, and still
+DIP-switch-shared with KEY2 on this board, carrying the same "which
+physical mode is actually active" ambiguity v1 was trying to avoid in the
+first place.
+
+**v3, current (GPIO19/GPIO5, both real header pins):** moved off the
+SD-card pads entirely. GPIO19 was freed by dropping the second status LED
+(LED_AUDIO_OUT_PIN — see led_status.c/bridge_config.h; audio-level display
+was removed rather than trying to fold two independent levels onto the
+remaining single LED). GPIO5 was the one header GPIO left genuinely
+unclaimed by anything else in this firmware. Both are on the actual pin
+header — no soldering to the SD card slot required, and neither should
+carry an SD-bus pull-up the way GPIO2 did (they aren't SD-bus pins at all
+on this board), though this hasn't been bench-verified yet — same
+continuity/multimeter check GPIO2 needed applies here before trusting a
+reading from GPIO19 with nothing wired to the header.
+
+Explicitly avoided (all versions):
+
 - **GPIO12** — SD DATA2, but also an ESP32 strapping pin (MTDI, selects
   flash voltage at boot). Driving this from external circuitry risks
   interfering with boot if it's held in the wrong state during reset.
-- **GPIO13** — SD DATA3, DIP-switch-shared with KEY2 on this board;
-  avoiding it sidesteps any ambiguity about which physical mode is active.
 - **GPIO34/36/39** — not broken out to the header at all on this board
   (used internally for SD-card-detect and KEY1), so not reachable
   regardless of their input-only/ADC1 nature.
 
-Needs hardware confirmation before wiring: verify GPIO2/GPIO4 don't have
-pull resistors from the (unpopulated) SD card circuit that would fight the
-external sense/drive signals — a quick continuity/multimeter check against
-the actual board, same caution already applied to the ES8388 PA-enable
-polarity elsewhere in this firmware.
+Needs hardware confirmation before wiring: verify GPIO19/GPIO5 read/drive
+as expected with the real interface board connected — the same caution
+already applied to the ES8388 PA-enable polarity elsewhere in this
+firmware, and the exact check that caught GPIO2's false-HIGH pull-up in v1.
 
 ## Behavior
 
