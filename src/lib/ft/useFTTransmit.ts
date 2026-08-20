@@ -8,6 +8,8 @@ import { createSignal } from 'solid-js'
 import { FTMode, FT_WINDOW_SECONDS, FT_SUPPORTED } from '$decoder-lib/ft/decoder'
 import { audioRecorder } from '$decoder-lib/audio/ringRecorder'
 import { createCaptureNode, type CaptureNode } from '$decoder-lib/audio/captureNode'
+import { speakerSink, bridgeSink, type AudioSinkKind, type AudioSinkHandle } from '$decoder-lib/audio/audioSource'
+import type { AudioBridge } from '$decoder-lib/cat/useAudioBridge'
 
 export interface TxQueueEntry {
   id: string;
@@ -236,6 +238,12 @@ export function createFTTransmit(
   getBaseFrequency: () => number,
   getVfoFrequency: () => number,
   getOnSetPTT: () => ((tx: boolean) => Promise<void>) | undefined,
+  // Where TX audio plays — the local speaker (default, matches all prior
+  // behavior when omitted) or out through the ESP32 bridge's mic-send path
+  // (see audioSource.ts's speakerSink()/bridgeSink()). getAudioBridge only
+  // needs to resolve when getAudioSinkKind() returns 'bridge'.
+  getAudioSinkKind: () => AudioSinkKind = () => 'speaker',
+  getAudioBridge: () => AudioBridge | undefined = () => undefined,
 ) {
   const [state, setState] = createSignal<FTTransmitState>({
     status: 'idle',
@@ -270,6 +278,13 @@ export function createFTTransmit(
   let queue: TxQueueEntry[] = [];
   const timers = new Set<ReturnType<typeof setTimeout>>();
   let audioCtx: AudioContext | null = null;
+  // Rebuilt (see ensureSink()) whenever the operator's chosen sink kind
+  // changes, or lazily on first playback — not eagerly in start(), since
+  // getAudioBridge()/getAudioSinkKind() can change mid-session (the panel's
+  // own <select>) and a stale sink would otherwise keep routing to the
+  // wrong place until the next stop()/start() cycle.
+  let sink: AudioSinkHandle | null = null;
+  let sinkKind: AudioSinkKind | null = null;
 
   function clearTimers() {
     for (const t of timers) clearTimeout(t);
@@ -516,6 +531,7 @@ export function createFTTransmit(
 
       try {
         const ctx = await getAudioContext();
+        if (gainNode) ensureSink(ctx, gainNode);
         const owned = new Float32Array(samples.length);
         owned.set(samples);
         const buf = ctx.createBuffer(1, owned.length, 12000);
@@ -608,6 +624,36 @@ export function createFTTransmit(
     }
   }
 
+  // ── Sink (speaker vs. bridge) ─────────────────────────────────────────────
+  // Re-checked before every transmission (not just once in start()), since
+  // the operator can switch sinks mid-session via the panel's own <select>.
+  // gainNode.connect() is additive in Web Audio (calling it again doesn't
+  // replace a prior connection) — disconnect explicitly before switching so
+  // audio doesn't keep going to BOTH the old and new sink at once.
+  function ensureSink(ctx: AudioContext, node: GainNode): void {
+    const kind = getAudioSinkKind();
+    if (sink && sinkKind === kind) return;
+    node.disconnect();
+    sink?.release();
+    if (kind === 'bridge') {
+      const bridge = getAudioBridge();
+      if (!bridge) {
+        // No bridge instance available (shouldn't happen if the UI only
+        // offers this option when props.audioBridge exists) — fall back to
+        // the speaker rather than silently dropping the transmission.
+        sink = speakerSink(ctx);
+        sinkKind = 'speaker';
+        sink.connectSource(node);
+        return;
+      }
+      sink = bridgeSink(bridge, ctx);
+    } else {
+      sink = speakerSink(ctx);
+    }
+    sinkKind = kind;
+    sink.connectSource(node);
+  }
+
   // ── Public API ────────────────────────────────────────────────────────────
 
   async function start() {
@@ -617,7 +663,9 @@ export function createFTTransmit(
       audioCtx = new AudioContext();
       gainNode = audioCtx.createGain();
       gainNode.gain.value = gain;
-      gainNode.connect(audioCtx.destination);
+      sink = null;
+      sinkKind = null;
+      ensureSink(audioCtx, gainNode);
 
       // Ring-buffer tap for the global "Rec" feature. Each playback source
       // also connects to this node (pre-gain, so the recording level doesn't
@@ -647,6 +695,9 @@ export function createFTTransmit(
       txTap.disconnect();
       txTap = null;
     }
+    sink?.release();
+    sink = null;
+    sinkKind = null;
     audioCtx?.close().catch(() => null);
     audioCtx = null;
     if (autoPTTOn) {

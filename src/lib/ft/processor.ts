@@ -5,6 +5,8 @@
 import { createSignal } from 'solid-js'
 import { type FTDecodeResult, type FTMessage, type FTMode, FT_WINDOW_SECONDS, FT_SUPPORTED, decodeFTAudio } from '$decoder-lib/ft/decoder'
 import { createCaptureNode, type CaptureNode } from '$decoder-lib/audio/captureNode'
+import { acquireMicrophoneSource, acquireBridgeSource, type AudioSourceKind, type AudioSourceHandle } from '$decoder-lib/audio/audioSource'
+import type { AudioBridge } from '$decoder-lib/cat/useAudioBridge'
 
 export interface FTProcessorState {
   isRecording: boolean
@@ -34,7 +36,14 @@ function msUntilNextWindow(windowSec: number): number {
   return elapsed < 50 ? 0 : totalMs - elapsed
 }
 
-export function createFTProcessor(getMode: () => FTMode) {
+export function createFTProcessor(
+  getMode: () => FTMode,
+  // Where capture comes from — the local mic (default, matches all prior
+  // behavior when omitted) or the ESP32 bridge's live incoming-radio-audio
+  // (see audioSource.ts's acquireMicrophoneSource()/acquireBridgeSource()).
+  getAudioSourceKind: () => AudioSourceKind = () => 'microphone',
+  getAudioBridge: () => AudioBridge | undefined = () => undefined,
+) {
   const [state, setState] = createSignal<FTProcessorState>({
     isRecording: false,
     isSupported:
@@ -46,7 +55,7 @@ export function createFTProcessor(getMode: () => FTMode) {
 
   let audioContext: AudioContext | null = null
   let analyser: AnalyserNode | null = null
-  let stream: MediaStream | null = null
+  let source: AudioSourceHandle | null = null
   let processorNode: CaptureNode | null = null
   let sampleBuf: Float32Array | null = null
   let sampleCount = 0
@@ -228,19 +237,24 @@ export function createFTProcessor(getMode: () => FTMode) {
     try {
       if (!state().isSupported) throw new Error('Web Audio API not supported')
 
-      const mediaStream = await navigator.mediaDevices.getUserMedia({
-        audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false },
-      })
-      stream = mediaStream
-
-      const ctx = new AudioContext()
+      const kind = getAudioSourceKind()
+      let handle: AudioSourceHandle
+      if (kind === 'bridge') {
+        const bridge = getAudioBridge()
+        const bridgeSource = bridge ? acquireBridgeSource(bridge) : null
+        if (!bridgeSource) throw new Error('Connect to the bridge (Listen to Radio) before selecting it as the audio source')
+        handle = bridgeSource
+      } else {
+        handle = await acquireMicrophoneSource()
+      }
+      source = handle
+      const ctx = handle.ctx
       audioContext = ctx
 
-      const source = ctx.createMediaStreamSource(mediaStream)
       const analyserNode = ctx.createAnalyser()
       analyserNode.fftSize = 4096
       analyser = analyserNode
-      source.connect(analyserNode)
+      handle.node.connect(analyserNode)
 
       // AudioWorkletNode's capture runs on the audio thread, not the main
       // thread — unlike the old ScriptProcessorNode, dropped/delayed
@@ -273,8 +287,6 @@ export function createFTProcessor(getMode: () => FTMode) {
   function stopRecording() {
     isRunning = false
     clearTimers()
-    stream?.getTracks().forEach((t) => t.stop())
-    stream = null
     sampleBuf = null
     if (processorNode) {
       processorNode.disconnect()
@@ -284,10 +296,14 @@ export function createFTProcessor(getMode: () => FTMode) {
       analyser.disconnect()
       analyser = null
     }
-    if (audioContext) {
-      audioContext.close()
-      audioContext = null
-    }
+    // audioContext is the SOURCE's context (mic: our own, created in
+    // acquireMicrophoneSource(); bridge: the bridge's own playCtx, owned by
+    // useAudioBridge, not us) — release() (not a raw ctx.close()) is what
+    // correctly distinguishes "tear this down" from "just stop reading from
+    // it," matching acquireBridgeSource()'s no-op release.
+    source?.release()
+    source = null
+    audioContext = null
     setState((prev) => ({ ...prev, isRecording: false, status: 'idle' }))
   }
 

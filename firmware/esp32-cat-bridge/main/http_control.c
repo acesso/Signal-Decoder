@@ -11,10 +11,14 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
+#include "audio_monitor.h"
 #include "bridge_config.h"
 #include "bridge_settings.h"
 #include "bridge_state.h"
 #include "cat_bridge.h"
+#include "cat_log.h"
+#include "cpu_monitor.h"
+#include "led_status.h"
 #include "pa_watchdog.h"
 #include "ws_server.h"
 #include "wifi_net.h"
@@ -29,8 +33,76 @@ static const char *TAG = "http_control";
 // "pa_watchdog" means: GET /status reports pa_sense/pa_emergency_tripped
 // and POST /pa-emergency-clear exists (see pa_watchdog.h for the full
 // safety design this backs).
+// "audio_input_select" means: GET /status reports adc_input and
+// POST /audio-input exists — lets the browser live-switch the ES8388's ADC
+// input mux between its 5 real supported modes (see the ADCCONTROL2
+// comment in audio_monitor.c for why this needs to be switchable rather
+// than a single hardcoded choice).
+// "mic_gain" means: POST /mic-gain exists — lets the browser live-adjust
+// the ES8388's MIC preamp gain (see audio_monitor_set_mic_gain_db()), for
+// attenuating the onboard MIC1 preamp's bleed-through into other input modes.
+// "rx_slot_select" means: GET /status reports rx_slot_right and
+// POST /rx-slot exists — lets the browser live-switch which I2S slot
+// (left/right) the ADC capture reads, independent of the ADCCONTROL2 mux
+// selection (see audio_monitor_set_rx_slot() for why this is a separate axis).
+// "led_enable" means: GET /status reports led_enabled and POST /led-enable
+// exists — a reversible kill-switch for the status LEDs, to test whether
+// their own PWM switching injects noise into the analog audio path.
+// "alc_control" means: GET /status reports alc_enabled and POST /alc
+// exists — live-toggles the ES8388's Automatic Level Control (see
+// audio_monitor_set_alc_enabled()). Confirmed off by the chip's own
+// power-on-reset default, exposed as a checkable diagnostic.
+// "noise_gate_control" means: GET /status reports noise_gate_enabled and
+// POST /noise-gate exists — same reasoning as alc_control, for the ALC's
+// Noise Gate sub-feature.
+// "cpu_monitor" means: GET /system-stats exists (heap + per-task CPU%/
+// core/stack usage) and POST /cpu-freq exists to live-repin the CPU
+// frequency between 80/160/240 MHz via esp_pm_configure() — see
+// cpu_monitor.h. Diagnostic tooling only, not persisted across reboots.
+// "wifi_tx_power_control" means: GET /status reports wifi_tx_power_quarter_dbm
+// and POST /wifi-tx-power exists — live-sets the WiFi radio's max TX power
+// via esp_wifi_set_max_tx_power() (see wifi_net.h). Applied immediately AND
+// persisted to NVS, same pattern as mic_gain.
+// "adc_hpf_control" means: GET /status reports adc_hpf_enabled and
+// POST /adc-hpf exists — live-toggles the ES8388's ADC digital high-pass
+// filter (see audio_monitor_set_adc_hpf_enabled()). UNLIKE alc_control/
+// noise_gate_control, this one is ON by the chip's own power-on-reset
+// default, so this toggle's diagnostic direction is disabling it, not
+// enabling it.
+// "sample_rate_select" means: GET /status reports sample_rate_hz and
+// POST /sample-rate exists — the /audio WebSocket's wire rate, which IS
+// the codec/I2S hardware's actual sample rate too (see
+// bridge_config.h/bridge_settings.h — an earlier fixed-4x-oversample
+// design was tried and dropped after A/B testing showed no benefit).
+// Changing it persists to NVS and REBOOTS the bridge to apply — not a
+// live reconfig, same pattern as POST /wifi-config.
+// "speaker_amp_control" means: GET /status reports speaker_amp_enabled and
+// POST /speaker-amp exists — live-forces the onboard NS4150 speaker amp's
+// enable/shutdown GPIO (see audio_monitor_set_speaker_amp_enabled()). A
+// class-D amp has its own free-running switching oscillator; exposed as a
+// live toggle since the enable-pin's polarity was only ever a guess
+// (ES8388_PA_REVERTED), never confirmed on real hardware.
+// "cat_log" means: GET /cat-log and POST /cat-log/clear exist — a
+// flash-persisted ring buffer of the most recent CAT_LOG_CAPACITY CAT
+// frames (see cat_log.h), surviving reboots unlike the control page's own
+// browser-only live log, specifically to help diagnose "what was the radio
+// doing right before a restart". GET /status reports cat_log_enabled and
+// POST /cat-log-enable exists to turn it on/off — defaults OFF (a debug
+// feature whose boot-time recovery scan grows with the log's own record
+// count; see bridge_settings.c's DEFAULT_CAT_LOG_ENABLED comment for why
+// that made it worth defaulting off rather than always-on).
+// "audio_mic_sniff" means: ws://<device>/audio-mic-sniff exists — a
+// read-only WebSocket broadcasting a copy of every sample block just
+// written to the radio's mic input (see audio_sniff.h). Exists because
+// the browser -> radio mic path otherwise has no return signal at all;
+// this lets an operator actually verify what got sent, separate from
+// (and never interfering with) /audio's own real traffic.
 static const char *const BRIDGE_FEATURES[] = {
     "cat", "wifi_config", "wifi_scan", "reset", "audio", "cat_baud", "pa_watchdog",
+    "audio_input_select", "mic_gain", "rx_slot_select", "led_enable",
+    "alc_control", "noise_gate_control", "cpu_monitor", "wifi_tx_power_control",
+    "adc_hpf_control", "sample_rate_select", "speaker_amp_control", "cat_log",
+    "audio_mic_sniff",
 };
 
 // The uSDX firmware's own CAT_BAUD menu setting (usdxBLACKBRICK.ino) only
@@ -94,11 +166,19 @@ static esp_err_t status_handler(httpd_req_t *req) {
 
     int64_t uptime_s = esp_timer_get_time() / 1000000;
 
-    char body[380];
+    int8_t tx_power_quarter_dbm = 0;
+    wifi_net_get_tx_power_quarter_dbm(&tx_power_quarter_dbm); // best-effort; 0 if WiFi hasn't started yet
+
+    char body[800];
     int n = snprintf(body, sizeof(body),
         "{\"wifi_state\":\"%s\",\"ssid\":\"%s\",\"rssi\":%d,\"ip\":\"%s\","
         "\"ws_clients\":%u,\"ws_max_clients\":%d,\"radio_linked\":%s,"
         "\"cat_baud\":%d,\"pa_sense\":%s,\"pa_emergency_tripped\":%s,"
+        "\"adc_input\":\"%s\",\"rx_slot_right\":%s,\"led_enabled\":%s,"
+        "\"alc_enabled\":%s,\"noise_gate_enabled\":%s,\"cpu_freq_mhz\":%d,"
+        "\"wifi_tx_power_quarter_dbm\":%d,\"adc_hpf_enabled\":%s,"
+        "\"sample_rate_hz\":%u,\"speaker_amp_enabled\":%s,"
+        "\"mic_gain_db\":%.1f,\"cat_log_enabled\":%s,"
         "\"uptime_s\":%lld}",
         wifi_state_str(st.wifi_state), ssid_escaped, (int)live_rssi,
         st.ip_addr[0] ? st.ip_addr : "",
@@ -107,6 +187,18 @@ static esp_err_t status_handler(httpd_req_t *req) {
         bridge_settings_get_cat_baud(),
         st.pa_sense ? "true" : "false",
         st.pa_emergency_tripped ? "true" : "false",
+        audio_monitor_get_adc_input_name(),
+        audio_monitor_get_rx_slot_is_right() ? "true" : "false",
+        led_status_get_enabled() ? "true" : "false",
+        audio_monitor_get_alc_enabled() ? "true" : "false",
+        audio_monitor_get_noise_gate_enabled() ? "true" : "false",
+        cpu_monitor_get_freq_mhz(),
+        (int)tx_power_quarter_dbm,
+        audio_monitor_get_adc_hpf_enabled() ? "true" : "false",
+        (unsigned)bridge_settings_get_sample_rate_hz(),
+        audio_monitor_get_speaker_amp_enabled() ? "true" : "false",
+        (double)audio_monitor_get_mic_gain_db(),
+        bridge_settings_get_cat_log_enabled() ? "true" : "false",
         (long long)uptime_s);
     if (n < 0 || (size_t)n >= sizeof(body)) {
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "status body truncated");
@@ -126,7 +218,20 @@ static esp_err_t status_handler(httpd_req_t *req) {
 // UI on "does this bridge support X" instead of comparing version numbers.
 // Queried once when the bridge panel opens, same as /status.
 static esp_err_t info_handler(httpd_req_t *req) {
-    char body[256];
+    // 256 was enough when this handler was first written, but
+    // BRIDGE_FEATURES[] is additive-only (see its own versioning comment)
+    // and has grown to 17 entries as of this comment — 256 bytes is no
+    // longer enough (needs ~288 as of writing) and this handler was
+    // silently returning "info body truncated" on every single call,
+    // which broke the control page's entire refreshStatus() (it
+    // Promise.all()s /status and /info together and awaits both .json()
+    // calls — a non-JSON error body here throws, and since the periodic
+    // auto-refresh always calls refreshStatus(true) [silent], that
+    // exception had been killing every subsequent status update with no
+    // visible error at all). Sized with real headroom this time so the
+    // next several feature additions don't repeat this exact bug a
+    // second time.
+    char body[512];
     size_t o = (size_t)snprintf(body, sizeof(body),
         "{\"firmware_version\":\"%s\",\"features\":[", BRIDGE_FIRMWARE_VERSION);
     for (size_t i = 0; i < BRIDGE_FEATURES_COUNT && o < sizeof(body); i++) {
@@ -282,6 +387,41 @@ static bool extract_json_int(const char *json, const char *key, int *out) {
     return true;
 }
 
+// Same minimal "just enough for this endpoint's own fixed shape" approach
+// as extract_json_int above, for a plain (optionally signed, optionally
+// fractional) "key":12.5 pair.
+static bool extract_json_float(const char *json, const char *key, float *out) {
+    char pattern[32];
+    snprintf(pattern, sizeof(pattern), "\"%s\"", key);
+    const char *p = strstr(json, pattern);
+    if (!p) return false;
+    p = strchr(p + strlen(pattern), ':');
+    if (!p) return false;
+    p++;
+    while (*p == ' ') p++;
+    char *end;
+    float v = strtof(p, &end);
+    if (end == p) return false; // no digits consumed — not a number
+    *out = v;
+    return true;
+}
+
+// Same minimal-scope approach as extract_json_int/extract_json_float
+// above, for a plain "key":true / "key":false literal.
+static bool extract_json_bool(const char *json, const char *key, bool *out) {
+    char pattern[32];
+    snprintf(pattern, sizeof(pattern), "\"%s\"", key);
+    const char *p = strstr(json, pattern);
+    if (!p) return false;
+    p = strchr(p + strlen(pattern), ':');
+    if (!p) return false;
+    p++;
+    while (*p == ' ') p++;
+    if (strncmp(p, "true", 4) == 0) { *out = true; return true; }
+    if (strncmp(p, "false", 5) == 0) { *out = false; return true; }
+    return false;
+}
+
 // POST /wifi-config — body: {"ssid":"...","password":"..."}. Persists to
 // NVS and reboots to apply (same pattern as most consumer Wi-Fi devices —
 // there's no clean way to tear down and rejoin a different AP without
@@ -338,6 +478,472 @@ static esp_err_t cat_baud_handler(httpd_req_t *req) {
     return httpd_resp_send(req, resp_body, n);
 }
 
+// POST /audio-input — body: {"input":"lin1"|"lin2"|"mic1"|"mic2"|"diff"}.
+// Applied immediately (a live I2C register write — see
+// audio_monitor_set_adc_input()) AND persisted to NVS, same pattern as
+// /cat-baud. Exists to sweep every ADC input mode the ES8388 actually
+// supports, not just a single onboard-mic-vs-P2-jack guess — that guess was
+// tried on real hardware and had no audible effect either way, so the
+// correct value (if any) needs to be found by testing each option.
+static esp_err_t audio_input_handler(httpd_req_t *req) {
+    char body[64];
+    if (read_request_body(req, body, sizeof(body)) != ESP_OK) return ESP_FAIL;
+
+    char input[8];
+    if (!extract_json_string(body, "input", input, sizeof(input))) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "missing \"input\"");
+        return ESP_FAIL;
+    }
+    int idx = audio_monitor_find_adc_input(input);
+    if (idx < 0) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "unsupported input — must be lin1/lin2/mic1/mic2/diff");
+        return ESP_FAIL;
+    }
+
+    bool applied = audio_monitor_set_adc_input(idx);
+    bool saved = applied && bridge_settings_set_adc_input_name(input);
+
+    httpd_resp_set_type(req, "application/json");
+    set_cors(req);
+    char resp_body[96];
+    int n = snprintf(resp_body, sizeof(resp_body), "{\"input\":\"%s\",\"applied\":%s,\"saved\":%s}",
+        audio_monitor_get_adc_input_name(),
+        applied ? "true" : "false", saved ? "true" : "false");
+    return httpd_resp_send(req, resp_body, n);
+}
+
+// POST /mic-gain — body: {"db":0}. Live-adjusts the ES8388's MIC preamp
+// (PGA) gain — see audio_monitor_set_mic_gain_db() for why this exists: the
+// onboard MIC1 preamp was found bleeding into every ADCCONTROL2 input
+// mode, including modes that shouldn't route it at all, and this is the
+// one documented (not guessed-bit) way to attenuate it. Applied
+// immediately AND persisted to NVS — 21dB was confirmed on real hardware
+// to produce a clean, strong signal (see bridge_settings.c's default).
+static esp_err_t mic_gain_handler(httpd_req_t *req) {
+    char body[64];
+    if (read_request_body(req, body, sizeof(body)) != ESP_OK) return ESP_FAIL;
+
+    float db = 0;
+    if (!extract_json_float(body, "db", &db)) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "missing or invalid \"db\"");
+        return ESP_FAIL;
+    }
+
+    bool applied = audio_monitor_set_mic_gain_db(db);
+    bool saved = applied && bridge_settings_set_mic_gain_db(db);
+
+    httpd_resp_set_type(req, "application/json");
+    set_cors(req);
+    char resp_body[80];
+    int n = snprintf(resp_body, sizeof(resp_body), "{\"db\":%.1f,\"applied\":%s,\"saved\":%s}",
+        db, applied ? "true" : "false", saved ? "true" : "false");
+    return httpd_resp_send(req, resp_body, n);
+}
+
+// POST /wifi-tx-power — body: {"quarter_dbm":84}. Live-sets the WiFi
+// radio's max TX power via wifi_net_set_tx_power_quarter_dbm() — units are
+// quarter-dBm (84 == 21.0dBm, the driver's own maximum), valid range [8,84]
+// (2..21dBm), snapped internally to the driver's own nearest supported
+// step. A low-confidence experiment for whether the WiFi radio's own
+// transmit activity couples noise into the analog audio path. Applied
+// immediately AND persisted to NVS.
+static esp_err_t wifi_tx_power_handler(httpd_req_t *req) {
+    char body[64];
+    if (read_request_body(req, body, sizeof(body)) != ESP_OK) return ESP_FAIL;
+
+    int quarter_dbm = 0;
+    if (!extract_json_int(body, "quarter_dbm", &quarter_dbm)) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "missing or invalid \"quarter_dbm\"");
+        return ESP_FAIL;
+    }
+
+    bool applied = wifi_net_set_tx_power_quarter_dbm((int8_t)quarter_dbm);
+
+    int8_t live_value = (int8_t)quarter_dbm;
+    wifi_net_get_tx_power_quarter_dbm(&live_value); // best-effort — falls back to the requested value on failure
+
+    // Persist the driver's own SNAPPED value, not the raw request — the
+    // driver only supports discrete steps (see wifi_net_set_tx_power_quarter_dbm()),
+    // so persisting the unsnapped request meant GET /status showed a
+    // different number right after this POST than it would after a
+    // reboot re-applied the persisted value (both eventually converge to
+    // the same snapped result, but only after a re-snap on the NEXT boot
+    // — in between, /status looked like the setting had drifted/not
+    // taken effect).
+    bool saved = applied && bridge_settings_set_wifi_tx_power_quarter_dbm(live_value);
+
+    httpd_resp_set_type(req, "application/json");
+    set_cors(req);
+    char resp_body[96];
+    int n = snprintf(resp_body, sizeof(resp_body), "{\"quarter_dbm\":%d,\"applied\":%s,\"saved\":%s}",
+        (int)live_value, applied ? "true" : "false", saved ? "true" : "false");
+    return httpd_resp_send(req, resp_body, n);
+}
+
+// POST /rx-slot — body: {"right":true|false}. Live-switches which I2S slot
+// the ADC capture side reads — see audio_monitor_set_rx_slot() for why
+// this is a SEPARATE axis from /audio-input's ADCCONTROL2 mux selection: a
+// jack's tip signal can land on either ADC channel depending on board
+// wiring. Applied immediately (disables/reconfigures/re-enables the RX I2S
+// channel, with a brief capture pause) AND persisted to NVS — right was
+// confirmed on real hardware to be where this board's P2 jack tip signal
+// actually lands.
+static esp_err_t rx_slot_handler(httpd_req_t *req) {
+    char body[64];
+    if (read_request_body(req, body, sizeof(body)) != ESP_OK) return ESP_FAIL;
+
+    bool use_right = false;
+    if (!extract_json_bool(body, "right", &use_right)) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "missing or invalid \"right\"");
+        return ESP_FAIL;
+    }
+
+    bool applied = audio_monitor_set_rx_slot(use_right);
+    bool saved = applied && bridge_settings_set_rx_slot_is_right(use_right);
+
+    httpd_resp_set_type(req, "application/json");
+    set_cors(req);
+    char resp_body[80];
+    int n = snprintf(resp_body, sizeof(resp_body), "{\"right\":%s,\"applied\":%s,\"saved\":%s}",
+        audio_monitor_get_rx_slot_is_right() ? "true" : "false", applied ? "true" : "false", saved ? "true" : "false");
+    return httpd_resp_send(req, resp_body, n);
+}
+
+// POST /led-enable — body: {"enabled":true|false}. One-time reversible test
+// for whether the status LEDs' own PWM switching (GPIO22/19, right next to
+// the audio codec on this board) is injecting noise into the analog audio
+// path — see led_status_set_enabled()'s comment. Applied immediately; NOT
+// persisted to NVS (defaults back to on after a reboot unless confirmed to
+// actually matter and made permanent later).
+static esp_err_t led_enable_handler(httpd_req_t *req) {
+    char body[64];
+    if (read_request_body(req, body, sizeof(body)) != ESP_OK) return ESP_FAIL;
+
+    bool enabled = true;
+    if (!extract_json_bool(body, "enabled", &enabled)) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "missing or invalid \"enabled\"");
+        return ESP_FAIL;
+    }
+
+    led_status_set_enabled(enabled);
+
+    httpd_resp_set_type(req, "application/json");
+    set_cors(req);
+    char resp_body[48];
+    int n = snprintf(resp_body, sizeof(resp_body), "{\"enabled\":%s}", led_status_get_enabled() ? "true" : "false");
+    return httpd_resp_send(req, resp_body, n);
+}
+
+// POST /alc — body: {"enabled":true|false}. Live-toggles the ES8388's ALC
+// (Automatic Level Control) — see audio_monitor_set_alc_enabled() for why
+// this exists: confirmed OFF by the chip's own power-on-reset default, but
+// exposed here as a checkable diagnostic (the operator suspected ALC/noise
+// gate might be contributing to the already-confirmed audio-noise
+// investigation) rather than left as an untested assumption. NOT persisted
+// to NVS (a live experiment, not a permanent setting yet).
+static esp_err_t alc_handler(httpd_req_t *req) {
+    char body[64];
+    if (read_request_body(req, body, sizeof(body)) != ESP_OK) return ESP_FAIL;
+
+    bool enabled = false;
+    if (!extract_json_bool(body, "enabled", &enabled)) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "missing or invalid \"enabled\"");
+        return ESP_FAIL;
+    }
+
+    bool applied = audio_monitor_set_alc_enabled(enabled);
+
+    httpd_resp_set_type(req, "application/json");
+    set_cors(req);
+    char resp_body[64];
+    int n = snprintf(resp_body, sizeof(resp_body), "{\"enabled\":%s,\"applied\":%s}",
+        audio_monitor_get_alc_enabled() ? "true" : "false", applied ? "true" : "false");
+    return httpd_resp_send(req, resp_body, n);
+}
+
+// POST /noise-gate — body: {"enabled":true|false}. Live-toggles the ALC's
+// Noise Gate sub-feature — same reasoning as /alc above. Only has an
+// audible effect while ALC itself is also enabled. NOT persisted to NVS.
+static esp_err_t noise_gate_handler(httpd_req_t *req) {
+    char body[64];
+    if (read_request_body(req, body, sizeof(body)) != ESP_OK) return ESP_FAIL;
+
+    bool enabled = false;
+    if (!extract_json_bool(body, "enabled", &enabled)) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "missing or invalid \"enabled\"");
+        return ESP_FAIL;
+    }
+
+    bool applied = audio_monitor_set_noise_gate_enabled(enabled);
+
+    httpd_resp_set_type(req, "application/json");
+    set_cors(req);
+    char resp_body[64];
+    int n = snprintf(resp_body, sizeof(resp_body), "{\"enabled\":%s,\"applied\":%s}",
+        audio_monitor_get_noise_gate_enabled() ? "true" : "false", applied ? "true" : "false");
+    return httpd_resp_send(req, resp_body, n);
+}
+
+// POST /adc-hpf — body: {"enabled":true|false}. Live-toggles the ES8388's
+// ADC digital high-pass filter — see audio_monitor_set_adc_hpf_enabled()
+// for why this exists: UNLIKE /alc and /noise-gate above, this one is
+// confirmed ON by the chip's own power-on-reset default and was never
+// touched by the vendored driver either, so "disabling" is the actual
+// diagnostic direction — exposed so the operator can compare with/without
+// while chasing a reported broadband noise floor that showed up even
+// feeding a clean sine wave from a known-clean source. NOT persisted to
+// NVS (a live experiment, not a permanent setting yet).
+static esp_err_t adc_hpf_handler(httpd_req_t *req) {
+    char body[64];
+    if (read_request_body(req, body, sizeof(body)) != ESP_OK) return ESP_FAIL;
+
+    bool enabled = true;
+    if (!extract_json_bool(body, "enabled", &enabled)) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "missing or invalid \"enabled\"");
+        return ESP_FAIL;
+    }
+
+    bool applied = audio_monitor_set_adc_hpf_enabled(enabled);
+
+    httpd_resp_set_type(req, "application/json");
+    set_cors(req);
+    char resp_body[64];
+    int n = snprintf(resp_body, sizeof(resp_body), "{\"enabled\":%s,\"applied\":%s}",
+        audio_monitor_get_adc_hpf_enabled() ? "true" : "false", applied ? "true" : "false");
+    return httpd_resp_send(req, resp_body, n);
+}
+
+// POST /speaker-amp — body: {"enabled":true|false}. Live-forces the onboard
+// NS4150 speaker amplifier's own enable/shutdown GPIO — see
+// audio_monitor_set_speaker_amp_enabled() for why: it's a class-D
+// (free-running switching) amp on the same board as the analog ADC input,
+// and its enable-pin polarity (ES8388_PA_REVERTED) was only ever a guess,
+// never confirmed. Exposed so the operator can test/compare both real GPIO
+// states live while chasing a reported noise floor. NOT persisted to NVS
+// (a live experiment, not a permanent setting yet).
+static esp_err_t speaker_amp_handler(httpd_req_t *req) {
+    char body[64];
+    if (read_request_body(req, body, sizeof(body)) != ESP_OK) return ESP_FAIL;
+
+    bool enabled = true;
+    if (!extract_json_bool(body, "enabled", &enabled)) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "missing or invalid \"enabled\"");
+        return ESP_FAIL;
+    }
+
+    bool applied = audio_monitor_set_speaker_amp_enabled(enabled);
+
+    httpd_resp_set_type(req, "application/json");
+    set_cors(req);
+    char resp_body[64];
+    int n = snprintf(resp_body, sizeof(resp_body), "{\"enabled\":%s,\"applied\":%s}",
+        audio_monitor_get_speaker_amp_enabled() ? "true" : "false", applied ? "true" : "false");
+    return httpd_resp_send(req, resp_body, n);
+}
+
+// GET /cat-log — the persisted CAT-frame ring buffer (see cat_log.h),
+// oldest-first. Each entry is small (direction + uptime_ms + up-to-40-char
+// frame), so CAT_LOG_CAPACITY (1000) of them comfortably fits one response;
+// no pagination. Reads straight from the in-RAM shadow (never touches
+// flash), so this is cheap enough to call on demand from a diagnostics panel.
+static esp_err_t cat_log_handler(httpd_req_t *req) {
+    // Heap-allocated, not stack — CAT_LOG_CAPACITY (1000) entries would
+    // blow the httpd worker task's stack if declared locally.
+    cat_log_entry_t *entries = malloc(sizeof(cat_log_entry_t) * CAT_LOG_CAPACITY);
+    if (!entries) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "out of memory");
+        return ESP_FAIL;
+    }
+    size_t count = cat_log_read_recent(entries, CAT_LOG_CAPACITY);
+
+    // Streamed as HTTP chunks (httpd_resp_send_chunk), one small buffer
+    // reused per entry, rather than building the whole JSON body in one
+    // contiguous malloc() first — a full CAT_LOG_CAPACITY (1000) response
+    // is ~150KB+ of JSON, which reliably failed to allocate as a single
+    // block on real hardware (WiFi/TLS/audio buffers fragment this
+    // device's ~300KB heap enough that a 96KB largest-free-block was all
+    // that remained even with 135KB nominally free) — this was a real,
+    // reproduced bug: GET /cat-log returned "out of memory" on every call
+    // once the ring buffer filled up, i.e. almost always in practice.
+    httpd_resp_set_type(req, "application/json");
+    set_cors(req);
+
+    esp_err_t err = httpd_resp_send_chunk(req, "{\"entries\":[", HTTPD_RESP_USE_STRLEN);
+    for (size_t i = 0; err == ESP_OK && i < count; i++) {
+        char frame_escaped[96];
+        json_escape(frame_escaped, sizeof(frame_escaped), entries[i].frame);
+        char chunk[192];
+        int n = snprintf(chunk, sizeof(chunk),
+            "%s{\"from_radio\":%s,\"uptime_ms\":%u,\"frame\":\"%s\"}",
+            i ? "," : "", entries[i].from_radio ? "true" : "false",
+            (unsigned)entries[i].uptime_ms_at_log, frame_escaped);
+        if (n < 0 || (size_t)n >= sizeof(chunk)) {
+            err = ESP_FAIL; // frame_escaped is bounded to 96 bytes, so this should never actually trip
+            break;
+        }
+        err = httpd_resp_send_chunk(req, chunk, (size_t)n);
+    }
+    free(entries);
+    if (err == ESP_OK) err = httpd_resp_send_chunk(req, "]}", 2);
+    if (err == ESP_OK) err = httpd_resp_send_chunk(req, NULL, 0); // terminates the chunked response
+    return err;
+}
+
+// POST /cat-log/clear — erases the persisted CAT log (flash + RAM shadow).
+// No body needed. Distinct from the control page's own browser-side "Clear"
+// button, which only clears the live DOM view.
+static esp_err_t cat_log_clear_handler(httpd_req_t *req) {
+    bool cleared = cat_log_clear();
+
+    httpd_resp_set_type(req, "application/json");
+    set_cors(req);
+    char resp_body[32];
+    int n = snprintf(resp_body, sizeof(resp_body), "{\"cleared\":%s}", cleared ? "true" : "false");
+    return httpd_resp_send(req, resp_body, n);
+}
+
+// The bridge's own supported wire/hardware sample rates — common steps
+// from the original 8kHz up through a typical laptop sound card/browser
+// AudioContext's own native rate (48kHz), so a same-rate A/B comparison
+// against a direct sound-card capture is possible at the top of the
+// range, with several intermediate steps for narrowing down where any
+// audible/measurable difference actually starts. Validated against on
+// POST /sample-rate so a typo/garbage value can't wedge the codec into an
+// unsupported rate.
+static const uint32_t SUPPORTED_SAMPLE_RATES_HZ[] = { 8000, 16000, 22050, 32000, 44100, 48000 };
+#define SUPPORTED_SAMPLE_RATES_COUNT (sizeof(SUPPORTED_SAMPLE_RATES_HZ) / sizeof(SUPPORTED_SAMPLE_RATES_HZ[0]))
+
+// POST /sample-rate — body: {"hz":48000}; one of SUPPORTED_SAMPLE_RATES_HZ.
+// Persists to NVS and REBOOTS to apply — the wire rate IS the codec/I2S
+// hardware's own rate (see bridge_config.h), and live-reconfiguring that
+// exact hardware path has already caused one subtle bug in this codebase
+// (see audio_monitor.c's RX-slot re-apply comment); rebooting sidesteps
+// repeating that class of bug, same pattern as POST /wifi-config.
+static esp_err_t sample_rate_handler(httpd_req_t *req) {
+    char body[64];
+    if (read_request_body(req, body, sizeof(body)) != ESP_OK) return ESP_FAIL;
+
+    int hz = 0;
+    if (!extract_json_int(body, "hz", &hz)) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "missing or invalid \"hz\"");
+        return ESP_FAIL;
+    }
+
+    bool supported = false;
+    for (size_t i = 0; i < SUPPORTED_SAMPLE_RATES_COUNT; i++) {
+        if (SUPPORTED_SAMPLE_RATES_HZ[i] == (uint32_t)hz) { supported = true; break; }
+    }
+    if (!supported) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "unsupported rate — must be one of 8000/16000/22050/32000/44100/48000");
+        return ESP_FAIL;
+    }
+
+    if (!bridge_settings_set_sample_rate_hz((uint32_t)hz)) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "failed to save to NVS");
+        return ESP_FAIL;
+    }
+
+    httpd_resp_set_type(req, "text/plain");
+    set_cors(req);
+    httpd_resp_sendstr(req, "saved, restarting");
+    xTaskCreate(restart_task, "bridge_restart", 2048, NULL, tskIDLE_PRIORITY + 1, NULL);
+    return ESP_OK;
+}
+
+// POST /cat-log-enable — body: {"enabled":true|false}. Turns the
+// persistent CAT-frame log (see cat_log.h/GET /cat-log) on or off.
+// Defaults OFF — this is a debug feature, and its boot-time flash-
+// recovery scan grows with the log's own accumulated record count; left
+// running indefinitely on real hardware, that scan grew close enough to
+// the 5s task-watchdog timeout to cause a genuine crash-loop (see
+// cat_log.c's recover_from_flash() yield fix for the immediate
+// mitigation, and bridge_settings.c's DEFAULT_CAT_LOG_ENABLED comment for
+// the full story). cat_log_init() only reads this once at boot, so
+// (like /sample-rate) this reboots to apply rather than trying to
+// live-start/stop the background task and its flash-recovery scan.
+static esp_err_t cat_log_enable_handler(httpd_req_t *req) {
+    char body[64];
+    if (read_request_body(req, body, sizeof(body)) != ESP_OK) return ESP_FAIL;
+
+    bool enabled = false;
+    if (!extract_json_bool(body, "enabled", &enabled)) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "missing or invalid \"enabled\"");
+        return ESP_FAIL;
+    }
+
+    if (!bridge_settings_set_cat_log_enabled(enabled)) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "failed to save to NVS");
+        return ESP_FAIL;
+    }
+
+    httpd_resp_set_type(req, "text/plain");
+    set_cors(req);
+    httpd_resp_sendstr(req, "saved, restarting");
+    xTaskCreate(restart_task, "bridge_restart", 2048, NULL, tskIDLE_PRIORITY + 1, NULL);
+    return ESP_OK;
+}
+
+// POST /cpu-freq — body: {"mhz":80|160|240}. Live-repins the ESP32's CPU
+// frequency via esp_pm_configure() (min==max, no dynamic scaling — see
+// cpu_monitor.c) — a cheap, low-confidence experiment for whether digital
+// switching activity is coupling into the analog audio path, separate
+// from the already-confirmed onboard-mic-bleed investigation. NOT
+// persisted to NVS (defaults back to CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ, 160,
+// after every reboot).
+static esp_err_t cpu_freq_handler(httpd_req_t *req) {
+    char body[64];
+    if (read_request_body(req, body, sizeof(body)) != ESP_OK) return ESP_FAIL;
+
+    int mhz = 0;
+    if (!extract_json_int(body, "mhz", &mhz)) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "missing or invalid \"mhz\"");
+        return ESP_FAIL;
+    }
+
+    bool applied = cpu_monitor_set_freq_mhz(mhz);
+    if (!applied) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "unsupported frequency — must be 80/160/240");
+        return ESP_FAIL;
+    }
+
+    httpd_resp_set_type(req, "application/json");
+    set_cors(req);
+    char resp_body[48];
+    int n = snprintf(resp_body, sizeof(resp_body), "{\"mhz\":%d,\"applied\":true}", cpu_monitor_get_freq_mhz());
+    return httpd_resp_send(req, resp_body, n);
+}
+
+// GET /system-stats — heap usage + per-task CPU%/core/stack-headroom. Kept
+// as its own endpoint (not folded into GET /status) since it's meaningfully
+// larger and meant to be polled on its own cadence by a live-refreshing
+// diagnostics panel, not fetched every time any other status field is needed.
+static esp_err_t system_stats_handler(httpd_req_t *req) {
+    cpu_monitor_heap_t heap;
+    cpu_monitor_get_heap(&heap);
+
+    char tasks_json[1536];
+    int tasks_len = cpu_monitor_write_tasks_json(tasks_json, sizeof(tasks_json));
+    if (tasks_len < 0) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "task stats buffer too small");
+        return ESP_FAIL;
+    }
+
+    char body[1700];
+    int n = snprintf(body, sizeof(body),
+        "{\"cpu_freq_mhz\":%d,\"heap_free\":%u,\"heap_min_free\":%u,\"heap_total\":%u,\"tasks\":%s}",
+        cpu_monitor_get_freq_mhz(),
+        (unsigned)heap.free_bytes, (unsigned)heap.min_free_bytes, (unsigned)heap.total_bytes,
+        tasks_json);
+    if (n < 0 || (size_t)n >= sizeof(body)) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "system-stats body truncated");
+        return ESP_FAIL;
+    }
+
+    httpd_resp_set_type(req, "application/json");
+    set_cors(req);
+    return httpd_resp_send(req, body, n);
+}
+
 // Browsers preflight cross-origin POST with OPTIONS — answer it so the web
 // app's fetch() to any POST route doesn't fail the preflight before the
 // real request.
@@ -363,6 +969,21 @@ void http_control_start(void) {
     httpd_uri_t wifi_config_uri  = { .uri = "/wifi-config", .method = HTTP_POST,    .handler = wifi_config_handler };
     httpd_uri_t cat_baud_uri     = { .uri = "/cat-baud",    .method = HTTP_POST,    .handler = cat_baud_handler };
     httpd_uri_t pa_clear_uri     = { .uri = "/pa-emergency-clear", .method = HTTP_POST, .handler = pa_emergency_clear_handler };
+    httpd_uri_t audio_input_uri = { .uri = "/audio-input", .method = HTTP_POST, .handler = audio_input_handler };
+    httpd_uri_t mic_gain_uri    = { .uri = "/mic-gain",    .method = HTTP_POST, .handler = mic_gain_handler };
+    httpd_uri_t wifi_tx_power_uri = { .uri = "/wifi-tx-power", .method = HTTP_POST, .handler = wifi_tx_power_handler };
+    httpd_uri_t rx_slot_uri     = { .uri = "/rx-slot",     .method = HTTP_POST, .handler = rx_slot_handler };
+    httpd_uri_t led_enable_uri = { .uri = "/led-enable", .method = HTTP_POST, .handler = led_enable_handler };
+    httpd_uri_t alc_uri         = { .uri = "/alc",         .method = HTTP_POST, .handler = alc_handler };
+    httpd_uri_t noise_gate_uri  = { .uri = "/noise-gate",  .method = HTTP_POST, .handler = noise_gate_handler };
+    httpd_uri_t cpu_freq_uri    = { .uri = "/cpu-freq",    .method = HTTP_POST, .handler = cpu_freq_handler };
+    httpd_uri_t system_stats_uri = { .uri = "/system-stats", .method = HTTP_GET, .handler = system_stats_handler };
+    httpd_uri_t adc_hpf_uri      = { .uri = "/adc-hpf",      .method = HTTP_POST, .handler = adc_hpf_handler };
+    httpd_uri_t sample_rate_uri  = { .uri = "/sample-rate",  .method = HTTP_POST, .handler = sample_rate_handler };
+    httpd_uri_t cat_log_enable_uri = { .uri = "/cat-log-enable", .method = HTTP_POST, .handler = cat_log_enable_handler };
+    httpd_uri_t speaker_amp_uri  = { .uri = "/speaker-amp",  .method = HTTP_POST, .handler = speaker_amp_handler };
+    httpd_uri_t cat_log_uri       = { .uri = "/cat-log",       .method = HTTP_GET,  .handler = cat_log_handler };
+    httpd_uri_t cat_log_clear_uri = { .uri = "/cat-log/clear", .method = HTTP_POST, .handler = cat_log_clear_handler };
     httpd_uri_t options_uri      = { .uri = "/*",           .method = HTTP_OPTIONS, .handler = options_handler };
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &status_uri));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &info_uri));
@@ -371,8 +992,23 @@ void http_control_start(void) {
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &wifi_config_uri));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &cat_baud_uri));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &pa_clear_uri));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &audio_input_uri));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &mic_gain_uri));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &wifi_tx_power_uri));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &rx_slot_uri));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &led_enable_uri));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &alc_uri));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &noise_gate_uri));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &cpu_freq_uri));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &system_stats_uri));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &adc_hpf_uri));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &sample_rate_uri));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &cat_log_enable_uri));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &speaker_amp_uri));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &cat_log_uri));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &cat_log_clear_uri));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &options_uri));
 
     ESP_LOGI(TAG, "control endpoints ready: GET /status, GET /info, GET /wifi-scan, POST /reset, "
-                   "POST /wifi-config, POST /cat-baud, POST /pa-emergency-clear");
+                   "POST /wifi-config, POST /cat-baud, POST /pa-emergency-clear, POST /audio-input, POST /mic-gain, POST /rx-slot, POST /led-enable");
 }

@@ -14,11 +14,14 @@
 #include "esp_log.h"
 
 #include "audio_monitor.h"
+#include "audio_sniff.h"
 #include "audio_ws.h"
 #include "bridge_settings.h"
 #include "bridge_state.h"
 #include "cat_bridge.h"
+#include "cat_log.h"
 #include "control_page.h"
+#include "cpu_monitor.h"
 #include "http_control.h"
 #include "led_status.h"
 #include "pa_watchdog.h"
@@ -32,11 +35,14 @@ void app_main(void) {
 
     bridge_settings_init();   // NVS init — must run before anything reads persisted settings
     bridge_state_init();
+    cpu_monitor_start();      // pins CPU freq to its fixed boot value — no ordering dependency on anything else
+    cat_log_init();           // before cat_bridge_start() so no early CAT frames are missed
     led_status_start();       // no ordering dependency — wifi_net/cat_bridge feed it state after
     pa_watchdog_start();       // after led_status_start() — calls led_status_set_pa_emergency()
     wifi_net_start();
     ws_server_start();
     audio_ws_start(ws_server_get_httpd()); // needs ws_server's httpd handle — after ws_server_start()
+    audio_sniff_start(ws_server_get_httpd()); // read-only mic-to-radio tap — see audio_sniff.h
     http_control_start();     // needs ws_server's httpd handle — after ws_server_start()
     control_page_start();     // standalone control UI — same httpd instance
     cat_bridge_start(ws_server_send_to_client);

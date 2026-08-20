@@ -116,11 +116,26 @@ static void watchdog_task(void *arg) {
 }
 
 void pa_watchdog_start(void) {
+    // Pulled down internally: with no PA interface board wired up yet (or
+    // if it's ever unplugged later), this pin would otherwise float and can
+    // read noise as HIGH — false-tripping the emergency latch on garbage,
+    // not a real fault. A weak internal pull-down defaults the reading to
+    // "not energized" whenever nothing is actively driving the line; once
+    // the real interface board is connected, its driven HIGH easily
+    // overrides this weak pull, so there's no downside once wired for real.
+    // NOTE: this alone isn't sufficient if the chosen pin has its own
+    // board-populated pull-up (confirmed the hard way on GPIO2/SD-DATA0,
+    // which this pin used to be — see bridge_config.h's PA_SENSE_PIN
+    // comment for the full story). A software pull-down cannot override a
+    // real resistor on the PCB; if PA_SENSE_PIN ever reads a steady,
+    // non-flickering HIGH with nothing wired to the header, that is the
+    // signature of this exact problem recurring on whatever pin is in use,
+    // not a genuine PA fault.
     gpio_config_t sense_cfg = {
         .pin_bit_mask = 1ULL << PA_SENSE_PIN,
         .mode = GPIO_MODE_INPUT,
         .pull_up_en = GPIO_PULLUP_DISABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_ENABLE,
         .intr_type = GPIO_INTR_DISABLE,
     };
     ESP_ERROR_CHECK(gpio_config(&sense_cfg));

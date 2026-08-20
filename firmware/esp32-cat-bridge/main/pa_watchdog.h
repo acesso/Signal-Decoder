@@ -1,8 +1,8 @@
 // PA safety watchdog — guards against the uSDX hanging with the external
 // miniPA70 amplifier still keyed. See main/doc/PA_WATCHDOG_DESIGN.md for
-// the full design and the research (miniPA70 has no feedback of its own;
-// GPIO2/GPIO4 chosen because every other A1S header pin is already
-// claimed) it's based on.
+// the full design, the research (miniPA70 has no feedback of its own) it's
+// based on, and the pin-choice revision history (now GPIO19/GPIO5, both on
+// the real header — see bridge_config.h's PA_SENSE_PIN/PA_EMERGENCY_PIN).
 //
 // PA_SENSE_PIN (input) reads the amp's own energized-state feedback, from
 // the user's interface board — ground truth, independent of the radio's

@@ -7,6 +7,8 @@
 import { createSignal } from 'solid-js'
 import { audioRecorder } from '$decoder-lib/audio/ringRecorder'
 import { createCaptureNode, type CaptureNode } from '$decoder-lib/audio/captureNode'
+import { acquireMicrophoneSource, acquireBridgeSource, type AudioSourceKind, type AudioSourceHandle } from '$decoder-lib/audio/audioSource'
+import type { AudioBridge } from '$decoder-lib/cat/useAudioBridge'
 
 export interface GlobalAudioState {
   isRecording: boolean
@@ -27,14 +29,26 @@ function createGlobalAudio() {
 
   const [analyser, setAnalyser] = createSignal<AnalyserNode | null>(null)
 
-  let stream: MediaStream | null = null
-  let audioCtx: AudioContext | null = null
+  // Set by App.tsx once the bridge is lifted — lets "Start Decoding"
+  // source from the ESP32 bridge's live radio audio instead of always
+  // prompting for a local mic. This mirrors the per-decoder audioSourceKind
+  // selector (see ft/processor.ts), but at the app-wide level: globalAudio
+  // gates EVERY mode's "Start Decoding" (see App.tsx's handleStart()), so
+  // without this, selecting "ESP32 Bridge" in a decoder's own dropdown was
+  // never enough — globalAudio.start() ran first and always grabbed the
+  // mic regardless, which is exactly the bug this fixes.
+  let sourceKind: AudioSourceKind = 'microphone'
+  let bridge: AudioBridge | undefined
+
+  function configureSource(kind: AudioSourceKind, bridgeInstance: AudioBridge | undefined) {
+    sourceKind = kind
+    bridge = bridgeInstance
+  }
+
+  let source: AudioSourceHandle | null = null
   let recTap: CaptureNode | null = null
 
   function stop() {
-    stream?.getTracks().forEach((t) => t.stop())
-    stream = null
-
     if (recTap) {
       recTap.disconnect()
       recTap = null
@@ -43,36 +57,48 @@ function createGlobalAudio() {
     analyser()?.disconnect()
     setAnalyser(null)
 
-    audioCtx?.close()
-    audioCtx = null
+    // release() is a no-op for a bridge source (the bridge owns its own
+    // AudioContext lifecycle — see acquireBridgeSource()'s comment) and a
+    // real teardown (stop mic tracks, close the context) for a microphone
+    // source. Either way, this is the only call needed; there's nothing
+    // left for this module to close/stop directly.
+    source?.release()
+    source = null
 
     setState((prev) => ({ ...prev, isRecording: false, error: null }))
   }
 
   async function start(): Promise<AnalyserNode | null> {
     try {
-      if (audioCtx) stop()
+      if (source) stop()
 
-      const mediaStream = await navigator.mediaDevices.getUserMedia({
-        audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false },
-      })
-      stream = mediaStream
-
-      const ctx = new AudioContext()
-      audioCtx = ctx
+      let handle: AudioSourceHandle
+      if (sourceKind === 'bridge') {
+        const bridgeSource = bridge ? acquireBridgeSource(bridge) : null
+        if (!bridgeSource) throw new Error('Connect to the bridge (Listen to Radio) before selecting it as the audio source')
+        handle = bridgeSource
+      } else {
+        handle = await acquireMicrophoneSource()
+      }
+      source = handle
+      const ctx = handle.ctx
 
       const node = ctx.createAnalyser()
       node.fftSize = 4096
       node.smoothingTimeConstant = 0.75
+      handle.node.connect(node)
 
-      const source = ctx.createMediaStreamSource(mediaStream)
-      source.connect(node)
-
-      // Keep the audio graph alive with a near-silent gain node
-      const silencer = ctx.createGain()
-      silencer.gain.value = 0.001
-      node.connect(silencer)
-      silencer.connect(ctx.destination)
+      // Keep the audio graph alive with a near-silent gain node — only
+      // needed for a fresh microphone AudioContext; the bridge's own
+      // context already has a real (non-silent) path to destination from
+      // its own playback graph, so adding another one here would just be
+      // redundant, not harmful, but skip it for clarity.
+      if (handle.kind === 'microphone') {
+        const silencer = ctx.createGain()
+        silencer.gain.value = 0.001
+        node.connect(silencer)
+        silencer.connect(ctx.destination)
+      }
 
       // Ring-buffer tap for the retroactive "Rec" feature — continuously
       // feeds the last N seconds of input audio to audioRecorder so it can
@@ -82,7 +108,7 @@ function createGlobalAudio() {
       const tap = await createCaptureNode(ctx, 4096, (samples) => {
         audioRecorder.write('input', samples, ctx.sampleRate)
       })
-      source.connect(tap.node)
+      node.connect(tap.node)
       recTap = tap
 
       setAnalyser(node)
@@ -98,7 +124,7 @@ function createGlobalAudio() {
     }
   }
 
-  return { state, analyser, start, stop }
+  return { state, analyser, start, stop, configureSource }
 }
 
 export const globalAudio = createGlobalAudio()

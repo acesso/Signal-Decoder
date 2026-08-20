@@ -3,6 +3,7 @@
 #include <stdbool.h>
 #include <string.h>
 
+#include "driver/gpio.h"
 #include "driver/uart.h"
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -12,6 +13,7 @@
 #include "bridge_config.h"
 #include "bridge_settings.h"
 #include "bridge_state.h"
+#include "cat_log.h"
 
 static const char *TAG = "cat_bridge";
 
@@ -131,6 +133,7 @@ static void feed_cat_snoop(cat_linebuf_t *lb, const uint8_t *data, size_t len, b
         if (c == ';') {
             try_extract_vfo(lb->buf, lb->len);
             try_extract_smeter(lb->buf, lb->len);
+            cat_log_append(from_radio, lb->buf, lb->len);
             lb->len = 0;
             continue;
         }
@@ -169,6 +172,18 @@ static void uart_open(int baud) {
     ESP_ERROR_CHECK(uart_param_config(CAT_UART_PORT, &cfg));
     ESP_ERROR_CHECK(uart_set_pin(CAT_UART_PORT, CAT_UART_TX_PIN, CAT_UART_RX_PIN,
                                   UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
+    // Supplements whatever pull-up the level shifter's LV side provides —
+    // added after real-hardware testing found the LV-side RX line sagging
+    // to ~3.0V (from a nominal ~3.3V idle-high) under nothing heavier than
+    // a multimeter probe's own loading, with visibly more corruption while
+    // probing. That's the signature of a too-weak external pull-up for the
+    // actual line capacitance/length, not a logic-level or polarity fault.
+    // The ESP32's internal pull-up is weak (~45kOhm) — too weak to fight a
+    // real driven signal, but it adds a second current path that can only
+    // help an already-marginal line hold its idle-high level more firmly.
+    // uart_set_pin() only handles GPIO-matrix routing, not pull resistors,
+    // so this needs its own explicit call.
+    ESP_ERROR_CHECK(gpio_set_pull_mode(CAT_UART_RX_PIN, GPIO_PULLUP_ONLY));
     ESP_LOGI(TAG, "UART2 open at %d baud (TX=%d RX=%d)", baud, CAT_UART_TX_PIN, CAT_UART_RX_PIN);
 }
 
@@ -183,22 +198,36 @@ static void uart_open(int baud) {
 // same as if a browser had asked.
 static const char BOOT_QUERY[] = "FA;SM;";
 
-// Retried a few times, spaced out, since a reply can be eaten by the LCD/
-// UART pin-share noise (see the firmware README's "known hardware quirk")
-// or simply miss the radio's boot window — same reasoning as the web app's
-// own FV;/AI; discovery retries in useRadioCAT.ts. Each attempt is
-// unconditional (no "did the last one already succeed?" check) since
-// re-asking a redundant FA;/SM; is harmless and simpler than wiring this
-// task to watch bridge_state for confirmation.
-#define BOOT_QUERY_RETRIES   3
-#define BOOT_QUERY_RETRY_MS  500
+// Retried a few times, spaced out, since a reply can occasionally be lost
+// to line noise or simply miss the radio's boot window — same reasoning as
+// the web app's own FV;/AI; discovery retries in useRadioCAT.ts.
+//
+// Stops as soon as a genuinely clean frame is confirmed (last_vfo_hz
+// becomes nonzero — try_extract_vfo() only ever sets that from a full,
+// validly-digited "FA" frame, so this can't be fooled by a lucky-looking
+// garbled byte) rather than always running the full retry count.
+#define BOOT_QUERY_MAX_RETRIES 5
+#define BOOT_QUERY_RETRY_MS    500
 
 static void boot_query_task(void *arg) {
-    for (int i = 0; i < BOOT_QUERY_RETRIES; i++) {
+    for (int i = 0; i < BOOT_QUERY_MAX_RETRIES; i++) {
         vTaskDelay(pdMS_TO_TICKS(BOOT_QUERY_RETRY_MS));
-        ESP_LOGI(TAG, "boot query -> radio: %s (attempt %d/%d)", BOOT_QUERY, i + 1, BOOT_QUERY_RETRIES);
+
+        bridge_state_t st;
+        bridge_state_get(&st);
+        if (st.last_vfo_hz != 0) {
+            ESP_LOGI(TAG, "boot query: clean frame confirmed (VFO=%u Hz) after %d attempt(s) — stopping",
+                     (unsigned)st.last_vfo_hz, i);
+            vTaskDelete(NULL);
+            return;
+        }
+
+        ESP_LOGI(TAG, "boot query -> radio: %s (attempt %d/%d, no clean reply confirmed yet)",
+                 BOOT_QUERY, i + 1, BOOT_QUERY_MAX_RETRIES);
         uart_write_bytes(CAT_UART_PORT, BOOT_QUERY, sizeof(BOOT_QUERY) - 1);
     }
+    ESP_LOGW(TAG, "boot query: gave up after %d attempts with no clean reply — radio may be off or disconnected",
+             BOOT_QUERY_MAX_RETRIES);
     vTaskDelete(NULL);
 }
 
@@ -254,4 +283,10 @@ int cat_bridge_write(const uint8_t *data, size_t len) {
 void cat_bridge_set_baud(int baud) {
     ESP_LOGI(TAG, "changing CAT UART baud to %d", baud);
     ESP_ERROR_CHECK(uart_set_baudrate(CAT_UART_PORT, baud));
+    // Any bytes already sitting in the driver's RX ring buffer were
+    // sampled at the OLD baud rate — without this flush, they'd still be
+    // delivered to uart_read_bytes() after the switch and get misread as
+    // garbage at the new bit timing, indistinguishable from a genuine
+    // line-noise problem.
+    ESP_ERROR_CHECK(uart_flush_input(CAT_UART_PORT));
 }

@@ -478,6 +478,37 @@ export function useRadioCAT(): RadioCATControls {
   // read loop distinguish "user clicked Disconnect" from "port vanished".
   let closing = false;
 
+  // Auto-reconnect (WEBSOCKET TRANSPORT ONLY — a dropped Web Serial port
+  // needs a fresh requestPort() user gesture, which can't be automated, so
+  // 'serial' keeps its existing manual-reconnect behavior unchanged).
+  // lastWsConfig holds whatever connect() config was last used with
+  // transport:'websocket', so a scheduled retry can call connect() again
+  // with the exact same settings. connectGeneration is bumped on every
+  // connect()/disconnect() — a scheduled reconnect captures its own
+  // generation and checks it's still current before firing, so an old
+  // timer left over from a previous session (superseded by a fresh
+  // connect() or cancelled by disconnect()) can never fire on top of it.
+  let lastWsConfig: CATConnectionConfig | null = null;
+  let connectGeneration = 0;
+  let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  // Exponential backoff (2s, 4s, 8s, ... capped at 30s), not a fixed
+  // interval — found on real hardware that this loop, running alongside
+  // useAudioBridge.ts's own independent 2s /audio reconnect loop, turned
+  // one marginal Wi-Fi link into a self-sustaining retry storm: up to 30
+  // combined reconnect attempts/minute across both sockets, each one
+  // itself consuming the ESP32's limited Wi-Fi/TCP resources, which never
+  // gave a struggling link a quiet window to actually settle — the bridge
+  // sat in continuous connect-fail-close churn for 6+ minutes straight
+  // rather than a handful of failed attempts before recovering or giving
+  // up. reconnectAttempt resets to 0 on every successful connect (see
+  // where `connected: true` is set below), so a connection that's
+  // actually stable goes right back to fast (2s) retries the next time it
+  // genuinely drops.
+  const RECONNECT_BASE_DELAY_MS = 2000;
+  const RECONNECT_MAX_DELAY_MS = 30000;
+  let reconnectAttempt = 0;
+  const nextReconnectDelayMs = () => Math.min(RECONNECT_BASE_DELAY_MS * 2 ** reconnectAttempt++, RECONNECT_MAX_DELAY_MS);
+
   const lastSet = {
     frequency: 0, mode: 0, volume: 0, att1: 0, att2: 0, nr: 0, agc: 0, agcLevel: 0, filter: 0, drive: 0, backlight: 0,
   };
@@ -745,7 +776,7 @@ export function useRadioCAT(): RadioCATControls {
 
   // ── Serial read loop ─────────────────────────────────────────────────────
 
-  const startReadLoop = (r: ReadableStreamDefaultReader<Uint8Array>) => {
+  const startReadLoop = (r: ReadableStreamDefaultReader<Uint8Array>, generation: number) => {
     const dec = new TextDecoder();
     (async () => {
       log('debug', 'read loop started');
@@ -776,17 +807,45 @@ export function useRadioCAT(): RadioCATControls {
         // device re-enumerated for serial; bridge rebooted or Wi-Fi dropped
         // for the WebSocket transport) — tear down cleanly and surface a
         // friendly warning instead of an unhandled NetworkError.
-        if (!closing && (port || ws)) {
-          log('warn', ws
+        //
+        // generation !== connectGeneration means this read loop belongs to
+        // an already-superseded session (a newer connect()/disconnect()
+        // happened since it started) — its exit carries no information
+        // worth acting on now, so skip straight past both the teardown and
+        // any reconnect scheduling below.
+        if (generation === connectGeneration && !closing && (port || ws)) {
+          const wasWebSocket = ws !== null;
+          const configToRetry = lastWsConfig;
+          log('warn', wasWebSocket
             ? 'CAT bridge connection lost (Wi-Fi dropped / bridge rebooted)'
             : 'serial port lost unexpectedly (cable unplugged / device re-enumerated)');
           disconnect();
-          setState(prev => ({
-            ...prev,
-            error: ws
-              ? 'Radio connection lost — CAT bridge unreachable. Reconnect when it’s back.'
-              : 'Radio connection lost — CAT cable unplugged or port closed. Reconnect when it’s back.',
-          }));
+          if (wasWebSocket && configToRetry) {
+            // Auto-reconnect — the operator asked to be connected and
+            // hasn't said otherwise; a bridge reboot or a brief Wi-Fi
+            // hiccup shouldn't require noticing the error and manually
+            // clicking Connect again. Serial intentionally has no
+            // equivalent: a dropped Web Serial port needs a fresh
+            // requestPort() user gesture that can't be automated, so it
+            // keeps the existing manual-reconnect behavior below.
+            setState(prev => ({
+              ...prev,
+              error: 'CAT bridge connection lost — reconnecting automatically...',
+            }));
+            const retryGeneration = connectGeneration; // disconnect() just bumped it; capture post-bump
+            const delay = nextReconnectDelayMs();
+            log('info', `scheduling CAT bridge auto-reconnect in ${delay}ms (attempt ${reconnectAttempt})`);
+            reconnectTimer = setTimeout(() => {
+              if (retryGeneration !== connectGeneration) return; // superseded by a newer connect()/disconnect() while waiting
+              log('info', 'attempting CAT bridge auto-reconnect');
+              void connect(configToRetry);
+            }, delay);
+          } else {
+            setState(prev => ({
+              ...prev,
+              error: 'Radio connection lost — CAT cable unplugged or port closed. Reconnect when it’s back.',
+            }));
+          }
         }
       }
     })();
@@ -1006,6 +1065,13 @@ export function useRadioCAT(): RadioCATControls {
   function disconnect() {
     log('info', 'disconnecting');
     closing = true;
+    // Cancel any pending auto-reconnect and invalidate it via the
+    // generation bump below — an explicit disconnect() means the operator
+    // no longer wants this connection, not "try again in a moment."
+    if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+    connectGeneration++;
+    reconnectAttempt = 0; // a fresh connect() afterward should start at the fast end of the backoff, not inherit a stale count
+    lastWsConfig = null;
     if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
     pollRunning = false;
     if (inflight) {
@@ -1037,6 +1103,14 @@ export function useRadioCAT(): RadioCATControls {
   }
 
   const connect = async (config: CATConnectionConfig) => {
+    // Invalidates any reconnect timer left over from a previous session —
+    // a fresh connect() (manual or auto-retry) always supersedes an older
+    // one. See the reconnect state block's comment above for the full
+    // generation-counter reasoning.
+    if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+    connectGeneration++;
+    const generation = connectGeneration;
+
     debug = config.debug;
     const transport = config.transport ?? 'serial';
     transportKind = transport;
@@ -1069,7 +1143,8 @@ export function useRadioCAT(): RadioCATControls {
         ws     = socket;
         writer = w;
         reader = r;
-        startReadLoop(r);
+        lastWsConfig = config; // remembered for startReadLoop's auto-reconnect on an unexpected close
+        startReadLoop(r, generation);
       } else {
         let p: SerialPort;
         if (useMock) {
@@ -1093,8 +1168,9 @@ export function useRadioCAT(): RadioCATControls {
         writer = p.writable.getWriter();
         const r = p.readable.getReader();
         reader = r;
-        startReadLoop(r);
+        startReadLoop(r, generation);
       }
+      reconnectAttempt = 0;
       setState(prev => ({ ...prev, connected: true, error: null }));
       log('info', 'polling every', config.pollIntervalMs + 'ms');
       schedulePoll();
@@ -1131,10 +1207,30 @@ export function useRadioCAT(): RadioCATControls {
       }
     } catch (err) {
       log('info', 'connection failed:', err);
-      setState(prev => ({
-        ...prev, connected: false,
-        error: err instanceof Error ? err.message : 'Connection failed',
-      }));
+      // Auto-retry a failed WEBSOCKET connect the same way an unexpected
+      // post-open close does (see startReadLoop's finally block) — the
+      // most common failure here is retrying too soon after a bridge
+      // reboot (still mid-boot, not yet listening), not a permanently
+      // wrong URL, so a bare one-shot failure shouldn't require noticing
+      // the error and clicking Connect again.
+      if (transport === 'websocket' && generation === connectGeneration) {
+        setState(prev => ({
+          ...prev, connected: false,
+          error: 'CAT bridge unreachable — retrying automatically...',
+        }));
+        const delay = nextReconnectDelayMs();
+        log('info', `scheduling CAT bridge retry in ${delay}ms (attempt ${reconnectAttempt})`);
+        reconnectTimer = setTimeout(() => {
+          if (generation !== connectGeneration) return; // superseded while waiting
+          log('info', 'retrying CAT bridge connect after failure');
+          void connect(config);
+        }, delay);
+      } else {
+        setState(prev => ({
+          ...prev, connected: false,
+          error: err instanceof Error ? err.message : 'Connection failed',
+        }));
+      }
     }
   };
 
