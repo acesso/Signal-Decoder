@@ -1,8 +1,9 @@
 // Port of src/components/SSTVDecoder.tsx (Next.js app).
 import { createEffect, createMemo, createSignal, For, onCleanup, onMount, Show, type JSX } from 'solid-js'
 import type { DecoderProps, DecoderControls } from '../lib/decoderControls'
-import AudioAnalysisPanel from './AudioAnalysisPanel'
+import SignalAnalysisPanel from './SignalAnalysisPanel'
 import { createAudioProcessor, type CapturedImage, type SSTVMode } from '../lib/sstv/audioProcessor'
+import type { AudioSourceKind } from '../lib/audio/audioSource'
 import { SSTV_MODES } from '$decoder-lib/sstv/constants'
 import { DecoderState } from '$decoder-lib/sstv/decoder'
 import { loadNumberArray, saveNumberArray } from '$decoder-lib/storage'
@@ -167,7 +168,12 @@ export default function SSTVDecoder(props: DecoderProps & { onReply?: (img: Capt
     })
   })
 
-  const processor = createAudioProcessor({ manualMode, autoDetect, autoSlant })
+  // Same iqBridge-first/audioBridge/microphone precedence as
+  // FTDecoder.tsx's audioSourceKind()/getBridge() — see that file's comment.
+  const audioSourceKind = (): AudioSourceKind =>
+    props.iqBridge?.state().connected ? 'bridge' : props.audioBridge?.state().playbackActive ? 'bridge' : 'microphone'
+  const getBridge = () => (props.iqBridge?.state().connected ? props.iqBridge : props.audioBridge)
+  const processor = createAudioProcessor({ manualMode, autoDetect, autoSlant }, audioSourceKind, getBridge)
 
   createEffect(() => {
     void manualMode()
@@ -285,15 +291,44 @@ export default function SSTVDecoder(props: DecoderProps & { onReply?: (img: Capt
           <div class="h-full w-px bg-[#30363d] transition-colors group-hover:bg-[#2ea043]/50" />
         </div>
 
-        {/* Panel 2 — Audio Analysis */}
-        <AudioAnalysisPanel
-          analyser={props.analyser ?? null}
-          isRecording={processor.state().isRecording}
-          vfoFrequency={props.vfoFrequency}
-          storageKeyPrefix="sstv"
-          class="min-w-0"
-          style={{ flex: panelWeights()[1] }}
-        />
+        {/* Panel 2 — Audio Analysis. In I/Q mode (see audioSourceKind()
+            above), shows the bridge's own wideband I/Q spectrum with a
+            draggable passband marker that retunes useIQBridge.ts's
+            SSBDemodulator — same pattern as FTDecoder.tsx's identical
+            branch. SSTV has no tone/frequency markers of its own today, so
+            there's nothing to preserve in the fallback branch beyond the
+            plain analyser view it already had. */}
+        <Show
+          when={props.iqBridge?.state().connected}
+          fallback={
+            <SignalAnalysisPanel
+              analyser={props.analyser ?? null}
+              isRecording={processor.state().isRecording}
+              vfoFrequency={props.vfoFrequency}
+              storageKeyPrefix="sstv"
+              class="min-w-0"
+              style={{ flex: panelWeights()[1] }}
+            />
+          }
+        >
+          <SignalAnalysisPanel
+            analyser={null}
+            iqSource={{
+              computer: props.iqBridge!.spectrum,
+              sampleRateHz: () => props.iqBridge!.state().sampleRateHz,
+              active: () => props.iqBridge!.state().connected,
+            }}
+            isRecording={processor.state().isRecording}
+            vfoFrequency={props.vfoFrequency}
+            storageKeyPrefix="sstv_iq"
+            defaultMaxHz={props.iqBridge!.state().sampleRateHz / 2}
+            passband={{ centerHz: props.iqBridge!.state().passbandCenterHz, bandwidthHz: props.iqBridge!.state().passbandBandwidthHz }}
+            onPassbandChange={(p) => props.iqBridge!.setPassband(p.centerHz, p.bandwidthHz)}
+            markerFieldLabel="Passband"
+            class="min-w-0"
+            style={{ flex: panelWeights()[1] }}
+          />
+        </Show>
 
         {/* Drag handle 1<->2 */}
         <div

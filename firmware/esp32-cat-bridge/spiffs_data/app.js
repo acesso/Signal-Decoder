@@ -77,7 +77,13 @@ async function refreshStatus(silent) {
 
     updatePaCard(status.pa_sense, status.pa_emergency_tripped);
     if (typeof status.adc_input === 'string') updateAudioInputButtons(status.adc_input);
-    if (typeof status.rx_slot_right === 'boolean') updateRxSlotButtons(status.rx_slot_right);
+    // input_mode processed BEFORE rx_slot_right — updateInputModeButtons()
+    // itself calls updateRxSlotButtons() (to force both-active in I/Q
+    // mode), so currentInputMode must already reflect the real value by
+    // the time this line runs, not still be yesterday's/the initial
+    // placeholder ("audio") while rx_slot_right applies.
+    if (typeof status.input_mode === 'string') updateInputModeButtons(status.input_mode);
+    if (typeof status.rx_slot_right === 'boolean') updateRxSlotButtons(status.rx_slot_right, status.input_mode === 'iq');
     if (typeof status.led_enabled === 'boolean') updateLedEnableButtons(status.led_enabled);
     if (typeof status.alc_enabled === 'boolean') updateAlcButtons(status.alc_enabled);
     if (typeof status.noise_gate_enabled === 'boolean') updateNoiseGateButtons(status.noise_gate_enabled);
@@ -170,10 +176,30 @@ audioInputBtns.forEach((btn) => btn.addEventListener('click', () => void setAudi
 // on either one depending on board wiring, independent of which physical
 // pins the mux selects — real-hardware testing needed both axes swept
 // together, not just one.
+//
+// Independent buttons (not a radio-button-styled exclusive pair) — but
+// still functionally exclusive to each other WHILE in "audio" input mode:
+// clicking Left calls POST /rx-slot {right:false}, which the firmware
+// applies as MONO+LEFT, so Right visibly deactivates as a side effect of
+// the same request, not because these buttons fight each other client-side.
+// The only way both are ever actually active at once is I/Q input mode,
+// which captures both channels unconditionally (see audio_monitor.c) —
+// these buttons reflect that but don't drive it, and are disabled while
+// I/Q mode is selected since clicking either one wouldn't mean anything
+// (there's no live "drop to mono" toggle for I/Q capture; switching back
+// to audio mode, which reboots, is what changes this axis in that case).
 const rxSlotBtns = document.querySelectorAll('[data-rx-slot]');
+// Tracked so updateInputModeButtons() can re-render this row (e.g. forcing
+// both-active while I/Q is selected) without needing a fresh /status
+// round-trip just to know which slot was last selected in audio mode.
+let lastRxSlotIsRight = false;
 
-function updateRxSlotButtons(isRight) {
-  rxSlotBtns.forEach((btn) => btn.classList.toggle('active', (btn.dataset.rxSlot === 'right') === isRight));
+function updateRxSlotButtons(isRight, iqModeActive) {
+  lastRxSlotIsRight = isRight;
+  rxSlotBtns.forEach((btn) => {
+    btn.classList.toggle('active', iqModeActive || (btn.dataset.rxSlot === 'right') === isRight);
+    btn.disabled = iqModeActive;
+  });
 }
 
 async function setRxSlot(right) {
@@ -185,7 +211,7 @@ async function setRxSlot(right) {
     });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const result = await res.json();
-    updateRxSlotButtons(result.right);
+    updateRxSlotButtons(result.right, currentInputMode === 'iq');
     showMsg(result.applied ? `ADC RX channel set to ${result.right ? 'right' : 'left'}.` : 'Failed to switch RX channel.',
             result.applied ? 'ok' : 'error');
   } catch (err) {
@@ -334,27 +360,93 @@ async function setSpeakerAmpEnabled(enabled) {
 
 speakerAmpBtns.forEach((btn) => btn.addEventListener('click', () => void setSpeakerAmpEnabled(btn.dataset.speakerAmpEnable === 'true')));
 
+// ── Input mode (audio / I/Q) ─────────────────────────────────────────────
+// Which physical signal the line-in jack is expected to carry — "audio"
+// (today's original mode: demodulated SSB/audio, mono, broadcast on
+// /audio) or "iq" (raw wideband in-phase/quadrature from the radio, I on
+// the ADC's left channel/Q on the right, captured as true stereo,
+// broadcast on the separate /iq-data). See bridge_settings.h's
+// input_mode_name comment and audio_monitor.c's iq_mode branches for the
+// full firmware-side reasoning. REBOOTS to apply, same as sample rate below
+// — switching this reconfigures the I2S RX channel's slot mode (mono vs
+// stereo), a boot-time-only operation in this firmware.
+const inputModeBtns = document.querySelectorAll('[data-input-mode]');
+let currentInputMode = 'audio'; // updated by refreshStatus(); read by setSampleRate()'s 96k gate below
+
+function updateInputModeButtons(mode) {
+  currentInputMode = mode;
+  inputModeBtns.forEach((btn) => btn.classList.toggle('active', btn.dataset.inputMode === mode));
+  updateRxSlotButtons(lastRxSlotIsRight, mode === 'iq');
+  update96kButtonAvailability();
+}
+
+async function setInputMode(mode) {
+  if (mode === currentInputMode) return;
+  if (!confirm(`Switch input mode to "${mode}"? This saves the setting and restarts the bridge (~5-10s) to apply it.${
+    mode === 'audio' ? ' If the saved sample rate is 96kHz (I/Q-only), change it to an audio-mode rate first.' : ''
+  }`)) return;
+  try {
+    const res = await fetch('/input-mode', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ mode }),
+    });
+    if (!res.ok) {
+      const errText = await res.text().catch(() => '');
+      throw new Error(errText || `HTTP ${res.status}`);
+    }
+    showMsg(`Input mode set to "${mode}" — bridge restarting...`, 'ok');
+  } catch (err) {
+    showMsg(`Failed to set input mode: ${err.message}`, 'error');
+  }
+}
+
+inputModeBtns.forEach((btn) => btn.addEventListener('click', () => void setInputMode(btn.dataset.inputMode)));
+
 // ── Sample rate ────────────────────────────────────────────────────────────
-// The /audio WebSocket's wire rate IS the codec/I2S hardware's own rate —
-// unlike every other toggle on this page, changing this persists to NVS
-// AND REBOOTS the bridge to apply (a live I2S/codec reclock was
-// deliberately avoided — see bridge_config.h), so this needs a confirm
-// prompt the other live-switchable controls don't.
+// The /audio (or /iq-data, in I/Q mode) WebSocket's wire rate IS the
+// codec/I2S hardware's own rate — unlike every other toggle on this page,
+// changing this persists to NVS AND REBOOTS the bridge to apply (a live
+// I2S/codec reclock was deliberately avoided — see bridge_config.h), so
+// this needs a confirm prompt the other live-switchable controls don't.
 const sampleRateBtns = document.querySelectorAll('[data-sample-rate]');
+const sampleRate96kBtn = document.getElementById('sample-rate-96k');
+const iqUnsupportedRateBtns = document.querySelectorAll('.iq-unsupported-rate');
+
+// 96kHz only makes sense (and is only accepted by the firmware — see
+// http_control.c's SUPPORTED_IQ_SAMPLE_RATES_HZ) in I/Q mode; disabled
+// rather than hidden in audio mode so its existence/purpose stays visible
+// even when it's not clickable.
+//
+// 22.05k/44.1k are the inverse: available in audio mode, disabled in I/Q
+// mode — real-hardware captures showed unique, reproducible spectral
+// artifacts at exactly those two rates in I/Q mode (see
+// SUPPORTED_IQ_SAMPLE_RATES_HZ's comment), not present at any other rate.
+function update96kButtonAvailability() {
+  if (!sampleRate96kBtn) return;
+  sampleRate96kBtn.disabled = currentInputMode !== 'iq';
+  iqUnsupportedRateBtns.forEach((btn) => { btn.disabled = currentInputMode === 'iq'; });
+}
 
 function updateSampleRateButtons(hz) {
   sampleRateBtns.forEach((btn) => btn.classList.toggle('active', Number(btn.dataset.sampleRate) === hz));
 }
 
 async function setSampleRate(hz) {
-  if (!confirm(`Change sample rate to ${hz} Hz? This saves the setting and restarts the bridge (~5-10s) to apply it.`)) return;
+  const extraWarning = hz === 96000
+    ? ' 96kHz switches the ES8388 into double-speed mode, which is less proven than the other rates on this board — if it doesn\'t clock cleanly, switch back to 48kHz.'
+    : '';
+  if (!confirm(`Change sample rate to ${hz} Hz? This saves the setting and restarts the bridge (~5-10s) to apply it.${extraWarning}`)) return;
   try {
     const res = await fetch('/sample-rate', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ hz }),
     });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    if (!res.ok) {
+      const errText = await res.text().catch(() => '');
+      throw new Error(errText || `HTTP ${res.status}`);
+    }
     showMsg(`Sample rate set to ${hz} Hz — bridge restarting...`, 'ok');
   } catch (err) {
     showMsg(`Failed to set sample rate: ${err.message}`, 'error');
@@ -499,6 +591,9 @@ async function refreshSystemStats() {
     document.getElementById('cpu-heap-free').textContent = fmtBytes(stats.heap_free);
     document.getElementById('cpu-heap-min').textContent = fmtBytes(stats.heap_min_free);
     document.getElementById('cpu-heap-total').textContent = fmtBytes(stats.heap_total);
+    document.getElementById('cpu-heap-largest').textContent = fmtBytes(stats.heap_largest_free_block);
+    document.getElementById('cpu-dma-free').textContent = fmtBytes(stats.dma_free);
+    document.getElementById('cpu-dma-largest').textContent = fmtBytes(stats.dma_largest_free_block);
 
     cpuTaskBody.innerHTML = '';
     for (const task of stats.tasks || []) {
@@ -1155,6 +1250,230 @@ const CLIP_FLASH_MS = 250;
 const NOISE_FLOOR_WINDOW_MS = 4000;
 const DC_OFFSET_WARN = 0.03; // ~3% of full-scale
 
+// ── I/Q wideband spectrum ─────────────────────────────────────────────────
+// Reads raw interleaved I/Q from ws://<device>/iq-data (see firmware's
+// audio_iq.h) and renders a full complex-FFT spectrum/waterfall — NOT the
+// browser's built-in AnalyserNode (used everywhere else on this page),
+// which only computes a REAL-valued FFT and therefore can't represent I/Q
+// data at all: a complex signal has independently meaningful positive AND
+// negative frequency content (a real-valued FFT's negative half is just
+// the mirror of its positive half, redundant information; a complex FFT's
+// two halves are genuinely different signals — e.g. distinguishing a
+// wanted signal above the LO from an image/interferer below it). Plain
+// radix-2 iterative FFT, no library — same "no bundler" reasoning as the
+// rest of this page.
+function fftRadix2(re, im) {
+  const n = re.length;
+  // Bit-reversal permutation.
+  for (let i = 1, j = 0; i < n; i++) {
+    let bit = n >> 1;
+    for (; j & bit; bit >>= 1) j ^= bit;
+    j ^= bit;
+    if (i < j) {
+      let t = re[i]; re[i] = re[j]; re[j] = t;
+      t = im[i]; im[i] = im[j]; im[j] = t;
+    }
+  }
+  for (let len = 2; len <= n; len <<= 1) {
+    const ang = (-2 * Math.PI) / len;
+    const wRe = Math.cos(ang), wIm = Math.sin(ang);
+    for (let i = 0; i < n; i += len) {
+      let curRe = 1, curIm = 0;
+      for (let k = 0; k < len / 2; k++) {
+        const uRe = re[i + k], uIm = im[i + k];
+        const vRe = re[i + k + len / 2] * curRe - im[i + k + len / 2] * curIm;
+        const vIm = re[i + k + len / 2] * curIm + im[i + k + len / 2] * curRe;
+        re[i + k] = uRe + vRe;
+        im[i + k] = uIm + vIm;
+        re[i + k + len / 2] = uRe - vRe;
+        im[i + k + len / 2] = uIm - vIm;
+        const nextRe = curRe * wRe - curIm * wIm;
+        const nextIm = curRe * wIm + curIm * wRe;
+        curRe = nextRe; curIm = nextIm;
+      }
+    }
+  }
+}
+
+const IQ_FFT_SIZE = 4096; // power of 2 — ~11.7Hz/bin at 96kHz (768kHz/N... see bin-width readout), ~85ms latency per window at 48kHz
+const IQ_MIN_DB = -90;
+const IQ_MAX_DB = -10;
+
+const iqSpectrumBtn = document.getElementById('iq-spectrum-btn');
+const iqSpectrumReadout = document.getElementById('iq-spectrum-readout');
+const iqSpectrumBars = document.getElementById('iq-spectrum-bars');
+const iqSpectrumWaterfall = document.getElementById('iq-spectrum-waterfall');
+const iqFreqZoomInput = document.getElementById('iq-freq-zoom');
+const iqFreqZoomVal = document.getElementById('iq-freq-zoom-val');
+const iqContrastInput = document.getElementById('iq-contrast');
+const iqFreqMinEl = document.getElementById('iq-freq-min');
+const iqFreqMid1El = document.getElementById('iq-freq-mid1');
+const iqFreqMid2El = document.getElementById('iq-freq-mid2');
+const iqFreqMaxEl = document.getElementById('iq-freq-max');
+const iqSampleRateEl = document.getElementById('iq-sample-rate');
+const iqFftSizeEl = document.getElementById('iq-fft-size');
+const iqBinWidthEl = document.getElementById('iq-bin-width');
+const iqPeakEl = document.getElementById('iq-peak');
+
+let iqWs = null;
+let iqActive = false;
+// Rolling accumulation buffers — filled from arriving WS frames (whatever
+// size the firmware's 50ms read window produces at the configured rate,
+// see audio_monitor.c's s_read_samples) until IQ_FFT_SIZE complex samples
+// are ready, then FFT'd and cleared. Deliberately not a fixed-size ring
+// with overlap — a fresh, non-overlapping window each time is simpler and
+// this view is a diagnostic tool, not a waterfall needing maximum time
+// resolution.
+let iqAccumRe = new Float32Array(IQ_FFT_SIZE);
+let iqAccumIm = new Float32Array(IQ_FFT_SIZE);
+let iqAccumCount = 0;
+let iqFftRe = new Float32Array(IQ_FFT_SIZE);
+let iqFftIm = new Float32Array(IQ_FFT_SIZE);
+// Shifted (fftshift'd — bin 0 = most-negative frequency, bin N-1 = just
+// below +Nyquist, center bin = 0Hz) byte-scaled magnitude, same 0-255
+// log-dB-mapped convention as AnalyserNode.getByteFrequencyData() so
+// drawBarSpectrum()/drawWaterfallColumn() work unmodified.
+let iqMagBytes = new Uint8Array(IQ_FFT_SIZE);
+let iqLastPeakDb = -Infinity;
+
+function updateIqZoomLabel() {
+  const nyquist = bridgeSampleRate / 2;
+  const zoomFrac = Number(iqFreqZoomInput.value) / 100;
+  // 100 = full ±Nyquist span; smaller values zoom into the center (0Hz) —
+  // exponential mapping so the low end of the slider still gives a usable
+  // zoomed-in range instead of being squeezed into the first few percent.
+  const halfSpanHz = Math.max(nyquist * 0.01, nyquist * Math.pow(zoomFrac, 2));
+  iqFreqZoomVal.textContent = `±${Math.round(halfSpanHz)} Hz`;
+  const fmt = (hz) => (Math.abs(hz) >= 1000 ? `${(hz / 1000).toFixed(hz % 1000 === 0 ? 0 : 1)}k` : `${Math.round(hz)}`);
+  iqFreqMinEl.textContent = fmt(-halfSpanHz);
+  iqFreqMid1El.textContent = fmt(-halfSpanHz / 2);
+  iqFreqMid2El.textContent = fmt(halfSpanHz / 2);
+  iqFreqMaxEl.textContent = `${fmt(halfSpanHz)} Hz`;
+  iqFftSizeEl.textContent = String(IQ_FFT_SIZE);
+  iqBinWidthEl.textContent = `${(bridgeSampleRate / IQ_FFT_SIZE).toFixed(1)} Hz`;
+  iqSampleRateEl.textContent = `${bridgeSampleRate} Hz`;
+}
+iqFreqZoomInput.addEventListener('input', updateIqZoomLabel);
+updateIqZoomLabel();
+
+// Runs one FFT over whatever's accumulated in iqAccumRe/Im, fftshifts the
+// magnitude into display order, and maps to the same byte/dB scale
+// AnalyserNode uses (so drawBarSpectrum/drawWaterfallColumn need no
+// I/Q-specific branch). Called once per full IQ_FFT_SIZE window.
+function processIqWindow() {
+  iqFftRe.set(iqAccumRe);
+  iqFftIm.set(iqAccumIm);
+  fftRadix2(iqFftRe, iqFftIm);
+
+  const n = IQ_FFT_SIZE;
+  const half = n / 2;
+  let peakDb = -Infinity;
+  for (let i = 0; i < n; i++) {
+    // fftshift: output bin i (0..n-1, natural FFT order: 0..+Nyquist then
+    // -Nyquist..0) maps to display bin (i + half) % n, so the display
+    // array reads most-negative-frequency-first, 0Hz exactly at the center.
+    const srcIdx = i;
+    const dstIdx = (i + half) % n;
+    const mag = Math.sqrt(iqFftRe[srcIdx] * iqFftRe[srcIdx] + iqFftIm[srcIdx] * iqFftIm[srcIdx]) / n;
+    const db = 20 * Math.log10(Math.max(mag, 1e-12));
+    if (db > peakDb) peakDb = db;
+    const frac = (db - IQ_MIN_DB) / (IQ_MAX_DB - IQ_MIN_DB);
+    iqMagBytes[dstIdx] = Math.max(0, Math.min(255, Math.round(frac * 255)));
+  }
+  iqLastPeakDb = peakDb;
+  iqPeakEl.textContent = Number.isFinite(peakDb) ? `${peakDb.toFixed(1)} dB` : '—';
+}
+
+// Feeds one incoming interleaved-I/Q Int16Array frame into the
+// accumulator, running processIqWindow() every time it fills — a frame
+// can be smaller OR larger than the remaining space, so this loops rather
+// than assuming a 1:1 frame-to-window relationship (frame size depends on
+// the firmware's configured sample rate, window size is fixed).
+function feedIqSamples(int16) {
+  let offset = 0;
+  const pairCount = int16.length / 2;
+  while (offset < pairCount) {
+    const remaining = IQ_FFT_SIZE - iqAccumCount;
+    const take = Math.min(remaining, pairCount - offset);
+    for (let i = 0; i < take; i++) {
+      iqAccumRe[iqAccumCount + i] = int16[(offset + i) * 2] / 32768;
+      iqAccumIm[iqAccumCount + i] = int16[(offset + i) * 2 + 1] / 32768;
+    }
+    iqAccumCount += take;
+    offset += take;
+    if (iqAccumCount >= IQ_FFT_SIZE) {
+      processIqWindow();
+      iqAccumCount = 0;
+    }
+  }
+}
+
+function stopIqSpectrum() {
+  if (iqWs) { iqWs.close(); iqWs = null; }
+  iqActive = false;
+  iqAccumCount = 0;
+  iqSpectrumBtn.textContent = 'Start I/Q Spectrum';
+  iqSpectrumReadout.textContent = 'inactive';
+  iqSpectrumReadout.classList.remove('clipping');
+}
+
+async function startIqSpectrum() {
+  await fetchBridgeSampleRate(); // fresh — the configured rate may have changed since this page loaded
+  updateIqZoomLabel();
+  iqAccumCount = 0;
+
+  const url = new URL('/iq-data', location.href);
+  url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
+  const ws = new WebSocket(url.toString());
+  ws.binaryType = 'arraybuffer';
+  ws.onopen = () => {
+    iqWs = ws;
+    iqActive = true;
+    iqSpectrumBtn.textContent = 'Stop I/Q Spectrum';
+    iqSpectrumReadout.textContent = 'connected — waiting for data';
+    showMsg('I/Q spectrum connected.', 'ok');
+  };
+  ws.onmessage = (ev) => {
+    if (!(ev.data instanceof ArrayBuffer)) return;
+    feedIqSamples(new Int16Array(ev.data));
+  };
+  ws.onerror = () => {
+    showMsg('I/Q spectrum connection failed.', 'error');
+  };
+  ws.onclose = () => {
+    if (iqWs !== ws) return; // superseded by a newer start — this close is stale
+    stopIqSpectrum();
+  };
+}
+
+iqSpectrumBtn.addEventListener('click', () => {
+  if (iqActive) stopIqSpectrum();
+  else void startIqSpectrum();
+});
+
+function iqSpectrumTick() {
+  if (!iqActive) return;
+  const nyquist = bridgeSampleRate / 2;
+  const zoomFrac = Number(iqFreqZoomInput.value) / 100;
+  const halfSpanHz = Math.max(nyquist * 0.01, nyquist * Math.pow(zoomFrac, 2));
+  // Crop the shifted (0Hz-centered) magnitude array to ±halfSpanHz around
+  // the center bin — same idea as the other channels' Max-freq slider,
+  // just symmetric around the center instead of cropping from an edge.
+  const binHz = bridgeSampleRate / IQ_FFT_SIZE;
+  const halfBins = Math.max(1, Math.round(halfSpanHz / binHz));
+  const center = IQ_FFT_SIZE / 2;
+  const lo = Math.max(0, center - halfBins);
+  const hi = Math.min(IQ_FFT_SIZE, center + halfBins);
+  const cropped = iqMagBytes.subarray(lo, hi);
+
+  drawBarSpectrum(iqSpectrumBars, cropped, cropped.length, null);
+  drawWaterfallColumn(iqSpectrumWaterfall, cropped, cropped.length, Number(iqContrastInput.value));
+
+  if (Number.isFinite(iqLastPeakDb)) {
+    iqSpectrumReadout.textContent = `peak ${iqLastPeakDb.toFixed(1)} dB`;
+  }
+}
+
 function makeChannelState(prefix) {
   return {
     prefix,
@@ -1181,8 +1500,6 @@ function makeChannelState(prefix) {
       document.getElementById(`quality-${prefix}-freq-mid3`),
       document.getElementById(`quality-${prefix}-freq-max`),
     ],
-    freqAxisMaxAmpEl: document.getElementById(`quality-${prefix}-freq-max-amp`),
-    freqAxisMidAmpEl: document.getElementById(`quality-${prefix}-freq-mid-amp`),
     freqData: null,
     timeDataFloat: null,
     timeDataByte: null,
@@ -1211,7 +1528,11 @@ for (const st of [qualityIn, qualityOut]) {
 // before the slider existed; the radio's actual passband tops out well
 // below that (per operator report, ~3kHz), so the slider defaults to full
 // range but the operator can crop in for a bigger, more legible view of the
-// signal they actually have.
+// signal they actually have. One label row serves BOTH the bar spectrum and
+// the waterfall below it — both put frequency on the x-axis now (the
+// waterfall used to run frequency on y/time on x; see drawWaterfallColumn's
+// comment for why that changed), so they share this one axis instead of
+// each needing its own.
 function updateFreqAxisLabels(st) {
   const maxFreq = Number(st.freqRangeInput.value);
   st.freqRangeValEl.textContent = `${maxFreq} Hz`;
@@ -1220,8 +1541,6 @@ function updateFreqAxisLabels(st) {
   st.freqAxisEls[1].textContent = fmt(maxFreq * 0.5);
   st.freqAxisEls[2].textContent = fmt(maxFreq * 0.75);
   st.freqAxisEls[3].textContent = `${fmt(maxFreq)} Hz`;
-  if (st.freqAxisMaxAmpEl) st.freqAxisMaxAmpEl.textContent = `${fmt(maxFreq)} Hz`;
-  if (st.freqAxisMidAmpEl) st.freqAxisMidAmpEl.textContent = fmt(maxFreq * 0.5);
 }
 
 for (const st of [qualityIn, qualityOut]) {
@@ -1289,21 +1608,26 @@ function drawBarSpectrum(canvas, data, binCount, peakAmpFrac) {
   }
 }
 
-// Simple scrolling waterfall: shift the existing image left by 1px each
-// frame edge-in via drawImage-of-self, then paint one new column of pixels
-// on the right from the current spectrum. Column-wise (not row-wise like
-// GLSpectrogram's texture) since that's the cheap direction for a plain
-// 2D canvas — shifting whole-canvas pixel data via getImageData/putImageData
-// every frame would be far more main-thread work than this page needs.
+// Falling (top-down) waterfall, matching the Signal-Decoder web app's own
+// GLSpectrogram convention — frequency across x (shared with the bar
+// spectrum directly above this canvas), newest row painted at the top,
+// history scrolling DOWN. Previously this scrolled sideways instead (time
+// across x, frequency across y) — a real usability bug on this page
+// specifically, since every other frequency-domain view here (bar
+// spectrum, and the web app's own waterfall for comparison) puts frequency
+// on x; keep this consistent now that it's fixed. Row-wise shift (not
+// column-wise) is still the cheap direction for a plain 2D canvas — shifts
+// via drawImage-of-self, one plain getImageData/putImageData full-canvas
+// copy would be far more main-thread work than this page needs.
 // gamma < 1 boosts faint signal into visible color range (more contrast on
 // quiet passbands); gamma > 1 compresses it (less sensitive to noise floor).
 function drawWaterfallColumn(canvas, data, binCount, gamma) {
   const ctx = canvas.getContext('2d');
   const w = canvas.width, h = canvas.height;
   const n = Math.min(binCount, data.length);
-  ctx.drawImage(canvas, 1, 0, w - 1, h, 0, 0, w - 1, h);
-  for (let y = 0; y < h; y++) {
-    const bf = (1 - y / h) * (n - 1);
+  ctx.drawImage(canvas, 0, 0, w, h - 1, 0, 1, w, h - 1);
+  for (let x = 0; x < w; x++) {
+    const bf = (x / w) * (n - 1);
     const b0 = Math.floor(bf), b1 = Math.min(b0 + 1, n - 1);
     const raw = (data[b0] * (1 - (bf - b0)) + data[b1] * (bf - b0)) / 255;
     const v = Math.pow(Math.max(0, Math.min(1, raw)), gamma);
@@ -1312,7 +1636,7 @@ function drawWaterfallColumn(canvas, data, binCount, gamma) {
     const g = Math.round(Math.min(255, Math.max(0, 510 * Math.min(v, 1 - v) + 60)));
     const b = Math.round(Math.min(255, Math.max(0, 255 - 510 * v)));
     ctx.fillStyle = `rgb(${r},${g},${b})`;
-    ctx.fillRect(w - 1, y, 1, 1);
+    ctx.fillRect(x, 0, 1, 1);
   }
 }
 
@@ -1501,6 +1825,7 @@ function tickQualityChannel(st, analyser, active, now) {
 function qualityTick(now) {
   tickQualityChannel(qualityIn, playAnalyserNode, playbackActive, now);
   tickQualityChannel(qualityOut, sniffAnalyserNode, sniffActive, now);
+  iqSpectrumTick();
   requestAnimationFrame(qualityTick);
 }
 requestAnimationFrame(qualityTick);

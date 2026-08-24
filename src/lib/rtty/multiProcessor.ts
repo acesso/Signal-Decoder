@@ -10,6 +10,9 @@
 import { createSignal } from 'solid-js'
 import { RTTYDecoder as RTTYCoreDecoder, type RTTYConfig } from '$decoder-lib/rtty/decoder'
 import { createCaptureNode, type CaptureNode } from '$decoder-lib/audio/captureNode'
+import { acquireMicrophoneSource, acquireBridgeSource, type AudioSourceKind, type AudioSourceHandle } from '$decoder-lib/audio/audioSource'
+import type { AudioBridge } from '$decoder-lib/cat/useAudioBridge'
+import type { IQBridge } from '$decoder-lib/cat/useIQBridge'
 
 export interface ProcessorState {
   isRecording: boolean
@@ -25,6 +28,10 @@ export function createMultiRTTYProcessor(
   // squelch level gates every session, each against its OWN mark/space band
   // (sessions can be tuned to different frequencies).
   getSquelch: () => number = () => 0,
+  // Where capture comes from — see ft/processor.ts's identical params for
+  // the full reasoning; audioSource.ts's shape is deliberately mode-agnostic.
+  getAudioSourceKind: () => AudioSourceKind = () => 'microphone',
+  getAudioBridge: () => AudioBridge | IQBridge | undefined = () => undefined,
 ) {
   const [state, setState] = createSignal<ProcessorState>({
     isRecording: false,
@@ -35,8 +42,7 @@ export function createMultiRTTYProcessor(
   })
 
   let audioContext: AudioContext | null = null
-  let stream: MediaStream | null = null
-  let source: MediaStreamAudioSourceNode | null = null
+  let source: AudioSourceHandle | null = null
   let processor: CaptureNode | null = null
   let analyser: AnalyserNode | null = null
   let snrInterval: ReturnType<typeof setInterval> | null = null
@@ -155,12 +161,19 @@ export function createMultiRTTYProcessor(
 
   async function startRecording() {
     try {
-      const mediaStream = await navigator.mediaDevices.getUserMedia({
-        audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false },
-      })
-      stream = mediaStream
+      const kind = getAudioSourceKind()
+      let handle: AudioSourceHandle
+      if (kind === 'bridge') {
+        const bridge = getAudioBridge()
+        const bridgeSource = bridge ? acquireBridgeSource(bridge) : null
+        if (!bridgeSource) throw new Error('Connect to the bridge (Listen to Radio) before selecting it as the audio source')
+        handle = bridgeSource
+      } else {
+        handle = await acquireMicrophoneSource()
+      }
+      source = handle
 
-      const ctx = new AudioContext()
+      const ctx = handle.ctx
       audioContext = ctx
       const sampleRate = ctx.sampleRate
 
@@ -174,9 +187,6 @@ export function createMultiRTTYProcessor(
       analyserNode.smoothingTimeConstant = 0.75
       analyser = analyserNode
 
-      const sourceNode = ctx.createMediaStreamSource(mediaStream)
-      source = sourceNode
-
       const proc = await createCaptureNode(ctx, 4096, (input) => {
         applySquelch()
         decoders.forEach((decoder, id) => {
@@ -186,8 +196,8 @@ export function createMultiRTTYProcessor(
       })
       processor = proc
 
-      sourceNode.connect(analyserNode)
-      sourceNode.connect(proc.node)
+      handle.node.connect(analyserNode)
+      handle.node.connect(proc.node)
 
       snrInterval = setInterval(computeSNR, 200)
       setState((prev) => ({ ...prev, isRecording: true, errorMessage: null, status: 'syncing' }))
@@ -207,15 +217,16 @@ export function createMultiRTTYProcessor(
       snrInterval = null
     }
     processor?.disconnect()
-    source?.disconnect()
     analyser?.disconnect()
-    stream?.getTracks().forEach((t) => t.stop())
-    audioContext?.close()
+    // source's own context is the SOURCE's, not necessarily ours (bridge
+    // mode: the bridge's shared playCtx) — release() (not a raw ctx.close())
+    // is what correctly distinguishes "tear this down" from "just stop
+    // reading from it," matching ft/processor.ts's identical reasoning.
+    source?.release()
 
     processor = null
     source = null
     analyser = null
-    stream = null
     audioContext = null
 
     decoders.forEach((d) => d.reset())
@@ -225,10 +236,8 @@ export function createMultiRTTYProcessor(
   function destroy() {
     if (snrInterval) clearInterval(snrInterval)
     processor?.disconnect()
-    source?.disconnect()
     analyser?.disconnect()
-    stream?.getTracks().forEach((t) => t.stop())
-    audioContext?.close()
+    source?.release()
   }
 
   return {

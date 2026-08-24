@@ -9,12 +9,43 @@ CONFIG_IDF_TARGET="esp32"
 
 # Target board: AI-Thinker ESP32-A1S Audio Kit — 4MB flash (the ESP-IDF
 # default assumes 2MB, which is wrong for this board and would make
-# esptool misjudge the flash layout). DIO flash mode is compatible either
-# way; not switching to QIO since this firmware doesn't enable PSRAM
-# support (CONFIG_SPIRAM) — nothing here needs it yet, and enabling PSRAM
-# support without actually using it just costs RAM to the allocator's
-# bookkeeping for no benefit.
+# esptool misjudge the flash layout).
 CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+
+# 8MB PSRAM is physically present on this WROVER-class module (see README's
+# "PSRAM is present but unused" note — this is what makes it used). DIO
+# flash mode remains compatible with PSRAM on original ESP32 (esp_psram's
+# own Kconfig only requires the PSRAM WP/SD3 pin be correct, which ESP-IDF
+# auto-selects here; no QIO switch needed).
+#
+# Deliberately NOT setting CONFIG_SPIRAM_USE_MALLOC — plain malloc() stays
+# internal-RAM-only by default. Candidate buffers opt into PSRAM explicitly
+# via heap_caps_malloc(..., MALLOC_CAP_SPIRAM) at their own call sites
+# (see http_control.c, cpu_monitor.c, wifi_net.c, ws_server.c, audio_ws.c,
+# audio_sniff.c, audio_iq.c, cat_log.c) rather than letting every malloc()
+# in the codebase silently become PSRAM-eligible — the time-critical I2S/
+# CAT/PA-watchdog path must never land there (PSRAM can't back DMA
+# allocations and has materially higher access latency than internal RAM),
+# and an explicit opt-in per call site is a much safer way to guarantee
+# that than trusting SPIRAM_MALLOC_ALWAYSINTERNAL's size threshold to catch
+# every case correctly forever as the firmware evolves.
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_TYPE_AUTO=y
+CONFIG_SPIRAM_SPEED_40M=y
+# SPI RAM access method is a Kconfig CHOICE (SPIRAM_USE_MEMMAP /
+# SPIRAM_USE_CAPS_ALLOC / SPIRAM_USE_MALLOC), defaulting to
+# SPIRAM_USE_MALLOC (esp_psram/Kconfig.spiram.common) — that default would
+# make every plain malloc() in this codebase PSRAM-eligible, including the
+# still-malloc()-based hot-path buffers in audio_monitor.c (the
+# per-iteration I2S read buffer, fed straight into esp_codec_dev_read) and
+# the TX-path buffer in audio_ws.c that was deliberately kept off PSRAM.
+# Explicitly selecting SPIRAM_USE_CAPS_ALLOC instead means PSRAM is ONLY
+# reachable via heap_caps_malloc(..., MALLOC_CAP_SPIRAM) — plain malloc()
+# always stays internal-RAM-only, no exceptions, regardless of allocation
+# size or allocator heuristics. (A single "# X is not set" line does NOT
+# override a choice's default — the fix is selecting a different member of
+# the choice, which is what this does.)
+CONFIG_SPIRAM_USE_CAPS_ALLOC=y
 
 # esp_http_server + mdns + wifi together need more than the default 4KB
 # main-task stack during init (mdns_init/httpd_start allocate on the
@@ -97,3 +128,13 @@ CONFIG_FREERTOS_VTASKLIST_INCLUDE_COREID=y
 # task-starvation hang reboots automatically instead of requiring a human
 # to notice and power-cycle it.
 CONFIG_ESP_TASK_WDT_PANIC=y
+
+# NOTE: a WiFi dynamic-buffer-count reduction (32->16 for RX/TX/cache) was
+# tried here as a mitigation for /iq-data-during-TX contention, but the
+# user reported it made real-world TX degradation MORE noticeable, not
+# less — reverted pending further investigation. Real-hardware profiling
+# numbers (before revert) are preserved in the "Suspend I/Q spectrum
+# during TX" toggle's comment (RadioCATPanel.tsx/useFTTransmit.ts) and in
+# scripts/tx-plus-iqspectrum-profile.ts's own header for reference; don't
+# re-apply this specific change without re-confirming against real
+# hardware first.

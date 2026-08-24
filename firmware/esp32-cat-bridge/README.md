@@ -162,23 +162,99 @@ No compression — raw PCM at 8kHz is ~128kbit/s, trivial for Wi-Fi, and
 avoids running any codec math on the ESP32 (G.711/Opus were considered and
 explicitly not used — see the Known Limitations note on this choice).
 
-**Backpressure**: `/audio` and `/audio-mic-sniff` both broadcast on a fixed
-~50ms timer, and both share the bridge's ONE httpd worker task with `/cat`
-and every plain HTTP route (`GET /status`, etc — `httpd_queue_work()` just
-posts to that same task's control socket, there's no separate worker pool
-or queue depth). Broadcasting unconditionally on that timer, regardless of
-whether a client's previous frame has actually finished sending, was found
-on real hardware to starve the whole httpd instance once a Wi-Fi link
-degraded enough that sends stopped completing within 50ms: new work kept
-queuing faster than the one worker could drain it, and `/status` timed out
-for as long as the backlog persisted (the device stayed reachable over
-plain ICMP the entire time — this was never a Wi-Fi disconnect, just an
-httpd task buried in its own backlog). Fixed by tracking one
-"send-in-flight" flag per client in both `audio_ws.c` and `audio_sniff.c`:
-a broadcast simply skips a client that's still waiting on its prior frame
-instead of queueing another one behind it — sheds load exactly when the
-worker is falling behind, and self-heals the moment sends start completing
-again.
+**Backpressure**: `/audio`, `/audio-mic-sniff`, and `/iq-data` all
+broadcast on a fixed timer (`/audio`/`/audio-mic-sniff` every ~50ms;
+`/iq-data` at whatever cadence the configured I/Q sample rate implies —
+see "Input mode" below), and all three share the bridge's ONE httpd worker
+task with `/cat` and every plain HTTP route (`GET /status`, etc —
+`httpd_queue_work()` just posts to that same task's control socket, there's
+no separate worker pool or queue depth). Broadcasting unconditionally on
+that timer, regardless of whether a client's previous frame has actually
+finished sending, was found on real hardware to starve the whole httpd
+instance once a Wi-Fi link degraded enough that sends stopped completing in
+time: new work kept queuing faster than the one worker could drain it, and
+`/status` timed out for as long as the backlog persisted (the device
+stayed reachable over plain ICMP the entire time — this was never a Wi-Fi
+disconnect, just an httpd task buried in its own backlog). Fixed by
+tracking one "send-in-flight" flag per client in `audio_ws.c`,
+`audio_sniff.c`, and `audio_iq.c`: a broadcast simply skips a client that's
+still waiting on its prior frame instead of queueing another one behind it
+— sheds load exactly when the worker is falling behind, and self-heals the
+moment sends start completing again. `audio_iq.c` additionally
+preallocates one send buffer per client slot at startup instead of
+malloc/free-ing a fresh copy per frame like the other two — I/Q's
+per-frame byte count can be several times larger (up to ~19.2KB/50ms at
+96kHz stereo, vs `/audio`'s mono ~4.8KB/50ms at 48kHz) on a device with a
+documented heap-fragmentation history and no PSRAM to fall back on.
+
+### Input mode (audio / I/Q)
+
+The line-in jack can carry two different kinds of signal, selected via
+`POST /input-mode` (body `{"mode":"audio"|"iq"}`, reported in `GET
+/status`'s `input_mode`, gated on `GET /info`'s `"input_mode_select"`
+feature) — additive, not a replacement for the existing mode:
+
+- **`audio`** (the default, and the only mode that existed before this
+  feature): already-demodulated SSB/audio, captured mono (one I2S slot —
+  see "ADC RX channel" below), broadcast on `/audio` exactly as described
+  above.
+- **`iq`**: raw wideband in-phase/quadrature, pre-demodulation — I on the
+  ADC's left channel, Q on the right (confirmed on real hardware) —
+  captured as true stereo (`I2S_SLOT_MODE_STEREO`, both slots kept
+  simultaneously) and broadcast on a separate `ws://<device>/iq-data`
+  instead, as raw interleaved `int16_t` I/Q pairs (same headerless
+  untyped-PCM convention as `/audio` — sample rate discovered out-of-band
+  via `GET /status`). Deliberately its own endpoint rather than a mode
+  flag on `/audio`, for the same reasons `/audio-mic-sniff` is separate:
+  `/audio` is bidirectional (browser mic → radio) and I/Q receive has
+  nothing to do with that, and backpressure needs to be independent so a
+  wideband I/Q stream can never starve the narrowband audio an operator is
+  actively listening to on `/audio`.
+
+Like sample rate, switching input mode **persists to NVS and reboots to
+apply** — it reconfigures the I2S RX channel's slot mode and
+`esp_codec_dev_open()`'s channel count, both boot-time-only operations in
+this firmware (see `audio_monitor_start()`'s `iq_mode` branches), not
+something with an established live-reconfig path the way ADC input
+selection has.
+
+**Sample rate interaction**: `POST /sample-rate`'s valid values depend on
+the currently-selected input mode. `audio` mode keeps the original
+8000-48000Hz set; `iq` mode additionally allows **96000 Hz**, this
+feature's own chosen default — but 96kHz is a genuinely less-proven rate
+on this hardware than the others (see Known Limitations below), not
+something assumed to just work; 48kHz stereo I/Q is a legitimate,
+already-verified-safe fallback if it doesn't clock cleanly on a given
+board. Switching input mode to `audio` while the saved rate is IQ-only
+(96kHz) is rejected — change the rate first, so the bridge never boots
+into an unsupported audio+96kHz combination.
+
+**ADC RX channel and I/Q**: the existing "ADC RX channel" Left/Right
+control (`POST /rx-slot`) picks which single I2S slot `audio` mode keeps —
+a jack's tip signal can land on either ADC channel depending on board
+wiring. In `iq` mode this axis doesn't apply (I/Q needs both channels
+simultaneously, not a choice between them) — the control page's Left/Right
+buttons show both active and become non-interactive while `iq` mode is
+selected, reflecting what the firmware is actually doing rather than
+implying there's a live per-channel toggle for I/Q capture.
+
+**Control-page I/Q spectrum view**: a dedicated "I/Q spectrum" card
+connects to `/iq-data` and renders a full complex-FFT
+bar-spectrum/waterfall — deliberately NOT the browser's built-in
+`AnalyserNode` used everywhere else on this page, since that only computes
+a real-valued FFT and can't represent I/Q's genuinely distinct positive
+and negative frequency content (a real FFT's negative half is just a
+mirror of its positive half; a complex FFT's two halves are actually
+different signals — e.g. telling a wanted signal above the LO apart from
+an image/interferer below it). Plain radix-2 iterative FFT in `app.js`, no
+library. 0Hz sits at the center (fftshift'd), negative frequencies to the
+left, positive to the right; a "Zoom (around center)" slider crops
+symmetrically around 0Hz instead of from an edge, since there's no single
+"passband start" the way demodulated audio has. Only produces data while
+Input mode is `iq` — the card is otherwise idle (`/iq-data` accepts the
+connection either way, per the "registered unconditionally" reasoning in
+`audio_monitor_start()`, but nothing is ever broadcast to it outside I/Q
+mode).
 
 ### Mic → radio sniffer
 
@@ -502,6 +578,141 @@ for `spiffs_data/`. `idf.py flash` writes both; editing anything under
 - **PSRAM is present but unused.** `CONFIG_SPIRAM` is deliberately left
   disabled — nothing in this firmware needs it yet. Revisit once the audio
   feature needs the extra RAM for buffering.
+- **96kHz I/Q mode's ES8388 clocking is unverified for signal QUALITY,
+  though the register write itself is confirmed to apply cleanly on real
+  hardware.** `audio_monitor_start()` writes ADCCONTROL5/DACCONTROL2 to
+  `0x22` (double-speed mode, ratio 256 — see that register's own comment
+  in `audio_monitor.c` for the datasheet citation/sourcing) whenever I/Q
+  mode is selected at 96000Hz; boot logs confirm this write succeeds and
+  the bridge comes up cleanly (I2S reports `slot_mode: STEREO,
+  sample_rate_hz: 96000`, no crash, no watchdog trip, heap stays healthy).
+  What's still unverified is whether the ES8388 is actually clocking
+  correctly at the resulting ~24.576MHz MCLK — the datasheet-specified
+  single-speed range tops out around 8-48kHz, and the driver's own
+  DLL-disable comment already flags 44.1/48kHz as untested beyond
+  8/16/32kHz being hardware-verified, so double-speed mode is genuinely
+  new territory; confirming real signal fidelity (not just "it boots")
+  needs a scope/logic-analyzer check or a real I/Q source and a known
+  reference signal. This is exactly why it's a selectable,
+  defaulted-but-not-forced option (see `bridge_settings.h`'s
+  `input_mode_name` comment) rather than the only I/Q rate — 48kHz stereo
+  I/Q is a real, already-hardware-verified fallback if 96kHz turns out not
+  to clock cleanly.
+- **WiFi throughput is the practical ceiling on I/Q rate, independent of
+  the codec question above.** Measured on real hardware (RSSI -75dBm,
+  `phy: bgn`, `BW20` — already this chip's best available PHY mode, WiFi
+  TX power already near its max): a plain HTTP GET (no WebSocket/I/Q code
+  involved at all) sustains only ~150-160KB/s. 96kHz stereo I/Q needs
+  ~384KB/s at its ideal 50ms broadcast cadence — roughly 2.5x over that
+  ceiling — so `/iq-data` frames arrive at a much slower, uneven cadence
+  than designed (observed ~150-200ms average gaps instead of 50ms; the
+  per-client backpressure fix means this degrades gracefully — no lockup,
+  no heap growth — rather than failing outright). 48kHz stereo I/Q's
+  ~192KB/s requirement sits much closer to the measured ceiling and
+  performed noticeably better in the same test (~55-60ms average gaps).
+  This is a physical/environmental limit (distance/obstruction between
+  the ESP32 and the router), not something fixable in firmware — moving
+  the bridge closer to the AP, or accepting 48kHz as the practical I/Q
+  rate on a given installation, are the real levers here.
+- **I/Q's DMA descriptor count is scaled up to protect liveness, with a
+  real crash history behind the current, PREVENTIVE design.**
+  `audio_monitor_start()` scales `dma_desc_num` (not just `dma_frame_num`)
+  so every supported rate/mode combination keeps roughly the same
+  ~180-210ms of buffered headroom against scheduling jitter — found via
+  real-hardware analysis: the frame-size cap needed to stay under the I2S
+  driver's 4092-byte single-descriptor limit was quietly shrinking that
+  headroom to ~62.5ms at 96kHz I/Q (under 3x the CAT UART reader's own
+  worst-case 20ms block, down from ~9x at every other rate).
+
+  **This scaling caused two real crashes on real hardware before landing
+  in its current form, both while I/Q + 96kHz + the persistent CAT log
+  were active together** (CAT log's one-time ~64KB boot-recovery
+  allocation, freed just before, leaves the DMA-capable pool — a STRICTLY
+  NARROWER pool than general internal RAM, see `GET /system-stats`'s
+  `dma_free`/`dma_largest_free_block`, added specifically to diagnose
+  this — too fragmented for I/Q's larger descriptor request):
+  1. First crash: `ESP_ERROR_CHECK` around `i2s_channel_init_std_mode()`
+     turned an `ESP_ERR_NO_MEM` from the DMA allocator into a hard abort
+     — a genuine crash-reboot LOOP. Fixed by handling that failure
+     gracefully (audio monitor disabled, rest of the bridge keeps
+     running) instead of aborting.
+  2. Second crash, found immediately after fixing the first: still
+     crashed, this time a `Guru Meditation (LoadProhibited)` inside
+     `esp_codec_dev_open()`'s own internal I2S reconfig — because this
+     codec is opened `ESP_CODEC_DEV_TYPE_IN_OUT`, its `channel=2` (I/Q's
+     stereo request) gets applied to BOTH the RX (ADC/capture) and TX
+     (DAC/mic-send) directions internally, but this firmware's own TX
+     I2S handle was still configured MONO going in — so
+     `esp_codec_dev_open()` forced a SECOND, unplanned DMA reallocation
+     on the TX channel that the first fix's memory pre-flight check never
+     accounted for (it only budgeted for RX). That second allocation's
+     own failure cascaded into memory corruption rather than a clean
+     error, deep inside vendored driver code not safely patchable
+     call-by-call.
+
+  **The actual fix is prevention, on both sides of that gap:**
+  - `audio_monitor_start()` now configures the TX I2S handle STEREO too,
+    in I/Q mode — matching what `esp_codec_dev_open()` will end up
+    requesting internally, so its internal reconfig becomes a genuine
+    no-op (`i2s_std_set_slot()`'s own "only reallocate if buffer size
+    changed" check) instead of a second surprise allocation. Since `/audio`'s
+    mic-send data is always mono regardless of input mode,
+    `audio_rx_callback()` now duplicates each mono sample onto both L/R
+    slots (dual-mono, not silence-padded) before writing to the now-stereo
+    TX handle — verified via `/audio-mic-sniff` that the ORIGINAL mono
+    samples still reach the sniffer unduplicated, only the wire
+    representation to the DAC changed.
+  - The `dma_desc_num` calculation now checks real available DMA-capable
+    memory (`heap_caps_get_largest_free_block(MALLOC_CAP_DMA)`) BEFORE
+    attempting the allocation, budgeting for BOTH TX and RX's stereo-sized
+    requests (not just one), and backs off to the safe 6-descriptor
+    baseline — with a 25% safety margin, not the full measured amount —
+    rather than requesting more than what's actually free. This is why
+    the failure mode is now genuinely graceful rather than theoretically
+    graceful: verified via repeated real-hardware reboots at the exact
+    worst-case combination (I/Q + 96kHz + CAT log enabled) with zero
+    crashes, correctly logging `"only N descriptors fit..."` and falling
+    back to a smaller headroom instead. At that specific worst case,
+    memory runs out one level further down instead — `audio_iq_start()`'s
+    own client-buffer preallocation and `audio_task`'s read buffer both
+    fail their OWN allocations gracefully (audio capture disabled, logged,
+    rest of the bridge keeps running) rather than the DMA layer failing
+    ungracefully. At the ORIGINAL `CAT_LOG_CAPACITY` (1000, ~64KB
+    transient + ~51KB permanent RAM cost — see `cat_log.h`), that's
+    exactly what happened: 96kHz I/Q's own allocations failed and audio
+    capture never started while the log was enabled. **Fixed by lowering
+    `CAT_LOG_CAPACITY` to 250** (~16KB transient, ~13KB permanent) —
+    confirmed on real hardware across repeated reboots that this clears
+    the collision with real margin: 96kHz I/Q + CAT log enabled together
+    now both work, with real I/Q data flowing (48 frames/921600 bytes in
+    5 seconds, matching the expected 96kHz-stereo frame size exactly) and
+    the persistent log itself unaffected beyond its smaller "most recent
+    N frames" window (flash retention is separate and untouched — see
+    `cat_log.h`'s own comment on why this constant doesn't bound that).
+- **Simultaneous TX + RX + CAT at 96kHz I/Q is safe but not reliable —
+  a real capacity ceiling, distinct from the crash/memory fixes above.**
+  Everything above was tested with `/iq-data` RX alone (no simultaneous
+  mic-send). Adding sustained `/audio` mic-send (TX) and CAT polling on
+  top, all at once, at 96kHz: the device NEVER crashed or needed a reboot
+  in repeated real-hardware tests, but `heap_min_free` was observed as low
+  as 220 bytes (versus several KB with RX alone) and BOTH `/audio` and
+  `/iq-data` WebSocket connections tended to fail outright within
+  seconds (`no close frame received or sent` / `invalid opcode` protocol
+  errors) while CAT polling kept working cleanly throughout. Serial logs
+  during a failure showed the shared httpd worker task genuinely
+  overloaded (`httpd_txrx: error in send: 11` / EAGAIN, forced socket
+  closures) — this is the SAME single-worker-task architecture the
+  mic-sniff-era backpressure fix (see "Backpressure" above) already
+  protects against lockup, and it did its job here too: the device always
+  self-recovered once load dropped, with no reboot needed. But recovering
+  from overload isn't the same as handling the load — at full 96kHz, TX
+  and RX together are pushing past what this device's WiFi
+  throughput/shared-httpd-worker/heap can sustain concurrently, not
+  something more error handling can fix. 48kHz I/Q has real margin to
+  spare for RX alone (see "WiFi throughput is the practical ceiling"
+  above); simultaneous TX+RX+CAT at high I/Q rates should be treated as
+  an open capacity question, not yet a supported combination — client
+  software (the web app) should not assume it works smoothly.
 - **The standalone control page has no auth.** Anyone on the LAN — or, while
   in AP fallback, anyone who joins the fallback AP itself — can view
   status, change its Wi-Fi network, or restart it. Acceptable for a

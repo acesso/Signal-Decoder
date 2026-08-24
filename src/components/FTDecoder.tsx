@@ -2,7 +2,7 @@
 import { createEffect, createMemo, createSignal, For, onCleanup, onMount, Show, type JSX } from 'solid-js'
 import type { DecoderControls } from '../lib/decoderControls'
 import { fmtAbsHz } from '$decoder-lib/formatFreq'
-import AudioAnalysisPanel from './AudioAnalysisPanel'
+import SignalAnalysisPanel from './SignalAnalysisPanel'
 import { createFTProcessor } from '../lib/ft/processor'
 import { type FTMode, type FTMessage, FT_WINDOW_SECONDS } from '$decoder-lib/ft/decoder'
 import {
@@ -23,6 +23,7 @@ import FTWasmPanel from './FTWasmPanel'
 import VirtualList from './VirtualList'
 import { loadNumberArray, saveNumberArray, loadBoolean, saveBoolean } from '$decoder-lib/storage'
 import type { AudioBridge } from '$decoder-lib/cat/useAudioBridge'
+import type { IQBridge } from '$decoder-lib/cat/useIQBridge'
 import type { AudioSourceKind } from '$decoder-lib/audio/audioSource'
 
 const DEFAULT_PANEL_WEIGHTS = [0.8, 0.6, 1.2]
@@ -322,6 +323,7 @@ interface Props {
   onStateChange?: (controls: DecoderControls) => void
   handle?: { current: DecoderControls | null }
   audioBridge?: AudioBridge
+  iqBridge?: IQBridge
 }
 
 export default function FTDecoder(props: Props): JSX.Element {
@@ -329,8 +331,16 @@ export default function FTDecoder(props: Props): JSX.Element {
   // whenever it's actually connected (matches globalAudio's own
   // auto-detection in App.tsx's handleStart(), so both agree without a
   // separate manual selector), falling back to the local mic otherwise.
-  const audioSourceKind = (): AudioSourceKind => (props.audioBridge?.state().playbackActive ? 'bridge' : 'microphone')
-  const processor = createFTProcessor(() => props.ftMode, audioSourceKind, () => props.audioBridge)
+  // Checks iqBridge FIRST: while the bridge is in "iq" input mode,
+  // audioBridge is never connected (see App.tsx's handleStart()) and
+  // wouldn't report playbackActive even though the bridge is very much
+  // live — iqBridge's own connected+getPlaybackSource() (demodulated
+  // client-side, see useIQBridge.ts's header comment) is the actual
+  // source of truth in that mode.
+  const audioSourceKind = (): AudioSourceKind =>
+    props.iqBridge?.state().connected ? 'bridge' : props.audioBridge?.state().playbackActive ? 'bridge' : 'microphone'
+  const getBridge = () => (props.iqBridge?.state().connected ? props.iqBridge : props.audioBridge)
+  const processor = createFTProcessor(() => props.ftMode, audioSourceKind, getBridge)
 
   createEffect((prevMode: FTMode | undefined) => {
     const mode = props.ftMode
@@ -784,12 +794,6 @@ export default function FTDecoder(props: Props): JSX.Element {
 
   return (
     <div class="space-y-3 sm:space-y-4">
-      <Show when={props.audioBridge && processor.state().isRecording}>
-        <p class="text-[10px] text-[#8b949e]">
-          Audio source: <span class="text-[#c9d1d9] font-semibold">{audioSourceKind() === 'bridge' ? 'ESP32 Bridge (radio audio)' : 'Local microphone'}</span>
-        </p>
-      </Show>
-
       {/* 3-panel layout — bounded height on lg so panel content scrolls instead of growing the page */}
       <div
         ref={containerEl}
@@ -978,18 +982,47 @@ export default function FTDecoder(props: Props): JSX.Element {
           <div class="h-full w-px bg-[#30363d] transition-colors group-hover:bg-[#2ea043]/50" />
         </div>
 
-        {/* Panel 2 — Audio Analysis */}
-        <AudioAnalysisPanel
-          analyser={props.analyser ?? null}
-          isRecording={processor.state().isRecording}
-          vfoFrequency={props.vfoFrequency}
-          storageKeyPrefix="ft"
-          markers={(props.txAudioHz ?? 0) > 0 ? [{ freq: props.txAudioHz!, color: '#f85149', label: 'TX' }] : undefined}
-          onMarkerDrag={props.onTxAudioHzChange ? (_i, hz) => props.onTxAudioHzChange!(hz) : undefined}
-          markerFieldLabel="Tx"
-          class="min-w-0"
-          style={{ flex: panelWeights()[1] }}
-        />
+        {/* Panel 2 — Signal Analysis. In I/Q mode (see audioSourceKind()
+            above), shows the bridge's own wideband I/Q spectrum with a
+            draggable passband marker that retunes useIQBridge.ts's
+            SSBDemodulator instead of the TX-tone marker used against
+            already-demodulated audio — TX itself still goes out over the
+            separate mic-send path regardless of RX input mode, so mixing
+            both markers into one view would conflate two unrelated things. */}
+        <Show
+          when={props.iqBridge?.state().connected}
+          fallback={
+            <SignalAnalysisPanel
+              analyser={props.analyser ?? null}
+              isRecording={processor.state().isRecording}
+              vfoFrequency={props.vfoFrequency}
+              storageKeyPrefix="ft"
+              markers={(props.txAudioHz ?? 0) > 0 ? [{ freq: props.txAudioHz!, color: '#f85149', label: 'TX' }] : undefined}
+              onMarkerDrag={props.onTxAudioHzChange ? (_i, hz) => props.onTxAudioHzChange!(hz) : undefined}
+              markerFieldLabel="Tx"
+              class="min-w-0"
+              style={{ flex: panelWeights()[1] }}
+            />
+          }
+        >
+          <SignalAnalysisPanel
+            analyser={null}
+            iqSource={{
+              computer: props.iqBridge!.spectrum,
+              sampleRateHz: () => props.iqBridge!.state().sampleRateHz,
+              active: () => props.iqBridge!.state().connected,
+            }}
+            isRecording={processor.state().isRecording}
+            vfoFrequency={props.vfoFrequency}
+            storageKeyPrefix="ft_iq"
+            defaultMaxHz={props.iqBridge!.state().sampleRateHz / 2}
+            passband={{ centerHz: props.iqBridge!.state().passbandCenterHz, bandwidthHz: props.iqBridge!.state().passbandBandwidthHz }}
+            onPassbandChange={(p) => props.iqBridge!.setPassband(p.centerHz, p.bandwidthHz)}
+            markerFieldLabel="Passband"
+            class="min-w-0"
+            style={{ flex: panelWeights()[1] }}
+          />
+        </Show>
 
         {/* Drag handle 1<->2 */}
         <div class="group hidden w-3 shrink-0 cursor-col-resize items-center justify-center self-stretch lg:flex" onMouseDown={startPanelDrag(1)}>

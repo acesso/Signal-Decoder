@@ -3,13 +3,26 @@
 // no mature, maintained WebRTC library for bare ESP-IDF, so this rides a
 // second WebSocket (/audio, alongside /cat) carrying raw 16-bit signed
 // mono PCM, in both directions:
-//   bridge -> browser: radio speaker audio (ES8388 ADC)
-//   browser -> bridge: this browser's mic, resampled to the bridge's rate
-//                       (ES8388 DAC -> radio mic input)
-// The sample rate is NOT fixed at 8kHz — the bridge's own control page can
-// change it (POST /sample-rate, one of 8000/16000/22050/32000/44100/48000
-// Hz, applied on reboot) — see fetchBridgeSampleRate(), which reads the
-// bridge's actual current rate from GET /status fresh on every connect.
+//   bridge -> browser: radio speaker audio (ES8388 ADC), at the bridge's
+//                       configured rate — see fetchBridgeSampleRate().
+//   browser -> bridge: this browser's mic, resampled to a FIXED
+//                       MIC_SEND_SAMPLE_RATE_HZ (not the bridge's rate —
+//                       see that constant's comment) before sending; the
+//                       bridge upsamples it back up to its own configured
+//                       rate firmware-side (audio_monitor.c's
+//                       audio_rx_callback/upsample_linear) before writing
+//                       to the DAC -> radio mic input. This asymmetry
+//                       (RX at the bridge's real rate, TX fixed low) is
+//                       deliberate: TX is voice-bandwidth mic audio with no
+//                       benefit from a higher wire rate, so sending it at
+//                       the same high rate RX may be running at (up to
+//                       96kHz in I/Q mode) would only cost WiFi bandwidth
+//                       for no audible gain.
+// The bridge's OWN rate is NOT fixed at 8kHz — the bridge's own control page
+// can change it (POST /sample-rate, one of 8000/16000/22050/32000/44100/
+// 48000 Hz, applied on reboot) — see fetchBridgeSampleRate(), which reads
+// the bridge's actual current rate from GET /status fresh on every connect.
+// This only affects the RX (bridge -> browser) direction now; TX is fixed.
 // Gated on the bridge's GET /info reporting the "audio" feature — see
 // hasFeature('audio') in RadioCATPanel.tsx's BridgeStatusPanel.
 import { createSignal, onCleanup } from 'solid-js'
@@ -34,6 +47,14 @@ function log(level: 'info' | 'warn' | 'error', ...args: unknown[]) {
 // bridge_config.h by hand, which stopped being viable once the rate
 // became operator-configurable there.
 const FALLBACK_SAMPLE_RATE = 8000
+
+// Fixed TX (mic-send) wire rate — NOT the bridge's own configured
+// sample_rate_hz. Must match firmware's audio_monitor.c's
+// MIC_SEND_SAMPLE_RATE_HZ exactly (kept in sync by hand — no shared
+// header between these two languages/runtimes, same as this project's
+// other independently-duplicated constants). See this file's header
+// comment for why TX is fixed low regardless of the bridge's RX rate.
+const MIC_SEND_SAMPLE_RATE_HZ = 16000
 
 // ws://host/cat -> ws://host/audio — same host/port, different path, same
 // transform philosophy as useRadioCAT.ts's bridgeHttpBase (ws:// -> http://
@@ -151,6 +172,192 @@ export function resampleLinear(
   return out
 }
 
+// Carries a bandlimited resampler's EXACT-INTEGER phase/center position
+// AND input-sample history across successive chunks of the SAME stream —
+// same continuity need as ResampleState above (used by resampleLinear()),
+// just for downsampleBandlimited() below. history is a fixed-size ring of
+// the last BANDLIMITED_SINC_HALF_WIDTH*2+1 input samples, since a
+// windowed-sinc evaluation (unlike linear interpolation's single left/
+// right neighbor) needs several samples on both sides of each output
+// position. kernel/L/M are built lazily on first use for a given
+// (fromRate, toRate) pair and reused across calls — see
+// buildPolyphaseKernel()'s own comment for why this MUST be exact-integer
+// rational tracking, not floating-point position accumulation.
+export interface BandlimitedResampleState {
+  center: number
+  phase: number
+  history: Float64Array
+  histLen: number
+  kernel: Float64Array | null
+  kernelL: number
+  kernelM: number
+  kernelFromRate: number
+  kernelToRate: number
+}
+
+const BANDLIMITED_SINC_HALF_WIDTH = 8
+const BANDLIMITED_TAPS = BANDLIMITED_SINC_HALF_WIDTH * 2 + 1
+const BANDLIMITED_HISTORY_LEN = BANDLIMITED_TAPS
+
+export function makeBandlimitedResampleState(): BandlimitedResampleState {
+  return {
+    center: 0,
+    phase: 0,
+    history: new Float64Array(BANDLIMITED_HISTORY_LEN),
+    histLen: 0,
+    kernel: null,
+    kernelL: 1,
+    kernelM: 1,
+    kernelFromRate: 0,
+    kernelToRate: 0,
+  }
+}
+
+function windowedSinc(x: number, halfWidth: number): number {
+  if (x <= -halfWidth || x >= halfWidth) return 0
+  const sinc = x === 0 ? 1 : Math.sin(Math.PI * x) / (Math.PI * x)
+  const t = (x + halfWidth) / (2 * halfWidth)
+  const window = 0.42 - 0.5 * Math.cos(2 * Math.PI * t) + 0.08 * Math.cos(4 * Math.PI * t)
+  return sinc * window
+}
+
+function gcd(a: number, b: number): number {
+  while (b !== 0) {
+    const t = b
+    b = a % b
+    a = t
+  }
+  return a
+}
+
+// Builds an M-phase x BANDLIMITED_TAPS windowed-sinc tap table for the
+// EXACT rational ratio fromRate/toRate (both real hardware sample rates,
+// always integer Hz per the Web Audio API) — same polyphase design as
+// audio_monitor.c's upsample_build_kernel(), and for the SAME reason: an
+// earlier version of this function tracked a floating-point `pos`
+// position, accumulating `pos += fromRate/toRate` every output sample —
+// over the tens of thousands of samples in one mic-send session, that
+// float error compounds and drifts, unpredictably shifting exactly which
+// point the sinc kernel gets evaluated at depending on incidental chunk
+// timing. That's consistent with a real report of the SAME FT8 message
+// sometimes sending cleanly and sometimes with visible broadband noise —
+// a symptom of numerical drift, not of the signal or the algorithm's
+// steady-state quality (which tested clean in isolation). Built once per
+// (fromRate, toRate) pair actually seen (typically just once per mic
+// session, since micCtx's own native rate doesn't change mid-session) and
+// reused for every chunk after that — cheap relative to real-time audio.
+function buildPolyphaseKernel(fromRate: number, toRate: number): { kernel: Float64Array; L: number; M: number } {
+  const g = gcd(fromRate, toRate)
+  const L = fromRate / g
+  const M = toRate / g
+  const kernel = new Float64Array(M * BANDLIMITED_TAPS)
+  for (let phase = 0; phase < M; phase++) {
+    const exact = (phase * L) / M
+    const frac = exact - Math.floor(exact)
+    for (let t = 0; t < BANDLIMITED_TAPS; t++) {
+      const x = (t - BANDLIMITED_SINC_HALF_WIDTH) - frac
+      kernel[phase * BANDLIMITED_TAPS + t] = windowedSinc(x, BANDLIMITED_SINC_HALF_WIDTH)
+    }
+  }
+  return { kernel, L, M }
+}
+
+// Bandlimited (windowed-sinc, polyphase, exact-integer phase tracking) —
+// replaces resampleLinear() at this file's ONE remaining real call site
+// (startMic()'s downsample to MIC_SEND_SAMPLE_RATE_HZ before sending over
+// /audio). Naive linear interpolation was confirmed, via a real-hardware
+// synthetic-tone test, to introduce audible/visible broadband noise
+// ("green haze" around an otherwise-clean FT8 tone in the mic-sniff
+// waterfall) — the root cause was TWO stacked naive-linear stages (this
+// one, plus firmware's own upsample back to the codec rate) where the
+// ORIGINAL pre-MIC_SEND_SAMPLE_RATE_HZ code path had only one native/
+// high-quality browser resample. This function and audio_monitor.c's
+// upsample_bandlimited() are the matched fix on both ends — same
+// windowed-sinc algorithm family, independently duplicated (different
+// language/runtime, no shared-module boundary, same reasoning as this
+// project's other DSP building blocks). Works for either direction (up or
+// down) — used here for downsampling (fromRate > toRate), audio_monitor.c's
+// C version is upsampling-only since that's its one real use, but the
+// underlying math (and the exact-integer phase tracking, see
+// buildPolyphaseKernel()'s comment) is identical.
+export function downsampleBandlimited(
+  input: Float32Array<ArrayBufferLike>,
+  fromRate: number,
+  toRate: number,
+  state: BandlimitedResampleState,
+): Float32Array<ArrayBuffer> {
+  if (fromRate === toRate) {
+    const out = new Float32Array(input.length)
+    out.set(input)
+    return out
+  }
+  if (state.kernel === null || state.kernelFromRate !== fromRate || state.kernelToRate !== toRate) {
+    const built = buildPolyphaseKernel(fromRate, toRate)
+    state.kernel = built.kernel
+    state.kernelL = built.L
+    state.kernelM = built.M
+    state.kernelFromRate = fromRate
+    state.kernelToRate = toRate
+    state.history.fill(0)
+    state.histLen = 0
+    state.center = 0
+    state.phase = 0
+  }
+
+  const total = state.histLen + input.length
+  const buf = new Float64Array(total)
+  buf.set(state.history.subarray(BANDLIMITED_HISTORY_LEN - state.histLen), 0)
+  for (let i = 0; i < input.length; i++) buf[state.histLen + i] = input[i]
+
+  // INVARIANT: state.center, read back at the top of the NEXT call, is
+  // the absolute index (within THIS call's buf[], i.e. already offset by
+  // this call's state.histLen) that the next output sample is centered
+  // on — center below is tracked in that exact same space throughout, so
+  // no extra offset is added when reading it in (unlike an earlier,
+  // buggy version of this function that added state.histLen on read AND
+  // subtracted a differently-sized histLen on write — those two offsets
+  // only canceled out correctly when histLen happened to stay the same
+  // call to call, which is what caused a real, confirmed-on-hardware
+  // intermittent bug: the SAME FT8 message sometimes sending cleanly and
+  // sometimes with broadband noise, depending on exact chunk-boundary
+  // history lengths).
+  let center = state.center
+  let phase = state.phase
+  const out: number[] = []
+  while (center + BANDLIMITED_SINC_HALF_WIDTH < total) {
+    const taps = state.kernel.subarray(phase * BANDLIMITED_TAPS, phase * BANDLIMITED_TAPS + BANDLIMITED_TAPS)
+    let acc = 0
+    for (let t = 0; t < BANDLIMITED_TAPS; t++) {
+      const idx = center + (t - BANDLIMITED_SINC_HALF_WIDTH)
+      if (idx < 0) continue
+      acc += buf[idx] * taps[t]
+    }
+    out.push(Math.max(-1, Math.min(1, acc)))
+
+    // Exact-rational advance (Bresenham-style) — see buildPolyphaseKernel()'s
+    // comment for why this avoids the floating-point position drift an
+    // earlier version of this function had.
+    phase += state.kernelL
+    while (phase >= state.kernelM) {
+      phase -= state.kernelM
+      center++
+    }
+  }
+  state.phase = phase
+
+  const carry = Math.min(BANDLIMITED_HISTORY_LEN, total)
+  state.history.fill(0)
+  state.history.set(buf.subarray(total - carry), BANDLIMITED_HISTORY_LEN - carry)
+  // The NEXT call's buf[] will start with `carry` history samples, i.e.
+  // its own absolute index 0 corresponds to THIS call's buf[] index
+  // (total - carry) — shift center by that same amount so it lands on
+  // the identical real position once re-based into the next call's space.
+  state.center = center - (total - carry)
+  state.histLen = carry
+
+  return new Float32Array(out)
+}
+
 function floatToInt16(samples: Float32Array<ArrayBufferLike>): Int16Array<ArrayBuffer> {
   const out = new Int16Array(samples.length)
   for (let i = 0; i < samples.length; i++) {
@@ -249,11 +456,12 @@ export function useAudioBridge() {
   let micSource: MediaStreamAudioSourceNode | null = null
   let micAnalyserNode: AnalyserNode | null = null
   let micTap: CaptureNode | null = null
-  // One resampler-state instance per mic session — see ResampleState's
-  // comment for why this must persist across chunks rather than being
-  // recreated per-chunk. Recreated fresh in startMic() so a NEW session
-  // never inherits a previous session's leftover phase/prevSample.
-  let micResampleState: ResampleState | null = null
+  // One resampler-state instance per mic session — see
+  // BandlimitedResampleState's comment for why this must persist across
+  // chunks rather than being recreated per-chunk. Recreated fresh in
+  // startMic() so a NEW session never inherits a previous session's
+  // leftover phase/history.
+  let micResampleState: BandlimitedResampleState | null = null
   // The bridge's actual /audio wire rate — fetched fresh from GET /status
   // at the start of every connect() (see fetchBridgeSampleRate()), since
   // POST /sample-rate on the bridge's own control page can change this at
@@ -507,21 +715,29 @@ export function useAudioBridge() {
       setAnalyserOut(micAnalyserNode)
 
       // 400-sample chunks at the mic's native rate resample down to roughly
-      // bridgeSampleRate-ish frame sizes — not exact (native rate varies by
-      // device/browser), but that's fine, the bridge has no
+      // MIC_SEND_SAMPLE_RATE_HZ-ish frame sizes — not exact (native rate
+      // varies by device/browser), but that's fine, the bridge has no
       // fixed-frame-size expectation on receive, just a byte stream of
-      // Int16 samples. This direction still uses resampleLinear() rather
-      // than the native-createBuffer trick playFrame() uses — we're
-      // producing a raw wire-format byte stream to send over WebSocket
-      // here, not playing through an AudioBufferSourceNode, so there's no
-      // browser resampler to hand this off to. micResampleState is fresh
-      // per session (reset just above) and threaded through every chunk of
-      // THIS session so the resampler treats them as one continuous stream
-      // — see ResampleState's comment for the audible click this fixes.
-      micResampleState = makeResampleState()
+      // Int16 samples. Uses downsampleBandlimited() (windowed-sinc), not
+      // the native-createBuffer trick playFrame() uses — we're producing a
+      // raw wire-format byte stream to send over WebSocket here, not
+      // playing through an AudioBufferSourceNode, so there's no browser
+      // resampler to hand this off to. Also NOT resampleLinear() (naive
+      // linear) — that was confirmed, stacked with firmware's own upsample
+      // back to the codec rate, to introduce real broadband noise (see
+      // downsampleBandlimited()'s own comment for the full real-hardware
+      // finding). micResampleState is fresh per session (reset just above)
+      // and threaded through every chunk of THIS session so the resampler
+      // treats them as one continuous stream — see
+      // BandlimitedResampleState's comment for the audible click this
+      // continuity avoids. Resamples to MIC_SEND_SAMPLE_RATE_HZ, NOT
+      // bridgeSampleRate — see this file's header comment and that
+      // constant's own comment for why TX is a fixed low rate independent
+      // of the bridge's configured RX rate.
+      micResampleState = makeBandlimitedResampleState()
       micTap = await createCaptureNode(micCtx, 2048, (samples) => {
         if (!ws || ws.readyState !== WebSocket.OPEN) return
-        const resampled = resampleLinear(samples, micCtx!.sampleRate, bridgeSampleRate, micResampleState!)
+        const resampled = downsampleBandlimited(samples, micCtx!.sampleRate, MIC_SEND_SAMPLE_RATE_HZ, micResampleState!)
         const int16 = floatToInt16(resampled)
         ws.send(int16.buffer)
         setState((s) => ({ ...s, levelOut: rmsLevel(resampled) }))

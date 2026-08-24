@@ -26,7 +26,23 @@
 
 // How many of the most recent frames the ring buffer holds — see cat_log.c
 // for the exact record size/partition size this was sized against.
-#define CAT_LOG_CAPACITY 1000
+// Deliberately smaller than the flash partition's own ~8192-record
+// capacity (this only bounds the in-RAM shadow + boot-recovery scan
+// target, not how much history the flash ring itself retains) — at
+// CAT_LOG_RECORD_SIZE (64 bytes/record), 1000 meant a transient ~64KB
+// malloc during recover_from_flash() (freed right after) plus a
+// permanent ~51KB RAM shadow for the rest of the session. That transient
+// allocation was found on real hardware to collide with the I/Q input
+// mode's own DMA-capable memory needs at 96kHz (see audio_monitor.c's
+// dma_desc_num comment for the full incident) — enabling the persistent
+// CAT log while running 96kHz I/Q could exhaust the DMA-capable pool
+// enough that audio capture failed to start (gracefully, not a crash,
+// but still not what the operator wanted). Lowered to 250 (~16KB
+// transient, ~13KB permanent) specifically to clear that collision with
+// real margin, while still keeping a meaningfully deep "what was the
+// radio doing right before a restart" window — the original motivating
+// case for this feature at all.
+#define CAT_LOG_CAPACITY 250
 
 // Mounts the catlog partition and recovers the write position by scanning
 // existing records (see cat_log.c — no separately-persisted pointer is

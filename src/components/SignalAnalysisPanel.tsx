@@ -1,9 +1,79 @@
-// Port of src/components/AudioAnalysisPanel.tsx (Next.js app).
+// Port of src/components/AudioAnalysisPanel.tsx (Next.js app), renamed
+// SignalAnalysisPanel and widened to accept I/Q data (see SpectrumSource
+// below) — same panel now serves both a decoder's demodulated-audio
+// spectrum (the original, real-FFT-only behavior) and, in I/Q mode, the
+// bridge's own full wideband I/Q spectrum with a draggable bandwidth
+// marker that retunes what SSBDemodulator extracts into audio (see
+// useIQBridge.ts's setPassband()). Retires IQSpectrumPanel.tsx, whose
+// job (an I/Q-aware GLSpectrogram view) this component now covers with a
+// real marker/bandwidth system instead of that panel's plain zoom slider.
 import { createEffect, createMemo, createSignal, onCleanup, onMount, type JSX } from 'solid-js'
 import GLSpectrogram, { type GLSpectrogramHandle, type SpectroBand } from './GLSpectrogram'
 import { loadNumber, saveNumber, loadString, saveString } from '$decoder-lib/storage'
 import { buildColormapLUT, COLORMAPS, COLORMAP_LABEL, type ColormapName } from '$decoder-lib/colormaps'
 import NumberField from './NumberField'
+
+// Abstracts "where the byte-magnitude spectrum data comes from" so this
+// panel doesn't need to know whether it's reading a real-valued
+// AnalyserNode (decoders' demodulated audio, span always 0..Nyquist) or
+// useIQBridge.ts's IQSpectrumComputer (raw wideband I/Q, span
+// -Nyquist..+Nyquist — a complex signal's negative and positive frequency
+// halves are genuinely different content, unlike a real FFT's mirrored
+// negative half). getBytes() returns null when there's nothing to read yet
+// (e.g. not connected) — same "draw nothing" behavior the old analyser==null
+// case already had.
+export interface SpectrumSource {
+  getBytes(): Uint8Array | null
+  minHz: number
+  maxHz: number
+}
+
+// Adapts a Web Audio AnalyserNode to SpectrumSource — every existing
+// decoder caller (CW/SSTV/MFSK/RTTY/FT8's own demodulated-audio view)
+// keeps passing `analyser` unchanged; this class is constructed internally
+// by SignalAnalysisPanel itself, not by callers.
+class AnalyserSpectrumSource implements SpectrumSource {
+  private buf: Uint8Array<ArrayBuffer> | null = null
+  constructor(private analyser: AnalyserNode) {}
+  get minHz() {
+    return 0
+  }
+  get maxHz() {
+    return this.analyser.context.sampleRate / 2
+  }
+  getBytes(): Uint8Array | null {
+    const bc = this.analyser.frequencyBinCount
+    if (!this.buf || this.buf.length !== bc) this.buf = new Uint8Array(bc) as Uint8Array<ArrayBuffer>
+    this.analyser.getByteFrequencyData(this.buf)
+    return this.buf
+  }
+}
+
+// Adapts useIQBridge.ts's IQSpectrumComputer to SpectrumSource — always
+// reports the FULL -Nyquist..+Nyquist span (IQSpectrumComputer.magBytes
+// itself covers exactly that, uncropped); zooming into a narrower slice is
+// left entirely to this panel's own existing displayMinHz/displayMaxHz
+// "View" controls, the same mechanism the real-FFT case already uses to
+// crop into a wider Nyquist span. getBytes() returns null when `active` is
+// false (mirrors the old analyser==null "draw nothing" behavior) — passed
+// as a plain value rather than read from a signal since the panel calls
+// this every animation frame already, not reactively.
+export class IQSpectrumSourceAdapter implements SpectrumSource {
+  constructor(
+    private computer: { magBytes: Uint8Array },
+    private sampleRateHz: () => number,
+    private active: () => boolean,
+  ) {}
+  get minHz() {
+    return -this.sampleRateHz() / 2
+  }
+  get maxHz() {
+    return this.sampleRateHz() / 2
+  }
+  getBytes(): Uint8Array | null {
+    return this.active() ? this.computer.magBytes : null
+  }
+}
 
 // Both views render on the GPU (GLSpectrogram); the old CPU 2D-canvas
 // pipeline survives only as an automatic fallback when WebGL init fails.
@@ -288,13 +358,38 @@ interface GLBand {
   color: string
 }
 
+// Config for the I/Q-mode passband marker — a SEPARATE concept from
+// markers/onMarkerDrag (used for tone markers within already-demodulated
+// audio): this one drives useIQBridge.ts's SSBDemodulator.setPassband(),
+// retuning what the bridge's raw I/Q gets turned into decodable audio, not
+// just relabeling a spot in an already-fixed audio stream. Rendered via
+// the SAME drawChannelMarker/MarkerGrips drag machinery as a regular
+// AudioMarker (kept as a single-element internal marker list), since the
+// visual — a shaded, draggable band — is identical either way.
+export interface IQPassband {
+  centerHz: number
+  bandwidthHz: number
+}
+
 interface Props {
+  /** Real-valued FFT source (decoders' demodulated audio) — mutually
+   *  exclusive with iqSource; exactly one should be non-null/set. */
   analyser: AnalyserNode | null
+  /** Raw wideband I/Q source (useIQBridge.ts) — mutually exclusive with
+   *  analyser. Span is always -sampleRateHz()/2..+sampleRateHz()/2. */
+  iqSource?: {
+    computer: { magBytes: Uint8Array }
+    sampleRateHz: () => number
+    active: () => boolean
+  }
   isRecording: boolean
   markers?: AudioMarker[]
   /** shiftKey reflects the modifier during the drag — lets a mode offer an
    *  alternate drag behavior (e.g. MFSK: move one tone instead of the group). */
   onMarkerDrag?: (index: number, newFreq: number, shiftKey?: boolean) => void
+  /** I/Q mode only — see IQPassband. Present together, or not at all. */
+  passband?: IQPassband
+  onPassbandChange?: (passband: IQPassband) => void
   squelch?: number
   onSquelchChange?: (v: number) => void
   showGrid?: boolean
@@ -310,13 +405,52 @@ interface Props {
   storageKeyPrefix?: string
 }
 
-export default function AudioAnalysisPanel(props: Props): JSX.Element {
+export default function SignalAnalysisPanel(props: Props): JSX.Element {
+  const source = createMemo<SpectrumSource | null>(() => {
+    if (props.iqSource) return new IQSpectrumSourceAdapter(props.iqSource.computer, props.iqSource.sampleRateHz, props.iqSource.active)
+    return props.analyser ? new AnalyserSpectrumSource(props.analyser) : null
+  })
+  // I/Q mode's passband marker is presented through the exact same
+  // drawChannelMarker/MarkerGrips path as a regular AudioMarker — appended
+  // to (never replacing) props.markers so a decoder could in principle show
+  // both, though in practice a component only ever passes one or the other.
+  const effectiveMarkers = createMemo<AudioMarker[]>(() => {
+    const base = props.markers ?? []
+    if (!props.passband) return base
+    return [...base, { freq: props.passband.centerHz, color: '#58a6ff', label: 'Passband', bandwidthHz: props.passband.bandwidthHz }]
+  })
+  const isPassbandMarkerIndex = (i: number) => props.passband != null && i === (props.markers ?? []).length
+  const handleMarkerDrag = (index: number, newFreq: number, shiftKey?: boolean) => {
+    if (isPassbandMarkerIndex(index)) {
+      props.onPassbandChange?.({ centerHz: newFreq, bandwidthHz: props.passband!.bandwidthHz })
+      return
+    }
+    props.onMarkerDrag?.(index, newFreq, shiftKey)
+  }
+  const hasMarkerDrag = createMemo(() => !!props.onMarkerDrag || !!props.onPassbandChange)
+
+  // I/Q's span can be negative (source.minHz < 0) — the real-FFT case
+  // always starts at 0, so defaulting to that keeps every existing caller's
+  // behavior byte-for-byte unchanged.
+  const sourceMinHz = () => source()?.minHz ?? 0
+  const sourceMaxHz = () => source()?.maxHz ?? (props.defaultMaxHz ?? 3000)
+
   const defaultMaxHz = () => props.defaultMaxHz ?? 3000
   const lsMinHz = props.storageKeyPrefix ? `${props.storageKeyPrefix}_sg_display_min_hz` : null
   const lsMaxHz = props.storageKeyPrefix ? `${props.storageKeyPrefix}_sg_display_max_hz` : null
 
-  const [displayMinHz, setDisplayMinHz] = createSignal(lsMinHz ? loadNumber(lsMinHz, 0) : 0)
+  const [displayMinHz, setDisplayMinHz] = createSignal(lsMinHz ? loadNumber(lsMinHz, sourceMinHz()) : sourceMinHz())
   const [displayMaxHz, setDisplayMaxHz] = createSignal(lsMaxHz ? loadNumber(lsMaxHz, defaultMaxHz()) : defaultMaxHz())
+  // iqSource's span is only known once sampleRateHz() resolves (e.g. after
+  // GET /status returns) — re-clamp the persisted/default View range into
+  // it whenever the source's own bounds change, rather than leaving a
+  // real-FFT-era 0-floored range stuck on screen after switching to I/Q.
+  createEffect(() => {
+    const lo = sourceMinHz()
+    const hi = sourceMaxHz()
+    if (displayMinHz() < lo) setDisplayMinHz(lo)
+    if (displayMaxHz() > hi) setDisplayMaxHz(hi)
+  })
   const [sgView, setSgView] = createSignal<SpectrogramView>(loadString(LS_SG_VIEW, 'waterfall', SPECTROGRAM_VIEWS))
   // WebGL init/shader failure → swap the spectrogram to the CPU 2D pipeline.
   const [glFailed, setGlFailed] = createSignal(false)
@@ -357,7 +491,6 @@ export default function AudioAnalysisPanel(props: Props): JSX.Element {
   let sgContainerEl: HTMLDivElement | undefined
   const [sgH, setSgH] = createSignal(300)
 
-  let fftBuf: Uint8Array<ArrayBuffer> | null = null
   let squelchDragging = false
   let markerDrag: { index: number; el: HTMLElement } | null = null
 
@@ -390,8 +523,8 @@ export default function AudioAnalysisPanel(props: Props): JSX.Element {
       }
     }
 
-    if (!props.onMarkerDrag) return
-    const ms = props.markers ?? []
+    if (!hasMarkerDrag()) return
+    const ms = effectiveMarkers()
     if (!ms.length) return
     const xRatio = (e.clientX - rect.left) / rect.width
     const clickHz = displayMinHz() + xRatio * (displayMaxHz() - displayMinHz())
@@ -432,7 +565,7 @@ export default function AudioAnalysisPanel(props: Props): JSX.Element {
   // waterfall. `el` is the box whose horizontal extent maps to the displayed
   // frequency span (the drag's pixel→Hz reference).
   function startGripDrag(index: number, el: HTMLElement | undefined, e: MouseEvent) {
-    if (!el || !props.onMarkerDrag) return
+    if (!el || !hasMarkerDrag()) return
     e.preventDefault()
     e.stopPropagation()
     markerDrag = { index, el }
@@ -452,12 +585,12 @@ export default function AudioAnalysisPanel(props: Props): JSX.Element {
         return
       }
       const drag = markerDrag
-      if (!drag || !props.onMarkerDrag) return
+      if (!drag || !hasMarkerDrag()) return
       e.preventDefault()
       const rect = drag.el.getBoundingClientRect()
       const xRatio = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width))
       const newHz = Math.round(displayMinHz() + xRatio * (displayMaxHz() - displayMinHz()))
-      props.onMarkerDrag(drag.index, newHz, e.shiftKey)
+      handleMarkerDrag(drag.index, newHz, e.shiftKey)
     }
     const onUp = () => {
       markerDrag = null
@@ -483,7 +616,7 @@ export default function AudioAnalysisPanel(props: Props): JSX.Element {
   })
 
   const centerFreq = createMemo(() => {
-    const markers = props.markers ?? []
+    const markers = effectiveMarkers()
     return markers.length
       ? Math.round(markers.reduce((s, m) => s + m.freq, 0) / markers.length)
       : Math.round((displayMinHz() + displayMaxHz()) / 2)
@@ -496,18 +629,22 @@ export default function AudioAnalysisPanel(props: Props): JSX.Element {
       maxHz = displayMaxHz()
     ctx.fillStyle = '#0a0a0a'
     ctx.fillRect(0, 0, canvas.width, CANVAS_H)
-    if (!props.analyser) return null
+    const src = source()
+    if (!src) return null
+    const d = src.getBytes()
+    if (!d) return null
 
-    const bc = props.analyser.frequencyBinCount
-    if (!fftBuf || fftBuf.length !== bc) fftBuf = new Uint8Array(bc) as Uint8Array<ArrayBuffer>
-    const d = fftBuf
-    props.analyser.getByteFrequencyData(d)
-    const nq = props.analyser.context.sampleRate / 2
-    const bin0 = Math.floor((minHz / nq) * bc)
-    const bin1 = Math.min(Math.floor((maxHz / nq) * bc), bc)
-    const vis = d.subarray(bin0, bin1)
+    // Maps the displayed [minHz, maxHz] window onto d's own [src.minHz,
+    // src.maxHz] span into bin indices — generalizes the old
+    // hardcoded-[0, Nyquist] real-FFT assumption to any linear span,
+    // including I/Q's negative-to-positive range.
+    const bc = d.length
+    const srcSpan = src.maxHz - src.minHz
+    const bin0 = Math.floor(((minHz - src.minHz) / srcSpan) * bc)
+    const bin1 = Math.min(Math.ceil(((maxHz - src.minHz) / srcSpan) * bc), bc)
+    const vis = d.subarray(Math.max(0, bin0), Math.max(0, bin1))
 
-    const ms = props.markers ?? []
+    const ms = effectiveMarkers()
     const showGrid = props.showGrid ?? false
     ctx.globalAlpha = showGrid ? 0.3 : 1
     ctx.strokeStyle = '#2ea043'
@@ -632,23 +769,23 @@ export default function AudioAnalysisPanel(props: Props): JSX.Element {
           const halfBw = 40
           return { fromHz: ch.freq - halfBw, toHz: ch.freq + halfBw, color: ch.color }
         })
-      : (props.markers ?? []).map((m) => {
+      : effectiveMarkers().map((m) => {
           const halfBw = m.bandwidthHz != null ? m.bandwidthHz / 2 : 40
           return { fromHz: m.freq - halfBw, toHz: m.freq + halfBw, color: m.color }
         }),
   )
 
   const glMarkers = createMemo<SpectroBand[]>(() =>
-    (props.markers ?? []).map((m) => ({ fromHz: m.freq, toHz: m.freq, color: m.color })),
+    effectiveMarkers().map((m) => ({ fromHz: m.freq, toHz: m.freq, color: m.color })),
   )
 
   function applyCenterShift(newCenter: number) {
-    if (!props.onMarkerDrag) return
+    if (!hasMarkerDrag()) return
     const delta = newCenter - centerFreq()
     if (delta === 0) return
-    const markers = props.markers ?? []
+    const markers = effectiveMarkers()
     markers.forEach((_, i) => {
-      props.onMarkerDrag!(i, markers[i].freq + delta)
+      handleMarkerDrag(i, markers[i].freq + delta)
     })
   }
 
@@ -659,8 +796,8 @@ export default function AudioAnalysisPanel(props: Props): JSX.Element {
   // span during the drag.
   const MarkerGrips = (p: { host: () => HTMLElement | undefined }) => (
     <>
-      {props.onMarkerDrag &&
-        (props.markers ?? []).map((m, i) => {
+      {hasMarkerDrag() &&
+        effectiveMarkers().map((m, i) => {
           const span = displayMaxHz() - displayMinHz()
           const frac = span > 0 ? (m.freq - displayMinHz()) / span : -1
           if (frac < 0 || frac > 1) return null
@@ -686,11 +823,11 @@ export default function AudioAnalysisPanel(props: Props): JSX.Element {
       style={props.style}
     >
       <div class="mb-2 shrink-0">
-        <h2 class="text-lg font-semibold sm:text-xl">Audio Analysis</h2>
+        <h2 class="text-lg font-semibold sm:text-xl">Signal Analysis</h2>
       </div>
 
       <div class="shrink-0">
-        {(props.markers ?? []).length > 0 && (
+        {effectiveMarkers().length > 0 && (
           <div class="mb-1.5 flex items-center gap-2 text-xs text-[#8b949e]">
             <span class="shrink-0">{props.markerFieldLabel ?? 'Center'}</span>
             {props.vfoFrequency ? (
@@ -703,22 +840,22 @@ export default function AudioAnalysisPanel(props: Props): JSX.Element {
                 max={(props.vfoFrequency + displayMaxHz()) / 1000}
                 step={0.01}
                 onCommit={(khz) => applyCenterShift(Math.round(khz * 1000) - props.vfoFrequency!)}
-                readOnly={!props.onMarkerDrag}
-                class={`w-28 rounded border border-[#30363d] bg-[#0d1117] px-2 py-0.5 font-mono text-xs text-[#c9d1d9] focus:border-[#2ea043] focus:outline-none ${!props.onMarkerDrag ? 'cursor-default opacity-60' : ''}`}
+                readOnly={!hasMarkerDrag()}
+                class={`w-28 rounded border border-[#30363d] bg-[#0d1117] px-2 py-0.5 font-mono text-xs text-[#c9d1d9] focus:border-[#2ea043] focus:outline-none ${!hasMarkerDrag() ? 'cursor-default opacity-60' : ''}`}
               />
             ) : (
               <NumberField
                 value={centerFreq()}
-                min={50}
+                min={displayMinHz()}
                 max={displayMaxHz()}
                 onCommit={applyCenterShift}
-                readOnly={!props.onMarkerDrag}
-                class={`w-20 rounded border border-[#30363d] bg-[#0d1117] px-2 py-0.5 font-mono text-[#c9d1d9] focus:border-[#2ea043] focus:outline-none ${!props.onMarkerDrag ? 'cursor-default opacity-60' : ''}`}
+                readOnly={!hasMarkerDrag()}
+                class={`w-20 rounded border border-[#30363d] bg-[#0d1117] px-2 py-0.5 font-mono text-[#c9d1d9] focus:border-[#2ea043] focus:outline-none ${!hasMarkerDrag() ? 'cursor-default opacity-60' : ''}`}
               />
             )}
             <span class="shrink-0 text-[#484f58]">{props.vfoFrequency ? 'kHz' : 'Hz'}</span>
             <span class="ml-auto text-[10px] text-[#484f58]">
-              {(props.markers ?? []).length} marker{(props.markers ?? []).length !== 1 ? 's' : ''}
+              {effectiveMarkers().length} marker{effectiveMarkers().length !== 1 ? 's' : ''}
             </span>
           </div>
         )}
@@ -729,9 +866,9 @@ export default function AudioAnalysisPanel(props: Props): JSX.Element {
             width={640}
             height={CANVAS_H}
             class={`block w-full touch-manipulation rounded border border-[#30363d] bg-[#0a0a0a] ${
-              props.onMarkerDrag ? 'cursor-ew-resize' : props.onSquelchChange ? 'cursor-ns-resize' : 'cursor-crosshair'
+              hasMarkerDrag() ? 'cursor-ew-resize' : props.onSquelchChange ? 'cursor-ns-resize' : 'cursor-crosshair'
             }`}
-            onMouseDown={props.onMarkerDrag || props.onSquelchChange ? handleSpectrumMouseDown : undefined}
+            onMouseDown={hasMarkerDrag() || props.onSquelchChange ? handleSpectrumMouseDown : undefined}
             onMouseMove={props.onSquelchChange ? handleSpectrumHover : undefined}
           />
           <MarkerGrips host={() => specWrapEl} />
@@ -762,13 +899,13 @@ export default function AudioAnalysisPanel(props: Props): JSX.Element {
           <span class="shrink-0">View</span>
           <input
             type="number"
-            min={0}
+            min={sourceMinHz()}
             max={displayMaxHz() - 100}
             step={100}
             value={displayMinHz()}
             onInput={(e) => {
               const v = parseInt(e.currentTarget.value)
-              if (!isNaN(v)) setDisplayMinHz(Math.max(0, Math.min(displayMaxHz() - 100, v)))
+              if (!isNaN(v)) setDisplayMinHz(Math.max(sourceMinHz(), Math.min(displayMaxHz() - 100, v)))
             }}
             class="w-16 rounded border border-[#30363d] bg-[#0d1117] px-1.5 py-0.5 font-mono text-[#c9d1d9] focus:border-[#2ea043] focus:outline-none"
           />
@@ -776,29 +913,41 @@ export default function AudioAnalysisPanel(props: Props): JSX.Element {
           <input
             type="number"
             min={displayMinHz() + 100}
-            max={24000}
+            max={sourceMaxHz()}
             step={100}
             value={displayMaxHz()}
             onInput={(e) => {
               const v = parseInt(e.currentTarget.value)
-              if (!isNaN(v)) setDisplayMaxHz(Math.max(displayMinHz() + 100, Math.min(24000, v)))
+              if (!isNaN(v)) setDisplayMaxHz(Math.max(displayMinHz() + 100, Math.min(sourceMaxHz(), v)))
             }}
             class="w-16 rounded border border-[#30363d] bg-[#0d1117] px-1.5 py-0.5 font-mono text-[#c9d1d9] focus:border-[#2ea043] focus:outline-none"
           />
           <span class="shrink-0 text-[#484f58]">Hz</span>
-          {[1000, 2000, 3000, 4000].map((mx) => (
+          {(props.iqSource
+            ? [
+                { lo: -1000, hi: 1000 },
+                { lo: -4000, hi: 4000 },
+                { lo: sourceMinHz(), hi: sourceMaxHz() },
+              ]
+            : [
+                { lo: 0, hi: 1000 },
+                { lo: 0, hi: 2000 },
+                { lo: 0, hi: 3000 },
+                { lo: 0, hi: 4000 },
+              ]
+          ).map(({ lo, hi }) => (
             <button
               onClick={() => {
-                setDisplayMinHz(0)
-                setDisplayMaxHz(mx)
+                setDisplayMinHz(lo)
+                setDisplayMaxHz(hi)
               }}
               class={`rounded border px-1.5 py-0.5 text-[9px] transition-colors ${
-                displayMinHz() === 0 && displayMaxHz() === mx
+                displayMinHz() === lo && displayMaxHz() === hi
                   ? 'border-[#2ea043]/50 bg-[#238636]/20 text-[#2ea043]'
                   : 'border-[#30363d] text-[#484f58] hover:text-[#8b949e]'
               }`}
             >
-              {mx / 1000}k
+              {props.iqSource ? `±${Math.round(hi / 1000)}k` : `${hi / 1000}k`}
             </button>
           ))}
         </div>

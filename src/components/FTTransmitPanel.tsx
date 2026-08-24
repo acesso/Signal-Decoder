@@ -408,9 +408,20 @@ interface FTTransmitPanelProps {
   contacts: Map<string, Contact>;
   vfoFrequency?: number;
   audioBridge?: AudioBridge;
+  /** CAT bridge WebSocket URL — needed so selecting "ESP32 Bridge" as the
+   *  TX output can auto-connect audioBridge's /audio WebSocket if
+   *  "Listen to Radio" was never separately clicked (see audioSource.ts's
+   *  bridgeSink() for the real-hardware bug this fixes). */
+  bridgeWsUrl?: string;
   onMyCallChange?: (call: string) => void;
   onMyGridChange?: (grid: string) => void;
   onSetPTT?: (tx: boolean) => Promise<void>;
+  /** Brackets each keyed TX window — see useFTTransmit.ts's
+   *  getOnTxWindowStart/End comment. App.tsx wires these to suspend/resume
+   *  the bridge's /iq-data spectrum connection (real-hardware WiFi/I2S DMA
+   *  contention — see loadSuspendIQDuringTx()). */
+  onTxWindowStart?: () => void;
+  onTxWindowEnd?: () => void;
   onStatusChange?: (s: TxStatus) => void;
   onReset?: (clearSentFn: () => void) => void;
   onBaseFreqHandle?: (setFn: (v: number) => void) => void;
@@ -467,6 +478,9 @@ export default function FTTransmitPanel(props: FTTransmitPanelProps): JSX.Elemen
     () => props.onSetPTT,
     audioSinkKind,
     () => props.audioBridge,
+    () => props.bridgeWsUrl,
+    () => props.onTxWindowStart,
+    () => props.onTxWindowEnd,
   )
 
   // Keep the auto-CQ cache in sync with mode/baseFreq changes. Debounced:

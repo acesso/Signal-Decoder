@@ -74,6 +74,7 @@ const LS_BASE_FREQ       = 'ft_base_freq';
 const LS_AUTOCQ_INTERVAL = 'ft_autocq_interval_min';
 const LS_PREKEY_MS       = 'ft_prekey_ms';
 const LS_POSTKEY_MS      = 'ft_postkey_ms';
+const LS_SUSPEND_IQ_TX   = 'ft_suspend_iq_during_tx';
 
 export const DEFAULT_BASE_FREQ = 1850;
 export function loadBaseFreq(): number {
@@ -121,6 +122,23 @@ export function loadAutoPTT(): boolean {
 }
 export function saveAutoPTT(v: boolean) {
   if (typeof window !== 'undefined') localStorage.setItem(LS_AUTOPTT, String(v));
+}
+// Real-hardware profiling of the ESP32 bridge found that WiFi's dynamic
+// packet-buffer allocator and I2S's DMA descriptors draw from the same
+// physical memory pool, so streaming /iq-data concurrently with TX
+// measurably degrades TX audio quality — a hardware/IDF limitation, not a
+// bug this codebase can fully fix (see the bridge firmware's WiFi buffer
+// count reduction, which helps but doesn't eliminate it). Defaults ON:
+// suspending the I/Q spectrum connection for the duration of each TX
+// window sidesteps the contention entirely at the cost of a spectrum-view
+// gap while transmitting.
+export function loadSuspendIQDuringTx(): boolean {
+  if (typeof window === 'undefined') return true;
+  const stored = localStorage.getItem(LS_SUSPEND_IQ_TX);
+  return stored !== null ? stored === 'true' : true;
+}
+export function saveSuspendIQDuringTx(v: boolean) {
+  if (typeof window !== 'undefined') localStorage.setItem(LS_SUSPEND_IQ_TX, String(v));
 }
 export function loadAllowConsecutiveTx(): boolean {
   if (typeof window === 'undefined') return false;
@@ -240,10 +258,22 @@ export function createFTTransmit(
   getOnSetPTT: () => ((tx: boolean) => Promise<void>) | undefined,
   // Where TX audio plays — the local speaker (default, matches all prior
   // behavior when omitted) or out through the ESP32 bridge's mic-send path
-  // (see audioSource.ts's speakerSink()/bridgeSink()). getAudioBridge only
-  // needs to resolve when getAudioSinkKind() returns 'bridge'.
+  // (see audioSource.ts's speakerSink()/bridgeSink()). getAudioBridge/
+  // getBridgeWsUrl only need to resolve when getAudioSinkKind() returns
+  // 'bridge' — getBridgeWsUrl is what lets bridgeSink() auto-connect the
+  // bridge's /audio WebSocket if "Listen to Radio" was never separately
+  // clicked (see bridgeSink()'s own comment on the real-hardware bug this
+  // fixes: TX silently producing no audio at all otherwise).
   getAudioSinkKind: () => AudioSinkKind = () => 'speaker',
   getAudioBridge: () => AudioBridge | undefined = () => undefined,
+  getBridgeWsUrl: () => string | undefined = () => undefined,
+  // Brackets each keyed TX window (same span as onSetPTT true/false above)
+  // so the caller can suspend/resume the bridge's I/Q spectrum connection —
+  // see loadSuspendIQDuringTx()'s comment for why. Called unconditionally;
+  // it's the caller's job (App.tsx) to check the setting and no-op when
+  // it's off or nothing's connected.
+  getOnTxWindowStart: () => (() => void) | undefined = () => undefined,
+  getOnTxWindowEnd: () => (() => void) | undefined = () => undefined,
 ) {
   const [state, setState] = createSignal<FTTransmitState>({
     status: 'idle',
@@ -510,6 +540,8 @@ export function createFTTransmit(
       if (useAutoCQ) { txId = `autocq-${windowStartMs}`; lastAutoCQAtMs = windowStartMs; }
       setState(prev => ({ ...prev, status: 'playing', error: null }));
 
+      getOnTxWindowStart()?.();
+
       // Auto-PTT on — race with a 500ms timeout so a non-responsive CAT never blocks TX
       const onSetPTT = getOnSetPTT();
       if (autoPTTOn && onSetPTT) {
@@ -567,6 +599,8 @@ export function createFTTransmit(
           ]);
         } catch { /* CAT not connected or timed out */ }
       }
+
+      getOnTxWindowEnd()?.();
 
       const sent: SentEntry = {
         id: txId, message: txMessage, label: txLabel, windowStart,
@@ -646,7 +680,7 @@ export function createFTTransmit(
         sink.connectSource(node);
         return;
       }
-      sink = bridgeSink(bridge, ctx);
+      sink = bridgeSink(bridge, ctx, getBridgeWsUrl);
     } else {
       sink = speakerSink(ctx);
     }
@@ -703,6 +737,11 @@ export function createFTTransmit(
     if (autoPTTOn) {
       getOnSetPTT()?.(false).catch(() => null);
     }
+    // Safety net: if stop() lands mid-TX-window (operator hit Stop while
+    // keyed), make sure the I/Q connection getOnTxWindowStart() suspended
+    // actually resumes — the normal getOnTxWindowEnd() call after PTT-off
+    // in the loop above never runs when the loop is aborted this way.
+    getOnTxWindowEnd()?.();
   }
 
   function enqueue(entry: Omit<TxQueueEntry, 'samples' | 'encodeStatus'>) {
