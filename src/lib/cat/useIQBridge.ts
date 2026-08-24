@@ -93,7 +93,39 @@ export interface IQBridgeState {
   passbandCenterHz: number
   passbandBandwidthHz: number
   error: string | null
+  // Whether the demodulated I/Q audio is also being played out the
+  // browser's own speakers — see setPlayThroughSpeakers(). Independent of
+  // getPlaybackSource()/decoder consumption; this is purely for an
+  // operator who wants to listen to what's being demodulated, same
+  // purpose as useAudioBridge.ts's "Listen to Radio" but for I/Q mode
+  // (which never had a speaker path at all before this).
+  playThroughSpeakers: boolean
+  // Which I/Q correction (if any) is applied before both the spectrum
+  // display and the demodulator see the raw stream — see
+  // setIQCorrection()'s comment for what each mode actually does and why
+  // there are four instead of just an on/off swap.
+  iqCorrection: IQCorrection
+  // Independent of iqCorrection — see DCRemover/ImbalanceCorrector's own
+  // comments for what each fixes and why they're separate, stackable
+  // toggles rather than folded into iqCorrection's options.
+  dcRemovalEnabled: boolean
+  imbalanceCorrectionEnabled: boolean
 }
+
+// A mirrored spectrum (signals above the tuned frequency appearing as if
+// below, and vice versa) comes from the two mixer outputs' 90-degree
+// phase relationship having the wrong sign — which can happen two
+// physically distinct ways that are NOT interchangeable to fix: a
+// literal channel swap (I/Q wiring crossed, e.g. on the ADC's left/right
+// pins) needs 'swap'; a single channel's sign/phase being wrong (e.g. an
+// inverted mixer stage or single-ended-to-differential conversion on just
+// one channel) needs 'negateI' or 'negateQ' instead — swapping wouldn't
+// fix that case, only negating the specific wrong channel would. All
+// three undo the SAME symptom (mirroring) but only one matches the real
+// underlying defect; exposing all of them lets an operator try each
+// against a real signal and see which one actually clears it, rather
+// than guessing.
+export type IQCorrection = 'none' | 'swap' | 'negateI' | 'negateQ'
 
 // Plain radix-2 iterative FFT, no library — same "no bundler-friendly FFT
 // dependency justified for one feature" reasoning as the ESP32 control
@@ -170,15 +202,22 @@ export class IQSpectrumComputer {
   // each time is simpler and correct for a diagnostic spectrum view; there
   // is no continuity requirement between windows the way there is for a
   // resampled audio *waveform*.
-  feed(int16: Int16Array): void {
+  // iq: interleaved I,Q pairs, already float-normalized to roughly [-1,1]
+  // and already through whatever upstream correction stages (DC removal,
+  // imbalance correction, swap/negate) are enabled — see onmessage's own
+  // comment for the full pipeline order. This class no longer does the
+  // int16-to-float conversion itself so every consumer of the corrected
+  // stream (this, and SSBDemodulator.demodulate()) agrees on exactly the
+  // same corrected values.
+  feed(iq: Float64Array): void {
     let offset = 0
-    const pairCount = int16.length >> 1
+    const pairCount = iq.length >> 1
     while (offset < pairCount) {
       const remaining = IQ_FFT_SIZE - this.accumCount
       const take = Math.min(remaining, pairCount - offset)
       for (let i = 0; i < take; i++) {
-        this.accumRe[this.accumCount + i] = int16[(offset + i) * 2] / 32768
-        this.accumIm[this.accumCount + i] = int16[(offset + i) * 2 + 1] / 32768
+        this.accumRe[this.accumCount + i] = iq[(offset + i) * 2]
+        this.accumIm[this.accumCount + i] = iq[(offset + i) * 2 + 1]
       }
       this.accumCount += take
       offset += take
@@ -221,6 +260,117 @@ export class IQSpectrumComputer {
     const was = this.hasFreshWindow
     this.hasFreshWindow = false
     return was
+  }
+}
+
+// Removes DC offset/LO-leakage from each channel independently — a
+// one-pole leaky integrator tracking each channel's running mean,
+// subtracted per-sample. Real hardware direct-conversion I/Q receivers
+// commonly show a spike exactly at 0Hz from mixer self-mixing or ADC/
+// analog-frontend DC offset; left in place, that offset gets frequency-
+// TRANSLATED by SSBDemodulator's complex mixer into a tone at exactly
+// centerHz (the tuned frequency) — i.e. it doesn't just look bad in the
+// spectrum display, it actively corrupts demodulated audio at the exact
+// frequency being listened to. Applied once, upstream of both
+// spectrum.feed() and the demodulator (see onmessage's pipeline comment),
+// so both agree and the imbalance corrector below (which assumes
+// near-zero-mean I/Q for its statistics to be unbiased) sees clean input.
+//
+// alpha sets the cutoff frequency (roughly alpha * sampleRateHz / 2π) —
+// small enough to sit well below any signal of interest (a few Hz) while
+// still tracking slow thermal/analog drift. Per-sample (not per-frame)
+// update to avoid a step discontinuity at each ~50ms frame boundary,
+// which the demodulator's carried-history filters would otherwise see as
+// a periodic click.
+const DC_REMOVAL_ALPHA = 0.001
+class DCRemover {
+  private dcI = 0
+  private dcQ = 0
+
+  // iq: interleaved I,Q pairs, modified in place.
+  process(iq: Float64Array): void {
+    const pairCount = iq.length >> 1
+    for (let n = 0; n < pairCount; n++) {
+      this.dcI += DC_REMOVAL_ALPHA * (iq[n * 2] - this.dcI)
+      this.dcQ += DC_REMOVAL_ALPHA * (iq[n * 2 + 1] - this.dcQ)
+      iq[n * 2] -= this.dcI
+      iq[n * 2 + 1] -= this.dcQ
+    }
+  }
+}
+
+// Corrects I/Q gain and phase imbalance — the two ADC/mixer channels not
+// being exactly equal amplitude and exactly 90 degrees apart. Unlike a
+// literal channel swap or a single channel's wrong sign (see IQCorrection
+// below, which fixes a FULL spectral mirror), this defect produces a
+// real signal's PARTIAL mirror image at reduced amplitude on the
+// opposite side of 0Hz while the true signal stays in place — a
+// continuous calibration error, not a discrete flip, and swap/negate
+// cannot fix it.
+//
+// Model: let a(n),b(n) be the true orthogonal baseband I/Q. An
+// imbalanced front-end produces I=a, Q=g*(b*cosφ + a*sinφ) — g is Q's
+// gain relative to I, φ is the phase error. Assuming a broadband/generic
+// signal (E[a²]=E[b²]=P, E[ab]≈0 — true for noise or any signal that
+// isn't a single perfectly-real tone exactly at DC, see below):
+//   E[I²]=P, E[Q²]=g²P, E[IQ]=g·P·sinφ
+// so g_est=sqrt(E[Q²]/E[I²]), sinPhi_est=E[IQ]/sqrt(E[I²]·E[Q²]).
+// Inverting for b given I=a known: b=(Q/g - I·sinφ)/cosφ, giving the
+// correction Q'=(Q/g_est - I·sinPhi_est)/sqrt(1-sinPhi_est²), I'=I. This
+// is the standard moment-based blind I/Q imbalance estimator used in SDR
+// software generally (sometimes attributed to Cordesses) — verified here
+// by direct derivation from the imbalance model above, not assumed.
+//
+// Continuously adaptive (slow EMA, not a one-shot calibration button):
+// gain/phase imbalance is a physical front-end property that changes
+// slowly if at all (thermal drift), so a slow-moving estimate is
+// appropriate — the correction APPLIED to a given frame uses the
+// estimate as converged BEFORE that frame (updated from stats that
+// include this frame, applied starting next frame), avoiding a circular
+// same-sample dependency. Guards: freezes (does not update, and does not
+// apply an invalid value) when signal power is too low to estimate from
+// (near-silence, where the ratio is dominated by quantization noise) or
+// when the estimate would produce a numerically invalid correction
+// (sinPhi_est clamped inside [-1,1], sqrt(1-sinPhi²) guarded from
+// hitting zero/imaginary).
+const IMBALANCE_EMA_ALPHA = 0.001
+const IMBALANCE_POWER_FLOOR = 1e-6 // ~-60dBFS-ish on this app's [-1,1]-normalized scale
+class ImbalanceCorrector {
+  private emaI2 = 1
+  private emaQ2 = 1
+  private emaIQ = 0
+  private gEst = 1
+  private sinPhiEst = 0
+
+  // iq: interleaved I,Q pairs, modified in place using the estimate as
+  // converged BEFORE this call, then updates the estimate from this
+  // call's own (pre-correction) statistics for use starting next call.
+  process(iq: Float64Array): void {
+    const pairCount = iq.length >> 1
+    const cosPhi = Math.sqrt(Math.max(0, 1 - this.sinPhiEst * this.sinPhiEst))
+    for (let n = 0; n < pairCount; n++) {
+      const i = iq[n * 2]
+      const q = iq[n * 2 + 1]
+      iq[n * 2 + 1] = (q / this.gEst - i * this.sinPhiEst) / cosPhi
+      // i unchanged — the model treats I as the reference channel.
+
+      this.emaI2 += IMBALANCE_EMA_ALPHA * (i * i - this.emaI2)
+      this.emaQ2 += IMBALANCE_EMA_ALPHA * (q * q - this.emaQ2)
+      this.emaIQ += IMBALANCE_EMA_ALPHA * (i * q - this.emaIQ)
+    }
+
+    const signalPower = this.emaI2 + this.emaQ2
+    if (signalPower < IMBALANCE_POWER_FLOOR || this.emaI2 < IMBALANCE_POWER_FLOOR) {
+      return // not enough signal to estimate from — freeze at last-known-good values
+    }
+    const gEst = Math.sqrt(this.emaQ2 / this.emaI2)
+    const denom = Math.sqrt(this.emaI2 * this.emaQ2)
+    let sinPhiEst = denom > 0 ? this.emaIQ / denom : 0
+    sinPhiEst = Math.max(-0.99, Math.min(0.99, sinPhiEst))
+    if (gEst > 0.1 && gEst < 10 && Number.isFinite(gEst) && Number.isFinite(sinPhiEst)) {
+      this.gEst = gEst
+      this.sinPhiEst = sinPhiEst
+    }
   }
 }
 
@@ -344,8 +494,11 @@ export class SSBDemodulator {
   // but defaulting them to USB is harmless here since only the sideband
   // mirror is affected, not decode correctness for the modes that matter
   // (FT8/MFSK only ever run on USB/LSB-tuned signals).
-  demodulate(int16: Int16Array, sideband: boolean, sampleRateHz: number): Float32Array<ArrayBuffer> {
-    const pairCount = int16.length >> 1
+  // iq: interleaved I,Q pairs, already float-normalized and already
+  // through whatever upstream correction stages are enabled — see
+  // IQSpectrumComputer.feed()'s comment; same contract.
+  demodulate(iq: Float64Array, sideband: boolean, sampleRateHz: number): Float32Array<ArrayBuffer> {
+    const pairCount = iq.length >> 1
     const out = new Float32Array(pairCount)
     if (sampleRateHz !== this.lowpassSampleRateHz) this.setPassband(this.centerHz, this.bandwidthHz, sampleRateHz)
 
@@ -357,8 +510,8 @@ export class SSBDemodulator {
     const angStep = (-2 * Math.PI * this.centerHz) / sampleRateHz
     let phase = this.mixerPhase
     for (let n = 0; n < pairCount; n++) {
-      const i = int16[n * 2] / 32768
-      const q = int16[n * 2 + 1] / 32768
+      const i = iq[n * 2]
+      const q = iq[n * 2 + 1]
       const c = Math.cos(phase)
       const s = Math.sin(phase)
       // Complex multiply (i + jq) * (c + js) = (i*c - q*s) + j(i*s + q*c).
@@ -448,11 +601,46 @@ export function useIQBridge() {
     passbandCenterHz: 0,
     passbandBandwidthHz: 2700,
     error: null,
+    playThroughSpeakers: false,
+    iqCorrection: 'none',
+    dcRemovalEnabled: false,
+    imbalanceCorrectionEnabled: false,
   })
 
   let ws: WebSocket | null = null
   const spectrum = new IQSpectrumComputer()
   const demod = new SSBDemodulator()
+  const dcRemover = new DCRemover()
+  const imbalanceCorrector = new ImbalanceCorrector()
+
+  // Applied to every incoming frame before either the spectrum display or
+  // the demodulator sees it — see onmessage's own comment for exactly
+  // where, and IQCorrection's own comment for what each mode means and
+  // why there are four. Session-only (not persisted), same as
+  // playThroughSpeakers below — this is a diagnostic control for
+  // confirming/ruling out a wiring theory, not a setting that should
+  // silently survive to a future session if the real fix turns out to be
+  // on the firmware/hardware side instead.
+  let iqCorrection: IQCorrection = 'none'
+  function setIQCorrection(mode: IQCorrection) {
+    iqCorrection = mode
+    setState((s) => ({ ...s, iqCorrection: mode }))
+  }
+
+  // Independent of iqCorrection and of each other — an operator might
+  // need any combination (e.g. a real hardware swap AND genuine DC
+  // leakage AND some residual imbalance, all at once). See
+  // DCRemover/ImbalanceCorrector's own comments.
+  let dcRemovalEnabled = false
+  function setDCRemoval(enabled: boolean) {
+    dcRemovalEnabled = enabled
+    setState((s) => ({ ...s, dcRemovalEnabled: enabled }))
+  }
+  let imbalanceCorrectionEnabled = false
+  function setImbalanceCorrection(enabled: boolean) {
+    imbalanceCorrectionEnabled = enabled
+    setState((s) => ({ ...s, imbalanceCorrectionEnabled: enabled }))
+  }
 
   // USB unless told otherwise — see setCatMode()/SSBDemodulator's own
   // comment on why CW/RTTY/AM/FM all fall back to the USB branch here.
@@ -483,17 +671,26 @@ export function useIQBridge() {
   let playCtx: AudioContext | null = null
   let playAnalyserNode: AnalyserNode | null = null
   let nextPlayTime = 0
+  // Separate gain stage between playAnalyserNode and destination — muted
+  // (gain 0) by default so opening the I/Q spectrum stays silent unless
+  // the operator explicitly asks to hear it (see setPlayThroughSpeakers()).
+  // A gain mute rather than connect()/disconnect() on toggle so flipping
+  // it mid-stream doesn't click, same reasoning as other mute-via-gain
+  // spots in this codebase (e.g. useFTTransmit.ts's TX gain node).
+  let speakersGainNode: GainNode | null = null
+  let speakersOn = false
 
   function teardownPlayback() {
     playCtx?.close().catch(() => null)
     playCtx = null
     playAnalyserNode = null
+    speakersGainNode = null
     nextPlayTime = 0
   }
 
-  function playDemodulatedFrame(int16: Int16Array, sampleRateHz: number) {
+  function playDemodulatedFrame(iq: Float64Array, sampleRateHz: number) {
     if (!playCtx) return
-    const floatSamples = demod.demodulate(int16, sideband, sampleRateHz)
+    const floatSamples = demod.demodulate(iq, sideband, sampleRateHz)
     if (floatSamples.length === 0) return
 
     const buffer = playCtx.createBuffer(1, floatSamples.length, sampleRateHz)
@@ -570,13 +767,18 @@ export function useIQBridge() {
       playCtx = new AudioContext()
       playAnalyserNode = playCtx.createAnalyser()
       playAnalyserNode.fftSize = 2048
-      // Deliberately NOT connected to playCtx.destination — unlike
-      // useAudioBridge.ts's "Listen to Radio" (whose whole point is
-      // speaker output), this graph exists to feed decoders (via
-      // getPlaybackSource()) and hasFramePairs-style liveness, not to play
-      // audio out loud as a side effect of opening the I/Q spectrum view.
-      // An AnalyserNode reads its input whether or not it's connected
-      // onward, so decoders/visualizers tapping it here still work.
+      // playAnalyserNode itself is NOT connected to playCtx.destination —
+      // unlike useAudioBridge.ts's "Listen to Radio" (whose whole point is
+      // speaker output), THIS graph primarily exists to feed decoders (via
+      // getPlaybackSource()) and hasFramePairs-style liveness. An
+      // AnalyserNode reads its input whether or not it's connected onward,
+      // so decoders/visualizers tapping it here still work regardless of
+      // the speaker path below. speakersGainNode is the optional, muted-
+      // by-default speaker tap — see setPlayThroughSpeakers().
+      speakersGainNode = playCtx.createGain()
+      speakersGainNode.gain.value = speakersOn ? 1 : 0
+      playAnalyserNode.connect(speakersGainNode)
+      speakersGainNode.connect(playCtx.destination)
       setState((s) => ({ ...s, connected: true, error: null }))
       resolveFirstAttempt?.(true)
     }
@@ -601,9 +803,43 @@ export function useIQBridge() {
       if (generation !== connectGeneration) return
       if (!(ev.data instanceof ArrayBuffer)) return
       const int16 = new Int16Array(ev.data)
-      spectrum.feed(int16)
-      playDemodulatedFrame(int16, state().sampleRateHz)
-      setState((s) => ({ ...s, lastFramePairs: int16.length >> 1 }))
+      // Convert to float once, here, then run every correction stage on
+      // that SAME buffer in a fixed order — the single choke point both
+      // spectrum.feed() and playDemodulatedFrame() read from, so the
+      // spectrum display and the demodulated audio always agree on
+      // exactly what correction(s) are active.
+      //
+      // Order: DC removal first (so the imbalance corrector's E[I]≈0/
+      // E[Q]≈0 assumption actually holds — a DC bias would bias its
+      // E[I²]/E[Q²]/E[IQ] estimates), then imbalance correction, then
+      // swap/negate last (those reindex/sign-flip which physical channel
+      // is "I" and which is "Q" — applying them last means DC removal and
+      // the imbalance estimator's g/φ operate on the channels in their
+      // pre-swap physical roles, which is what a hardware defect actually
+      // affects; swap/negate is closer to "how the app INTERPRETS the two
+      // channels" than a per-channel property to correct before that).
+      const iq = new Float64Array(int16.length)
+      for (let n = 0; n < int16.length; n++) iq[n] = int16[n] / 32768
+      if (dcRemovalEnabled) dcRemover.process(iq)
+      if (imbalanceCorrectionEnabled) imbalanceCorrector.process(iq)
+      switch (iqCorrection) {
+        case 'swap':
+          for (let n = 0; n + 1 < iq.length; n += 2) {
+            const tmp = iq[n]
+            iq[n] = iq[n + 1]
+            iq[n + 1] = tmp
+          }
+          break
+        case 'negateI':
+          for (let n = 0; n < iq.length; n += 2) iq[n] = -iq[n]
+          break
+        case 'negateQ':
+          for (let n = 1; n < iq.length; n += 2) iq[n] = -iq[n]
+          break
+      }
+      spectrum.feed(iq)
+      playDemodulatedFrame(iq, state().sampleRateHz)
+      setState((s) => ({ ...s, lastFramePairs: iq.length >> 1 }))
     }
   }
 
@@ -634,9 +870,23 @@ export function useIQBridge() {
     if (generation === connectGeneration) setState((s) => ({ ...s, inputMode, sampleRateHz }))
   }
 
+  // Live-mutes/unmutes speakersGainNode — see that field's own comment for
+  // why a gain mute, not connect/disconnect. Takes effect immediately if
+  // already connected; otherwise just seeds the value the NEXT connect()
+  // creates speakersGainNode with, same "remembered until changed again"
+  // behavior as setCatMode()/setPassband() above.
+  function setPlayThroughSpeakers(enabled: boolean) {
+    speakersOn = enabled
+    if (speakersGainNode) speakersGainNode.gain.value = enabled ? 1 : 0
+    setState((s) => ({ ...s, playThroughSpeakers: enabled }))
+  }
+
   onCleanup(disconnect)
 
-  return { state, connect, disconnect, refreshInfo, spectrum, setCatMode, setPassband, getPlaybackSource }
+  return {
+    state, connect, disconnect, refreshInfo, spectrum, setCatMode, setPassband, getPlaybackSource,
+    setPlayThroughSpeakers, setIQCorrection, setDCRemoval, setImbalanceCorrection,
+  }
 }
 
 export type IQBridge = ReturnType<typeof useIQBridge>

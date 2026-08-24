@@ -9,8 +9,8 @@
 //                              "pa_sense":false,"pa_emergency_tripped":false,
 //                              "adc_input":"lin2","rx_slot_right":false,
 //                              "led_enabled":true,"alc_enabled":false,
-//                              "noise_gate_enabled":false,"cpu_freq_mhz":160,
-//                              "wifi_tx_power_quarter_dbm":84,"adc_hpf_enabled":true,
+//                              "noise_gate_enabled":false,"cpu_freq_mhz":240,
+//                              "wifi_tx_power_quarter_dbm":78,"adc_hpf_enabled":true,
 //                              "sample_rate_hz":48000,"speaker_amp_enabled":true,
 //                              "mic_gain_db":0.0,"cat_log_enabled":false,"uptime_s":1234}
 //                       wifi_state is one of "connected"/"connecting"/
@@ -82,16 +82,20 @@
 //                       minimum. Applied immediately AND persisted to NVS
 //                       — defaults to 0.0dB, the ES8388's own PGA default.
 //                       Response: {"db":0.0,"applied":true,"saved":true}.
-// POST /wifi-tx-power -> body {"quarter_dbm":84}; live-sets the WiFi
+// POST /wifi-tx-power -> body {"quarter_dbm":78}; live-sets the WiFi
 //                       radio's max TX power via esp_wifi_set_max_tx_power()
-//                       — units are quarter-dBm (84 == 21.0dBm, the driver's
-//                       own maximum), valid range [8,84] (2..21dBm), snapped
+//                       — units are quarter-dBm (78 == ~19.5dBm, the
+//                       driver's REAL maximum on this board, confirmed by
+//                       sweeping real hardware — the API accepts requests
+//                       up to 84 but anything above 78 silently snaps down
+//                       to it, so 84 was never actually achievable),
+//                       accepted input range [8,84] (2..21dBm), snapped
 //                       internally to the driver's own nearest supported
 //                       step (not a continuous scale). A low-confidence
 //                       experiment for whether the WiFi radio's own
 //                       transmit activity couples noise into the analog
 //                       audio path. Applied immediately AND persisted to
-//                       NVS. Response: {"quarter_dbm":84,"applied":true,"saved":true}.
+//                       NVS. Response: {"quarter_dbm":78,"applied":true,"saved":true}.
 // POST /rx-slot     -> body {"right":true|false}; live-switches which I2S
 //                       slot the ADC capture side reads — a SEPARATE axis
 //                       from /audio-input's ADCCONTROL2 mux selection (see

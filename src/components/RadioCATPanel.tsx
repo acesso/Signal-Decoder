@@ -1174,6 +1174,74 @@ function BridgeInputModeControl(props: {
           Streaming I/Q while transmitting shares WiFi/I2S DMA memory on this hardware and measurably degrades TX
           audio quality — leave this on unless you're specifically testing that tradeoff.
         </p>
+        <label class="flex items-center gap-2 text-[10px] text-[#8b949e]">
+          <input
+            type="checkbox"
+            checked={iq.state().playThroughSpeakers}
+            onChange={(e) => iq.setPlayThroughSpeakers(e.currentTarget.checked)}
+          />
+          Play demodulated audio through browser speakers
+        </label>
+        <p class="text-[10px] text-[#8b949e]">
+          Lets you hear the incoming radio audio (demodulated client-side from the raw I/Q stream) before it ever
+          reaches a decoder — off by default so opening the I/Q view doesn't unexpectedly start playing audio.
+        </p>
+        <div class="flex items-center gap-2 flex-wrap">
+          <span class="text-[10px] text-[#8b949e] whitespace-nowrap">I/Q correction</span>
+          <For each={[
+            { value: 'none' as const, label: 'None' },
+            { value: 'swap' as const, label: 'Swap I/Q' },
+            { value: 'negateI' as const, label: 'Negate I' },
+            { value: 'negateQ' as const, label: 'Negate Q' },
+          ]}>
+            {(opt) => (
+              <button
+                onClick={() => iq.setIQCorrection(opt.value)}
+                class={`text-[10px] font-semibold px-2.5 py-1.5 rounded border transition-colors whitespace-nowrap
+                  ${iq.state().iqCorrection === opt.value
+                    ? 'bg-[#1f6feb] border-[#1f6feb] text-white'
+                    : 'bg-[#21262d] border-[#30363d] text-[#8b949e] hover:text-[#c9d1d9] hover:border-[#8b949e]'
+                  }`}
+              >
+                {opt.label}
+              </button>
+            )}
+          </For>
+        </div>
+        <p class="text-[10px] text-[#8b949e]">
+          If the I/Q spectrum or decoded signal looks mirrored around the tuned frequency, try each of these — a
+          swapped ADC left/right wiring needs "Swap I/Q", but a single inverted channel (mixer or
+          single-ended-to-differential stage) needs "Negate I" or "Negate Q" instead; swapping wouldn't fix that
+          case. All three undo the same mirroring symptom but only one matches the real cause — try them against a
+          real signal to see which one actually clears it. "None" by default; not persisted across reloads.
+        </p>
+        <label class="flex items-center gap-2 text-[10px] text-[#8b949e]">
+          <input
+            type="checkbox"
+            checked={iq.state().dcRemovalEnabled}
+            onChange={(e) => iq.setDCRemoval(e.currentTarget.checked)}
+          />
+          Remove DC offset / LO leakage
+        </label>
+        <p class="text-[10px] text-[#8b949e]">
+          If there's a spike exactly at 0Hz that stays put regardless of the correction above, this is a different
+          issue (mixer self-mixing or ADC/analog DC offset, not a wiring swap) — this subtracts each channel's own
+          running mean before anything else sees the signal.
+        </p>
+        <label class="flex items-center gap-2 text-[10px] text-[#8b949e]">
+          <input
+            type="checkbox"
+            checked={iq.state().imbalanceCorrectionEnabled}
+            onChange={(e) => iq.setImbalanceCorrection(e.currentTarget.checked)}
+          />
+          Correct I/Q gain &amp; phase imbalance
+        </label>
+        <p class="text-[10px] text-[#8b949e]">
+          If a real signal shows a fainter PARTIAL mirror of itself on the opposite side (not a full, equal-strength
+          mirror — that's what the correction above fixes), the two channels likely aren't exactly equal-amplitude
+          and exactly 90° apart. This continuously estimates and corrects that from the live signal itself; works
+          best combined with DC removal above.
+        </p>
       </Show>
       <Show when={iq.state().error}>
         <p class="text-[10px] text-[#f0883e]">{iq.state().error}</p>
@@ -1587,6 +1655,20 @@ export default function RadioCATPanel(props: {
   // the audio bridge (transport === 'websocket' + a wsUrl to open /audio
   // against), without duplicating this panel's own connection-config state.
   onWsUrlChange?: (wsUrl: string | undefined) => void
+  // Reports whether ANY of this panel's own sub-panels (Settings, Bridge
+  // status, PA bias, calibration) is open — App.tsx's scroll-driven
+  // auto-collapse (see its own comment) was cutting an explicitly-opened
+  // sub-panel out from under the operator mid-scroll: expanding Bridge
+  // status (tall — I/Q spectrum waterfall + several rows of controls) and
+  // then scrolling down to read the rest of it crossed the same
+  // scroll-position threshold that collapses this whole panel down to its
+  // main bar, which hides showBridgeStatus's content entirely (see
+  // !props.collapsed gating below) and made the page jump straight to
+  // whatever renders after this panel. Suppressing auto-collapse while
+  // any sub-panel is open fixes that without touching the collapse
+  // feature's original purpose (decoder content below stays reachable
+  // once nothing here is expanded).
+  onSubpanelOpenChange?: (open: boolean) => void
 }): JSX.Element {
   const cat = props.cat
   const state = () => cat.state()
@@ -1595,6 +1677,9 @@ export default function RadioCATPanel(props: {
   const [showPABias, setShowPABias] = createSignal(false)
   const [showCalibration, setShowCalibration] = createSignal(false)
   const [showBridgeStatus, setShowBridgeStatus] = createSignal(false)
+  createEffect(() => {
+    props.onSubpanelOpenChange?.(showSettings() || showPABias() || showCalibration() || showBridgeStatus())
+  })
   const [config, setConfig] = createSignal(loadInitialConfig())
 
   // Persist on every change — matches the load side: everything is saved,

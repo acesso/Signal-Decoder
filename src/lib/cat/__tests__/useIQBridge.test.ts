@@ -5,12 +5,13 @@ import { SSBDemodulator } from '../useIQBridge'
 // still exercises the full mixer -> lowpass -> Hilbert-combine chain
 // end-to-end: after shifting f0 down to 0Hz, the demodulator should recover
 // a clean real sinusoid at f0's own original offset from the chosen center.
-function makeComplexToneInt16(freqHz: number, sampleRateHz: number, count: number): Int16Array {
-  const out = new Int16Array(count * 2)
+function makeComplexTone(freqHz: number, sampleRateHz: number, count: number): Float64Array {
+  const out = new Float64Array(count * 2)
+  const amp = 20000 / 32768 // same peak amplitude as the old Int16-based helper, normalized
   for (let n = 0; n < count; n++) {
     const ang = (2 * Math.PI * freqHz * n) / sampleRateHz
-    out[n * 2] = Math.round(Math.cos(ang) * 20000) // I
-    out[n * 2 + 1] = Math.round(Math.sin(ang) * 20000) // Q
+    out[n * 2] = Math.cos(ang) * amp // I
+    out[n * 2 + 1] = Math.sin(ang) * amp // Q
   }
   return out
 }
@@ -41,9 +42,9 @@ describe('SSBDemodulator', () => {
     // Prime the filters with a few frames of settling before measuring.
     const toneRfHz = centerHz + audioHz
     for (let i = 0; i < 10; i++) {
-      demod.demodulate(makeComplexToneInt16(toneRfHz, SAMPLE_RATE, 2400), true, SAMPLE_RATE)
+      demod.demodulate(makeComplexTone(toneRfHz, SAMPLE_RATE, 2400), true, SAMPLE_RATE)
     }
-    const out = demod.demodulate(makeComplexToneInt16(toneRfHz, SAMPLE_RATE, 4800), true, SAMPLE_RATE)
+    const out = demod.demodulate(makeComplexTone(toneRfHz, SAMPLE_RATE, 4800), true, SAMPLE_RATE)
 
     const magAtAudioHz = goertzelMagnitude(out, audioHz, SAMPLE_RATE)
     const magAtWrongHz = goertzelMagnitude(out, audioHz + 1000, SAMPLE_RATE)
@@ -58,9 +59,9 @@ describe('SSBDemodulator', () => {
 
     const outsideHz = 5000 // far outside the 500Hz-wide passband
     for (let i = 0; i < 10; i++) {
-      demod.demodulate(makeComplexToneInt16(outsideHz, SAMPLE_RATE, 2400), true, SAMPLE_RATE)
+      demod.demodulate(makeComplexTone(outsideHz, SAMPLE_RATE, 2400), true, SAMPLE_RATE)
     }
-    const out = demod.demodulate(makeComplexToneInt16(outsideHz, SAMPLE_RATE, 4800), true, SAMPLE_RATE)
+    const out = demod.demodulate(makeComplexTone(outsideHz, SAMPLE_RATE, 4800), true, SAMPLE_RATE)
 
     let rms = 0
     for (let i = 0; i < out.length; i++) rms += out[i] * out[i]
@@ -71,14 +72,14 @@ describe('SSBDemodulator', () => {
   it('retunes cleanly when setPassband is called again with a new center', () => {
     const demod = new SSBDemodulator()
     demod.setPassband(1000, 2700, SAMPLE_RATE)
-    demod.demodulate(makeComplexToneInt16(1000 + 500, SAMPLE_RATE, 2400), true, SAMPLE_RATE)
+    demod.demodulate(makeComplexTone(1000 + 500, SAMPLE_RATE, 2400), true, SAMPLE_RATE)
 
     demod.setPassband(6000, 2700, SAMPLE_RATE)
     const audioHz = 500
     for (let i = 0; i < 10; i++) {
-      demod.demodulate(makeComplexToneInt16(6000 + audioHz, SAMPLE_RATE, 2400), true, SAMPLE_RATE)
+      demod.demodulate(makeComplexTone(6000 + audioHz, SAMPLE_RATE, 2400), true, SAMPLE_RATE)
     }
-    const out = demod.demodulate(makeComplexToneInt16(6000 + audioHz, SAMPLE_RATE, 4800), true, SAMPLE_RATE)
+    const out = demod.demodulate(makeComplexTone(6000 + audioHz, SAMPLE_RATE, 4800), true, SAMPLE_RATE)
     const mag = goertzelMagnitude(out, audioHz, SAMPLE_RATE)
     const magAtWrongHz = goertzelMagnitude(out, audioHz + 1000, SAMPLE_RATE)
     expect(mag).toBeGreaterThan(0.05)

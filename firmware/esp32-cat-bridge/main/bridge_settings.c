@@ -23,7 +23,17 @@ static const char *TAG = "bridge_settings";
 #define NVS_KEY_RX_SLOT_RIGHT "rx_slot_r"
 #define NVS_KEY_MIC_GAIN_DB "mic_gain_db"
 #define NVS_KEY_WIFI_TX_POWER "wifi_tx_pwr"
-#define DEFAULT_WIFI_TX_POWER_QUARTER_DBM 84 // 21.0 dBm — the driver's own maximum
+// 78, not 84 — 84 (21.0dBm) was never a real driver step. Confirmed by
+// sweeping POST /wifi-tx-power against real hardware (esp_wifi.h's own
+// documented table doesn't match this board/IDF version exactly — trust
+// the measured behavior): requests in roughly [74,84] all snap down to
+// 78, which is the TRUE ceiling — nothing above it is achievable. 84
+// could never actually be applied, so the control page's "21 dBm (max)"
+// button never lit up as active even right after being clicked (its
+// round-tripped value from GET/POST never matched its own requested
+// value) — see index.html's wifi-tx-power buttons, now corrected to the
+// real snap points.
+#define DEFAULT_WIFI_TX_POWER_QUARTER_DBM 78 // ~19.5 dBm — the driver's own real maximum on this board
 #define NVS_KEY_SAMPLE_RATE "sample_rate"
 #define DEFAULT_SAMPLE_RATE_HZ 48000 // matches a typical browser AudioContext's native device rate
 #define NVS_KEY_INPUT_MODE "input_mode"
