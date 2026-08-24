@@ -9,6 +9,7 @@
 // graph. Only FT8 actually consumes this today; the shape is deliberately
 // mode-agnostic so RTTY/SSTV/CW/MFSK can adopt it later with no changes here.
 import type { AudioBridge } from '$decoder-lib/cat/useAudioBridge'
+import type { IQBridge } from '$decoder-lib/cat/useIQBridge'
 
 export type AudioSourceKind = 'microphone' | 'bridge'
 export type AudioSinkKind = 'speaker' | 'bridge'
@@ -47,7 +48,15 @@ export async function acquireMicrophoneSource(): Promise<AudioSourceHandle> {
 // audio path — null if "Listen to Radio" isn't active, since there's
 // nothing to tap yet (the caller should ask the operator to connect first
 // rather than silently falling back to the mic).
-export function acquireBridgeSource(bridge: AudioBridge): AudioSourceHandle | null {
+//
+// Accepts EITHER the demodulated-audio bridge (useAudioBridge.ts,
+// input_mode "audio") or the I/Q bridge (useIQBridge.ts, input_mode "iq",
+// demodulated client-side — see that file's header comment on why I/Q is a
+// superset, not a separate/incompatible mode). Both expose the identical
+// getPlaybackSource(): {ctx, node} shape, so this function — and every
+// decoder built on AudioSourceHandle — doesn't need to know or care which
+// one is actually live.
+export function acquireBridgeSource(bridge: AudioBridge | IQBridge): AudioSourceHandle | null {
   const playback = bridge.getPlaybackSource()
   if (!playback) return null
   return {
@@ -55,9 +64,11 @@ export function acquireBridgeSource(bridge: AudioBridge): AudioSourceHandle | nu
     ctx: playback.ctx,
     node: playback.node,
     // Nothing to release — the bridge owns this context/node for as long as
-    // "Listen to Radio" stays on; a decoder switching away just stops
-    // reading from it. Tearing it down here would kill playback for anyone
-    // else (e.g. the operator's own ears) still listening to the same feed.
+    // "Listen to Radio" (or, for the I/Q bridge, "Start I/Q Spectrum")
+    // stays on; a decoder switching away just stops reading from it.
+    // Tearing it down here would kill playback/decode for anyone else
+    // (e.g. the operator's own ears, or another decoder) still on the same
+    // feed.
     release() {},
   }
 }
@@ -88,23 +99,51 @@ export function speakerSink(ctx: AudioContext): AudioSinkHandle {
 // of calling getUserMedia() itself. The TX code's own context/scheduling is
 // untouched — this only adds a second output tap alongside (or instead of)
 // ctx.destination.
-export function bridgeSink(bridge: AudioBridge, ctx: AudioContext): AudioSinkHandle {
+//
+// getWsUrl: the CAT bridge's WebSocket URL, needed to auto-connect
+// bridge.startMic()'s underlying /audio WebSocket if it isn't already open.
+// Before this was added, selecting "ESP32 Bridge" as the TX output without
+// having separately clicked "Listen to Radio" first caused a REAL,
+// confirmed-on-real-hardware silent failure: startMic() requires ws to
+// already be OPEN (see useAudioBridge.ts's startMic() guard) and returned
+// false immediately otherwise — but that return value was never checked
+// here (bridge.startMic(...) was a fire-and-forget void call), so TX
+// appeared to run/log as sent in the UI while zero audio ever reached the
+// bridge, with no error shown to the operator at all.
+export function bridgeSink(bridge: AudioBridge, ctx: AudioContext, getWsUrl: () => string | undefined): AudioSinkHandle {
   const dest = ctx.createMediaStreamDestination()
   let started = false
+  const ensureMicStarted = () => {
+    if (started) return
+    started = true
+    // 'ft8-tx' owner tag — see MicOwner in useAudioBridge.ts. If the
+    // Bridge panel's own "Send Mic to Radio" already holds the session,
+    // this call is rejected rather than stealing it out from under the
+    // operator; the UI (FTTransmitPanel.tsx) also disables picking this
+    // sink at all while that's the case, so this is a backstop, not the
+    // primary guard.
+    void (async () => {
+      if (!bridge.state().connected) {
+        const wsUrl = getWsUrl()
+        if (!wsUrl) {
+          started = false // nothing to retry against — allow a later connectSource() call to try again
+          return
+        }
+        const ok = await bridge.connect(wsUrl)
+        if (!ok) {
+          started = false // connect failed — allow a later call (e.g. next TX cycle) to retry
+          return
+        }
+      }
+      const ok = await bridge.startMic(dest.stream, 'ft8-tx')
+      if (!ok) started = false // startMic failed (e.g. session already held elsewhere) — allow a retry later
+    })()
+  }
   return {
     kind: 'bridge',
     connectSource(node) {
       node.connect(dest)
-      if (!started) {
-        started = true
-        // 'ft8-tx' owner tag — see MicOwner in useAudioBridge.ts. If the
-        // Bridge panel's own "Send Mic to Radio" already holds the session,
-        // this call is rejected rather than stealing it out from under the
-        // operator; the UI (FTTransmitPanel.tsx) also disables picking this
-        // sink at all while that's the case, so this is a backstop, not the
-        // primary guard.
-        void bridge.startMic(dest.stream, 'ft8-tx')
-      }
+      ensureMicStarted()
     },
     release() {
       // requireOwner: only stop OUR session — if the Bridge panel's manual

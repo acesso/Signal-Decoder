@@ -26,6 +26,8 @@ static const char *TAG = "bridge_settings";
 #define DEFAULT_WIFI_TX_POWER_QUARTER_DBM 84 // 21.0 dBm — the driver's own maximum
 #define NVS_KEY_SAMPLE_RATE "sample_rate"
 #define DEFAULT_SAMPLE_RATE_HZ 48000 // matches a typical browser AudioContext's native device rate
+#define NVS_KEY_INPUT_MODE "input_mode"
+#define DEFAULT_INPUT_MODE_NAME "audio"
 #define NVS_KEY_CAT_LOG_ENABLED "cat_log_en"
 // Defaults OFF — this is a debug feature (see cat_log.h), and its boot-time
 // flash-recovery scan grows with the log's own record count; left running
@@ -222,6 +224,29 @@ bool bridge_settings_set_sample_rate_hz(uint32_t rate_hz) {
     nvs_close(h);
     bool ok = e1 == ESP_OK && e2 == ESP_OK;
     ESP_LOGI(TAG, "saved sample rate to NVS (%u Hz): %s", (unsigned)rate_hz, ok ? "ok" : "FAILED");
+    return ok;
+}
+
+void bridge_settings_get_input_mode_name(char *name_out, size_t out_sz) {
+    nvs_handle_t h;
+    bool have_it = false;
+    if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &h) == ESP_OK) {
+        size_t len = out_sz;
+        have_it = nvs_get_str(h, NVS_KEY_INPUT_MODE, name_out, &len) == ESP_OK;
+        nvs_close(h);
+    }
+    if (!have_it) strncpy(name_out, DEFAULT_INPUT_MODE_NAME, out_sz - 1);
+    name_out[out_sz - 1] = '\0';
+}
+
+bool bridge_settings_set_input_mode_name(const char *name) {
+    nvs_handle_t h;
+    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h) != ESP_OK) return false;
+    esp_err_t e1 = nvs_set_str(h, NVS_KEY_INPUT_MODE, name);
+    esp_err_t e2 = nvs_commit(h);
+    nvs_close(h);
+    bool ok = e1 == ESP_OK && e2 == ESP_OK;
+    ESP_LOGI(TAG, "saved input mode selection to NVS (%s): %s", name, ok ? "ok" : "FAILED");
     return ok;
 }
 

@@ -115,6 +115,9 @@
         <dt>Heap free</dt><dd id="cpu-heap-free">&hellip;</dd>
         <dt>Heap min free</dt><dd id="cpu-heap-min">&hellip;</dd>
         <dt>Heap total</dt><dd id="cpu-heap-total">&hellip;</dd>
+        <dt>Largest free block</dt><dd id="cpu-heap-largest">&hellip;</dd>
+        <dt>DMA-capable free</dt><dd id="cpu-dma-free">&hellip;</dd>
+        <dt>DMA largest free block</dt><dd id="cpu-dma-largest">&hellip;</dd>
       </dl>
       <table id="cpu-task-table" class="cpu-task-table">
         <thead>
@@ -162,13 +165,10 @@
             <span>0</span><span id="quality-in-freq-mid1">&mdash;</span><span id="quality-in-freq-mid2">&mdash;</span><span id="quality-in-freq-mid3">&mdash;</span><span id="quality-in-freq-max">&mdash;</span>
           </div>
           <div class="quality-canvas-row">
-            <div class="quality-axis-amp"><span id="quality-in-freq-max-amp">&mdash;</span><span id="quality-in-freq-mid-amp">&mdash;</span><span>0</span></div>
+            <div class="quality-axis-time-vert"><span>newer</span><span>&#x25bc;</span><span>older</span></div>
             <div class="quality-waterfall-row">
-              <canvas id="quality-in-waterfall" width="480" height="70" class="quality-canvas"></canvas>
+              <canvas id="quality-in-waterfall" width="480" height="160" class="quality-canvas"></canvas>
             </div>
-          </div>
-          <div class="quality-axis quality-axis-time quality-axis-indent">
-            <span>&larr; older</span><span>newer &rarr;</span>
           </div>
           <label class="quality-contrast-label">
             Max freq
@@ -223,13 +223,10 @@
             <span>0</span><span id="quality-out-freq-mid1">&mdash;</span><span id="quality-out-freq-mid2">&mdash;</span><span id="quality-out-freq-mid3">&mdash;</span><span id="quality-out-freq-max">&mdash;</span>
           </div>
           <div class="quality-canvas-row">
-            <div class="quality-axis-amp"><span id="quality-out-freq-max-amp">&mdash;</span><span id="quality-out-freq-mid-amp">&mdash;</span><span>0</span></div>
+            <div class="quality-axis-time-vert"><span>newer</span><span>&#x25bc;</span><span>older</span></div>
             <div class="quality-waterfall-row">
-              <canvas id="quality-out-waterfall" width="480" height="70" class="quality-canvas"></canvas>
+              <canvas id="quality-out-waterfall" width="480" height="160" class="quality-canvas"></canvas>
             </div>
-          </div>
-          <div class="quality-axis quality-axis-time quality-axis-indent">
-            <span>&larr; older</span><span>newer &rarr;</span>
           </div>
           <label class="quality-contrast-label">
             Max freq
@@ -348,19 +345,39 @@
       ways and listen/measure to see which one actually silences it, and whether it changes the line-in noise
       floor at all. Not persisted; resets to On after a reboot regardless.</p>
       <div class="audio-input-row">
+        <span class="audio-input-label">Input mode</span>
+        <div class="audio-input-toggle">
+          <button data-input-mode="audio" type="button" class="audio-input-option">Audio</button>
+          <button data-input-mode="iq" type="button" class="audio-input-option">I/Q</button>
+        </div>
+      </div>
+      <p class="hint audio-input-hint"><strong>Audio</strong> is the original, long-proven mode: the line-in jack
+      carries already-demodulated SSB/audio, captured mono, broadcast on <code>/audio</code>. <strong>I/Q</strong>
+      is for a radio that instead puts raw in-phase/quadrature (pre-demodulation, wideband) on the SAME jack &mdash;
+      I on the left ADC channel, Q on the right &mdash; captured as true stereo and broadcast on the separate
+      <code>ws://&lt;device&gt;/iq-data</code> instead. <strong>Changing this saves and reboots the bridge</strong>
+      to apply. Switching to I/Q forces the ADC RX channel row below to both-Left-and-Right (it needs both
+      channels at once, not a choice between them) and unlocks 96kHz on the Sample rate row.</p>
+      <div class="audio-input-row">
         <span class="audio-input-label">Sample rate</span>
         <div class="audio-input-toggle">
           <button data-sample-rate="8000" type="button" class="audio-input-option">8k</button>
           <button data-sample-rate="16000" type="button" class="audio-input-option">16k</button>
-          <button data-sample-rate="22050" type="button" class="audio-input-option">22.05k</button>
+          <button data-sample-rate="22050" type="button" class="audio-input-option iq-unsupported-rate">22.05k</button>
           <button data-sample-rate="32000" type="button" class="audio-input-option">32k</button>
-          <button data-sample-rate="44100" type="button" class="audio-input-option">44.1k</button>
+          <button data-sample-rate="44100" type="button" class="audio-input-option iq-unsupported-rate">44.1k</button>
           <button data-sample-rate="48000" type="button" class="audio-input-option">48k</button>
+          <button data-sample-rate="96000" type="button" class="audio-input-option" id="sample-rate-96k">96k</button>
         </div>
       </div>
-      <p class="hint audio-input-hint">The /audio WebSocket's wire rate, which IS the codec/I2S hardware's own
-      sample rate too. Defaults to 48kHz to match a typical laptop sound card, so A/B comparisons against a direct
-      sound-card capture aren't also comparing two different rates. <strong>Changing this saves and reboots the
+      <p class="hint audio-input-hint">The /audio (or /iq-data, in I/Q mode) WebSocket's wire rate, which IS the
+      codec/I2S hardware's own sample rate too. Defaults to 48kHz to match a typical laptop sound card, so A/B
+      comparisons against a direct sound-card capture aren't also comparing two different rates.
+      <strong>96k is only available in I/Q mode</strong> and switches the ES8388 into double-speed mode &mdash;
+      genuinely less proven than the other rates (see the Known Limitations note in the README); 48k is a safe
+      fallback if it doesn't clock cleanly on your board. <strong>22.05k and 44.1k are disabled in I/Q mode</strong>
+      &mdash; real-hardware captures showed unique, reproducible spectral artifacts at exactly those two rates,
+      not present at any other rate; still available in Audio mode. <strong>Changing this saves and reboots the
       bridge</strong> to apply &mdash; not a live switch, unlike the other controls on this page.</p>
       <p class="hint">"Listen to Radio" streams raw audio over a second
       WebSocket (<code>/audio</code>), independent of the CAT connection.
@@ -374,6 +391,53 @@
       audio-in/audio-out RC filter trimpots by eye &mdash; the horizontal
       blue dashed line marks the estimated passband rolloff amplitude
       (~-6dB below peak); watch it move as you adjust each trimpot.</p>
+    </section>
+
+    <section id="iq-spectrum-card" class="card">
+      <div class="cat-header">
+        <h2>I/Q spectrum</h2>
+        <span id="iq-spectrum-readout" class="quality-readout">inactive</span>
+      </div>
+      <p class="hint">Wideband view of the raw I/Q stream on
+      <code>ws://&lt;device&gt;/iq-data</code> &mdash; only produces data
+      while Input mode (in the Audio card above) is set to
+      <strong>I/Q</strong>. Full complex FFT computed in this page (not the
+      browser's real-valued <code>AnalyserNode</code>, which can't
+      represent I/Q's distinct positive/negative frequencies) &mdash; 0Hz
+      sits at the center, negative frequencies to the left, positive to the
+      right, spanning the full &plusmn;Nyquist range of whatever sample
+      rate is currently configured (up to &plusmn;48kHz at 96kHz).</p>
+      <div class="audio-buttons">
+        <button id="iq-spectrum-btn" type="button">Start I/Q Spectrum</button>
+      </div>
+      <div class="quality-canvas-row">
+        <div class="quality-axis-amp"><span>0dB</span><span>-40dB</span><span>-90dB</span></div>
+        <canvas id="iq-spectrum-bars" width="480" height="90" class="quality-canvas"></canvas>
+      </div>
+      <div class="quality-axis quality-axis-freq quality-axis-indent">
+        <span id="iq-freq-min">&mdash;</span><span id="iq-freq-mid1">&mdash;</span><span>0</span><span id="iq-freq-mid2">&mdash;</span><span id="iq-freq-max">&mdash;</span>
+      </div>
+      <div class="quality-canvas-row">
+        <div class="quality-axis-time-vert"><span>newer</span><span>&#x25bc;</span><span>older</span></div>
+        <div class="quality-waterfall-row">
+          <canvas id="iq-spectrum-waterfall" width="480" height="160" class="quality-canvas"></canvas>
+        </div>
+      </div>
+      <label class="quality-contrast-label">
+        Zoom (around center)
+        <input id="iq-freq-zoom" type="range" min="1" max="100" step="1" value="100">
+        <span id="iq-freq-zoom-val">&plusmn;48000 Hz</span>
+      </label>
+      <label class="quality-contrast-label">
+        Contrast
+        <input id="iq-contrast" type="range" min="0.1" max="1.5" step="0.05" value="0.5">
+      </label>
+      <div class="quality-stats">
+        <span>Sample rate</span><span id="iq-sample-rate">&mdash;</span>
+        <span>FFT size</span><span id="iq-fft-size">&mdash;</span>
+        <span>Bin width</span><span id="iq-bin-width">&mdash;</span>
+        <span>Peak</span><span id="iq-peak">&mdash;</span>
+      </div>
     </section>
 
     <section id="cat-card" class="card">

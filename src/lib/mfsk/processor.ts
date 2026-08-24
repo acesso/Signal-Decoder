@@ -8,6 +8,9 @@ import {
   type MFSKDecoderOptions,
 } from '$decoder-lib/mfsk/decoder'
 import { createCaptureNode, type CaptureNode } from '$decoder-lib/audio/captureNode'
+import { acquireMicrophoneSource, acquireBridgeSource, type AudioSourceKind, type AudioSourceHandle } from '$decoder-lib/audio/audioSource'
+import type { AudioBridge } from '$decoder-lib/cat/useAudioBridge'
+import type { IQBridge } from '$decoder-lib/cat/useIQBridge'
 
 export type { MFSKSymbol, MFSKWord }
 
@@ -28,7 +31,13 @@ export interface MFSKProcessorParams {
 
 const MAX_HISTORY = 2048
 
-export function createMFSKProcessor(params: MFSKProcessorParams) {
+export function createMFSKProcessor(
+  params: MFSKProcessorParams,
+  // Where capture comes from — see ft/processor.ts's identical params for
+  // the full reasoning; audioSource.ts's shape is deliberately mode-agnostic.
+  getAudioSourceKind: () => AudioSourceKind = () => 'microphone',
+  getAudioBridge: () => AudioBridge | IQBridge | undefined = () => undefined,
+) {
   const [state, setState] = createSignal<MFSKProcessorState>({
     isRecording: false,
     isSupported:
@@ -45,7 +54,7 @@ export function createMFSKProcessor(params: MFSKProcessorParams) {
 
   let audioContext: AudioContext | null = null
   let analyser: AnalyserNode | null = null
-  let stream: MediaStream | null = null
+  let source: AudioSourceHandle | null = null
   let decoder: MFSKDecoder | null = null
   let processorNode: CaptureNode | null = null
   let fftBuf: Uint8Array<ArrayBuffer> | null = null
@@ -133,19 +142,25 @@ export function createMFSKProcessor(params: MFSKProcessorParams) {
     try {
       if (!state().isSupported) throw new Error('Web Audio API not supported')
 
-      const mediaStream = await navigator.mediaDevices.getUserMedia({
-        audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false },
-      })
-      stream = mediaStream
+      const kind = getAudioSourceKind()
+      let handle: AudioSourceHandle
+      if (kind === 'bridge') {
+        const bridge = getAudioBridge()
+        const bridgeSource = bridge ? acquireBridgeSource(bridge) : null
+        if (!bridgeSource) throw new Error('Connect to the bridge (Listen to Radio) before selecting it as the audio source')
+        handle = bridgeSource
+      } else {
+        handle = await acquireMicrophoneSource()
+      }
+      source = handle
 
-      const ctx = new AudioContext()
+      const ctx = handle.ctx
       audioContext = ctx
 
-      const source = ctx.createMediaStreamSource(mediaStream)
       const analyserNode = ctx.createAnalyser()
       analyserNode.fftSize = 4096
       analyser = analyserNode
-      source.connect(analyserNode)
+      handle.node.connect(analyserNode)
 
       symbols = []
       words = []
@@ -182,8 +197,8 @@ export function createMFSKProcessor(params: MFSKProcessorParams) {
   }
 
   function stopRecording() {
-    stream?.getTracks().forEach((t) => t.stop())
-    stream = null
+    source?.release()
+    source = null
     if (processorNode) {
       processorNode.disconnect()
       processorNode = null
@@ -192,10 +207,7 @@ export function createMFSKProcessor(params: MFSKProcessorParams) {
       analyser.disconnect()
       analyser = null
     }
-    if (audioContext) {
-      audioContext.close()
-      audioContext = null
-    }
+    audioContext = null
     decoder = null
     setState((prev) => ({ ...prev, isRecording: false }))
   }

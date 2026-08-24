@@ -12,7 +12,8 @@ import {
   type BridgeInfo,
 } from '../lib/cat/useRadioCAT'
 import type { AudioBridge } from '../lib/cat/useAudioBridge'
-import AudioQualityPanel from './AudioQualityPanel'
+import type { IQBridge } from '../lib/cat/useIQBridge'
+import { loadSuspendIQDuringTx, saveSuspendIQDuringTx } from '../lib/ft/useFTTransmit'
 import CalibrationWizard from './CalibrationWizard'
 import NumberField from './NumberField'
 import { loadObject, saveObject } from '../lib/storage'
@@ -1067,34 +1068,131 @@ function BridgeWifiConfigForm(props: {
 
 // ── BridgeAudioControl ────────────────────────────────────────────────────────
 // Live audio bridge to the ESP32's onboard codec (see useAudioBridge.ts) —
-// two level meters (radio speaker -> browser, browser mic -> radio mic) plus
-// play/mic toggles. Not real WebRTC (no ICE/DTLS-SRTP on bare ESP-IDF); a
-// second WebSocket (/audio) carrying raw PCM, same infra as /cat.
+// play/mic toggles only, no signal display (see SignalAnalysisPanel for
+// that). Not real WebRTC (no ICE/DTLS-SRTP on bare ESP-IDF); a second
+// WebSocket (/audio) carrying raw PCM, same infra as /cat.
 
-function AudioMeter(props: { label: string; level: number; active: boolean }) {
-  const pct = () => Math.round(props.level * 100)
+// ── Input mode (audio / I/Q) ─────────────────────────────────────────────
+// Selects whether the bridge's line-in jack is captured as demodulated
+// mono audio (the original mode) or raw wideband I/Q — see useIQBridge.ts's
+// header comment for the full firmware-side reasoning. Reboot-to-apply,
+// same UX pattern as BridgeStatusPanel's own handleRestart(): poll GET
+// /status after the POST until the bridge answers again, rather than
+// leaving a stale mode/rate displayed as if the switch hadn't happened.
+// Control only — no signal display here (see SignalAnalysisPanel, reached
+// via a decoder's own "Start Decoding", for the actual spectrum/waterfall/
+// bandwidth-marker view of whichever mode is selected).
+function BridgeInputModeControl(props: {
+  wsUrl: string
+  iqBridge: IQBridge
+  setBridgeInputMode: (wsUrl: string, mode: 'audio' | 'iq') => Promise<boolean>
+  onSwitched: () => void
+}) {
+  const iq = props.iqBridge
+  const [busy, setBusy] = createSignal(false)
+  // Persisted via useFTTransmit.ts's load/save pair (co-located with the
+  // other TX-related settings) even though this checkbox lives here, not
+  // in FTTransmitPanel — App.tsx reads loadSuspendIQDuringTx() fresh at
+  // the moment each TX window starts, rather than needing this threaded
+  // through as reactive props across three component layers.
+  const [suspendDuringTx, setSuspendDuringTx] = createSignal(loadSuspendIQDuringTx())
+
+  // Mirrors the firmware's own rejection (http_control.c's input_mode_handler):
+  // switching to "audio" while the saved rate is 96000 (I/Q-only) is
+  // refused server-side — surfaced here as a disabled button + tooltip
+  // instead of letting the operator hit a silent-looking failure.
+  const audioBlockedBy96k = () => iq.state().inputMode === 'iq' && iq.state().sampleRateHz === 96000
+
+  const handleToggle = async (target: 'audio' | 'iq') => {
+    if (busy() || iq.state().inputMode === target) return
+    setBusy(true)
+    const ok = await props.setBridgeInputMode(props.wsUrl, target)
+    if (ok) {
+      // Bridge is rebooting — same "poll until it answers again" reasoning
+      // as BridgeStatusPanel's handleRestart(): an immediate re-query would
+      // just fail while ESP-IDF boots + rejoins Wi-Fi.
+      for (let attempt = 0; attempt < 15; attempt++) {
+        await new Promise((r) => setTimeout(r, 2000))
+        try {
+          await iq.refreshInfo(props.wsUrl)
+        } catch {
+          continue
+        }
+        if (iq.state().inputMode === target) break
+      }
+      props.onSwitched()
+    }
+    setBusy(false)
+  }
+
   return (
-    <div class="flex items-center gap-2">
-      <span class="text-[10px] font-semibold text-[#8b949e] whitespace-nowrap w-16">{props.label}</span>
-      <div class="flex-1 h-2 rounded bg-[#0d1117] border border-[#30363d] overflow-hidden">
-        <div
-          class="h-full bg-[#3fb950] transition-[width] duration-75"
-          style={{ width: `${props.active ? pct() : 0}%` }}
-        />
+    <div class="flex flex-col gap-2">
+      <div class="flex items-center gap-2 flex-wrap">
+        <span class="text-[10px] text-[#8b949e] whitespace-nowrap">Input mode</span>
+        <button
+          onClick={() => void handleToggle('audio')}
+          disabled={busy() || iq.state().inputMode === 'audio'}
+          class={`text-[10px] font-semibold px-2.5 py-1.5 rounded border transition-colors whitespace-nowrap disabled:opacity-50
+            ${iq.state().inputMode === 'audio'
+              ? 'bg-[#1f6feb] border-[#1f6feb] text-white'
+              : 'bg-[#21262d] border-[#30363d] text-[#8b949e] hover:text-[#c9d1d9] hover:border-[#8b949e]'
+            }`}
+        >
+          Audio
+        </button>
+        <button
+          onClick={() => void handleToggle('iq')}
+          disabled={busy() || iq.state().inputMode === 'iq'}
+          class={`text-[10px] font-semibold px-2.5 py-1.5 rounded border transition-colors whitespace-nowrap disabled:opacity-50
+            ${iq.state().inputMode === 'iq'
+              ? 'bg-[#1f6feb] border-[#1f6feb] text-white'
+              : 'bg-[#21262d] border-[#30363d] text-[#8b949e] hover:text-[#c9d1d9] hover:border-[#8b949e]'
+            }`}
+        >
+          I/Q
+        </button>
       </div>
-      <span class="text-[10px] text-[#8b949e] font-mono w-8 text-right">{props.active ? `${pct()}%` : '—'}</span>
+      <Show when={audioBlockedBy96k()}>
+        <p class="text-[10px] text-[#f0883e]">
+          Switching to Audio is blocked while the sample rate is 96kHz (I/Q-only) — lower it first in the bridge's
+          own control page.
+        </p>
+      </Show>
+      <Show when={iq.state().inputMode === 'iq'}>
+        <label class="flex items-center gap-2 text-[10px] text-[#8b949e]">
+          <input
+            type="checkbox"
+            checked={suspendDuringTx()}
+            onChange={(e) => {
+              setSuspendDuringTx(e.currentTarget.checked)
+              saveSuspendIQDuringTx(e.currentTarget.checked)
+            }}
+          />
+          Suspend I/Q spectrum during TX
+        </label>
+        <p class="text-[10px] text-[#8b949e]">
+          Streaming I/Q while transmitting shares WiFi/I2S DMA memory on this hardware and measurably degrades TX
+          audio quality — leave this on unless you're specifically testing that tradeoff.
+        </p>
+      </Show>
+      <Show when={iq.state().error}>
+        <p class="text-[10px] text-[#f0883e]">{iq.state().error}</p>
+      </Show>
+      <p class="text-[10px] text-[#8b949e]">
+        <strong>Audio</strong> is the original mode: demodulated SSB/audio, mono. <strong>I/Q</strong> is for a radio
+        putting raw in-phase/quadrature on the same line-in jack instead — streamed over its own separate WebSocket
+        ({'/iq-data'}). Switching saves and reboots the bridge.
+      </p>
     </div>
   )
 }
 
+// Control only — no signal display here (see SignalAnalysisPanel for the
+// actual spectrum/waterfall view once a decoder is running against this
+// bridge audio).
 function BridgeAudioControl(props: { wsUrl: string; audioBridge: AudioBridge }) {
   const audio = props.audioBridge
   const [busy, setBusy] = createSignal(false)
-  // Quality view (spectrum/waterfall/scope) is opt-in, not always-rendered
-  // — it redraws canvases + a GL waterfall every animation frame per
-  // channel, real but unnecessary work when the operator just wants to
-  // confirm "is there audio" rather than actively tuning a trimpot.
-  const [showQuality, setShowQuality] = createSignal(false)
 
   const handlePlayToggle = async () => {
     setBusy(true)
@@ -1123,8 +1221,6 @@ function BridgeAudioControl(props: { wsUrl: string; audioBridge: AudioBridge }) 
 
   return (
     <div class="flex flex-col gap-2">
-      <AudioMeter label="Speaker" level={audio.state().levelIn} active={audio.state().playbackActive} />
-      <AudioMeter label="Mic" level={audio.state().levelOut} active={audio.state().micActive} />
       <div class="flex items-center gap-2 flex-wrap">
         <button
           onClick={() => void handlePlayToggle()}
@@ -1149,34 +1245,9 @@ function BridgeAudioControl(props: { wsUrl: string; audioBridge: AudioBridge }) 
         >
           {audio.state().micActive ? 'Stop Mic' : 'Send Mic to Radio'}
         </button>
-        <button
-          onClick={() => setShowQuality((v) => !v)}
-          disabled={!audio.state().connected}
-          class={`text-[10px] font-semibold px-2.5 py-1.5 rounded border transition-colors whitespace-nowrap disabled:opacity-50
-            ${showQuality()
-              ? 'bg-[#1f6feb] border-[#1f6feb] text-white'
-              : 'bg-[#21262d] border-[#30363d] text-[#8b949e] hover:text-[#c9d1d9] hover:border-[#8b949e]'
-            }`}
-        >
-          {showQuality() ? 'Hide Signal Quality' : 'Show Signal Quality'}
-        </button>
       </div>
       <Show when={audio.state().error}>
         <p class="text-[10px] text-[#f0883e]">{audio.state().error}</p>
-      </Show>
-      <Show when={showQuality() && audio.state().connected}>
-        <div class="border-t border-[#21262d] pt-2">
-          <AudioQualityPanel
-            analyserIn={audio.analyserIn()}
-            analyserOut={audio.analyserOut()}
-            playbackActive={audio.state().playbackActive}
-            micActive={audio.state().micActive}
-          />
-          <p class="text-[10px] text-[#8b949e] mt-2">
-            For tuning the interface board's audio-in/audio-out RC filter trimpots by eye — the blue dashed line marks
-            the estimated passband rolloff (~-6dB point); watch it move as you adjust each trimpot.
-          </p>
-        </div>
       </Show>
       <p class="text-[10px] text-[#8b949e]">
         Streams raw audio over a second WebSocket ({'/audio'}), not the CAT connection — independent of the radio's own PTT state.
@@ -1203,6 +1274,7 @@ function BridgeAudioControl(props: { wsUrl: string; audioBridge: AudioBridge }) 
 function BridgeStatusPanel(props: {
   wsUrl: string
   audioBridge: AudioBridge
+  iqBridge: IQBridge
   getBridgeStatus: (wsUrl: string) => Promise<BridgeStatus | null>
   resetBridge: (wsUrl: string) => Promise<boolean>
   getBridgeInfo: (wsUrl: string) => Promise<BridgeInfo | null>
@@ -1211,6 +1283,7 @@ function BridgeStatusPanel(props: {
   setBridgeWifiConfig: (wsUrl: string, ssid: string, password: string) => Promise<boolean>
   setBridgeCatBaud: (wsUrl: string, baud: number) => Promise<{ baud: number; saved: boolean } | null>
   clearBridgePaEmergency: (wsUrl: string) => Promise<boolean | null>
+  setBridgeInputMode: (wsUrl: string, mode: 'audio' | 'iq') => Promise<boolean>
 }) {
   const [status, setStatus] = createSignal<BridgeStatus | null>(null)
   const [info, setInfo] = createSignal<BridgeInfo | null>(null)
@@ -1243,6 +1316,12 @@ function BridgeStatusPanel(props: {
     // endpoint doesn't report. cat_baud IS reported, though, so that select
     // reflects the bridge's real current setting.
     if (s?.catBaud) setCatBaudDraft(s.catBaud)
+    // input_mode/sample_rate_hz aren't part of BridgeStatus (see
+    // useIQBridge.ts's header comment for why) — refreshInfo() does its
+    // own narrow /status read, only when the firmware actually reports the
+    // feature (older bridges 404 on /input-mode's absence gracefully
+    // enough, but there's no reason to even try).
+    if (i?.features.includes('input_mode_select')) void props.iqBridge.refreshInfo(props.wsUrl)
   }
 
   load()
@@ -1448,6 +1527,17 @@ function BridgeStatusPanel(props: {
         </div>
       </Show>
 
+      <Show when={hasFeature('input_mode_select')}>
+        <div class="border-t border-[#21262d] pt-3">
+          <BridgeInputModeControl
+            wsUrl={props.wsUrl}
+            iqBridge={props.iqBridge}
+            setBridgeInputMode={props.setBridgeInputMode}
+            onSwitched={() => void load()}
+          />
+        </div>
+      </Show>
+
       <Show when={hasFeature('audio')}>
         <div class="border-t border-[#21262d] pt-3">
           <BridgeAudioControl wsUrl={props.wsUrl} audioBridge={props.audioBridge} />
@@ -1490,6 +1580,7 @@ function loadInitialConfig(): CATConnectionConfig & { presetIdx: number } {
 export default function RadioCATPanel(props: {
   cat: RadioCATControls
   audioBridge: AudioBridge
+  iqBridge: IQBridge
   collapsed?: boolean
   // Reports the current CAT transport/wsUrl upward whenever either changes
   // — App.tsx needs this to know whether "Start Decoding" can auto-connect
@@ -1671,11 +1762,13 @@ export default function RadioCATPanel(props: {
         <BridgeStatusPanel
           wsUrl={config().wsUrl!}
           audioBridge={props.audioBridge}
+          iqBridge={props.iqBridge}
           getBridgeStatus={cat.getBridgeStatus} resetBridge={cat.resetBridge}
           getBridgeInfo={cat.getBridgeInfo}
           setBridgeBacklight={cat.setBridgeBacklight} setBridgeContrast={cat.setBridgeContrast}
           setBridgeWifiConfig={cat.setBridgeWifiConfig} setBridgeCatBaud={cat.setBridgeCatBaud}
           clearBridgePaEmergency={cat.clearBridgePaEmergency}
+          setBridgeInputMode={cat.setBridgeInputMode}
         />
       </Show>
 

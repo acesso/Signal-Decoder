@@ -183,6 +183,10 @@ button:disabled { opacity: 0.5; cursor: default; }
   border-color: var(--accent);
   color: #fff;
 }
+.audio-input-option:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
 .audio-gain-slider { flex: 1; min-width: 8rem; max-width: 16rem; }
 .audio-input-hint { margin-top: 0; margin-bottom: 0.5rem; }
 #msg {
@@ -387,6 +391,22 @@ dl#pa-list {
 .quality-axis-indent { margin-left: calc(2.6rem + 0.35rem); }
 .quality-waterfall-row { flex: 1; min-width: 0; }
 .quality-waterfall-row .quality-canvas { display: block; width: 100%; }
+/* Falling (top-down) waterfall's own time axis — newest row painted at the
+   top, so this reads top-to-bottom instead of the scope/bars' left-to-right
+   axes. Same sizing as .quality-axis-amp (same 2.6rem column it visually
+   replaces on this row) but a column of stacked labels instead of numbers. */
+.quality-axis-time-vert {
+  flex: 0 0 auto;
+  width: 2.6rem;
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  align-items: center;
+  font-size: 0.6rem;
+  font-family: monospace;
+  color: color-mix(in srgb, var(--fg) 45%, transparent);
+  padding: 0.1rem 0;
+}
 .quality-contrast-label {
   display: flex;
   align-items: center;

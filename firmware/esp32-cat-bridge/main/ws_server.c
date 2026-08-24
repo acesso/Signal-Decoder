@@ -3,12 +3,14 @@
 #include <string.h>
 #include <unistd.h>
 
+#include "esp_heap_caps.h"
 #include "esp_http_server.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 
 #include "audio_sniff.h"
+#include "audio_iq.h"
 #include "audio_ws.h"
 #include "bridge_config.h"
 #include "bridge_state.h"
@@ -139,10 +141,16 @@ static void broadcast_excluding_locked(int exclude_fd, const uint8_t *data, size
     xSemaphoreGive(s_client_mutex);
     if (n == 0) return; // no (other) client connected — drop silently, radio keeps running
 
+    // PSRAM — same reasoning as the audio broadcast paths (audio_ws.c,
+    // audio_sniff.c, audio_iq.c): pure httpd_ws_send_frame_async() staging,
+    // no codec/DMA involvement. CAT frames are tiny and infrequent
+    // (nowhere near the ~50ms continuous cadence of audio broadcasts), so
+    // PSRAM's per-access latency here is immaterial against CAT's own
+    // timing budget.
     for (int i = 0; i < n; i++) {
-        async_send_ctx_t *ctx = malloc(sizeof(async_send_ctx_t));
+        async_send_ctx_t *ctx = heap_caps_malloc(sizeof(async_send_ctx_t), MALLOC_CAP_SPIRAM);
         if (!ctx) continue;
-        ctx->data = malloc(len);
+        ctx->data = heap_caps_malloc(len, MALLOC_CAP_SPIRAM);
         if (!ctx->data) { free(ctx); continue; }
         memcpy(ctx->data, data, len);
         ctx->len = len;
@@ -208,7 +216,11 @@ static esp_err_t cat_ws_handler(httpd_req_t *req) {
     }
     if (frame.len == 0) return ESP_OK; // ping/control frame with no payload
 
-    uint8_t *buf = malloc(frame.len + 1);
+    // PSRAM: a plain per-frame receive buffer filled by httpd_ws_recv_frame()'s
+    // socket read (lwIP recv(), not a peripheral DMA transfer) — no
+    // internal-RAM requirement, and this only ever runs on the httpd
+    // worker task, never the time-critical CAT/audio/PA-watchdog path.
+    uint8_t *buf = heap_caps_malloc(frame.len + 1, MALLOC_CAP_SPIRAM);
     if (!buf) return ESP_ERR_NO_MEM;
     frame.payload = buf;
     err = httpd_ws_recv_frame(req, &frame, frame.len);
@@ -253,9 +265,9 @@ static esp_err_t cat_ws_handler(httpd_req_t *req) {
 // httpd_close_func_t returns void — httpd itself always closes the socket
 // after calling this hook, so we only need to clear our own bookkeeping.
 // This is the ONLY close_fn httpd supports per server instance — since
-// /audio and /audio-mic-sniff share this httpd instance with /cat, this
-// hook also untracks the closed fd from both of their client sets (a
-// no-op if it was never one of theirs either).
+// /audio, /audio-mic-sniff, and /iq-data all share this httpd instance
+// with /cat, this hook also untracks the closed fd from each of their
+// client sets (a no-op if it was never one of theirs either).
 static void on_client_close(httpd_handle_t hd, int sockfd) {
     xSemaphoreTake(s_client_mutex, portMAX_DELAY);
     remove_client_locked(sockfd);
@@ -263,6 +275,7 @@ static void on_client_close(httpd_handle_t hd, int sockfd) {
     xSemaphoreGive(s_client_mutex);
     audio_ws_on_client_close(sockfd);
     audio_sniff_on_client_close(sockfd);
+    audio_iq_on_client_close(sockfd);
     ESP_LOGI(TAG, "CAT client socket closed (fd=%d)", sockfd);
     close(sockfd);
 }
@@ -304,9 +317,17 @@ void ws_server_start(void) {
     // next feature added to this httpd instance.
     config.stack_size = 12288;
     // +2 headroom for a short-lived /status/etc request landing alongside
-    // every already-open CAT AND audio socket at once (both routes share
-    // this one httpd instance/socket pool).
-    config.max_open_sockets = WS_MAX_CLIENTS + AUDIO_WS_MAX_CLIENTS + 2;
+    // every already-open CAT AND audio socket at once (every route shares
+    // this one httpd instance/socket pool). AUDIO_WS_MAX_CLIENTS covers
+    // /audio; the flat +6 covers /audio-mic-sniff and /iq-data's own
+    // client caps (2 each — see audio_sniff.c/audio_iq.c, both deliberately
+    // small debug/instrument taps, not exposed via header so duplicated
+    // here as a constant rather than an include) plus 2 spare. This was
+    // previously under-counted (missing /audio-mic-sniff's 2 entirely) —
+    // caught while adding /iq-data, not something that had caused a
+    // visible failure, since max_open_sockets is a soft cap httpd enforces
+    // by refusing new connections, not by silently corrupting existing ones.
+    config.max_open_sockets = WS_MAX_CLIENTS + AUDIO_WS_MAX_CLIENTS + 6;
     config.close_fn = on_client_close;
     // Default is disabled — there's no WS-level ping/pong anywhere in this
     // server either, so without this a socket whose peer vanished without a

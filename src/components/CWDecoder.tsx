@@ -2,9 +2,10 @@
 import { createEffect, createMemo, createSignal, For, onCleanup, onMount, Show, type JSX } from 'solid-js'
 import type { DecoderProps, DecoderControls } from '../lib/decoderControls'
 import { fmtAbsHz } from '$decoder-lib/formatFreq'
-import AudioAnalysisPanel from './AudioAnalysisPanel'
+import SignalAnalysisPanel from './SignalAnalysisPanel'
 import NumberField from './NumberField'
 import { createCWProcessor, type TextToken } from '../lib/cw/processor'
+import type { AudioSourceKind } from '../lib/audio/audioSource'
 import { loadNumberArray, saveNumberArray } from '$decoder-lib/storage'
 
 const DEFAULT_PANEL_WEIGHTS = [1, 1, 0.75]
@@ -242,15 +243,24 @@ export default function CWDecoder(props: DecoderProps): JSX.Element {
   let prevSym1 = ''
   let prevSym2 = ''
 
-  const processor = createCWProcessor({
-    toneFreq,
-    squelch,
-    adaptiveDitLength,
-    dualMode,
-    toneFreq2,
-    wpm: manualWpm,
-    filterQ,
-  })
+  // Same iqBridge-first/audioBridge/microphone precedence as
+  // FTDecoder.tsx's audioSourceKind()/getBridge() — see that file's comment.
+  const audioSourceKind = (): AudioSourceKind =>
+    props.iqBridge?.state().connected ? 'bridge' : props.audioBridge?.state().playbackActive ? 'bridge' : 'microphone'
+  const getBridge = () => (props.iqBridge?.state().connected ? props.iqBridge : props.audioBridge)
+  const processor = createCWProcessor(
+    {
+      toneFreq,
+      squelch,
+      adaptiveDitLength,
+      dualMode,
+      toneFreq2,
+      wpm: manualWpm,
+      filterQ,
+    },
+    audioSourceKind,
+    getBridge,
+  )
 
   createEffect(() => {
     // Depend on every param so this re-syncs whenever any of them change,
@@ -529,26 +539,55 @@ export default function CWDecoder(props: DecoderProps): JSX.Element {
           <div class="h-full w-px bg-[#30363d] transition-colors group-hover:bg-[#2ea043]/50" />
         </div>
 
-        {/* Panel 2 — Audio Analysis */}
-        <AudioAnalysisPanel
-          analyser={props.analyser ?? null}
-          isRecording={processor.state().isRecording}
-          storageKeyPrefix="cw"
-          markers={[
-            { freq: toneFreq(), color: '#f85149', label: 'T', bandwidthHz: filterBandwidth() },
-            ...(dualMode() ? [{ freq: toneFreq2(), color: '#ffa657', label: 'T2', bandwidthHz: filterBandwidth() }] : []),
-          ]}
-          onMarkerDrag={(idx, newHz) => {
-            const f = Math.max(50, newHz)
-            if (idx === 0) setToneFreq(f)
-            else setToneFreq2(f)
-          }}
-          squelch={squelch()}
-          onSquelchChange={setSquelch}
-          vfoFrequency={props.vfoFrequency}
-          class="min-w-0"
-          style={{ flex: panelWeights()[1] }}
-        />
+        {/* Panel 2 — Audio Analysis. In I/Q mode (see audioSourceKind()
+            above), shows the bridge's own wideband I/Q spectrum with a
+            draggable passband marker that retunes useIQBridge.ts's
+            SSBDemodulator — same "don't mix the two marker concepts"
+            reasoning as FTDecoder.tsx's identical branch; the tone
+            marker(s) below are only meaningful against already-demodulated
+            audio. */}
+        <Show
+          when={props.iqBridge?.state().connected}
+          fallback={
+            <SignalAnalysisPanel
+              analyser={props.analyser ?? null}
+              isRecording={processor.state().isRecording}
+              storageKeyPrefix="cw"
+              markers={[
+                { freq: toneFreq(), color: '#f85149', label: 'T', bandwidthHz: filterBandwidth() },
+                ...(dualMode() ? [{ freq: toneFreq2(), color: '#ffa657', label: 'T2', bandwidthHz: filterBandwidth() }] : []),
+              ]}
+              onMarkerDrag={(idx, newHz) => {
+                const f = Math.max(50, newHz)
+                if (idx === 0) setToneFreq(f)
+                else setToneFreq2(f)
+              }}
+              squelch={squelch()}
+              onSquelchChange={setSquelch}
+              vfoFrequency={props.vfoFrequency}
+              class="min-w-0"
+              style={{ flex: panelWeights()[1] }}
+            />
+          }
+        >
+          <SignalAnalysisPanel
+            analyser={null}
+            iqSource={{
+              computer: props.iqBridge!.spectrum,
+              sampleRateHz: () => props.iqBridge!.state().sampleRateHz,
+              active: () => props.iqBridge!.state().connected,
+            }}
+            isRecording={processor.state().isRecording}
+            vfoFrequency={props.vfoFrequency}
+            storageKeyPrefix="cw_iq"
+            defaultMaxHz={props.iqBridge!.state().sampleRateHz / 2}
+            passband={{ centerHz: props.iqBridge!.state().passbandCenterHz, bandwidthHz: props.iqBridge!.state().passbandBandwidthHz }}
+            onPassbandChange={(p) => props.iqBridge!.setPassband(p.centerHz, p.bandwidthHz)}
+            markerFieldLabel="Passband"
+            class="min-w-0"
+            style={{ flex: panelWeights()[1] }}
+          />
+        </Show>
 
         {/* Drag handle 1<->2 */}
         <div

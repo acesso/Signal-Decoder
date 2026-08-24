@@ -5,11 +5,48 @@
 // Line 4 of a planned pair of features on this board: CAT bridging and this
 // audio bridge, plus any other small radio controls that make sense once
 // both exist.
+//
+// Also owns input-mode selection (audio_input_mode_t below) — the SAME
+// line-in jack can instead carry raw I/Q from the radio (a wideband,
+// pre-demodulation signal, I on the left ADC channel/Q on the right); in
+// that mode this module captures true stereo instead of discarding one
+// channel, and broadcasts to the separate /iq-data endpoint (audio_iq.h)
+// instead of /audio.
 #pragma once
 
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+
+// Which physical signal the line-in jack is expected to carry — see
+// bridge_settings.h's input_mode_name comment for the full reasoning.
+// AUDIO_INPUT_MODE_AUDIO is today's existing, long-proven path: mono,
+// demodulated, one I2S slot kept (see audio_monitor_get_rx_slot_is_right()).
+// AUDIO_INPUT_MODE_IQ is new: stereo capture (BOTH I2S slots kept — I on
+// left, Q on right, confirmed on real hardware), broadcast on the separate
+// /iq-data endpoint (audio_iq.h) instead of /audio, since raw I/Q has
+// nothing in common with /audio's mono-demodulated-audio wire format or
+// its bidirectional (mic-send) semantics.
+typedef enum {
+    AUDIO_INPUT_MODE_AUDIO = 0,
+    AUDIO_INPUT_MODE_IQ = 1,
+} audio_input_mode_t;
+
+// Parses a mode name ("audio"/"iq") into audio_input_mode_t — returns false
+// (leaving *mode_out unchanged) if the name isn't recognized. Used both by
+// POST /input-mode (to validate the request body) and audio_monitor_start()
+// (to resolve the name last saved in bridge_settings).
+bool audio_monitor_parse_input_mode(const char *name, audio_input_mode_t *mode_out);
+
+// The reverse of audio_monitor_parse_input_mode() — for GET /status and log
+// messages.
+const char *audio_monitor_input_mode_name(audio_input_mode_t mode);
+
+// Current input mode, reflecting whatever audio_monitor_start() resolved
+// from bridge_settings_get_input_mode_name() at boot — this is a
+// reboot-to-apply setting (see bridge_settings.h), so this never changes
+// between boots the way audio_monitor_set_adc_input()'s live toggle does.
+audio_input_mode_t audio_monitor_get_input_mode(void);
 
 // Brings up I2C + I2S + the ES8388 codec, opens it in ADC+DAC mode, registers
 // its /audio rx callback (see audio_ws_set_rx_callback), and starts the

@@ -12,6 +12,7 @@ idf_component_register(
         "audio_monitor.c"
         "audio_ws.c"
         "audio_sniff.c"
+        "audio_iq.c"
         "pa_watchdog.c"
         "cpu_monitor.c"
         "cat_log.c"

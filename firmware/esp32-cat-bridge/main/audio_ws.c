@@ -3,6 +3,7 @@
 #include <string.h>
 #include <unistd.h>
 
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
@@ -166,11 +167,18 @@ void audio_ws_send_to_clients(const int16_t *samples, size_t count) {
     xSemaphoreGive(s_client_mutex);
     if (n == 0) return; // no client listening, or all still draining a prior frame
 
+    // PSRAM — per-broadcast transient scratch (malloc+free every ~50ms
+    // while streaming), never touches esp_codec_dev/I2S (only
+    // httpd_ws_send_frame_async(), see async_send_frame() below). Moving
+    // this off internal RAM also helps AVOID causing the kind of
+    // fragmentation that broke audio_task's own read buffer on real
+    // hardware — frequent alloc/free churn on a scarce pool is exactly
+    // what fragments it over time.
     size_t bytes = count * sizeof(int16_t);
     for (int i = 0; i < n; i++) {
-        async_send_ctx_t *ctx = malloc(sizeof(async_send_ctx_t));
+        async_send_ctx_t *ctx = heap_caps_malloc(sizeof(async_send_ctx_t), MALLOC_CAP_SPIRAM);
         if (!ctx) { xSemaphoreTake(s_client_mutex, portMAX_DELAY); clear_pending_locked(fds[i]); xSemaphoreGive(s_client_mutex); continue; }
-        ctx->samples = malloc(bytes);
+        ctx->samples = heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM);
         if (!ctx->samples) {
             free(ctx);
             xSemaphoreTake(s_client_mutex, portMAX_DELAY);
@@ -232,7 +240,18 @@ static esp_err_t audio_ws_handler(httpd_req_t *req) {
     }
     if (frame.len == 0) return ESP_OK;
 
-    uint8_t *buf = malloc(frame.len);
+    // PSRAM — this WAS deliberately kept internal, on the belief that
+    // feeding esp_codec_dev_write() (via s_rx_callback() below) required
+    // DMA-capable source memory. That belief is wrong and caused a REAL
+    // real-hardware bug elsewhere (see audio_monitor.c's audio_task read
+    // buffer, and its own upsample/stereo-duplication scratch buffers):
+    // esp_codec_dev_write() -> _i2s_data_write() -> i2s_channel_write()
+    // memcpy()s the caller's buffer into the driver's OWN separately-
+    // allocated DMA descriptors — the source pointer itself has no
+    // capability requirement, symmetric with the read side. Moving this
+    // one too, now that the pattern is confirmed rather than a judgment
+    // call.
+    uint8_t *buf = heap_caps_malloc(frame.len, MALLOC_CAP_SPIRAM);
     if (!buf) return ESP_ERR_NO_MEM;
     frame.payload = buf;
     err = httpd_ws_recv_frame(req, &frame, frame.len);

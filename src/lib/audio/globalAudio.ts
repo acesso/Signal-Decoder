@@ -9,6 +9,7 @@ import { audioRecorder } from '$decoder-lib/audio/ringRecorder'
 import { createCaptureNode, type CaptureNode } from '$decoder-lib/audio/captureNode'
 import { acquireMicrophoneSource, acquireBridgeSource, type AudioSourceKind, type AudioSourceHandle } from '$decoder-lib/audio/audioSource'
 import type { AudioBridge } from '$decoder-lib/cat/useAudioBridge'
+import type { IQBridge } from '$decoder-lib/cat/useIQBridge'
 
 export interface GlobalAudioState {
   isRecording: boolean
@@ -38,9 +39,9 @@ function createGlobalAudio() {
   // never enough — globalAudio.start() ran first and always grabbed the
   // mic regardless, which is exactly the bug this fixes.
   let sourceKind: AudioSourceKind = 'microphone'
-  let bridge: AudioBridge | undefined
+  let bridge: AudioBridge | IQBridge | undefined
 
-  function configureSource(kind: AudioSourceKind, bridgeInstance: AudioBridge | undefined) {
+  function configureSource(kind: AudioSourceKind, bridgeInstance: AudioBridge | IQBridge | undefined) {
     sourceKind = kind
     bridge = bridgeInstance
   }
@@ -88,12 +89,18 @@ function createGlobalAudio() {
       node.smoothingTimeConstant = 0.75
       handle.node.connect(node)
 
-      // Keep the audio graph alive with a near-silent gain node — only
-      // needed for a fresh microphone AudioContext; the bridge's own
-      // context already has a real (non-silent) path to destination from
-      // its own playback graph, so adding another one here would just be
-      // redundant, not harmful, but skip it for clarity.
-      if (handle.kind === 'microphone') {
+      // Keep the audio graph alive with a near-silent gain node. A
+      // microphone AudioContext has no other path to destination at all.
+      // useAudioBridge.ts's ("Listen to Radio") context already has one
+      // via its own playback graph, so this is redundant there — but
+      // useIQBridge.ts's context deliberately has NO destination
+      // connection (see that file's comment: opening the I/Q spectrum
+      // view shouldn't start playing audio out loud), so without this it
+      // would have no real path to destination either and could be
+      // throttled/suspended by a browser's autoplay/power-saving policy.
+      // Always attaching this is simplest and harmless for the
+      // already-audible bridge case too.
+      {
         const silencer = ctx.createGain()
         silencer.gain.value = 0.001
         node.connect(silencer)

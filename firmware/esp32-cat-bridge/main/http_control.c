@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_system.h"
 #include "esp_timer.h"
@@ -97,12 +98,23 @@ static const char *TAG = "http_control";
 // the browser -> radio mic path otherwise has no return signal at all;
 // this lets an operator actually verify what got sent, separate from
 // (and never interfering with) /audio's own real traffic.
+// "input_mode_select" means: GET /status reports input_mode and
+// POST /input-mode exists — selects whether the line-in jack is captured
+// as demodulated mono audio ("audio", broadcast on /audio, the original
+// and default mode) or raw wideband I/Q ("iq", stereo capture — I on the
+// ADC's left channel, Q on the right — broadcast on the separate
+// ws://<device>/iq-data instead, see audio_iq.h). Reboot-to-apply, same
+// as sample_rate_select above; POST /sample-rate's own valid-rate list
+// depends on which mode is currently selected (audio: 8-48kHz; iq: also
+// allows 96kHz, this feature's own default — see http_control.c's
+// SUPPORTED_IQ_SAMPLE_RATES_HZ for why that's unverified-but-selectable
+// rather than assumed to just work).
 static const char *const BRIDGE_FEATURES[] = {
     "cat", "wifi_config", "wifi_scan", "reset", "audio", "cat_baud", "pa_watchdog",
     "audio_input_select", "mic_gain", "rx_slot_select", "led_enable",
     "alc_control", "noise_gate_control", "cpu_monitor", "wifi_tx_power_control",
     "adc_hpf_control", "sample_rate_select", "speaker_amp_control", "cat_log",
-    "audio_mic_sniff",
+    "audio_mic_sniff", "input_mode_select",
 };
 
 // The uSDX firmware's own CAT_BAUD menu setting (usdxBLACKBRICK.ino) only
@@ -179,6 +191,7 @@ static esp_err_t status_handler(httpd_req_t *req) {
         "\"wifi_tx_power_quarter_dbm\":%d,\"adc_hpf_enabled\":%s,"
         "\"sample_rate_hz\":%u,\"speaker_amp_enabled\":%s,"
         "\"mic_gain_db\":%.1f,\"cat_log_enabled\":%s,"
+        "\"input_mode\":\"%s\","
         "\"uptime_s\":%lld}",
         wifi_state_str(st.wifi_state), ssid_escaped, (int)live_rssi,
         st.ip_addr[0] ? st.ip_addr : "",
@@ -199,6 +212,7 @@ static esp_err_t status_handler(httpd_req_t *req) {
         audio_monitor_get_speaker_amp_enabled() ? "true" : "false",
         (double)audio_monitor_get_mic_gain_db(),
         bridge_settings_get_cat_log_enabled() ? "true" : "false",
+        audio_monitor_input_mode_name(audio_monitor_get_input_mode()),
         (long long)uptime_s);
     if (n < 0 || (size_t)n >= sizeof(body)) {
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "status body truncated");
@@ -588,7 +602,21 @@ static esp_err_t wifi_tx_power_handler(httpd_req_t *req) {
 // channel, with a brief capture pause) AND persisted to NVS — right was
 // confirmed on real hardware to be where this board's P2 jack tip signal
 // actually lands.
+//
+// Rejected outright in AUDIO_INPUT_MODE_IQ: audio_monitor_set_rx_slot()
+// unconditionally reconfigures to I2S_SLOT_MODE_MONO, which would silently
+// break I/Q's stereo capture. This axis doesn't apply in I/Q mode at all
+// (both channels are always kept — see audio_monitor_start()'s iq_mode
+// branch); switching back to audio mode (POST /input-mode, reboot) is the
+// only way to change it once I/Q is selected. The control page's own
+// Left/Right buttons are disabled client-side too, but that's a UX
+// nicety, not the real guard — this check is.
 static esp_err_t rx_slot_handler(httpd_req_t *req) {
+    if (audio_monitor_get_input_mode() == AUDIO_INPUT_MODE_IQ) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "RX slot doesn't apply in I/Q input mode — both channels are always captured");
+        return ESP_FAIL;
+    }
+
     char body[64];
     if (read_request_body(req, body, sizeof(body)) != ESP_OK) return ESP_FAIL;
 
@@ -743,13 +771,18 @@ static esp_err_t speaker_amp_handler(httpd_req_t *req) {
 
 // GET /cat-log — the persisted CAT-frame ring buffer (see cat_log.h),
 // oldest-first. Each entry is small (direction + uptime_ms + up-to-40-char
-// frame), so CAT_LOG_CAPACITY (1000) of them comfortably fits one response;
+// frame), so CAT_LOG_CAPACITY of them comfortably fits one response;
 // no pagination. Reads straight from the in-RAM shadow (never touches
 // flash), so this is cheap enough to call on demand from a diagnostics panel.
 static esp_err_t cat_log_handler(httpd_req_t *req) {
-    // Heap-allocated, not stack — CAT_LOG_CAPACITY (1000) entries would
-    // blow the httpd worker task's stack if declared locally.
-    cat_log_entry_t *entries = malloc(sizeof(cat_log_entry_t) * CAT_LOG_CAPACITY);
+    // Heap-allocated, not stack — CAT_LOG_CAPACITY entries would blow the
+    // httpd worker task's stack if declared locally. PSRAM (MALLOC_CAP_SPIRAM):
+    // this is a per-request scratch buffer on the httpd worker task, never
+    // touched by the time-critical CAT/audio/PA-watchdog path — see
+    // sdkconfig.defaults' CONFIG_SPIRAM comment. Directly relieves the
+    // documented history below (this used to collide with the internal
+    // heap's fragmentation at the OLD CAT_LOG_CAPACITY of 1000).
+    cat_log_entry_t *entries = heap_caps_malloc(sizeof(cat_log_entry_t) * CAT_LOG_CAPACITY, MALLOC_CAP_SPIRAM);
     if (!entries) {
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "out of memory");
         return ESP_FAIL;
@@ -758,8 +791,9 @@ static esp_err_t cat_log_handler(httpd_req_t *req) {
 
     // Streamed as HTTP chunks (httpd_resp_send_chunk), one small buffer
     // reused per entry, rather than building the whole JSON body in one
-    // contiguous malloc() first — a full CAT_LOG_CAPACITY (1000) response
-    // is ~150KB+ of JSON, which reliably failed to allocate as a single
+    // contiguous malloc() first — at the ORIGINAL CAT_LOG_CAPACITY of
+    // 1000 (since reduced — see cat_log.h), a full response was ~150KB+
+    // of JSON, which reliably failed to allocate as a single
     // block on real hardware (WiFi/TLS/audio buffers fragment this
     // device's ~300KB heap enough that a 96KB largest-free-block was all
     // that remained even with 135KB nominally free) — this was a real,
@@ -802,22 +836,51 @@ static esp_err_t cat_log_clear_handler(httpd_req_t *req) {
     return httpd_resp_send(req, resp_body, n);
 }
 
-// The bridge's own supported wire/hardware sample rates — common steps
-// from the original 8kHz up through a typical laptop sound card/browser
-// AudioContext's own native rate (48kHz), so a same-rate A/B comparison
-// against a direct sound-card capture is possible at the top of the
-// range, with several intermediate steps for narrowing down where any
-// audible/measurable difference actually starts. Validated against on
-// POST /sample-rate so a typo/garbage value can't wedge the codec into an
-// unsupported rate.
+// The bridge's own supported wire/hardware sample rates in
+// AUDIO_INPUT_MODE_AUDIO — common steps from the original 8kHz up through
+// a typical laptop sound card/browser AudioContext's own native rate
+// (48kHz), so a same-rate A/B comparison against a direct sound-card
+// capture is possible at the top of the range, with several intermediate
+// steps for narrowing down where any audible/measurable difference
+// actually starts. Validated against on POST /sample-rate so a
+// typo/garbage value can't wedge the codec into an unsupported rate.
 static const uint32_t SUPPORTED_SAMPLE_RATES_HZ[] = { 8000, 16000, 22050, 32000, 44100, 48000 };
 #define SUPPORTED_SAMPLE_RATES_COUNT (sizeof(SUPPORTED_SAMPLE_RATES_HZ) / sizeof(SUPPORTED_SAMPLE_RATES_HZ[0]))
 
-// POST /sample-rate — body: {"hz":48000}; one of SUPPORTED_SAMPLE_RATES_HZ.
-// Persists to NVS and REBOOTS to apply — the wire rate IS the codec/I2S
-// hardware's own rate (see bridge_config.h), and live-reconfiguring that
-// exact hardware path has already caused one subtle bug in this codebase
-// (see audio_monitor.c's RX-slot re-apply comment); rebooting sidesteps
+// AUDIO_INPUT_MODE_IQ's own supported rates — DELIBERATELY a separate,
+// smaller list from SUPPORTED_SAMPLE_RATES_HZ above, not a superset: the
+// ES8388's vendored driver hardcodes single-speed mode (see
+// audio_monitor.c's DLL-disable comment) and its own known-good range is
+// 8-32kHz, with 48kHz already flagged as untested and everything above
+// that requiring undocumented double-speed register work this firmware
+// doesn't attempt yet. 96000 is included as the FEATURE's chosen default
+// (selectable, not forced — see bridge_settings.h's input_mode_name
+// comment) specifically so it can be bench-tested for real, with 48000
+// kept as a known-safe fallback if it doesn't pan out. 22050/44100 were
+// removed after real-hardware waterfall captures showed unique, reliably
+// reproducible spectral artifacts at exactly those two rates in I/Q mode
+// (not present at any other supported rate) — not chasing the root cause
+// since these fractional-of-44.1kHz rates have no real use for this
+// project's I/Q consumers anyway.
+static const uint32_t SUPPORTED_IQ_SAMPLE_RATES_HZ[] = { 8000, 16000, 32000, 48000, 96000 };
+#define SUPPORTED_IQ_SAMPLE_RATES_COUNT (sizeof(SUPPORTED_IQ_SAMPLE_RATES_HZ) / sizeof(SUPPORTED_IQ_SAMPLE_RATES_HZ[0]))
+
+static bool is_supported_sample_rate_for_mode(int hz, audio_input_mode_t mode) {
+    const uint32_t *rates = mode == AUDIO_INPUT_MODE_IQ ? SUPPORTED_IQ_SAMPLE_RATES_HZ : SUPPORTED_SAMPLE_RATES_HZ;
+    size_t count = mode == AUDIO_INPUT_MODE_IQ ? SUPPORTED_IQ_SAMPLE_RATES_COUNT : SUPPORTED_SAMPLE_RATES_COUNT;
+    for (size_t i = 0; i < count; i++) {
+        if (rates[i] == (uint32_t)hz) return true;
+    }
+    return false;
+}
+
+// POST /sample-rate — body: {"hz":48000}; one of SUPPORTED_SAMPLE_RATES_HZ
+// (or SUPPORTED_IQ_SAMPLE_RATES_HZ if the bridge is currently in
+// AUDIO_INPUT_MODE_IQ — see audio_monitor_get_input_mode()). Persists to
+// NVS and REBOOTS to apply — the wire rate IS the codec/I2S hardware's own
+// rate (see bridge_config.h), and live-reconfiguring that exact hardware
+// path has already caused one subtle bug in this codebase (see
+// audio_monitor.c's RX-slot re-apply comment); rebooting sidesteps
 // repeating that class of bug, same pattern as POST /wifi-config.
 static esp_err_t sample_rate_handler(httpd_req_t *req) {
     char body[64];
@@ -829,16 +892,70 @@ static esp_err_t sample_rate_handler(httpd_req_t *req) {
         return ESP_FAIL;
     }
 
-    bool supported = false;
-    for (size_t i = 0; i < SUPPORTED_SAMPLE_RATES_COUNT; i++) {
-        if (SUPPORTED_SAMPLE_RATES_HZ[i] == (uint32_t)hz) { supported = true; break; }
-    }
-    if (!supported) {
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "unsupported rate — must be one of 8000/16000/22050/32000/44100/48000");
+    if (!is_supported_sample_rate_for_mode(hz, audio_monitor_get_input_mode())) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+            audio_monitor_get_input_mode() == AUDIO_INPUT_MODE_IQ
+                ? "unsupported rate — must be one of 8000/16000/32000/48000/96000"
+                : "unsupported rate — must be one of 8000/16000/22050/32000/44100/48000");
         return ESP_FAIL;
     }
 
     if (!bridge_settings_set_sample_rate_hz((uint32_t)hz)) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "failed to save to NVS");
+        return ESP_FAIL;
+    }
+
+    httpd_resp_set_type(req, "text/plain");
+    set_cors(req);
+    httpd_resp_sendstr(req, "saved, restarting");
+    xTaskCreate(restart_task, "bridge_restart", 2048, NULL, tskIDLE_PRIORITY + 1, NULL);
+    return ESP_OK;
+}
+
+// POST /input-mode — body: {"mode":"audio"|"iq"}. Persists to NVS and
+// REBOOTS to apply, same reasoning as /sample-rate above — switching input
+// mode means reconfiguring the I2S RX channel's slot mode (mono vs
+// stereo) and esp_codec_dev_open()'s channel count, both boot-time-only
+// operations in this codebase (see audio_monitor_start()'s iq_mode
+// branches), not something with an established live-reconfig path the way
+// e.g. ADC input selection has.
+//
+// Switching modes while the currently-saved sample rate isn't valid in
+// the TARGET mode would leave the bridge about to boot into an
+// unsupported combination — rather than silently clamping the rate here
+// (surprising, and this handler doesn't know what the operator actually
+// wants it clamped TO), reject the mode switch and ask them to change the
+// rate first. This used to only matter for "audio" (e.g. a saved 96000,
+// which is IQ-only) since SUPPORTED_IQ_SAMPLE_RATES_HZ used to be a
+// strict superset of SUPPORTED_SAMPLE_RATES_HZ — no longer true now that
+// 22050/44100 were removed from the IQ list (see that array's comment),
+// so both directions need the check.
+static esp_err_t input_mode_handler(httpd_req_t *req) {
+    char body[64];
+    if (read_request_body(req, body, sizeof(body)) != ESP_OK) return ESP_FAIL;
+
+    char mode_name[8];
+    if (!extract_json_string(body, "mode", mode_name, sizeof(mode_name))) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "missing \"mode\"");
+        return ESP_FAIL;
+    }
+    audio_input_mode_t mode;
+    if (!audio_monitor_parse_input_mode(mode_name, &mode)) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "unsupported mode — must be \"audio\" or \"iq\"");
+        return ESP_FAIL;
+    }
+
+    uint32_t current_rate = bridge_settings_get_sample_rate_hz();
+    if (!is_supported_sample_rate_for_mode((int)current_rate, mode)) {
+        char err_msg[128];
+        snprintf(err_msg, sizeof(err_msg),
+            "current sample rate (%u Hz) isn't valid in %s mode — change POST /sample-rate first",
+            (unsigned)current_rate, mode_name);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, err_msg);
+        return ESP_FAIL;
+    }
+
+    if (!bridge_settings_set_input_mode_name(mode_name)) {
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "failed to save to NVS");
         return ESP_FAIL;
     }
@@ -930,9 +1047,13 @@ static esp_err_t system_stats_handler(httpd_req_t *req) {
 
     char body[1700];
     int n = snprintf(body, sizeof(body),
-        "{\"cpu_freq_mhz\":%d,\"heap_free\":%u,\"heap_min_free\":%u,\"heap_total\":%u,\"tasks\":%s}",
+        "{\"cpu_freq_mhz\":%d,\"heap_free\":%u,\"heap_min_free\":%u,\"heap_total\":%u,"
+        "\"heap_largest_free_block\":%u,\"dma_free\":%u,\"dma_largest_free_block\":%u,"
+        "\"tasks\":%s}",
         cpu_monitor_get_freq_mhz(),
         (unsigned)heap.free_bytes, (unsigned)heap.min_free_bytes, (unsigned)heap.total_bytes,
+        (unsigned)heap.largest_free_block_bytes,
+        (unsigned)heap.dma_free_bytes, (unsigned)heap.dma_largest_free_block_bytes,
         tasks_json);
     if (n < 0 || (size_t)n >= sizeof(body)) {
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "system-stats body truncated");
@@ -980,6 +1101,7 @@ void http_control_start(void) {
     httpd_uri_t system_stats_uri = { .uri = "/system-stats", .method = HTTP_GET, .handler = system_stats_handler };
     httpd_uri_t adc_hpf_uri      = { .uri = "/adc-hpf",      .method = HTTP_POST, .handler = adc_hpf_handler };
     httpd_uri_t sample_rate_uri  = { .uri = "/sample-rate",  .method = HTTP_POST, .handler = sample_rate_handler };
+    httpd_uri_t input_mode_uri  = { .uri = "/input-mode",  .method = HTTP_POST, .handler = input_mode_handler };
     httpd_uri_t cat_log_enable_uri = { .uri = "/cat-log-enable", .method = HTTP_POST, .handler = cat_log_enable_handler };
     httpd_uri_t speaker_amp_uri  = { .uri = "/speaker-amp",  .method = HTTP_POST, .handler = speaker_amp_handler };
     httpd_uri_t cat_log_uri       = { .uri = "/cat-log",       .method = HTTP_GET,  .handler = cat_log_handler };
@@ -1003,6 +1125,7 @@ void http_control_start(void) {
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &system_stats_uri));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &adc_hpf_uri));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &sample_rate_uri));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &input_mode_uri));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &cat_log_enable_uri));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &speaker_amp_uri));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &cat_log_uri));

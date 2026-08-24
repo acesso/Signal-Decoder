@@ -10,6 +10,9 @@
 import { createSignal } from 'solid-js'
 import { CWDecoder, type CWStats } from '$decoder-lib/cw/decoder'
 import { createCaptureNode, type CaptureNode } from '$decoder-lib/audio/captureNode'
+import { acquireMicrophoneSource, acquireBridgeSource, type AudioSourceKind, type AudioSourceHandle } from '$decoder-lib/audio/audioSource'
+import type { AudioBridge } from '$decoder-lib/cat/useAudioBridge'
+import type { IQBridge } from '$decoder-lib/cat/useIQBridge'
 
 export interface TextToken {
   text: string
@@ -35,7 +38,13 @@ export interface CWProcessorParams {
   filterQ: () => number
 }
 
-export function createCWProcessor(params: CWProcessorParams) {
+export function createCWProcessor(
+  params: CWProcessorParams,
+  // Where capture comes from — see ft/processor.ts's identical params for
+  // the full reasoning; audioSource.ts's shape is deliberately mode-agnostic.
+  getAudioSourceKind: () => AudioSourceKind = () => 'microphone',
+  getAudioBridge: () => AudioBridge | IQBridge | undefined = () => undefined,
+) {
   const [state, setState] = createSignal<CWProcessorState>({
     isRecording: false,
     isSupported:
@@ -51,7 +60,7 @@ export function createCWProcessor(params: CWProcessorParams) {
 
   let audioContext: AudioContext | null = null
   let analyser: AnalyserNode | null = null
-  let stream: MediaStream | null = null
+  let source: AudioSourceHandle | null = null
   let decoder: CWDecoder | null = null
   let decoder2: CWDecoder | null = null
   let processorNode: CaptureNode | null = null
@@ -143,19 +152,25 @@ export function createCWProcessor(params: CWProcessorParams) {
     try {
       if (!state().isSupported) throw new Error('Web Audio API not supported')
 
-      const mediaStream = await navigator.mediaDevices.getUserMedia({
-        audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false },
-      })
-      stream = mediaStream
+      const kind = getAudioSourceKind()
+      let handle: AudioSourceHandle
+      if (kind === 'bridge') {
+        const bridge = getAudioBridge()
+        const bridgeSource = bridge ? acquireBridgeSource(bridge) : null
+        if (!bridgeSource) throw new Error('Connect to the bridge (Listen to Radio) before selecting it as the audio source')
+        handle = bridgeSource
+      } else {
+        handle = await acquireMicrophoneSource()
+      }
+      source = handle
 
-      const ctx = new AudioContext()
+      const ctx = handle.ctx
       audioContext = ctx
 
-      const source = ctx.createMediaStreamSource(mediaStream)
       const analyserNode = ctx.createAnalyser()
       analyserNode.fftSize = 2048
       analyser = analyserNode
-      source.connect(analyserNode)
+      handle.node.connect(analyserNode)
 
       const sampleRate = ctx.sampleRate
       tokens = []
@@ -195,8 +210,8 @@ export function createCWProcessor(params: CWProcessorParams) {
   }
 
   function stopRecording() {
-    stream?.getTracks().forEach((t) => t.stop())
-    stream = null
+    source?.release()
+    source = null
     if (processorNode) {
       processorNode.disconnect()
       processorNode = null
@@ -205,10 +220,7 @@ export function createCWProcessor(params: CWProcessorParams) {
       analyser.disconnect()
       analyser = null
     }
-    if (audioContext) {
-      audioContext.close()
-      audioContext = null
-    }
+    audioContext = null
     decoder = null
     decoder2 = null
     setState((prev) => ({ ...prev, isRecording: false }))

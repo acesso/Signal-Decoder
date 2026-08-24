@@ -13,6 +13,8 @@ import FTTransmitPanel, { type TxStatus } from './components/FTTransmitPanel'
 import type { RTTYConfig } from '$decoder-lib/rtty/decoder'
 import RadioCATPanel, { useRadioCAT } from './components/RadioCATPanel'
 import { useAudioBridge } from './lib/cat/useAudioBridge'
+import { useIQBridge } from './lib/cat/useIQBridge'
+import { loadSuspendIQDuringTx } from './lib/ft/useFTTransmit'
 import PWAInstallPrompt from './components/PWAInstallPrompt'
 import UpdateAvailablePrompt from './components/UpdateAvailablePrompt'
 import { globalAudio } from './lib/audio/globalAudio'
@@ -161,7 +163,20 @@ function recDurationLabel(sec: number): string {
   return sec < 60 ? `${sec} s` : `${sec / 60} min`
 }
 
-function TopBar(props: { controls: DecoderControls | null; mode: DecoderMode; ftMode: FTMode; onFTModeChange: (m: FTMode) => void }): JSX.Element {
+// 'iq' is its own distinct value (not folded into 'bridge') so this line can
+// say "ESP32 Bridge (I/Q, demodulated)" rather than leaving the operator to
+// infer that from the Bridge status panel's input-mode toggle, which no
+// longer shows any signal info of its own — see RadioCATPanel.tsx's
+// BridgeInputModeControl/BridgeAudioControl (now controls-only).
+type AudioSourceDisplay = 'microphone' | 'bridge' | 'bridge-iq'
+
+function TopBar(props: {
+  controls: DecoderControls | null
+  mode: DecoderMode
+  ftMode: FTMode
+  onFTModeChange: (m: FTMode) => void
+  audioSource: AudioSourceDisplay | null
+}): JSX.Element {
   const isRecording = () => props.controls?.isRecording ?? false
   const isSupported = () => props.controls?.isSupported ?? true
   const error = () => props.controls?.error ?? null
@@ -267,8 +282,21 @@ function TopBar(props: { controls: DecoderControls | null; mode: DecoderMode; ft
           </div>
         </Show>
 
+        <Show when={isRecording() && props.audioSource}>
+          <span class="ml-auto text-[10px] text-[#8b949e] whitespace-nowrap">
+            Audio source:{' '}
+            <span class="text-[#c9d1d9] font-semibold">
+              {props.audioSource === 'bridge-iq'
+                ? 'ESP32 Bridge (I/Q, demodulated)'
+                : props.audioSource === 'bridge'
+                  ? 'ESP32 Bridge (radio audio)'
+                  : 'Local microphone'}
+            </span>
+          </span>
+        </Show>
+
         <Show when={error()}>
-          <span class="ml-auto font-mono text-xs text-[#f85149]">{error()}</span>
+          <span class={`${isRecording() && props.audioSource ? '' : 'ml-auto'} font-mono text-xs text-[#f85149]`}>{error()}</span>
         </Show>
       </div>
 
@@ -511,6 +539,15 @@ function App(): JSX.Element {
   // One shared connection rather than each consumer (RadioCATPanel, FTDecoder,
   // FTTransmitPanel) opening its own /audio WebSocket.
   const audioBridge = useAudioBridge()
+  // Lifted alongside audioBridge for the same reason, and passed to
+  // RadioCATPanel's own input-mode selector/spectrum view — see
+  // useIQBridge.ts's header comment. handleStart() below reads
+  // iqBridge.state().inputMode to decide whether /audio is even meaningful
+  // right now: while the bridge is in "iq" mode, /audio produces nothing
+  // useful, so auto-connecting it there would silently look like a normal
+  // (if empty) bridge audio connection instead of the "wrong mode" problem
+  // it actually is.
+  const iqBridge = useIQBridge()
   // Reported by RadioCATPanel whenever its CAT transport/wsUrl changes —
   // undefined unless transport is 'websocket'. Lets handleStart() below
   // decide whether "Start Decoding" can auto-connect the bridge instead of
@@ -567,7 +604,30 @@ function App(): JSX.Element {
     // be enough for decoding to just work.
     const wsUrl = bridgeWsUrl()
     setBridgeAudioFallbackWarning(null)
-    if (wsUrl && !audioBridge.state().playbackActive) {
+
+    // Which physical path the bridge is currently sampling — "audio"
+    // (already-demodulated) or "iq" (raw, demodulated client-side by
+    // useIQBridge.ts; see that file's header comment on why this is a
+    // superset, not a separate/incompatible mode). A quick refreshInfo()
+    // here (one /status fetch) rather than trusting iqBridge's last-known
+    // state, since the operator may not have opened the Bridge panel at
+    // all this session — the RadioCATPanel-driven refresh isn't guaranteed
+    // to have run yet.
+    let bridgeInIQMode = false
+    if (wsUrl) {
+      await iqBridge.refreshInfo(wsUrl)
+      bridgeInIQMode = iqBridge.state().inputMode === 'iq'
+    }
+
+    if (wsUrl && bridgeInIQMode) {
+      iqBridge.setCatMode(cat.state().mode)
+      if (!iqBridge.state().connected) await iqBridge.connect(wsUrl)
+      if (!iqBridge.state().connected) {
+        setBridgeAudioFallbackWarning(
+          `Could not connect to the bridge's I/Q stream (${iqBridge.state().error ?? 'unknown error'}) — falling back to the microphone.`
+        )
+      }
+    } else if (wsUrl && !audioBridge.state().playbackActive) {
       await audioBridge.connect(wsUrl)
       // connect() failing used to fall through to the microphone with no
       // visible sign anything had gone wrong — a bridge/network hiccup on
@@ -580,7 +640,9 @@ function App(): JSX.Element {
         )
       }
     }
-    globalAudio.configureSource(wsUrl && audioBridge.state().playbackActive ? 'bridge' : 'microphone', audioBridge)
+    const useIQ = wsUrl && bridgeInIQMode && iqBridge.state().connected
+    const useAudio = wsUrl && !bridgeInIQMode && audioBridge.state().playbackActive
+    globalAudio.configureSource(useIQ ? 'bridge' : useAudio ? 'bridge' : 'microphone', useIQ ? iqBridge : useAudio ? audioBridge : undefined)
 
     const node = await globalAudio.start()
     if (node) {
@@ -591,6 +653,30 @@ function App(): JSX.Element {
   function handleStop() {
     activeHandle().current?.stop()
     globalAudio.stop()
+  }
+
+  // Real-hardware profiling of the ESP32 bridge found WiFi's dynamic
+  // packet buffers and I2S's DMA descriptors draw from the same physical
+  // memory pool — streaming /iq-data concurrently with TX measurably
+  // degrades TX audio quality (see the bridge firmware's WiFi buffer-count
+  // reduction, RadioCATPanel.tsx's "Suspend I/Q spectrum during TX"
+  // checkbox). Bracket each keyed TX window by disconnecting iqBridge
+  // (also fine RX-wise: half-duplex, nothing to receive while keyed) and
+  // reconnecting once it ends. wasConnectedForTx tracks whether THIS
+  // window actually suspended a connection, so windowEnd doesn't
+  // reconnect when the operator wasn't using I/Q at all.
+  let wasConnectedForTx = false
+  function handleTxWindowStart() {
+    if (!loadSuspendIQDuringTx()) return
+    if (!iqBridge.state().connected) return
+    wasConnectedForTx = true
+    iqBridge.disconnect()
+  }
+  function handleTxWindowEnd() {
+    if (!wasConnectedForTx) return
+    wasConnectedForTx = false
+    const wsUrl = bridgeWsUrl()
+    if (wsUrl) void iqBridge.connect(wsUrl)
   }
   let clearSent: (() => void) | null = null
   function handleReset() {
@@ -629,6 +715,13 @@ function App(): JSX.Element {
     reset: handleReset,
   }))
 
+  // Same precedence as handleStart()'s useIQ/useAudio and FTDecoder.tsx's
+  // own audioSourceKind() — iqBridge first, since audioBridge is never
+  // connected while the bridge is in "iq" input mode.
+  const audioSourceDisplay = createMemo<AudioSourceDisplay | null>(() =>
+    iqBridge.state().connected ? 'bridge-iq' : audioBridge.state().playbackActive ? 'bridge' : 'microphone'
+  )
+
   const meta = createMemo(() => MODE_META[mode()])
 
   return (
@@ -659,7 +752,7 @@ function App(): JSX.Element {
 
       {/* Shared top bar — Start/Stop/Reset + FT sub-mode when active */}
       <div class="shrink-0 px-4 pb-2 sm:px-6 lg:px-8">
-        <TopBar controls={globalControls()} mode={mode()} ftMode={ftMode()} onFTModeChange={handleFTModeChange} />
+        <TopBar controls={globalControls()} mode={mode()} ftMode={ftMode()} onFTModeChange={handleFTModeChange} audioSource={audioSourceDisplay()} />
       </div>
 
       {/* Scrollable body — CAT + TX panel + decoder content */}
@@ -671,7 +764,7 @@ function App(): JSX.Element {
         {/* CAT radio control panel — sticky: stays visible while scrolling,
             collapsing to just its main bar so it doesn't eat too much space. */}
         <div class="sticky top-0 z-10 bg-[#0d1117] pb-3">
-          <RadioCATPanel cat={cat} audioBridge={audioBridge} collapsed={catCollapsed()} onWsUrlChange={setBridgeWsUrl} />
+          <RadioCATPanel cat={cat} audioBridge={audioBridge} iqBridge={iqBridge} collapsed={catCollapsed()} onWsUrlChange={setBridgeWsUrl} />
         </div>
 
         {/* FT Transmit panel — only shown when FT mode is active */}
@@ -690,9 +783,12 @@ function App(): JSX.Element {
                   contacts={ftContacts()}
                   vfoFrequency={vfoFrequency()}
                   audioBridge={audioBridge}
+                  bridgeWsUrl={bridgeWsUrl()}
                   onMyCallChange={setFtMyCall}
                   onMyGridChange={setFtMyGrid}
                   onSetPTT={cat.state().connected ? cat.setPTT : undefined}
+                  onTxWindowStart={handleTxWindowStart}
+                  onTxWindowEnd={handleTxWindowEnd}
                   onStatusChange={setTxStatus}
                   onReset={(fn) => {
                     clearSent = fn
@@ -749,7 +845,12 @@ function App(): JSX.Element {
           </div>
         </Show>
 
-        {/* All decoders mounted persistently, toggled via CSS */}
+        {/* All decoders mounted persistently, toggled via CSS. audioBridge/
+            iqBridge threaded into every decoder now (not just FT8) — each
+            decoder's own processor picks iqBridge-connected first, then
+            audioBridge-playbackActive, else microphone (see each
+            component's audioSourceKind()/getBridge(), mirroring
+            FTDecoder.tsx's original pattern). */}
         <div class={mode() === 'rtty' ? '' : 'hidden'}>
           <RTTYDecoder
             handle={rtty}
@@ -757,16 +858,40 @@ function App(): JSX.Element {
             analyser={globalAudio.analyser()}
             vfoFrequency={vfoFrequency()}
             onActiveConfigChange={setRttyActiveConfig}
+            audioBridge={audioBridge}
+            iqBridge={iqBridge}
           />
         </div>
         <div class={mode() === 'sstv' ? '' : 'hidden'}>
-          <SSTVDecoder handle={sstv} onStateChange={() => {}} analyser={globalAudio.analyser()} vfoFrequency={vfoFrequency()} onReply={handleSSTVReply} />
+          <SSTVDecoder
+            handle={sstv}
+            onStateChange={() => {}}
+            analyser={globalAudio.analyser()}
+            vfoFrequency={vfoFrequency()}
+            onReply={handleSSTVReply}
+            audioBridge={audioBridge}
+            iqBridge={iqBridge}
+          />
         </div>
         <div class={mode() === 'cw' ? '' : 'hidden'}>
-          <CWDecoder handle={cw} onStateChange={() => {}} analyser={globalAudio.analyser()} vfoFrequency={vfoFrequency()} />
+          <CWDecoder
+            handle={cw}
+            onStateChange={() => {}}
+            analyser={globalAudio.analyser()}
+            vfoFrequency={vfoFrequency()}
+            audioBridge={audioBridge}
+            iqBridge={iqBridge}
+          />
         </div>
         <div class={mode() === 'mfsk' ? '' : 'hidden'}>
-          <MFSKDecoder handle={mfsk} onStateChange={() => {}} analyser={globalAudio.analyser()} vfoFrequency={vfoFrequency()} />
+          <MFSKDecoder
+            handle={mfsk}
+            onStateChange={() => {}}
+            analyser={globalAudio.analyser()}
+            vfoFrequency={vfoFrequency()}
+            audioBridge={audioBridge}
+            iqBridge={iqBridge}
+          />
         </div>
         <div class={mode() === 'ft' ? '' : 'hidden'}>
           <FTDecoder
@@ -781,6 +906,7 @@ function App(): JSX.Element {
             txAudioHz={txAudioHz()}
             onTxAudioHzChange={(hz) => setTxBaseFreq?.(hz)}
             audioBridge={audioBridge}
+            iqBridge={iqBridge}
           />
         </div>
       </div>

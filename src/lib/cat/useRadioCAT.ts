@@ -244,6 +244,17 @@ export interface RadioCATControls {
    *  getBridgeInfo().features includes "pa_watchdog". Resolves the
    *  resulting tripped state (false on success), or null on failure. */
   clearBridgePaEmergency: (wsUrl: string) => Promise<boolean | null>;
+  /** POST /input-mode — selects whether the bridge's line-in jack is
+   *  captured as demodulated mono audio ("audio", the original mode,
+   *  broadcast on /audio) or raw wideband I/Q ("iq", stereo capture,
+   *  broadcast on the separate /iq-data — see useIQBridge.ts). Persists
+   *  to NVS and REBOOTS the bridge to apply, same as setBridgeWifiConfig
+   *  — resolves true once the bridge ACKs the save, not once it's back up
+   *  on the new mode. Switching to "audio" while the bridge's currently
+   *  saved sample rate is I/Q-only (96000Hz) is REJECTED by the firmware
+   *  (resolves false) — the caller must lower the rate first. Only
+   *  meaningful if getBridgeInfo().features includes "input_mode_select". */
+  setBridgeInputMode: (wsUrl: string, mode: 'audio' | 'iq') => Promise<boolean>;
 }
 
 /** Snapshot of the ESP32 CAT bridge's own status — distinct from RadioState,
@@ -1537,6 +1548,23 @@ export function useRadioCAT(): RadioCATControls {
     }
   };
 
+  const setBridgeInputMode = async (wsUrl: string, mode: 'audio' | 'iq'): Promise<boolean> => {
+    const base = bridgeHttpBase(wsUrl);
+    if (!base) return false;
+    log('info', 'setBridgeInputMode →', mode);
+    try {
+      const resp = await fetch(base + '/input-mode', {
+        method: 'POST', signal: AbortSignal.timeout(5000),
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ mode }),
+      });
+      return resp.ok;
+    } catch (err) {
+      log('warn', 'setBridgeInputMode failed:', err);
+      return false;
+    }
+  };
+
   const setBridgeContrast = async (wsUrl: string, vop: number): Promise<{ vop: number; saved: boolean } | null> => {
     const base = bridgeHttpBase(wsUrl);
     if (!base) return null;
@@ -1610,6 +1638,6 @@ export function useRadioCAT(): RadioCATControls {
     setBacklight, getPABias, setPABias, getTxTimeout, setTxTimeout, resetRadio,
     getFactoryDefaults, factoryResetRadio, getRefFreq, setRefFreq,
     getBridgeStatus, resetBridge, getBridgeInfo, setBridgeBacklight, setBridgeWifiConfig, setBridgeContrast,
-    setBridgeCatBaud, clearBridgePaEmergency,
+    setBridgeCatBaud, clearBridgePaEmergency, setBridgeInputMode,
   };
 }

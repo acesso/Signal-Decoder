@@ -7,6 +7,7 @@ import { type FTDecodeResult, type FTMessage, type FTMode, FT_WINDOW_SECONDS, FT
 import { createCaptureNode, type CaptureNode } from '$decoder-lib/audio/captureNode'
 import { acquireMicrophoneSource, acquireBridgeSource, type AudioSourceKind, type AudioSourceHandle } from '$decoder-lib/audio/audioSource'
 import type { AudioBridge } from '$decoder-lib/cat/useAudioBridge'
+import type { IQBridge } from '$decoder-lib/cat/useIQBridge'
 
 export interface FTProcessorState {
   isRecording: boolean
@@ -42,7 +43,7 @@ export function createFTProcessor(
   // behavior when omitted) or the ESP32 bridge's live incoming-radio-audio
   // (see audioSource.ts's acquireMicrophoneSource()/acquireBridgeSource()).
   getAudioSourceKind: () => AudioSourceKind = () => 'microphone',
-  getAudioBridge: () => AudioBridge | undefined = () => undefined,
+  getAudioBridge: () => AudioBridge | IQBridge | undefined = () => undefined,
 ) {
   const [state, setState] = createSignal<FTProcessorState>({
     isRecording: false,

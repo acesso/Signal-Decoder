@@ -12,7 +12,10 @@
  * would silently kill the other's audio session too.
  */
 
-import { micStartConflicts, micStopAllowed, makeResampleState, resampleLinear, type MicOwner } from '../useAudioBridge';
+import {
+  micStartConflicts, micStopAllowed, makeResampleState, resampleLinear,
+  makeBandlimitedResampleState, downsampleBandlimited, type MicOwner,
+} from '../useAudioBridge';
 
 describe('micStartConflicts', () => {
   it('allows starting when nothing is active', () => {
@@ -173,6 +176,109 @@ describe('resampleLinear with a carried ResampleState', () => {
       for (let i = 0; i < 2048; i++) input[i] = Math.sin(sampleCounter++ * 0.01);
       const out = resampleLinear(input, 48000, 8000, state);
       expect(out.some((v) => Number.isNaN(v))).toBe(false);
+    }
+  });
+});
+
+// Real bug found on real hardware: naive linear-interpolation resampling,
+// stacked on both ends of the /audio wire (this downsample + firmware's
+// own upsample_bandlimited() predecessor), introduced a real, visible
+// broadband noise floor around an otherwise-clean FT8 tone in the
+// mic-sniff waterfall ("green haze"). downsampleBandlimited() (windowed
+// sinc) replaced resampleLinear() at startMic()'s one real call site to
+// fix this — these tests confirm it actually suppresses the
+// image/harmonic energy a naive linear resample leaves behind.
+describe('downsampleBandlimited', () => {
+  function goertzelMag(samples: Float32Array | Int16Array, freqHz: number, sampleRateHz: number): number {
+    const w = (2 * Math.PI * freqHz) / sampleRateHz;
+    const cw = 2 * Math.cos(w);
+    let s0 = 0, s1 = 0, s2 = 0;
+    for (let n = 0; n < samples.length; n++) {
+      s0 = samples[n] + cw * s1 - s2;
+      s2 = s1;
+      s1 = s0;
+    }
+    const real = s1 - s2 * Math.cos(w);
+    const imag = s2 * Math.sin(w);
+    return Math.sqrt(real * real + imag * imag) / samples.length;
+  }
+
+  it('never produces NaN or out-of-range output across many chunks', () => {
+    const state = makeBandlimitedResampleState();
+    let sampleCounter = 0;
+    for (let c = 0; c < 50; c++) {
+      const input = new Float32Array(2048);
+      for (let i = 0; i < 2048; i++) input[i] = Math.sin(sampleCounter++ * 0.01) * 0.6;
+      const out = downsampleBandlimited(input, 48000, 16000, state);
+      expect(out.some((v) => Number.isNaN(v))).toBe(false);
+      expect(out.every((v) => v >= -1 && v <= 1)).toBe(true);
+    }
+  });
+
+  it('passes a fundamental tone through cleanly with a suppressed broadband floor', () => {
+    const fromRate = 48000;
+    const toRate = 16000;
+    const toneHz = 1500;
+    const chunkSize = 2048;
+    const state = makeBandlimitedResampleState();
+    const step = (2 * Math.PI * toneHz) / fromRate;
+    let phase = 0;
+    const outChunks: Float32Array[] = [];
+    // Enough chunks to settle past the filter's own group delay and give a
+    // real analysis window.
+    for (let c = 0; c < 40; c++) {
+      const input = new Float32Array(chunkSize);
+      for (let i = 0; i < chunkSize; i++) { input[i] = Math.sin(phase) * 0.6; phase += step; }
+      outChunks.push(downsampleBandlimited(input, fromRate, toRate, state));
+    }
+    const total = outChunks.reduce((s, c) => s + c.length, 0);
+    const all = new Float32Array(total);
+    let off = 0;
+    for (const c of outChunks) { all.set(c, off); off += c.length; }
+
+    const settled = all.subarray(Math.round(toRate * 0.3)); // skip filter settling time
+    const fundamental = goertzelMag(settled, toneHz, toRate);
+    expect(fundamental).toBeGreaterThan(0.2); // real signal survived the resample
+
+    let broadbandSum = 0, broadbandCount = 0;
+    for (let f = 100; f < toRate / 2; f += 137) {
+      if (Math.abs(f - toneHz) < 100) continue;
+      broadbandSum += goertzelMag(settled, f, toRate);
+      broadbandCount++;
+    }
+    const broadbandAvg = broadbandSum / broadbandCount;
+    // A naive linear resample of the same tone leaves broadband energy
+    // within ~2 orders of magnitude of the fundamental; windowed-sinc
+    // should suppress it far more than that.
+    expect(fundamental / broadbandAvg).toBeGreaterThan(500);
+  });
+
+  it('carries continuity across chunk boundaries (no discontinuity click)', () => {
+    // Same real-hardware-motivated check as resampleLinear()'s own
+    // continuity test above, ported to the bandlimited resampler.
+    const fromRate = 48000;
+    const toRate = 16000;
+    const chunkSize = 2048;
+    const state = makeBandlimitedResampleState();
+    let phase = 0;
+    const step = (2 * Math.PI * 700) / fromRate;
+    const outputs: Float32Array[] = [];
+    for (let c = 0; c < 10; c++) {
+      const input = new Float32Array(chunkSize);
+      for (let i = 0; i < chunkSize; i++) { input[i] = Math.sin(phase) * 0.6; phase += step; }
+      outputs.push(downsampleBandlimited(input, fromRate, toRate, state));
+    }
+    // No single-sample jump across a chunk boundary should be drastically
+    // larger than the typical sample-to-sample step within a chunk — a
+    // discontinuity (the click a stateless per-chunk reset would cause)
+    // shows up as an outlier-sized jump right at the seam.
+    for (let i = 1; i < outputs.length; i++) {
+      const prevLast = outputs[i - 1][outputs[i - 1].length - 1];
+      const curFirst = outputs[i][0];
+      const withinChunkSteps: number[] = [];
+      for (let j = 1; j < outputs[i].length; j++) withinChunkSteps.push(Math.abs(outputs[i][j] - outputs[i][j - 1]));
+      const maxNormalStep = Math.max(...withinChunkSteps) * 3;
+      expect(Math.abs(curFirst - prevLast)).toBeLessThan(Math.max(maxNormalStep, 0.05));
     }
   });
 });

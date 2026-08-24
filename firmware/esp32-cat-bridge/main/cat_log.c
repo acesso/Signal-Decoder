@@ -2,6 +2,7 @@
 
 #include <string.h>
 
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_partition.h"
 #include "esp_timer.h"
@@ -298,15 +299,24 @@ static void recover_from_flash(void) {
     // n_records — the partition is deliberately oversized relative to the
     // live data it needs to hold (see this file's header comment on flash
     // wear), so n_records (in the low thousands) massively overshoots what
-    // the RAM shadow actually keeps (CAT_LOG_CAPACITY, 1000) — allocating
-    // n_records here was the previous bug: it tried to malloc the entire
-    // partition's worth of records (512KB) on top of the already-allocated
-    // 45KB RAM ring, which reliably failed. Once the window is full, a new
+    // the RAM shadow actually keeps (CAT_LOG_CAPACITY — see cat_log.h for
+    // its current value and the real-hardware memory-pressure incident
+    // that sized it down from 1000) — allocating n_records here was the
+    // previous bug: it tried to malloc the entire partition's worth of
+    // records (512KB) on top of the already-allocated RAM ring, which
+    // reliably failed. Once the window is full, a new
     // record only displaces the current OLDEST kept record if the new one
     // is actually newer (per the same wraparound-tolerant seq comparison
     // used above) — otherwise it's discarded, since it's older than
     // everything already being kept.
-    cat_log_record_t *valid = malloc(CAT_LOG_CAPACITY * sizeof(cat_log_record_t));
+    // PSRAM: one-time boot-time scratch, freed immediately after this scan
+    // — this exact allocation is the one that historically collided with
+    // MALLOC_CAP_DMA availability for 96kHz I/Q mode (see cat_log.h and
+    // the README's Known Limitations entry); moving it off internal RAM
+    // removes that collision at its actual source, no runtime task ever
+    // touches this buffer, and a one-time few-KB-per-access PSRAM latency
+    // cost during a boot-time scan is immaterial.
+    cat_log_record_t *valid = heap_caps_malloc(CAT_LOG_CAPACITY * sizeof(cat_log_record_t), MALLOC_CAP_SPIRAM);
     if (!valid) {
         ESP_LOGW(TAG, "recover_from_flash: malloc failed, RAM log will start empty this boot (flash content is unaffected)");
         return;

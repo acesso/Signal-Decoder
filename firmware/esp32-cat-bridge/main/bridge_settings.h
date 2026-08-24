@@ -90,6 +90,24 @@ bool bridge_settings_set_wifi_tx_power_quarter_dbm(int8_t quarter_dbm);
 uint32_t bridge_settings_get_sample_rate_hz(void);
 bool bridge_settings_set_sample_rate_hz(uint32_t rate_hz);
 
+// Which physical signal the line-in jack is expected to carry — "audio"
+// (today's default: already-demodulated SSB/audio, mono, narrowband) or
+// "iq" (raw in-phase/quadrature from the radio, pre-demodulation, wideband
+// — I on the ADC's left channel, Q on the right, per real-hardware
+// confirmation of the uSDX's I/Q output wiring). This is a SEPARATE axis
+// from adc_input_name above: adc_input_name picks which physical pins
+// reach the ES8388's ADC (LIN1/LIN2/MIC1/MIC2/diff), while this picks how
+// the resulting samples are captured and interpreted once they arrive —
+// "audio" mode keeps one I2S slot (see rx_slot_is_right), "iq" mode keeps
+// BOTH slots (stereo capture) since I/Q needs both channels simultaneously,
+// not a choice between them. Like sample_rate_hz, changing this reboots to
+// apply rather than reconfiguring a running I2S/codec setup live. Defaults
+// to "audio" — the existing, long-proven mode; "iq" is new and opt-in.
+// out_sz is the caller's buffer size including room for the NUL terminator
+// (the longest name, "audio", needs 6 bytes).
+void bridge_settings_get_input_mode_name(char *name_out, size_t out_sz);
+bool bridge_settings_set_input_mode_name(const char *name);
+
 // Whether the persistent CAT-frame log (cat_log.h) should be running at
 // all — a debug feature, defaults to OFF (see bridge_settings.c's default
 // comment for why: its boot-time flash-recovery scan grows with the log's

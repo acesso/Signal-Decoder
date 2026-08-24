@@ -4,9 +4,10 @@
 import { createEffect, createMemo, createSignal, For, onCleanup, onMount, Show, type JSX } from 'solid-js'
 import type { DecoderControls, DecoderProps } from '../lib/decoderControls'
 import { fmtAbsHz } from '$decoder-lib/formatFreq'
-import AudioAnalysisPanel from './AudioAnalysisPanel'
+import SignalAnalysisPanel from './SignalAnalysisPanel'
 import NumberField from './NumberField'
 import { createMFSKProcessor, type MFSKSymbol, type MFSKWord } from '../lib/mfsk/processor'
+import type { AudioSourceKind } from '../lib/audio/audioSource'
 import { MFSKChannel, MFSKDecoderOptions, DEFAULT_DECODER_OPTIONS } from '$decoder-lib/mfsk/decoder'
 import { bitsToBaudotCode, decodeBaudotCodePoints } from '$decoder-lib/mfsk/baudot'
 import { decodeCCIR476FromBits } from '$decoder-lib/mfsk/ccir476'
@@ -758,7 +759,16 @@ export default function MFSKDecoder(props: DecoderProps): JSX.Element {
   const [, setActivePresetLabel] = createSignal<string | null>(null)
 
   // ── Processor ─────────────────────────────────────────────────────────────
-  const processor = createMFSKProcessor({ channels, baudRate, squelch, decoderOptions: decoderOpts })
+  // Same iqBridge-first/audioBridge/microphone precedence as
+  // FTDecoder.tsx's audioSourceKind()/getBridge() — see that file's comment.
+  const audioSourceKind = (): AudioSourceKind =>
+    props.iqBridge?.state().connected ? 'bridge' : props.audioBridge?.state().playbackActive ? 'bridge' : 'microphone'
+  const getBridge = () => (props.iqBridge?.state().connected ? props.iqBridge : props.audioBridge)
+  const processor = createMFSKProcessor(
+    { channels, baudRate, squelch, decoderOptions: decoderOpts },
+    audioSourceKind,
+    getBridge,
+  )
 
   createEffect(() => {
     // Depend on every param so this re-syncs whenever any of them change,
@@ -1476,38 +1486,70 @@ export default function MFSKDecoder(props: DecoderProps): JSX.Element {
           <div class="h-full w-px bg-[#30363d] transition-colors group-hover:bg-[#2ea043]/50" />
         </div>
 
-        {/* ── Panel 2: Audio Analysis ── */}
-        <AudioAnalysisPanel
-          analyser={props.analyser ?? null}
-          isRecording={processor.state().isRecording}
-          storageKeyPrefix="mfsk"
-          markers={channels().map((ch) => ({ freq: ch.freq, color: ch.color, label: ch.label }))}
-          onMarkerDrag={(idx, newHz, shiftKey) => {
-            const ch = channels()[idx]
-            if (!ch) return
-            if (shiftKey) {
-              // Shift+drag: move just this tone, leave the rest of the group.
-              const f = Math.max(50, Math.min(24000, Math.round(newHz)))
-              if (f !== ch.freq) setChannels((p) => p.map((c) => (c.id === ch.id ? { ...c, freq: f } : c)))
-              return
-            }
-            let delta = Math.round(newHz) - ch.freq
-            // Clamp delta so no channel escapes [50, 24000] — preserves spacing
-            const minFreq = Math.min(...channels().map((c) => c.freq))
-            const maxFreq = Math.max(...channels().map((c) => c.freq))
-            delta = Math.max(50 - minFreq, Math.min(24000 - maxFreq, delta))
-            if (delta === 0) return
-            setChannels((p) => p.map((c) => ({ ...c, freq: c.freq + delta })))
-          }}
-          showGrid={showGrid()}
-          gridSize={gridSize()}
-          squelch={squelch()}
-          onSquelchChange={setSquelch}
-          glBands={channels()}
-          vfoFrequency={props.vfoFrequency}
-          class="min-w-0"
-          style={{ flex: pW()[1] }}
-        />
+        {/* ── Panel 2: Audio Analysis. In I/Q mode (see audioSourceKind()
+            above), shows the bridge's own wideband I/Q spectrum with a
+            draggable passband marker that retunes useIQBridge.ts's
+            SSBDemodulator — same "don't mix the two marker concepts"
+            reasoning as FTDecoder.tsx's identical branch; the per-channel
+            tone markers below (and showGrid/gridSize/glBands) are only
+            meaningful against already-demodulated audio. Unrelated to the
+            showWordMarkers/showBitMarkers/showFrameMarkers decoded-symbol-
+            table overlays elsewhere in this component — those aren't
+            touched by this branch at all. ── */}
+        <Show
+          when={props.iqBridge?.state().connected}
+          fallback={
+            <SignalAnalysisPanel
+              analyser={props.analyser ?? null}
+              isRecording={processor.state().isRecording}
+              storageKeyPrefix="mfsk"
+              markers={channels().map((ch) => ({ freq: ch.freq, color: ch.color, label: ch.label }))}
+              onMarkerDrag={(idx, newHz, shiftKey) => {
+                const ch = channels()[idx]
+                if (!ch) return
+                if (shiftKey) {
+                  // Shift+drag: move just this tone, leave the rest of the group.
+                  const f = Math.max(50, Math.min(24000, Math.round(newHz)))
+                  if (f !== ch.freq) setChannels((p) => p.map((c) => (c.id === ch.id ? { ...c, freq: f } : c)))
+                  return
+                }
+                let delta = Math.round(newHz) - ch.freq
+                // Clamp delta so no channel escapes [50, 24000] — preserves spacing
+                const minFreq = Math.min(...channels().map((c) => c.freq))
+                const maxFreq = Math.max(...channels().map((c) => c.freq))
+                delta = Math.max(50 - minFreq, Math.min(24000 - maxFreq, delta))
+                if (delta === 0) return
+                setChannels((p) => p.map((c) => ({ ...c, freq: c.freq + delta })))
+              }}
+              showGrid={showGrid()}
+              gridSize={gridSize()}
+              squelch={squelch()}
+              onSquelchChange={setSquelch}
+              glBands={channels()}
+              vfoFrequency={props.vfoFrequency}
+              class="min-w-0"
+              style={{ flex: pW()[1] }}
+            />
+          }
+        >
+          <SignalAnalysisPanel
+            analyser={null}
+            iqSource={{
+              computer: props.iqBridge!.spectrum,
+              sampleRateHz: () => props.iqBridge!.state().sampleRateHz,
+              active: () => props.iqBridge!.state().connected,
+            }}
+            isRecording={processor.state().isRecording}
+            vfoFrequency={props.vfoFrequency}
+            storageKeyPrefix="mfsk_iq"
+            defaultMaxHz={props.iqBridge!.state().sampleRateHz / 2}
+            passband={{ centerHz: props.iqBridge!.state().passbandCenterHz, bandwidthHz: props.iqBridge!.state().passbandBandwidthHz }}
+            onPassbandChange={(p) => props.iqBridge!.setPassband(p.centerHz, p.bandwidthHz)}
+            markerFieldLabel="Passband"
+            class="min-w-0"
+            style={{ flex: pW()[1] }}
+          />
+        </Show>
 
         {/* Drag handle 1<->2 */}
         <div class="group hidden w-3 shrink-0 cursor-col-resize items-center justify-center self-stretch lg:flex" onMouseDown={(e) => startDrag(e, 1)}>

@@ -1,13 +1,14 @@
 // Port of src/components/RTTYDecoder.tsx (Next.js app) — implements
 // DecoderControls via a caller-owned mutable handle (props.handle.current),
 // filled in via onMount, instead of forwardRef+useImperativeHandle.
-import { createEffect, createMemo, createSignal, For, onCleanup, onMount, type JSX } from 'solid-js'
+import { createEffect, createMemo, createSignal, For, onCleanup, onMount, Show, type JSX } from 'solid-js'
 import type { RTTYConfig } from '$decoder-lib/rtty/decoder'
 import { loadNumberArray, saveNumberArray } from '$decoder-lib/storage'
 import { createMultiRTTYProcessor } from '../lib/rtty/multiProcessor'
+import type { AudioSourceKind } from '../lib/audio/audioSource'
 import { createSessionsStore } from '../lib/rtty/sessionsStore'
 import type { DecoderControls, DecoderProps } from '../lib/decoderControls'
-import AudioAnalysisPanel from './AudioAnalysisPanel'
+import SignalAnalysisPanel from './SignalAnalysisPanel'
 import { SessionCard } from './SessionCard'
 
 const DISPLAY_MAX_HZ = 1500
@@ -35,11 +36,18 @@ export default function RTTYDecoder(props: RTTYDecoderProps): JSX.Element {
   const sessions = createSessionsStore(DEFAULT_CONFIG)
   const initialSession = sessions.initialSession
   const [squelch, setSquelch] = createSignal(0)
+  // Same iqBridge-first/audioBridge/microphone precedence as
+  // FTDecoder.tsx's audioSourceKind()/getBridge() — see that file's comment.
+  const audioSourceKind = (): AudioSourceKind =>
+    props.iqBridge?.state().connected ? 'bridge' : props.audioBridge?.state().playbackActive ? 'bridge' : 'microphone'
+  const getBridge = () => (props.iqBridge?.state().connected ? props.iqBridge : props.audioBridge)
   const processor = createMultiRTTYProcessor(
     (sessionId, chars) => {
       sessions.dispatch({ type: 'APPEND_TEXT', id: sessionId, chars })
     },
     squelch,
+    audioSourceKind,
+    getBridge,
   )
 
   const activeSession = createMemo(
@@ -276,31 +284,60 @@ export default function RTTYDecoder(props: RTTYDecoderProps): JSX.Element {
           <div class="h-full w-px bg-[#30363d] transition-colors group-hover:bg-[#2ea043]/50" />
         </div>
 
-        {/* Audio Analysis — 2nd column */}
-        <AudioAnalysisPanel
-          analyser={props.analyser ?? null}
-          isRecording={processor.state().isRecording}
-          defaultMaxHz={DISPLAY_MAX_HZ}
-          storageKeyPrefix="rtty"
-          markers={spectrumMarkers()}
-          onMarkerDrag={(idx, newHz) => {
-            const half = activeConfig().carrierShift / 2
-            const newCenter =
-              idx === 0
-                ? activeConfig().reverseShift
-                  ? newHz - half
-                  : newHz + half
-                : activeConfig().reverseShift
-                  ? newHz + half
-                  : newHz - half
-            updateSessionConfig(sessions.state().activeSessionId, { centerFreq: Math.round(newCenter) })
-          }}
-          squelch={squelch()}
-          onSquelchChange={setSquelch}
-          vfoFrequency={props.vfoFrequency}
-          class="min-w-0"
-          style={{ flex: panelWeights()[1] }}
-        />
+        {/* Audio Analysis — 2nd column. In I/Q mode (see audioSourceKind()
+            above), shows the bridge's own wideband I/Q spectrum with a
+            draggable passband marker that retunes useIQBridge.ts's
+            SSBDemodulator — same "don't mix the two marker concepts"
+            reasoning as FTDecoder.tsx's identical branch; the mark/space
+            tone markers below are only meaningful against already-
+            demodulated audio. */}
+        <Show
+          when={props.iqBridge?.state().connected}
+          fallback={
+            <SignalAnalysisPanel
+              analyser={props.analyser ?? null}
+              isRecording={processor.state().isRecording}
+              defaultMaxHz={DISPLAY_MAX_HZ}
+              storageKeyPrefix="rtty"
+              markers={spectrumMarkers()}
+              onMarkerDrag={(idx, newHz) => {
+                const half = activeConfig().carrierShift / 2
+                const newCenter =
+                  idx === 0
+                    ? activeConfig().reverseShift
+                      ? newHz - half
+                      : newHz + half
+                    : activeConfig().reverseShift
+                      ? newHz + half
+                      : newHz - half
+                updateSessionConfig(sessions.state().activeSessionId, { centerFreq: Math.round(newCenter) })
+              }}
+              squelch={squelch()}
+              onSquelchChange={setSquelch}
+              vfoFrequency={props.vfoFrequency}
+              class="min-w-0"
+              style={{ flex: panelWeights()[1] }}
+            />
+          }
+        >
+          <SignalAnalysisPanel
+            analyser={null}
+            iqSource={{
+              computer: props.iqBridge!.spectrum,
+              sampleRateHz: () => props.iqBridge!.state().sampleRateHz,
+              active: () => props.iqBridge!.state().connected,
+            }}
+            isRecording={processor.state().isRecording}
+            vfoFrequency={props.vfoFrequency}
+            storageKeyPrefix="rtty_iq"
+            defaultMaxHz={props.iqBridge!.state().sampleRateHz / 2}
+            passband={{ centerHz: props.iqBridge!.state().passbandCenterHz, bandwidthHz: props.iqBridge!.state().passbandBandwidthHz }}
+            onPassbandChange={(p) => props.iqBridge!.setPassband(p.centerHz, p.bandwidthHz)}
+            markerFieldLabel="Passband"
+            class="min-w-0"
+            style={{ flex: panelWeights()[1] }}
+          />
+        </Show>
 
         {/* Drag handle 1<->2 */}
         <div

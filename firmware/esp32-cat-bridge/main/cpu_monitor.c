@@ -80,13 +80,21 @@ void cpu_monitor_get_heap(cpu_monitor_heap_t *out) {
     out->free_bytes = (uint32_t)info.total_free_bytes;
     out->min_free_bytes = esp_get_minimum_free_heap_size();
     out->total_bytes = (uint32_t)(info.total_free_bytes + info.total_allocated_bytes);
+    out->largest_free_block_bytes = (uint32_t)info.largest_free_block;
+
+    multi_heap_info_t dma_info;
+    heap_caps_get_info(&dma_info, MALLOC_CAP_DMA);
+    out->dma_free_bytes = (uint32_t)dma_info.total_free_bytes;
+    out->dma_largest_free_block_bytes = (uint32_t)dma_info.largest_free_block;
 }
 
 int cpu_monitor_write_tasks_json(char *buf, size_t buf_sz) {
     if (buf_sz < 3) return -1; // not even room for "[]"
 
     UBaseType_t task_count = uxTaskGetNumberOfTasks();
-    TaskStatus_t *statuses = malloc(task_count * sizeof(TaskStatus_t));
+    // PSRAM: per-request scratch for a diagnostics-only endpoint
+    // (GET /system-stats), never touched outside this httpd worker call.
+    TaskStatus_t *statuses = heap_caps_malloc(task_count * sizeof(TaskStatus_t), MALLOC_CAP_SPIRAM);
     if (!statuses) {
         // Fall back to an empty array rather than failing the whole
         // /status response — a missing task list is a lot less bad than

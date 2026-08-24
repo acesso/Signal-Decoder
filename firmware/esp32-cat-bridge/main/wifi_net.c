@@ -3,6 +3,7 @@
 #include <string.h>
 
 #include "esp_event.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_netif.h"
 #include "esp_wifi.h"
@@ -278,15 +279,25 @@ int wifi_net_scan(wifi_net_scan_result_t *out, int max_results) {
     esp_wifi_scan_get_ap_num(&found);
     if (found == 0) return 0;
 
-    // Static, not stack-local: wifi_ap_record_t is ~90 bytes, so a [32]
-    // array is ~2.9KB — layered on top of the caller's own httpd-worker
-    // stack usage, that overflowed the httpd worker's stack and corrupted
-    // the call frame (LoadStoreAlignment panic) the first time this ran on
-    // real hardware. wifi_net_scan() is only ever called synchronously
-    // from one HTTP request at a time (the control page's single refresh
-    // button), so a shared static buffer is safe — no concurrent scan can
-    // be in flight to race it.
-    static wifi_ap_record_t records[32];
+    // Heap-allocated (PSRAM), not stack-local: wifi_ap_record_t is ~90
+    // bytes, so a [32] array is ~2.9KB — layered on top of the caller's
+    // own httpd-worker stack usage, that overflowed the httpd worker's
+    // stack and corrupted the call frame (LoadStoreAlignment panic) the
+    // first time this ran on real hardware with a plain stack-local array.
+    // Was a `static` internal-RAM array; moved to a lazily-allocated
+    // PSRAM buffer instead — same permanent-lifetime shape (allocated
+    // once, kept for the firmware's life), but off internal RAM entirely,
+    // since esp_wifi_scan_get_ap_records() has no DMA/internal-RAM
+    // requirement (it's a plain memcpy-style output-array API). Still
+    // safe to share across calls: wifi_net_scan() is only ever called
+    // synchronously from one HTTP request at a time (the control page's
+    // single refresh button), so no concurrent scan can race it.
+    static wifi_ap_record_t *records = NULL;
+    if (!records) records = heap_caps_malloc(32 * sizeof(wifi_ap_record_t), MALLOC_CAP_SPIRAM);
+    if (!records) {
+        ESP_LOGW(TAG, "failed to allocate scan-results buffer");
+        return -1;
+    }
     uint16_t to_fetch = found < 32 ? found : 32;
     err = esp_wifi_scan_get_ap_records(&to_fetch, records);
     if (err != ESP_OK) {

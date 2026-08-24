@@ -8,6 +8,9 @@ import { transmittedLines } from '$decoder-lib/sstv/encoder'
 import { createCaptureNode, type CaptureNode } from '$decoder-lib/audio/captureNode'
 import { estimateSignalReport, type SignalReport } from '$decoder-lib/sstv/signalReport'
 import { GoertzelFilter } from '$decoder-lib/sstv/dsp'
+import { acquireMicrophoneSource, acquireBridgeSource, type AudioSourceKind, type AudioSourceHandle } from '$decoder-lib/audio/audioSource'
+import type { AudioBridge } from '$decoder-lib/cat/useAudioBridge'
+import type { IQBridge } from '$decoder-lib/cat/useIQBridge'
 
 export type SSTVMode = keyof typeof SSTV_MODES
 
@@ -138,7 +141,13 @@ export interface AudioProcessorParams {
   autoSlant: () => boolean
 }
 
-export function createAudioProcessor(params: AudioProcessorParams) {
+export function createAudioProcessor(
+  params: AudioProcessorParams,
+  // Where capture comes from — see ft/processor.ts's identical params for
+  // the full reasoning; audioSource.ts's shape is deliberately mode-agnostic.
+  getAudioSourceKind: () => AudioSourceKind = () => 'microphone',
+  getAudioBridge: () => AudioBridge | IQBridge | undefined = () => undefined,
+) {
   const [state, setState] = createSignal<AudioProcessorState>({
     isRecording: false,
     isSupported:
@@ -156,7 +165,7 @@ export function createAudioProcessor(params: AudioProcessorParams) {
 
   let audioContext: AudioContext | null = null
   let analyser: AnalyserNode | null = null
-  let stream: MediaStream | null = null
+  let source: AudioSourceHandle | null = null
   let decoder: SSTVDecoder | null = null
   let visDetector: VISDetector | null = null
   // Fallback for tuning in mid-transmission (VIS header already passed) —
@@ -363,19 +372,25 @@ export function createAudioProcessor(params: AudioProcessorParams) {
     try {
       if (!state().isSupported) throw new Error('Web Audio API not supported in this browser')
 
-      const mediaStream = await navigator.mediaDevices.getUserMedia({
-        audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false },
-      })
-      stream = mediaStream
+      const kind = getAudioSourceKind()
+      let handle: AudioSourceHandle
+      if (kind === 'bridge') {
+        const bridge = getAudioBridge()
+        const bridgeSource = bridge ? acquireBridgeSource(bridge) : null
+        if (!bridgeSource) throw new Error('Connect to the bridge (Listen to Radio) before selecting it as the audio source')
+        handle = bridgeSource
+      } else {
+        handle = await acquireMicrophoneSource()
+      }
+      source = handle
 
-      const ctx = new AudioContext()
+      const ctx = handle.ctx
       audioContext = ctx
 
-      const source = ctx.createMediaStreamSource(mediaStream)
       const analyserNode = ctx.createAnalyser()
       analyserNode.fftSize = 2048
       analyser = analyserNode
-      source.connect(analyserNode)
+      handle.node.connect(analyserNode)
 
       const sampleRate = ctx.sampleRate
 
@@ -404,9 +419,9 @@ export function createAudioProcessor(params: AudioProcessorParams) {
   }
 
   function stopRecording() {
-    if (stream) {
-      stream.getTracks().forEach((t) => t.stop())
-      stream = null
+    if (source) {
+      source.release()
+      source = null
     }
     if (processorNode) {
       processorNode.disconnect()
@@ -416,10 +431,7 @@ export function createAudioProcessor(params: AudioProcessorParams) {
       analyser.disconnect()
       analyser = null
     }
-    if (audioContext) {
-      audioContext.close()
-      audioContext = null
-    }
+    audioContext = null
     if (decoder) decoder.stop()
     if (visDetector) visDetector.reset()
     if (syncIntervalDetector) syncIntervalDetector.reset()
