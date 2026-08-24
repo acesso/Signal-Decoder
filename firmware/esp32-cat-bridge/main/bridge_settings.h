@@ -68,10 +68,12 @@ float bridge_settings_get_mic_gain_db(void);
 bool bridge_settings_set_mic_gain_db(float db_value);
 
 // WiFi max TX power in quarter-dBm units (see wifi_net_set_tx_power_quarter_dbm()
-// for the full range/units explanation). Defaults to 84 (21.0 dBm, the
-// driver's own maximum) — this control exists purely as a diagnostic for
-// whether the radio's own transmit activity couples noise into the analog
-// audio path, not because a lower default is known to help.
+// for the full range/units explanation). Defaults to 78 (~19.5 dBm, the
+// driver's own real maximum on this board — 84 was never an actual
+// achievable step, see bridge_settings.c's DEFAULT_WIFI_TX_POWER_QUARTER_DBM
+// comment) — this control exists purely as a diagnostic for whether the
+// radio's own transmit activity couples noise into the analog audio path,
+// not because a lower default is known to help.
 int8_t bridge_settings_get_wifi_tx_power_quarter_dbm(void);
 bool bridge_settings_set_wifi_tx_power_quarter_dbm(int8_t quarter_dbm);
 

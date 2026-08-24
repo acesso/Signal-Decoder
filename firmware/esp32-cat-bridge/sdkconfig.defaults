@@ -99,6 +99,17 @@ CONFIG_PM_ENABLE=y
 # except during a sleep/wake cycle").
 # CONFIG_FREERTOS_USE_TICKLESS_IDLE is not set
 
+# Boot-time default CPU frequency — cpu_monitor_start() pins to this at
+# every boot (see that function's comment), and it's what the board comes
+# back up at after ANY reboot (POST /cpu-freq's own runtime changes are
+# NOT persisted to NVS, so without an explicit default here every reboot
+# silently reverted to the ESP-IDF component default of 160MHz). Real-
+# hardware A/B by the user found 240MHz measurably helps the TX-audio-
+# quality investigation (see audio_monitor.c's related comments) — set as
+# the new baseline until/unless that's superseded by a better fix.
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
+# CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_160 is not set
+
 # Per-task CPU usage stats for the same control-page diagnostics panel (see
 # cpu_monitor.c) — auto-selects FREERTOS_USE_TRACE_FACILITY. Left on the
 # default esp_timer clock source (not the CPU clock) deliberately: the CPU

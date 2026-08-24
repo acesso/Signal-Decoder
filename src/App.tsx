@@ -515,8 +515,24 @@ function App(): JSX.Element {
   // content below scrolls. Re-expands once scrolled back near the top. ─────
   let scrollBodyEl: HTMLDivElement | undefined
   const [catCollapsed, setCatCollapsed] = createSignal(false)
+  // Whether RadioCATPanel has one of its own sub-panels open (Settings,
+  // Bridge status, PA bias, calibration) — real bug found on real
+  // hardware: expanding Bridge status (tall — I/Q spectrum waterfall +
+  // several rows of controls) and scrolling down to read the rest of it
+  // crossed handleBodyScroll()'s own collapse threshold below, which hid
+  // the sub-panel's content entirely (RadioCATPanel gates it on
+  // !props.collapsed) and made the page jump straight past it. Suppress
+  // auto-collapse while a sub-panel is open — the operator opened it on
+  // purpose and is very likely mid-task with it, so collapsing out from
+  // under them is always wrong in that state regardless of scroll
+  // position.
+  const [catSubpanelOpen, setCatSubpanelOpen] = createSignal(false)
   function handleBodyScroll() {
     if (!scrollBodyEl) return
+    if (catSubpanelOpen()) {
+      setCatCollapsed(false)
+      return
+    }
     const y = scrollBodyEl.scrollTop
     // Hysteresis, not a single threshold: collapsing shrinks the panel, and
     // the browser's scroll anchoring then pulls scrollTop back across the
@@ -762,9 +778,23 @@ function App(): JSX.Element {
         class="min-h-0 flex-1 overflow-y-auto px-4 pb-8 sm:px-6 lg:px-8 [overflow-anchor:none]"
       >
         {/* CAT radio control panel — sticky: stays visible while scrolling,
-            collapsing to just its main bar so it doesn't eat too much space. */}
-        <div class="sticky top-0 z-10 bg-[#0d1117] pb-3">
-          <RadioCATPanel cat={cat} audioBridge={audioBridge} iqBridge={iqBridge} collapsed={catCollapsed()} onWsUrlChange={setBridgeWsUrl} />
+            collapsing to just its main bar so it doesn't eat too much space.
+            NOT sticky while a sub-panel (Bridge status, Settings, etc.) is
+            open — a sticky element's content that's taller than the
+            viewport can never be scrolled into view (the PAGE scrolls, but
+            a sticky element stays pinned at top with its overflow simply
+            unreachable) — see catSubpanelOpen's own comment for the real
+            bug this caused. Scrolling normally while a sub-panel is open
+            lets its full content actually be reached. */}
+        <div class={`${catSubpanelOpen() ? '' : 'sticky top-0 z-10'} bg-[#0d1117] pb-3`}>
+          <RadioCATPanel
+            cat={cat}
+            audioBridge={audioBridge}
+            iqBridge={iqBridge}
+            collapsed={catCollapsed()}
+            onWsUrlChange={setBridgeWsUrl}
+            onSubpanelOpenChange={setCatSubpanelOpen}
+          />
         </div>
 
         {/* FT Transmit panel — only shown when FT mode is active */}

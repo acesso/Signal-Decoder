@@ -1314,6 +1314,21 @@ const iqSampleRateEl = document.getElementById('iq-sample-rate');
 const iqFftSizeEl = document.getElementById('iq-fft-size');
 const iqBinWidthEl = document.getElementById('iq-bin-width');
 const iqPeakEl = document.getElementById('iq-peak');
+const iqCorrectionBtns = document.querySelectorAll('[data-iq-correction]');
+
+// 'none' | 'swap' | 'negateI' | 'negateQ' — see index.html's I/Q
+// correction row and its hint text for what each means and why there are
+// four instead of just an on/off swap (a literal channel swap and a
+// single inverted channel are two physically distinct defects that both
+// produce the same mirrored-spectrum symptom, but only one actually
+// matches whatever's really wrong on THIS board).
+let iqCorrection = 'none';
+iqCorrectionBtns.forEach((btn) => {
+  btn.addEventListener('click', () => {
+    iqCorrection = btn.dataset.iqCorrection;
+    iqCorrectionBtns.forEach((b) => b.classList.toggle('active', b === btn));
+  });
+});
 
 let iqWs = null;
 let iqActive = false;
@@ -1392,12 +1407,27 @@ function processIqWindow() {
 function feedIqSamples(int16) {
   let offset = 0;
   const pairCount = int16.length / 2;
+  // I/Q correction buttons above — see their own comment for what each
+  // mode means. Same choke point as the Signal-Decoder web app's
+  // useIQBridge.ts (its onmessage handler) — this page has its own
+  // independent I/Q pipeline, so the two controls are unrelated and must
+  // each be set separately.
+  const correction = iqCorrection;
   while (offset < pairCount) {
     const remaining = IQ_FFT_SIZE - iqAccumCount;
     const take = Math.min(remaining, pairCount - offset);
     for (let i = 0; i < take; i++) {
-      iqAccumRe[iqAccumCount + i] = int16[(offset + i) * 2] / 32768;
-      iqAccumIm[iqAccumCount + i] = int16[(offset + i) * 2 + 1] / 32768;
+      let iSample = int16[(offset + i) * 2];
+      let qSample = int16[(offset + i) * 2 + 1];
+      if (correction === 'swap') {
+        const tmp = iSample; iSample = qSample; qSample = tmp;
+      } else if (correction === 'negateI') {
+        iSample = iSample === -32768 ? 32767 : -iSample;
+      } else if (correction === 'negateQ') {
+        qSample = qSample === -32768 ? 32767 : -qSample;
+      }
+      iqAccumRe[iqAccumCount + i] = iSample / 32768;
+      iqAccumIm[iqAccumCount + i] = qSample / 32768;
     }
     iqAccumCount += take;
     offset += take;

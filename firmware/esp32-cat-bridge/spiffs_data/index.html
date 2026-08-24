@@ -96,15 +96,15 @@
       </div>
       <p class="hint audio-input-hint">Pins the ESP32's CPU clock (no dynamic scaling either way) &mdash; a
       low-confidence experiment for whether digital switching activity couples into the analog audio path. Not
-      persisted; reverts to 160 MHz after a reboot.</p>
+      persisted; reverts to 240 MHz (the board's boot-time default) after a reboot.</p>
       <div class="audio-input-row">
         <span class="audio-input-label">WiFi TX power</span>
         <div class="audio-input-toggle">
           <button data-wifi-tx-power="8" type="button" class="audio-input-option">2 dBm</button>
           <button data-wifi-tx-power="34" type="button" class="audio-input-option">8 dBm</button>
           <button data-wifi-tx-power="52" type="button" class="audio-input-option">13 dBm</button>
-          <button data-wifi-tx-power="68" type="button" class="audio-input-option">17 dBm</button>
-          <button data-wifi-tx-power="84" type="button" class="audio-input-option">21 dBm (max)</button>
+          <button data-wifi-tx-power="66" type="button" class="audio-input-option">16 dBm</button>
+          <button data-wifi-tx-power="78" type="button" class="audio-input-option">19.5 dBm (max)</button>
         </div>
       </div>
       <p class="hint audio-input-hint">Live-sets the WiFi radio's max transmit power &mdash; a low-confidence
@@ -432,6 +432,20 @@
         Contrast
         <input id="iq-contrast" type="range" min="0.1" max="1.5" step="0.05" value="0.5">
       </label>
+      <div class="audio-input-row">
+        <span class="audio-input-label">I/Q correction</span>
+        <div class="audio-input-toggle">
+          <button data-iq-correction="none" type="button" class="audio-input-option active">None</button>
+          <button data-iq-correction="swap" type="button" class="audio-input-option">Swap I/Q</button>
+          <button data-iq-correction="negateI" type="button" class="audio-input-option">Negate I</button>
+          <button data-iq-correction="negateQ" type="button" class="audio-input-option">Negate Q</button>
+        </div>
+      </div>
+      <p class="hint">If the spectrum looks mirrored around the tuned frequency, try each of these &mdash; a
+      swapped ADC left/right wiring needs <strong>Swap I/Q</strong>, but a single inverted channel (mixer or
+      single-ended-to-differential stage) needs <strong>Negate I</strong> or <strong>Negate Q</strong> instead;
+      swapping wouldn't fix that case. All three undo the same mirroring symptom but only one matches the real
+      cause. Applied before the FFT below. Not persisted across reloads.</p>
       <div class="quality-stats">
         <span>Sample rate</span><span id="iq-sample-rate">&mdash;</span>
         <span>FFT size</span><span id="iq-fft-size">&mdash;</span>
