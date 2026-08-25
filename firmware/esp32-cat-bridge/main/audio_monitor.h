@@ -155,3 +155,20 @@ bool audio_monitor_set_rx_slot(bool use_right);
 // audio_monitor_start()'s I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG default) —
 // for GET /status to report.
 bool audio_monitor_get_rx_slot_is_right(void);
+
+// RX-loop timing diagnostics — added to investigate a real report of
+// periodic "cutting/paper-crackling" noise on the digitized I/Q signal,
+// confirmed present on THIS board's capture path but absent when the same
+// analog signal is fed directly into a PC sound card instead (i.e. it's
+// something in this board's read/broadcast loop, not the radio or the
+// analog tap). See audio_monitor.c's s_rx_max_loop_interval_us comment for
+// the full reasoning and why this reports "max since the last GET", not
+// an all-time max — meant to be polled live (via GET /system-stats) while
+// reproducing the noise, to see exactly where time is actually going.
+typedef struct {
+    int64_t max_loop_interval_us;      // longest gap between successive read-loop iterations
+    int64_t max_read_duration_us;      // longest single esp_codec_dev_read() call
+    int64_t max_broadcast_duration_us; // longest single audio_iq_broadcast()/audio_ws_send_to_clients() call
+    uint32_t loop_count;               // how many iterations contributed to the above since the last call
+} audio_monitor_rx_timing_t;
+void audio_monitor_get_rx_timing(audio_monitor_rx_timing_t *out);

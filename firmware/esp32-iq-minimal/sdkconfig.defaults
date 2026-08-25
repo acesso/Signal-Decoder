@@ -1,0 +1,18 @@
+# Minimal single-purpose I/Q streaming test firmware — strict minimal setup,
+# no partition customization, no PSRAM usage, no runtime controls. Uses
+# ESP-IDF's own default single-factory-app partition table (no
+# partitions.csv needed) since there's no SPIFFS/OTA/extra data partition
+# to carve out here.
+CONFIG_IDF_TARGET="esp32"
+
+# Target board: AI-Thinker ESP32-A1S Audio Kit — 4MB flash (the ESP-IDF
+# default assumes 2MB).
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+
+# Deliberately NOT enabling PSRAM (CONFIG_SPIRAM) — this firmware never
+# allocates from it; the board's 8MB PSRAM sits unused, per the "strict
+# minimal" scope of this experiment.
+
+# Required for the /iq-data WebSocket endpoint — off by esp_http_server's
+# own default.
+CONFIG_HTTPD_WS_SUPPORT=y

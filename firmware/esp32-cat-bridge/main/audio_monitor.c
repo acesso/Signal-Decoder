@@ -11,6 +11,7 @@
 #include "esp_codec_dev_defaults.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
@@ -202,6 +203,25 @@ static i2s_chan_handle_t s_rx_handle = NULL;
 // which we're deliberately bypassing here rather than fighting over).
 static _Atomic bool s_rx_paused = false;
 static _Atomic bool s_rx_slot_is_right = false; // real value set from bridge_settings in audio_monitor_start() — this initializer is just the pre-boot placeholder
+
+// RX-loop timing instrumentation — added specifically to investigate a
+// real report of "cutting/paper-crackling" noise on the digitized I/Q
+// signal (heard on the ESP32/ES8388 path, confirmed ABSENT when the same
+// analog I/Q signal is instead fed directly into a PC sound card — i.e.
+// isolated to this board's capture/broadcast path, not the radio or the
+// analog tap). Rather than guess at another fix (two earlier WiFi/DMA
+// mitigations tried for a DIFFERENT, TX-side symptom both made things
+// WORSE per real-hardware listening tests), this measures the actual
+// read-to-read cadence and where time is spent inside audio_task's loop,
+// exposed via GET /system-stats so it can be correlated live against
+// real WebSocket/client activity. Reset-on-read (GET) — each field
+// reports the max seen since the LAST stats fetch, not since boot, so a
+// live-polling diagnostics panel sees fresh peaks each time rather than
+// one stale all-time value.
+static _Atomic int64_t s_rx_max_loop_interval_us = 0;  // time between successive esp_codec_dev_read() call STARTS
+static _Atomic int64_t s_rx_max_read_duration_us = 0;  // time INSIDE esp_codec_dev_read() itself
+static _Atomic int64_t s_rx_max_broadcast_duration_us = 0; // time inside audio_iq_broadcast()/audio_ws_send_to_clients()
+static _Atomic uint32_t s_rx_loop_count = 0; // how many iterations contributed to the above since the last reset
 
 // Both default to false — the ES8388's own power-on-reset defaults, per
 // the datasheet, already have ALC and the noise gate off (see the
@@ -868,6 +888,7 @@ static void audio_task(void *arg) {
         return;
     }
 
+    int64_t last_loop_start_us = 0;
     for (;;) {
         if (atomic_load(&s_rx_paused)) {
             // audio_monitor_set_rx_slot() is mid-reconfig — see its comment.
@@ -879,7 +900,22 @@ static void audio_task(void *arg) {
             vTaskDelay(pdMS_TO_TICKS(20));
             continue;
         }
+
+        int64_t loop_start_us = esp_timer_get_time();
+        if (last_loop_start_us != 0) {
+            int64_t interval_us = loop_start_us - last_loop_start_us;
+            int64_t prev_max = atomic_load(&s_rx_max_loop_interval_us);
+            if (interval_us > prev_max) atomic_store(&s_rx_max_loop_interval_us, interval_us);
+        }
+        last_loop_start_us = loop_start_us;
+
         int ret = esp_codec_dev_read(s_codec_dev, buf, values_per_read * sizeof(int16_t));
+        int64_t after_read_us = esp_timer_get_time();
+        {
+            int64_t read_us = after_read_us - loop_start_us;
+            int64_t prev_max = atomic_load(&s_rx_max_read_duration_us);
+            if (read_us > prev_max) atomic_store(&s_rx_max_read_duration_us, read_us);
+        }
         if (ret != ESP_CODEC_DEV_OK) {
             ESP_LOGW(TAG, "codec read failed (%d), retrying", ret);
             vTaskDelay(pdMS_TO_TICKS(200));
@@ -890,7 +926,22 @@ static void audio_task(void *arg) {
         } else {
             audio_ws_send_to_clients(buf, s_read_samples);
         }
+        {
+            int64_t broadcast_us = esp_timer_get_time() - after_read_us;
+            int64_t prev_max = atomic_load(&s_rx_max_broadcast_duration_us);
+            if (broadcast_us > prev_max) atomic_store(&s_rx_max_broadcast_duration_us, broadcast_us);
+        }
+        atomic_fetch_add(&s_rx_loop_count, 1);
     }
+}
+
+// Read-and-reset — see s_rx_max_loop_interval_us's own comment for why
+// this reports "max since the last call" rather than an all-time max.
+void audio_monitor_get_rx_timing(audio_monitor_rx_timing_t *out) {
+    out->max_loop_interval_us = atomic_exchange(&s_rx_max_loop_interval_us, 0);
+    out->max_read_duration_us = atomic_exchange(&s_rx_max_read_duration_us, 0);
+    out->max_broadcast_duration_us = atomic_exchange(&s_rx_max_broadcast_duration_us, 0);
+    out->loop_count = atomic_exchange(&s_rx_loop_count, 0);
 }
 
 void audio_monitor_start(void) {

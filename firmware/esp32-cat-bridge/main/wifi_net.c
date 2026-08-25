@@ -1,5 +1,6 @@
 #include "wifi_net.h"
 
+#include <stdio.h>
 #include <string.h>
 
 #include "esp_event.h"
@@ -31,6 +32,22 @@ static esp_netif_t *s_ap_netif = NULL;
 static void start_mdns(void);
 static void start_ap_fallback(void);
 static void stop_ap_fallback(void);
+
+// Parses "aa:bb:cc:dd:ee:ff" into 6 raw bytes — returns false (leaving
+// *out untouched) on anything malformed, including an empty string (the
+// "no BSSID pin" default — see bridge_settings_get_wifi_bssid()'s
+// comment). Deliberately strict (exactly 6 colon-separated hex pairs) so
+// a typo in the web UI's BSSID field fails obviously (falls back to no
+// pin) rather than silently associating with an unintended/wrong AP.
+static bool parse_bssid(const char *s, uint8_t out[6]) {
+    unsigned b[6];
+    if (sscanf(s, "%x:%x:%x:%x:%x:%x", &b[0], &b[1], &b[2], &b[3], &b[4], &b[5]) != 6) return false;
+    for (int i = 0; i < 6; i++) {
+        if (b[i] > 0xFF) return false;
+        out[i] = (uint8_t)b[i];
+    }
+    return true;
+}
 
 // bridge_state_update() mutator callbacks — plain static functions (not
 // nested functions) so this builds with any standard C compiler and never
@@ -212,6 +229,23 @@ void wifi_net_start(void) {
     wifi_config.sta.pmf_cfg.capable = true;
     wifi_config.sta.pmf_cfg.required = false;
 
+    // Optional BSSID pin — see bridge_settings_get_wifi_bssid()'s comment
+    // for why this exists (a real, confirmed fix for intermittent
+    // multi-second WiFi-layer stalls on a network broadcasting the same
+    // SSID from multiple same-channel APs). Empty string (the default) or
+    // a malformed value leaves bssid_set false — esp_wifi picks any AP for
+    // the configured SSID, today's long-standing behavior, unchanged.
+    char bssid_str[18];
+    bridge_settings_get_wifi_bssid(bssid_str, sizeof(bssid_str));
+    uint8_t bssid[6];
+    if (bssid_str[0] && parse_bssid(bssid_str, bssid)) {
+        wifi_config.sta.bssid_set = true;
+        memcpy(wifi_config.sta.bssid, bssid, sizeof(bssid));
+        ESP_LOGI(TAG, "pinning to BSSID %s", bssid_str);
+    } else if (bssid_str[0]) {
+        ESP_LOGW(TAG, "BSSID pin \"%s\" is malformed (expected aa:bb:cc:dd:ee:ff) — ignoring", bssid_str);
+    }
+
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
     ESP_ERROR_CHECK(esp_wifi_start());
@@ -354,4 +388,10 @@ bool wifi_net_get_tx_power_quarter_dbm(int8_t *quarter_dbm) {
         return false;
     }
     return true;
+}
+
+bool wifi_net_is_valid_bssid(const char *bssid) {
+    if (bssid[0] == '\0') return true; // "no pin" is a valid value
+    uint8_t discard[6];
+    return parse_bssid(bssid, discard);
 }

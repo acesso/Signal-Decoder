@@ -58,3 +58,12 @@ bool wifi_net_set_tx_power_quarter_dbm(int8_t quarter_dbm);
 // report the value actually in effect. Returns false (value left untouched)
 // if WiFi hasn't started yet or the underlying call failed.
 bool wifi_net_get_tx_power_quarter_dbm(int8_t *quarter_dbm);
+
+// Validates a BSSID string ("aa:bb:cc:dd:ee:ff" format, exactly 6
+// colon-separated hex pairs) — an empty string is considered valid too
+// (it means "no pin," see bridge_settings_get_wifi_bssid()'s comment).
+// Used by http_control.c's POST /wifi-config to reject a malformed value
+// at save time rather than silently ignoring it at the next boot (see
+// wifi_net_start()'s own parse — same format, kept in sync by hand since
+// duplicating one tiny sscanf() isn't worth a shared-header dependency).
+bool wifi_net_is_valid_bssid(const char *bssid);

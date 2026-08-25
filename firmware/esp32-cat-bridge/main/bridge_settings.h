@@ -24,6 +24,27 @@ void bridge_settings_get_wifi(char *ssid_out, size_t ssid_sz, char *pass_out, si
 // devices: save, then restart to reconnect with the new network.
 bool bridge_settings_set_wifi(const char *ssid, const char *password);
 
+// Optional BSSID pin — "aa:bb:cc:dd:ee:ff" format, empty string means "no
+// pin, let esp_wifi pick any AP broadcasting the configured SSID" (the
+// long-standing default). Added after a real investigation found a home
+// network broadcasting the same SSID from MULTIPLE same-channel APs at
+// similar signal strength — classic co-channel-congestion/roaming-hunt
+// territory, and the direct cause of intermittent multi-second WiFi-layer
+// stalls that looked like an I2S/DMA/firmware bug from every other angle
+// (confirmed by isolating it on firmware/esp32-iq-minimal, a stripped-down
+// single-purpose build that ruled out every OTHER task on this bridge
+// first). Pinning to one physical AP removes that roaming ambiguity
+// entirely. Falls back to CONFIG_BRIDGE_WIFI_BSSID (Kconfig) if nothing
+// has been saved yet — same "Kconfig first-boot default, NVS override"
+// pattern as Wi-Fi SSID/password above. out_sz is the caller's buffer size
+// including room for the NUL terminator (18 bytes covers the format above).
+void bridge_settings_get_wifi_bssid(char *bssid_out, size_t out_sz);
+
+// Persists a new BSSID pin to NVS — empty string clears the pin (reverts
+// to "any AP for this SSID"). Does NOT apply it or reboot, same pattern as
+// bridge_settings_set_wifi() above — the caller triggers the reboot.
+bool bridge_settings_set_wifi_bssid(const char *bssid);
+
 // CAT UART baud rate — falls back to CONFIG_BRIDGE_CAT_UART_BAUD (Kconfig)
 // if nothing has been saved yet. Unlike Wi-Fi, this has no reboot step:
 // the radio's own baud is a local-menu-only setting on the radio itself

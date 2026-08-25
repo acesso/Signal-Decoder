@@ -15,6 +15,24 @@ menu "CAT Bridge Config"
             it's build-local secret configuration, same treatment as any
             other credential in this repo.
 
+    config BRIDGE_WIFI_BSSID
+        string "Wi-Fi BSSID pin (optional)"
+        default ""
+        help
+            Pins the bridge to one specific access point's MAC address
+            ("aa:bb:cc:dd:ee:ff" format) instead of letting esp_wifi pick
+            any AP broadcasting BRIDGE_WIFI_SSID. Leave empty (the default)
+            for normal behavior. Only needed on a network broadcasting the
+            same SSID from multiple same-channel APs at similar signal
+            strength — that setup was found to cause intermittent
+            multi-second WiFi-layer stalls from roaming/co-channel
+            contention, which this pin eliminates by removing the ambiguity
+            about which physical AP to associate with. Overridable at
+            runtime via POST /wifi-config (same as SSID/password) — this is
+            only the first-boot fallback.
+
+
+
     config BRIDGE_CAT_UART_BAUD
         int "CAT UART baud rate"
         default 38400

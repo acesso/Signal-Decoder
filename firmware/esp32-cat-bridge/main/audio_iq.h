@@ -14,11 +14,15 @@
 // backpressure/eviction needs to be independent so a wideband I/Q stream
 // can never starve the narrowband audio an operator is actively listening
 // to on /audio. Modeled closely on audio_sniff.c's broadcast/backpressure
-// machinery, with one deliberate difference: PREALLOCATED per-client
-// buffers instead of a malloc/free per frame, since I/Q's byte rate can be
-// far higher than /audio's (up to 96kHz stereo = ~19.2KB per 50ms window,
-// vs /audio's mono ~800B-4.8KB) on a device with a documented heap-
-// fragmentation history and no PSRAM — see audio_iq_start()'s comment.
+// machinery, with one deliberate difference: a small PREALLOCATED ring of
+// per-client buffers instead of a malloc/free per frame, since I/Q's byte
+// rate can be far higher than /audio's (up to 96kHz stereo = ~19.2KB per
+// 50ms window, vs /audio's mono ~800B-4.8KB) on a device with a documented
+// heap-fragmentation history — see audio_iq_start()'s comment. The ring
+// (not just a single reused buffer) exists specifically to absorb a brief
+// WiFi-layer stall as added latency instead of a dropped frame — see
+// IQ_RING_DEPTH's own comment in audio_iq.c for the real-hardware
+// investigation that motivated it.
 //
 // Server -> client only, same as audio_sniff.c — a client sending anything
 // here is simply ignored.

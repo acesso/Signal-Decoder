@@ -3,7 +3,8 @@
 // queried once when that panel opens, same pattern as the radio's own PA
 // bias/factory-defaults advanced settings in useRadioCAT.ts).
 //
-// GET  /status      -> JSON: {"wifi_state":"connected","ssid":"...","rssi":-67,
+// GET  /status      -> JSON: {"wifi_state":"connected","ssid":"...","bssid":"",
+//                              "rssi":-67,
 //                              "ip":"192.168.0.7","ws_clients":1,"ws_max_clients":4,
 //                              "radio_linked":true,"cat_baud":38400,
 //                              "pa_sense":false,"pa_emergency_tripped":false,
@@ -31,6 +32,9 @@
 //                       speaker_amp_enabled — see POST /speaker-amp below.
 //                       mic_gain_db — see POST /mic-gain below.
 //                       cat_log_enabled — see POST /cat-log-enable below.
+//                       bssid — "" means no pin (esp_wifi picks any AP for
+//                       ssid); "aa:bb:cc:dd:ee:ff" means pinned. See POST
+//                       /wifi-config below.
 // GET  /info        -> JSON: {"firmware_version":"0.2.0","features":["cat",
 //                              "wifi_config","wifi_scan","reset","audio",
 //                              "cat_baud","pa_watchdog","audio_input_select",
@@ -46,8 +50,17 @@
 //                       too (APSTA mode).
 // POST /reset       -> 200 "restarting" then reboots the ESP32 after replying
 //                       (so the HTTP response actually reaches the browser first).
-// POST /wifi-config -> body {"ssid":"...","password":"..."}; persists to NVS
-//                       (bridge_settings.c) and reboots to apply, same as /reset.
+// POST /wifi-config -> body {"ssid":"...","password":"...","bssid":"..."};
+//                       bssid is OPTIONAL ("aa:bb:cc:dd:ee:ff" format, or
+//                       omit/empty to clear an existing pin) — pins the
+//                       bridge to one specific AP instead of letting
+//                       esp_wifi pick any AP broadcasting ssid. Only
+//                       useful on a network broadcasting the same SSID
+//                       from multiple same-channel APs (confirmed cause of
+//                       intermittent multi-second WiFi-layer stalls in
+//                       that setup — see bridge_settings_get_wifi_bssid()'s
+//                       comment). Persists to NVS (bridge_settings.c) and
+//                       reboots to apply, same as /reset.
 // POST /cat-baud    -> body {"baud":38400}; one of 9600/19200/38400/57600
 //                       (the uSDX firmware's own CAT_BAUD menu options).
 //                       Applied immediately (cat_bridge_set_baud(), no
@@ -208,6 +221,12 @@
 //                       Response: "saved, restarting" (text/plain).
 // GET  /system-stats -> JSON: {"cpu_freq_mhz":160,"heap_free":123456,
 //                              "heap_min_free":98765,"heap_total":327680,
+//                              "heap_largest_free_block":65432,"dma_free":54321,
+//                              "dma_largest_free_block":43210,
+//                              "rx_max_loop_interval_us":52341,
+//                              "rx_max_read_duration_us":1023,
+//                              "rx_max_broadcast_duration_us":412,
+//                              "rx_loop_count":198,
 //                              "tasks":[{"name":"...","cpu_pct":12.3,
 //                              "core":0,"stack_free":1234},...]}
 //                       Heap usage (heap_caps_get_info()) and per-task CPU%
@@ -215,7 +234,13 @@
 //                       cpu_monitor_write_tasks_json()), core affinity, and
 //                       stack headroom. Kept separate from GET /status since
 //                       it's meant to be polled on its own cadence by a
-//                       live-refreshing diagnostics panel.
+//                       live-refreshing diagnostics panel. rx_* fields are
+//                       audio_task's RX read-loop timing (see
+//                       audio_monitor_get_rx_timing()) — max value seen
+//                       since the LAST call to this endpoint, not an
+//                       all-time max, and rx_loop_count is how many
+//                       iterations contributed to that max (a low count
+//                       means the values aren't a reliable peak yet).
 #pragma once
 
 // Registers all control routes on the already-running httpd instance. Call

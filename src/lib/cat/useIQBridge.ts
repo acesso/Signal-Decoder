@@ -47,6 +47,8 @@ const LS_IQ_CORRECTION = 'iq_correction'
 const LS_DC_REMOVAL = 'iq_dc_removal'
 const LS_IMBALANCE_CORRECTION = 'iq_imbalance_correction'
 const LS_PLAY_THROUGH_SPEAKERS = 'iq_play_through_speakers'
+const LS_FORCE_IQ_MODE = 'iq_force_mode'
+const LS_FORCE_SAMPLE_RATE = 'iq_force_sample_rate'
 
 function loadIQCorrection(): IQCorrection {
   if (typeof window === 'undefined') return 'none'
@@ -76,6 +78,44 @@ function loadPlayThroughSpeakers(): boolean {
 }
 function savePlayThroughSpeakers(v: boolean) {
   if (typeof window !== 'undefined') localStorage.setItem(LS_PLAY_THROUGH_SPEAKERS, String(v))
+}
+// Bypasses GET /status entirely — for a bridge that doesn't serve /status
+// at all (e.g. firmware/esp32-iq-minimal, a deliberately status-less
+// single-purpose test build with only /iq-data) rather than a real bridge
+// glitch. fetchBridgeIQInfo() has no way to distinguish "this bridge is in
+// audio mode" from "this bridge has no /status handler" — both look like a
+// failed fetch — so it correctly defaults to "audio" (the safer assumption
+// for a real bridge hiccup) UNLESS this override says otherwise. Persisted
+// like the other diagnostic toggles above: an operator testing one of
+// these minimal firmwares wants it to stay on across reloads, not
+// rediscover it every session.
+function loadForceIQMode(): boolean {
+  if (typeof window === 'undefined') return false
+  return localStorage.getItem(LS_FORCE_IQ_MODE) === 'true'
+}
+function saveForceIQMode(v: boolean) {
+  if (typeof window !== 'undefined') localStorage.setItem(LS_FORCE_IQ_MODE, String(v))
+}
+// Same reasoning as forceIQMode above, for the OTHER field GET /status
+// normally supplies: without a real /status to read, fetchBridgeIQInfo()'s
+// fallback reports FALLBACK_SAMPLE_RATE (96000) regardless of what rate
+// the bridge is actually running — silently mismatched against a bridge
+// like firmware/esp32-iq-minimal that's hardcoded to 48000Hz, this doubles
+// every frequency the demodulator/spectrum computes against and badly
+// aliases the signal (reported as "metallic crackling, FT8 barely audible
+// underneath" — exactly this symptom). null means "no override, trust
+// whatever fetchBridgeIQInfo() returns" — the normal path for a real
+// bridge that actually serves /status.
+function loadForceSampleRateHz(): number | null {
+  if (typeof window === 'undefined') return null
+  const stored = localStorage.getItem(LS_FORCE_SAMPLE_RATE)
+  const n = stored ? Number(stored) : NaN
+  return Number.isFinite(n) && n > 0 ? n : null
+}
+function saveForceSampleRateHz(v: number | null) {
+  if (typeof window === 'undefined') return
+  if (v === null) localStorage.removeItem(LS_FORCE_SAMPLE_RATE)
+  else localStorage.setItem(LS_FORCE_SAMPLE_RATE, String(v))
 }
 
 // ws://host/cat -> ws://host/iq-data — same transform philosophy as
@@ -152,6 +192,13 @@ export interface IQBridgeState {
   // toggles rather than folded into iqCorrection's options.
   dcRemovalEnabled: boolean
   imbalanceCorrectionEnabled: boolean
+  // See setForceIQMode()'s comment — when true, inputMode above is always
+  // reported as "iq" regardless of what (or whether) GET /status answers.
+  forceIQMode: boolean
+  // See setForceSampleRateHz()'s comment — null means "no override," a
+  // number pins sampleRateHz above to that value regardless of what (or
+  // whether) GET /status answers.
+  forceSampleRateHz: number | null
 }
 
 // A mirrored spectrum (signals above the tuned frequency appearing as if
@@ -708,6 +755,8 @@ export function useIQBridge() {
     iqCorrection: loadIQCorrection(),
     dcRemovalEnabled: loadDCRemoval(),
     imbalanceCorrectionEnabled: loadImbalanceCorrection(),
+    forceIQMode: loadForceIQMode(),
+    forceSampleRateHz: loadForceSampleRateHz(),
   })
 
   let ws: WebSocket | null = null
@@ -858,7 +907,13 @@ export function useIQBridge() {
 
   function openSocket(iqUrl: string, catWsUrl: string, generation: number, resolveFirstAttempt?: (ok: boolean) => void) {
     void fetchBridgeIQInfo(catWsUrl).then(({ inputMode, sampleRateHz }) => {
-      if (generation === connectGeneration) setState((s) => ({ ...s, inputMode, sampleRateHz }))
+      if (generation === connectGeneration) {
+        setState((s) => ({
+          ...s,
+          inputMode: s.forceIQMode ? 'iq' : inputMode,
+          sampleRateHz: s.forceSampleRateHz ?? sampleRateHz,
+        }))
+      }
     })
 
     const socket = new WebSocket(iqUrl)
@@ -973,7 +1028,49 @@ export function useIQBridge() {
   async function refreshInfo(catWsUrl: string): Promise<void> {
     const generation = connectGeneration
     const { inputMode, sampleRateHz } = await fetchBridgeIQInfo(catWsUrl)
-    if (generation === connectGeneration) setState((s) => ({ ...s, inputMode, sampleRateHz }))
+    if (generation === connectGeneration) {
+      setState((s) => ({
+        ...s,
+        inputMode: s.forceIQMode ? 'iq' : inputMode,
+        sampleRateHz: s.forceSampleRateHz ?? sampleRateHz,
+      }))
+    }
+  }
+
+  // See IQBridgeState.forceIQMode's comment — for a bridge with no /status
+  // handler at all (a minimal single-purpose test firmware), not a normal
+  // operator control. Takes effect on the next refreshInfo()/connect(),
+  // same "remembered until changed again" pattern as the other setters
+  // here — it does not retroactively fix already-stale inputMode state.
+  function setForceIQMode(enabled: boolean) {
+    saveForceIQMode(enabled)
+    setState((s) => {
+      // Turning this on also seeds a sample-rate override if none is set
+      // yet — a status-less bridge needs BOTH overrides to actually work
+      // (see IQBridgeState.forceSampleRateHz's comment: mode alone still
+      // leaves sampleRateHz at fetchBridgeIQInfo()'s 96000 fallback,
+      // silently doubling every frequency the demodulator computes
+      // against). 48000 matches firmware/esp32-iq-minimal, the one
+      // status-less bridge that exists today; the UI's own sample-rate
+      // field lets the operator correct this if a different one is ever
+      // built. Never overwrites an override the operator already set.
+      const forceSampleRateHz = enabled ? (s.forceSampleRateHz ?? 48000) : s.forceSampleRateHz
+      if (forceSampleRateHz !== s.forceSampleRateHz) saveForceSampleRateHz(forceSampleRateHz)
+      return {
+        ...s,
+        forceIQMode: enabled,
+        inputMode: enabled ? 'iq' : s.inputMode,
+        forceSampleRateHz,
+        sampleRateHz: enabled ? forceSampleRateHz ?? s.sampleRateHz : s.sampleRateHz,
+      }
+    })
+  }
+
+  // See IQBridgeState.forceSampleRateHz's comment. hz === null clears the
+  // override (back to trusting fetchBridgeIQInfo()/its fallback).
+  function setForceSampleRateHz(hz: number | null) {
+    saveForceSampleRateHz(hz)
+    setState((s) => ({ ...s, forceSampleRateHz: hz, sampleRateHz: hz ?? s.sampleRateHz }))
   }
 
   // Live-mutes/unmutes speakersGainNode — see that field's own comment for
@@ -992,7 +1089,8 @@ export function useIQBridge() {
 
   return {
     state, connect, disconnect, refreshInfo, spectrum, setCatMode, setPassband, getPlaybackSource,
-    setPlayThroughSpeakers, setIQCorrection, setDCRemoval, setImbalanceCorrection,
+    setPlayThroughSpeakers, setIQCorrection, setDCRemoval, setImbalanceCorrection, setForceIQMode,
+    setForceSampleRateHz,
   }
 }
 
