@@ -85,4 +85,92 @@ describe('SSBDemodulator', () => {
     expect(mag).toBeGreaterThan(0.05)
     expect(mag).toBeGreaterThan(magAtWrongHz * 5)
   })
+
+  // Regression guard for a real bug found during the FIRFilter rewrite: the
+  // Hilbert kernel's taps were generated in the wrong order for
+  // FIRFilter.processOne()'s convention (oldest-sample-first instead of
+  // newest-sample-first) — for this odd-symmetric kernel specifically,
+  // that's equivalent to negating every tap, which doesn't just attenuate
+  // image rejection, it INVERTS which sideband gets cancelled vs.
+  // reinforced. Directly exercises USB vs. LSB selectivity: a tone on the
+  // correct side of centerHz for the selected sideband must come through
+  // much stronger than an equal-amplitude tone the same distance on the
+  // WRONG side (the image) — the property that silently broke.
+  it('rejects the image sideband (USB passes above center, suppresses below; LSB the reverse)', () => {
+    const centerHz = 3000
+    const audioHz = 700
+    const sampleCount = 24000
+
+    for (const usb of [true, false]) {
+      const demod = new SSBDemodulator()
+      demod.setPassband(centerHz, 2700, SAMPLE_RATE)
+      // USB should pass centerHz+audioHz strongly and suppress centerHz-audioHz;
+      // LSB the reverse.
+      const wantedHz = usb ? centerHz + audioHz : centerHz - audioHz
+      const imageHz = usb ? centerHz - audioHz : centerHz + audioHz
+
+      const demodWanted = demod
+      for (let i = 0; i < 10; i++) demodWanted.demodulate(makeComplexTone(wantedHz, SAMPLE_RATE, 2400), usb, SAMPLE_RATE)
+      const outWanted = demodWanted.demodulate(makeComplexTone(wantedHz, SAMPLE_RATE, sampleCount), usb, SAMPLE_RATE)
+      const magWanted = goertzelMagnitude(outWanted, audioHz, SAMPLE_RATE)
+
+      const demodImage = new SSBDemodulator()
+      demodImage.setPassband(centerHz, 2700, SAMPLE_RATE)
+      for (let i = 0; i < 10; i++) demodImage.demodulate(makeComplexTone(imageHz, SAMPLE_RATE, 2400), usb, SAMPLE_RATE)
+      const outImage = demodImage.demodulate(makeComplexTone(imageHz, SAMPLE_RATE, sampleCount), usb, SAMPLE_RATE)
+      const magImage = goertzelMagnitude(outImage, audioHz, SAMPLE_RATE)
+
+      expect(magWanted).toBeGreaterThan(0.3)
+      expect(magWanted).toBeGreaterThan(magImage * 5)
+    }
+  })
+
+  // Regression guard for the class of bug this file's FIRFilter rewrite was
+  // meant to fix once and for all: a genuinely causal, correctly-streaming
+  // filter must produce numerically identical output whether its input
+  // arrives as one big call or many small ones — there is no other way for
+  // a real-time pipeline (arbitrary WebSocket frame sizes) to behave
+  // correctly. A "centered"/forward-looking convolution (this file's
+  // pre-FIRFilter implementation) fails this hard; a tap-ordering bug (also
+  // found and fixed during this rewrite — an odd-symmetric Hilbert kernel
+  // applied in the wrong direction) does NOT fail this specific test (both
+  // orderings are equally self-consistent across chunk sizes), which is why
+  // this test alone wasn't sufficient to catch that bug — see the other
+  // tests above (image rejection, passband selectivity) for that coverage.
+  it('produces identical output whether fed as one call or many small chunks', () => {
+    const centerHz = 1500
+    const audioHz = 700
+    const sampleCount = 24000 // 500ms at 48kHz — several frames' worth either way
+
+    const whole = new SSBDemodulator()
+    whole.setPassband(centerHz, 2700, SAMPLE_RATE)
+    const fullTone = makeComplexTone(centerHz + audioHz, SAMPLE_RATE, sampleCount)
+    const wholeOut = whole.demodulate(fullTone, true, SAMPLE_RATE)
+
+    const chunked = new SSBDemodulator()
+    chunked.setPassband(centerHz, 2700, SAMPLE_RATE)
+    const chunkSize = 137 // deliberately not a divisor of sampleCount or of any filter length
+    const chunkedOut = new Float32Array(sampleCount)
+    let offset = 0
+    while (offset < sampleCount) {
+      const n = Math.min(chunkSize, sampleCount - offset)
+      const chunk = fullTone.subarray(offset * 2, (offset + n) * 2)
+      const out = chunked.demodulate(chunk, true, SAMPLE_RATE)
+      chunkedOut.set(out, offset)
+      offset += n
+    }
+
+    // Skip the first ~2 filter lengths (mixer/lowpass/Hilbert group delay +
+    // settling) — only the STEADY-STATE streaming behavior needs to match
+    // exactly, not the transient while filters are still filling.
+    let maxDiff = 0
+    for (let i = 1000; i < sampleCount; i++) {
+      maxDiff = Math.max(maxDiff, Math.abs(wholeOut[i] - chunkedOut[i]))
+    }
+    // 1e-6, not tighter — demodulate() returns Float32Array, so both paths
+    // go through an extra float32 rounding step each; real algorithmic
+    // divergence shows up orders of magnitude larger than float32 rounding
+    // noise, not at it.
+    expect(maxDiff).toBeLessThan(1e-6)
+  })
 })

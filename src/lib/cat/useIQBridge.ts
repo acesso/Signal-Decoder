@@ -374,126 +374,241 @@ class ImbalanceCorrector {
   }
 }
 
-// Windowed-sinc Hilbert transform FIR — an odd-length, odd-symmetry filter
-// whose even-indexed taps are exactly zero and whose odd-indexed taps are
-// 2/(pi*k) (k the tap's offset from center), Blackman-windowed to control
-// ripple/rolloff. This is the same phasing-method building block the uSDX
-// radio's OWN receiver uses (see usdxBLACKBRICK.ino's Hilbert-transform
-// comment on its `q = ...` demod line) — SSB audio is just
-// `(delayed I) ± (Hilbert-transformed Q)`, sign picked by sideband. Doing
-// this here (client-side, on the raw I/Q the bridge already sends) is what
-// makes AUDIO_INPUT_MODE_IQ a superset of AUDIO_INPUT_MODE_AUDIO instead of
-// a separate, decode-incompatible mode — see this file's header comment.
-const HILBERT_TAPS = 65 // odd length; ~64-tap-equivalent transition band, plenty for a 2.7kHz-ish SSB passband well under any of this bridge's I/Q sample rates
-const HILBERT_CENTER = (HILBERT_TAPS - 1) / 2
+// ── FIR filter math — ported from jLynx/BrowSDR (github.com/jLynx/BrowSDR),
+// src/client/worker/dsp-pipeline.ts, itself modeled on SDR++'s dsp/taps &
+// dsp/window. Copyright (c) 2026, jLynx <https://github.com/jLynx>; BSD-3-
+// Clause-style license (see that file). Adopted here specifically because
+// FIRFilter's per-sample circular-buffer convolution is genuinely, provably
+// causal (never reads a "future" sample relative to the one just pushed) —
+// a hand-rolled "centered" convolution attempted earlier in this file's
+// history read up to (taps/2) samples FORWARD of the current position to
+// keep the window symmetric, which only exist within the SAME processing
+// call; no forward history is ever carried across calls, only backward, so
+// every call's trailing ~(taps/2) samples silently ran off the end of the
+// buffer and got convolved with a truncated kernel — inaudible at a short
+// filter length, but an audible, periodic (every processing-call boundary)
+// discontinuity once a filter is long enough for that truncation to matter.
+// FIRFilter's design has no such failure mode: every tap read is strictly
+// backward-looking by construction.
+export const sinc = (x: number): number => (x === 0.0 ? 1.0 : Math.sin(x) / x)
 
-function buildHilbertKernel(): Float64Array {
-  const kernel = new Float64Array(HILBERT_TAPS)
-  for (let i = 0; i < HILBERT_TAPS; i++) {
-    const k = i - HILBERT_CENTER
-    if (k === 0 || k % 2 === 0) continue // even taps (incl. center) are exactly zero
-    const ideal = 2 / (Math.PI * k)
-    // Blackman window — same family of choice as this app's other hand-rolled
-    // FIR/window code, low sidelobes so out-of-passband image rejection stays
-    // reasonable without needing a much longer filter.
-    const w = 0.42 - 0.5 * Math.cos((2 * Math.PI * i) / (HILBERT_TAPS - 1)) + 0.08 * Math.cos((4 * Math.PI * i) / (HILBERT_TAPS - 1))
-    kernel[i] = ideal * w
+export const cosineWindow = (n: number, N: number, coefs: number[]): number => {
+  let win = 0.0
+  let sign = 1.0
+  for (let i = 0; i < coefs.length; i++) {
+    win += sign * coefs[i] * Math.cos((i * 2.0 * Math.PI * n) / N)
+    sign = -sign
   }
-  return kernel
+  return win
 }
-const HILBERT_KERNEL = buildHilbertKernel()
 
-// Windowed-sinc lowpass FIR, used AFTER the complex mixer below to reject
-// everything outside the chosen passband before the Hilbert/SSB combine —
-// both to isolate the operator-selected signal from everything else in the
-// wideband I/Q capture, and because a too-wide Hilbert input on a busy band
-// would otherwise fold neighboring signals into the demodulated audio.
-// Rebuilt whenever setPassband() changes the bandwidth; cutoffHz is HALF the
-// requested bandwidth (a lowpass from -bw/2..+bw/2 around the mixed-to-zero
-// center), sampleRateHz is whatever the bridge is currently streaming at.
-const LOWPASS_TAPS = 65
-function buildLowpassKernel(cutoffHz: number, sampleRateHz: number): Float64Array {
-  const kernel = new Float64Array(LOWPASS_TAPS)
-  const center = (LOWPASS_TAPS - 1) / 2
-  const fc = cutoffHz / sampleRateHz // normalized cutoff, cycles/sample
-  let sum = 0
-  for (let i = 0; i < LOWPASS_TAPS; i++) {
-    const k = i - center
-    const ideal = k === 0 ? 2 * fc : Math.sin(2 * Math.PI * fc * k) / (Math.PI * k)
-    const w = 0.42 - 0.5 * Math.cos((2 * Math.PI * i) / (LOWPASS_TAPS - 1)) + 0.08 * Math.cos((4 * Math.PI * i) / (LOWPASS_TAPS - 1))
-    kernel[i] = ideal * w
-    sum += kernel[i]
+// 4-term Nuttall window — lower sidelobes than the Blackman window this
+// codebase used previously, at the same tap count.
+export const nuttall = (n: number, N: number): number => {
+  const coefs = [0.355768, 0.487396, 0.144232, 0.012604]
+  return cosineWindow(n, N, coefs)
+}
+
+export const hzToRads = (freq: number, samplerate: number): number => 2.0 * Math.PI * (freq / samplerate)
+
+export const estimateTapCount = (transWidth: number, samplerate: number): number => {
+  return Math.floor((3.8 * samplerate) / transWidth)
+}
+
+export const windowedSincBase = (
+  count: number,
+  omega: number,
+  windowFunc: (n: number, N: number) => number,
+  norm = 1.0,
+): Float64Array => {
+  const taps = new Float64Array(count)
+  const half = count / 2.0
+  const corr = (norm * omega) / Math.PI
+  for (let i = 0; i < count; i++) {
+    const t = i - half + 0.5
+    taps[i] = sinc(t * omega) * windowFunc(t - half, count) * corr
   }
-  // Normalize to unity DC gain — the windowed-sinc formula above doesn't
-  // sum to exactly 1 on its own, and a gain error here would make the
-  // demodulated audio's level drift with every bandwidth change.
-  if (sum !== 0) for (let i = 0; i < LOWPASS_TAPS; i++) kernel[i] /= sum
-  return kernel
+  return taps
+}
+
+// oddTapCount not exposed — this app always wants FIRFilter's plain
+// circular-buffer form, which has no even/odd-length requirement (unlike a
+// "centered" convolution, which needs an odd length for a well-defined
+// middle tap).
+export const lowPassTaps = (cutoff: number, transWidth: number, samplerate: number): Float64Array => {
+  const count = estimateTapCount(transWidth, samplerate)
+  const omega = hzToRads(cutoff, samplerate)
+  return windowedSincBase(count, omega, (n, N) => nuttall(n, N))
+}
+
+// Genuinely causal, per-sample FIR — see this section's header comment for
+// why this replaced a hand-rolled "centered" convolution. Circular history
+// buffer, O(taps) per sample, taps.length can differ from history.length
+// only briefly during setTaps() (both are always resized together).
+export class FIRFilter {
+  taps: Float64Array
+  history: Float64Array
+  histIdx: number
+
+  constructor(taps?: Float64Array) {
+    this.taps = taps ?? new Float64Array([1.0])
+    this.history = new Float64Array(this.taps.length)
+    this.histIdx = 0
+  }
+
+  setTaps(taps: Float64Array): void {
+    this.taps = taps
+    this.history = new Float64Array(this.taps.length)
+    this.histIdx = 0
+  }
+
+  reset(): void {
+    this.history.fill(0)
+    this.histIdx = 0
+  }
+
+  processOne(sample: number): number {
+    this.history[this.histIdx] = sample
+    let out = 0
+    let tapIdx = 0
+    // Circular buffer dot product: from histIdx down to 0, then from the
+    // end of the history buffer down to histIdx+1 — together these visit
+    // every history sample exactly once, most-recent-first, which is what
+    // convolving against taps[0..] (also most-recent-tap-first) requires.
+    for (let i = this.histIdx; i >= 0; i--) out += this.history[i] * this.taps[tapIdx++]
+    for (let i = this.history.length - 1; i > this.histIdx; i--) out += this.history[i] * this.taps[tapIdx++]
+    this.histIdx++
+    if (this.histIdx >= this.history.length) this.histIdx = 0
+    return out
+  }
 }
 
 // Demodulates raw interleaved I/Q into real-valued mono audio at the SAME
 // sample rate the I/Q arrived at (no resampling/decimation here — playFrame()
 // -style playback below hands rate conversion to AudioBuffer/
 // AudioBufferSourceNode exactly like useAudioBridge.ts's playFrame() already
-// does for /audio; skipping decimation costs a bit more CPU than strictly
-// needed but keeps this pipeline simple and correct, matching this project's
-// standing preference for spending CPU/mem over adding complexity/latency).
-// Three stages per call, all streaming (state carried across calls so a
-// frame boundary never introduces a phase/filter discontinuity):
+// does for /audio). Two stages per call, both streaming (state carried
+// across calls so a frame boundary never introduces a phase/filter
+// discontinuity):
 //   1. Complex mixer — shifts the operator-selected center frequency down to
 //      0Hz by multiplying I/Q by e^{-j*2*pi*f_offset*n/fs}, via a running
-//      phase accumulator (see setPassband()/mixerPhase).
-//   2. Lowpass FIR (real, applied identically to shifted-I and shifted-Q) —
-//      rejects everything outside the chosen bandwidth before the Hilbert
-//      transform sees it.
-//   3. Hilbert-transform phasing combine — same technique the uSDX radio's
-//      own receiver uses: audio = (delayed I) ± Hilbert(Q), sign by sideband.
+//      phase accumulator (see setPassband()/mixerPhase), then a per-channel
+//      FIRFilter (real lowpass, applied identically to shifted-I and
+//      shifted-Q) rejects everything outside the chosen bandwidth.
+//   2. Hilbert-transform phasing combine — same technique the uSDX radio's
+//      own receiver uses: audio = (delayed I) ± Hilbert(Q), sign by
+//      sideband. (An earlier version of this rewrite tried porting
+//      BrowSDR's "rotate by ±bandwidth/2 and take the real part" technique
+//      here instead — that trick assumes the PRECEDING complex filter has
+//      already re-centered the passband so the carrier sits at
+//      -bandwidth/2 from 0Hz, a different reference frame than this
+//      pipeline's centerHz convention (audio content spans 0..+bandwidth/2
+//      above centerHz, not centered around bandwidth/2) — applying it
+//      directly double-shifted the audio by bandwidth/2 and was reverted
+//      after a unit test caught the tone landing at the wrong frequency
+//      entirely. The Hilbert combine below is the same, already-correct
+//      math this file used before this rewrite; only its FILTER
+//      IMPLEMENTATION changed, to FIRFilter's genuinely causal circular
+//      buffer — see this section's header comment for why.)
+function buildHilbertTaps(count: number): Float64Array {
+  // Odd-symmetry FIR: even-indexed taps (including center) are exactly
+  // zero, odd-indexed taps are the ideal Hilbert response 2/(pi*k) (k =
+  // tap offset from center), Nuttall-windowed — same coefficients/window
+  // family as this file's other ported tap generators, applied to the
+  // Hilbert kernel shape specifically rather than a lowpass shape.
+  if (count % 2 === 0) count++ // needs a well-defined center tap
+  const center = (count - 1) / 2
+  const taps = new Float64Array(count)
+  for (let i = 0; i < count; i++) {
+    const k = i - center
+    if (k === 0 || k % 2 === 0) continue
+    const ideal = 2 / (Math.PI * k)
+    taps[i] = ideal * nuttall(i, count - 1)
+  }
+  // Reverse: this loop built taps[i] indexed so i=0 is the MOST NEGATIVE
+  // offset from center (oldest relative sample) — but FIRFilter.processOne()
+  // expects taps[0] to pair with the MOST RECENT history sample (see its
+  // own comment: "convolving against taps[0..] (also most-recent-tap-
+  // first)"). A real bug was found and fixed here: without this reversal,
+  // an odd-symmetric kernel like this one gets applied with every tap's
+  // sign effectively flipped (reversing an odd-symmetric array is
+  // numerically equivalent to negating it), which doesn't just attenuate
+  // the Hilbert transform's effect — it flips which sideband gets
+  // reinforced vs. cancelled, collapsing SSB image rejection entirely
+  // (confirmed by comparing output magnitude at the wanted frequency vs.
+  // its mirror image: both came out IDENTICAL before this fix, meaning no
+  // image rejection was happening at all — the two sidebands were being
+  // combined in a way that split power evenly rather than cancelling one).
+  taps.reverse()
+  return taps
+}
+// Pure delay line (an impulse at the center tap) matching a same-length
+// Hilbert filter's own group delay — I needs no actual filtering, just
+// the same (count-1)/2-sample delay the Hilbert-filtered Q rail
+// accumulates, so both rails stay time-aligned at the combine step.
+function buildDelayTaps(count: number): Float64Array {
+  if (count % 2 === 0) count++
+  const taps = new Float64Array(count)
+  taps[(count - 1) / 2] = 1
+  return taps
+}
+const HILBERT_TAPS = 129 // odd; ~64-tap-equivalent transition band either side, plenty for a 2.7kHz-ish SSB passband well under any of this bridge's I/Q sample rates
+
 export class SSBDemodulator {
   private centerHz = 0
   private bandwidthHz = 2700 // a typical SSB voice passband width; overridden by setPassband()
   private mixerPhase = 0 // radians, carried across calls for phase continuity
 
-  private lowpassKernel = buildLowpassKernel(this.bandwidthHz / 2, FALLBACK_SAMPLE_RATE)
   private lowpassSampleRateHz = FALLBACK_SAMPLE_RATE
-
-  private mixIHistory = new Float64Array(LOWPASS_TAPS)
-  private mixQHistory = new Float64Array(LOWPASS_TAPS)
-  private mixHistLen = 0
-
-  private iHistory = new Float64Array(HILBERT_TAPS)
-  private qHistory = new Float64Array(HILBERT_TAPS)
-  private histLen = 0 // how much of iHistory/qHistory is real history vs. zero-padding (only nonzero briefly, right after construction)
+  private lowpassI = new FIRFilter()
+  private lowpassQ = new FIRFilter()
+  private hilbertDelay = new FIRFilter(buildDelayTaps(HILBERT_TAPS))
+  private hilbertQ = new FIRFilter(buildHilbertTaps(HILBERT_TAPS))
 
   // centerHz: how far the desired signal sits from the I/Q capture's own
   // 0Hz (baseband) center — positive/negative, driven by dragging the
   // SignalAnalysisPanel marker in I/Q mode. bandwidthHz: the marker's width,
-  // clamped to a sane minimum so the lowpass kernel stays well-defined.
+  // clamped to a sane minimum so the lowpass taps stay well-defined.
   setPassband(centerHz: number, bandwidthHz: number, sampleRateHz: number): void {
     const bw = Math.max(50, bandwidthHz)
-    if (bw === this.bandwidthHz && sampleRateHz === this.lowpassSampleRateHz) {
-      this.centerHz = centerHz
-      return
-    }
     this.centerHz = centerHz
+    if (bw === this.bandwidthHz && sampleRateHz === this.lowpassSampleRateHz) return
     this.bandwidthHz = bw
     this.lowpassSampleRateHz = sampleRateHz
-    this.lowpassKernel = buildLowpassKernel(bw / 2, sampleRateHz)
-    // Changing the filter mid-stream invalidates carried history — a stale
-    // tap history from a different kernel length/cutoff would smear into
-    // the first few samples after a bandwidth change. A brief, one-time
-    // glitch on change is preferable to persisting mismatched state.
-    this.mixIHistory.fill(0)
-    this.mixQHistory.fill(0)
-    this.mixHistLen = 0
+    // Cutoff at HALF the requested bandwidth (a lowpass from -bw/2..+bw/2
+    // around the mixed-to-zero center) — same convention as before this
+    // rewrite. transWidth (BrowSDR's estimateTapCount() input) set equal
+    // to the cutoff itself (a 100%-relative transition width) — a real
+    // bug was found and fixed here: an earlier attempt at 10% of the
+    // cutoff produced estimateTapCount(135, 48000) = 1351 taps for a
+    // typical 2700Hz-wide SSB passband, whose filter settling time (many
+    // tens of thousands of samples for a sinc this long) is far longer
+    // than this app's ~50ms/2400-sample processing frames — the
+    // demodulated audio never actually reached steady state in normal
+    // operation, which is exactly the kind of "sounds thin/cuts out"
+    // symptom this whole rewrite was meant to fix, not reproduce with a
+    // different mechanism. 100%-relative transition width keeps the tap
+    // count in the same ballpark (~130-270 taps across this app's typical
+    // 8-96kHz sample rates) as the pre-rewrite hand-rolled filter (65-129
+    // taps), which was known to settle acceptably fast.
+    const cutoffHz = bw / 2
+    const taps = lowPassTaps(cutoffHz, cutoffHz, sampleRateHz)
+    this.lowpassI.setTaps(taps)
+    // Q needs its OWN FIRFilter instance (not the same taps object shared
+    // by reference issue — setTaps() already copies into a fresh history
+    // buffer per instance) so its circular-buffer history stays
+    // independent of I's, even though the tap coefficients themselves are
+    // identical real values applied to both rails.
+    this.lowpassQ.setTaps(taps)
   }
 
-  // sideband: true = USB (I + Hilbert(Q)), false = LSB (I - Hilbert(Q)) —
-  // matches the uSDX's own mode==USB branch. CW/RTTY are treated as USB
-  // (a keyed/shifted tone within an SSB-shaped passband, standard SDR
-  // practice); AM/FM aren't meaningfully decodable via this phasing path,
-  // but defaulting them to USB is harmless here since only the sideband
-  // mirror is affected, not decode correctness for the modes that matter
-  // (FT8/MFSK only ever run on USB/LSB-tuned signals).
+  // sideband: true = USB, false = LSB — matches the uSDX's own mode==USB
+  // branch. CW/RTTY are treated as USB (a keyed/shifted tone within an
+  // SSB-shaped passband, standard SDR practice); AM/FM aren't meaningfully
+  // decodable via this technique, but defaulting them to USB is harmless
+  // here since only the sideband mirror is affected, not decode
+  // correctness for the modes that matter (FT8/MFSK only ever run on
+  // USB/LSB-tuned signals).
   // iq: interleaved I,Q pairs, already float-normalized and already
   // through whatever upstream correction stages are enabled — see
   // IQSpectrumComputer.feed()'s comment; same contract.
@@ -502,91 +617,37 @@ export class SSBDemodulator {
     const out = new Float32Array(pairCount)
     if (sampleRateHz !== this.lowpassSampleRateHz) this.setPassband(this.centerHz, this.bandwidthHz, sampleRateHz)
 
-    // Stage 1: complex mixer — shift centerHz down to 0Hz. A running phase
-    // accumulator (not angle = 2*pi*f*n/fs recomputed from n=0 every call)
-    // is what keeps this phase-continuous across frame boundaries.
-    const mixedI = new Float64Array(pairCount)
-    const mixedQ = new Float64Array(pairCount)
-    const angStep = (-2 * Math.PI * this.centerHz) / sampleRateHz
-    let phase = this.mixerPhase
+    const mixAngStep = (-2 * Math.PI * this.centerHz) / sampleRateHz
+    let mixPhase = this.mixerPhase
+    const sign = sideband ? 1 : -1
+
     for (let n = 0; n < pairCount; n++) {
       const i = iq[n * 2]
       const q = iq[n * 2 + 1]
-      const c = Math.cos(phase)
-      const s = Math.sin(phase)
-      // Complex multiply (i + jq) * (c + js) = (i*c - q*s) + j(i*s + q*c).
-      mixedI[n] = i * c - q * s
-      mixedQ[n] = i * s + q * c
-      phase += angStep
+
+      // Stage 1: complex mixer (shift centerHz to 0Hz) then per-channel
+      // lowpass — complex multiply (i + jq) * (c + js) = (i*c - q*s) +
+      // j(i*s + q*c).
+      const mc = Math.cos(mixPhase)
+      const ms = Math.sin(mixPhase)
+      const mixedI = i * mc - q * ms
+      const mixedQ = i * ms + q * mc
+      mixPhase += mixAngStep
+
+      const filtI = this.lowpassI.processOne(mixedI)
+      const filtQ = this.lowpassQ.processOne(mixedQ)
+
+      // Stage 2: Hilbert-transform phasing combine — delayedI (via a pure
+      // delay FIRFilter matching the Hilbert filter's own group delay) ±
+      // Hilbert(Q), sign by sideband.
+      const delayedI = this.hilbertDelay.processOne(filtI)
+      const hilbertQ = this.hilbertQ.processOne(filtQ)
+      out[n] = delayedI + sign * hilbertQ
     }
+
     // Wrap to keep phase from growing unbounded over a long-running session
     // (float precision would otherwise degrade after many hours).
-    this.mixerPhase = phase % (2 * Math.PI)
-
-    // Stage 2: lowpass FIR on both mixed rails, streaming across calls.
-    const mixIBuf = new Float64Array(this.mixHistLen + pairCount)
-    const mixQBuf = new Float64Array(this.mixHistLen + pairCount)
-    mixIBuf.set(this.mixIHistory.subarray(LOWPASS_TAPS - this.mixHistLen), 0)
-    mixQBuf.set(this.mixQHistory.subarray(LOWPASS_TAPS - this.mixHistLen), 0)
-    mixIBuf.set(mixedI, this.mixHistLen)
-    mixQBuf.set(mixedQ, this.mixHistLen)
-
-    const filtI = new Float64Array(pairCount)
-    const filtQ = new Float64Array(pairCount)
-    const lpCenter = (LOWPASS_TAPS - 1) / 2
-    for (let n = 0; n < pairCount; n++) {
-      const centerIdx = this.mixHistLen + n
-      let accI = 0
-      let accQ = 0
-      for (let k = 0; k < LOWPASS_TAPS; k++) {
-        const idx = centerIdx - k + lpCenter
-        if (idx >= 0 && idx < mixIBuf.length) {
-          accI += this.lowpassKernel[k] * mixIBuf[idx]
-          accQ += this.lowpassKernel[k] * mixQBuf[idx]
-        }
-      }
-      filtI[n] = accI
-      filtQ[n] = accQ
-    }
-    const mixCarry = Math.min(LOWPASS_TAPS - 1, mixIBuf.length)
-    this.mixIHistory.fill(0)
-    this.mixQHistory.fill(0)
-    this.mixIHistory.set(mixIBuf.subarray(mixIBuf.length - mixCarry), LOWPASS_TAPS - mixCarry)
-    this.mixQHistory.set(mixQBuf.subarray(mixQBuf.length - mixCarry), LOWPASS_TAPS - mixCarry)
-    this.mixHistLen = mixCarry
-
-    // Stage 3: Hilbert-transform phasing combine on the filtered, centered
-    // I/Q — same math as before the mixer/lowpass stages were added.
-    const iBuf = new Float64Array(this.histLen + pairCount)
-    const qBuf = new Float64Array(this.histLen + pairCount)
-    iBuf.set(this.iHistory.subarray(HILBERT_TAPS - this.histLen), 0)
-    qBuf.set(this.qHistory.subarray(HILBERT_TAPS - this.histLen), 0)
-    iBuf.set(filtI, this.histLen)
-    qBuf.set(filtQ, this.histLen)
-
-    const sign = sideband ? 1 : -1
-    for (let n = 0; n < pairCount; n++) {
-      // Center-tapped index for "delayed I" (the plain center sample —
-      // HILBERT_KERNEL's even taps are zero, so I needs no filtering, just
-      // the same HILBERT_CENTER-sample delay the Q rail's filter imposes).
-      const centerIdx = this.histLen + n
-      const delayedI = iBuf[centerIdx - HILBERT_CENTER] ?? 0
-      let qHilbert = 0
-      for (let k = 0; k < HILBERT_TAPS; k++) {
-        const idx = centerIdx - k
-        if (idx >= 0) qHilbert += HILBERT_KERNEL[k] * qBuf[idx]
-      }
-      out[n] = delayedI + sign * qHilbert
-    }
-
-    // Carry the last HILBERT_TAPS-1 samples of this frame (or history, for a
-    // frame shorter than that) forward as next call's history.
-    const carry = Math.min(HILBERT_TAPS - 1, iBuf.length)
-    this.iHistory.fill(0)
-    this.qHistory.fill(0)
-    this.iHistory.set(iBuf.subarray(iBuf.length - carry), HILBERT_TAPS - carry)
-    this.qHistory.set(qBuf.subarray(qBuf.length - carry), HILBERT_TAPS - carry)
-    this.histLen = carry
+    this.mixerPhase = mixPhase % (2 * Math.PI)
 
     return out
   }
