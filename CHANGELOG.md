@@ -14,6 +14,7 @@ them into a version section when cutting a release.
 
 ### Fixed
 
+- Fixed intermittent multi-second I/Q stream stalls (heard as metallic crackling, decode-breaking) on the ESP32 bridge's `/iq-data` WebSocket: the bridge's Wi-Fi network broadcasts one SSID from multiple same-channel APs, and the bridge could roam between them mid-session — added an optional BSSID pin (Kconfig default + `POST /wifi-config`) to keep it associated with one AP. Also gave `/iq-data` a small per-client ring buffer (was a single reused slot) so a brief send stall becomes added latency instead of a dropped frame.
 - Fixed a periodic click/buzz in audio sent to the radio over the ESP32 bridge (FT8 TX and manual mic-send): the browser-side resampler treated every capture chunk as an independent buffer, discarding the fractional sample position and true next sample at each chunk boundary — now carries that state across the whole session.
 - Fixed the ESP32 bridge locking up after several minutes of audio streaming (`/status` and all other requests timing out while the device stayed reachable): `/audio` and `/audio-mic-sniff` broadcasts queued a new send to the shared httpd worker task every 50ms per client with no backpressure, and a degraded Wi-Fi link let that backlog grow faster than the single worker could drain it. Broadcasts now skip a client whose previous frame hasn't finished sending instead of piling on more work.
 - Fixed the ESP32 bridge's persistent CAT log crash-looping on boot once it grew large enough that its flash-scan recovery starved the task watchdog.
@@ -29,6 +30,7 @@ them into a version section when cutting a release.
 - ESP32 bridge control page: the sniffer replaces the previous "Send Mic to Radio" button, with the same spectrum/waterfall/oscilloscope/stats quality view as the "Listen to Radio" channel, including an operator-adjustable max-frequency slider on both channels and a horizontal (rather than frequency-position) rolloff marker.
 - ESP32 bridge: an on/off toggle for the persistent CAT log (`POST /cat-log-enable`), default off since it's a debug feature.
 - ESP32 bridge: PA sense/emergency-cutoff wiring moved from SD-card pads to header pins (GPIO19/GPIO5), consolidating the two status LEDs into one.
+- ESP32 bridge: RX-loop timing diagnostics in `GET /system-stats` (longest loop interval/read/broadcast duration since the last poll) — used to isolate the I/Q stream stall fixed above.
 
 ## [0.11.5] - 2026-08-07
 

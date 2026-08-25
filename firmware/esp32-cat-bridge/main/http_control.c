@@ -175,15 +175,17 @@ static esp_err_t status_handler(httpd_req_t *req) {
     bridge_settings_get_wifi(ssid, sizeof(ssid), password, sizeof(password));
     char ssid_escaped[64];
     json_escape(ssid_escaped, sizeof(ssid_escaped), ssid);
+    char bssid[18];
+    bridge_settings_get_wifi_bssid(bssid, sizeof(bssid));
 
     int64_t uptime_s = esp_timer_get_time() / 1000000;
 
     int8_t tx_power_quarter_dbm = 0;
     wifi_net_get_tx_power_quarter_dbm(&tx_power_quarter_dbm); // best-effort; 0 if WiFi hasn't started yet
 
-    char body[800];
+    char body[850];
     int n = snprintf(body, sizeof(body),
-        "{\"wifi_state\":\"%s\",\"ssid\":\"%s\",\"rssi\":%d,\"ip\":\"%s\","
+        "{\"wifi_state\":\"%s\",\"ssid\":\"%s\",\"bssid\":\"%s\",\"rssi\":%d,\"ip\":\"%s\","
         "\"ws_clients\":%u,\"ws_max_clients\":%d,\"radio_linked\":%s,"
         "\"cat_baud\":%d,\"pa_sense\":%s,\"pa_emergency_tripped\":%s,"
         "\"adc_input\":\"%s\",\"rx_slot_right\":%s,\"led_enabled\":%s,"
@@ -193,7 +195,7 @@ static esp_err_t status_handler(httpd_req_t *req) {
         "\"mic_gain_db\":%.1f,\"cat_log_enabled\":%s,"
         "\"input_mode\":\"%s\","
         "\"uptime_s\":%lld}",
-        wifi_state_str(st.wifi_state), ssid_escaped, (int)live_rssi,
+        wifi_state_str(st.wifi_state), ssid_escaped, bssid, (int)live_rssi,
         st.ip_addr[0] ? st.ip_addr : "",
         (unsigned)st.ws_client_count, WS_MAX_CLIENTS,
         (esp_timer_get_time() - st.last_radio_rx_us) <= 3000000 ? "true" : "false",
@@ -436,24 +438,34 @@ static bool extract_json_bool(const char *json, const char *key, bool *out) {
     return false;
 }
 
-// POST /wifi-config — body: {"ssid":"...","password":"..."}. Persists to
-// NVS and reboots to apply (same pattern as most consumer Wi-Fi devices —
-// there's no clean way to tear down and rejoin a different AP without
-// disrupting every open CAT WebSocket anyway, so a full restart is no
-// worse than a live reconnect would be from the client's point of view).
+// POST /wifi-config — body: {"ssid":"...","password":"...","bssid":"..."}.
+// bssid is OPTIONAL — omit it (or send "") to clear any existing pin and
+// let esp_wifi pick any AP for the SSID, today's long-standing default.
+// See bridge_settings_get_wifi_bssid()'s comment for why this pin exists
+// at all: a real fix for intermittent multi-second WiFi-layer stalls on a
+// network broadcasting one SSID from multiple same-channel APs. Persists
+// to NVS and reboots to apply (same pattern as most consumer Wi-Fi
+// devices — there's no clean way to tear down and rejoin a different AP
+// without disrupting every open CAT WebSocket anyway, so a full restart is
+// no worse than a live reconnect would be from the client's point of view).
 static esp_err_t wifi_config_handler(httpd_req_t *req) {
-    char body[160];
+    char body[200];
     if (read_request_body(req, body, sizeof(body)) != ESP_OK) return ESP_FAIL;
 
-    char ssid[33] = {0}, password[65] = {0};
+    char ssid[33] = {0}, password[65] = {0}, bssid[18] = {0};
     if (!extract_json_string(body, "ssid", ssid, sizeof(ssid)) || ssid[0] == '\0') {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "missing or empty \"ssid\"");
         return ESP_FAIL;
     }
     // Password CAN legitimately be empty (open networks) — only ssid is required.
     extract_json_string(body, "password", password, sizeof(password));
+    extract_json_string(body, "bssid", bssid, sizeof(bssid));
+    if (!wifi_net_is_valid_bssid(bssid)) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "\"bssid\" must be \"aa:bb:cc:dd:ee:ff\" format, or omitted/empty to clear");
+        return ESP_FAIL;
+    }
 
-    if (!bridge_settings_set_wifi(ssid, password)) {
+    if (!bridge_settings_set_wifi(ssid, password) || !bridge_settings_set_wifi_bssid(bssid)) {
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "failed to save to NVS");
         return ESP_FAIL;
     }
@@ -1038,6 +1050,11 @@ static esp_err_t system_stats_handler(httpd_req_t *req) {
     cpu_monitor_heap_t heap;
     cpu_monitor_get_heap(&heap);
 
+    // RX-loop timing — see audio_monitor_get_rx_timing()'s own comment;
+    // read-and-reset, so each GET reports the max seen since the LAST GET.
+    audio_monitor_rx_timing_t rx_timing;
+    audio_monitor_get_rx_timing(&rx_timing);
+
     char tasks_json[1536];
     int tasks_len = cpu_monitor_write_tasks_json(tasks_json, sizeof(tasks_json));
     if (tasks_len < 0) {
@@ -1045,15 +1062,19 @@ static esp_err_t system_stats_handler(httpd_req_t *req) {
         return ESP_FAIL;
     }
 
-    char body[1700];
+    char body[1850];
     int n = snprintf(body, sizeof(body),
         "{\"cpu_freq_mhz\":%d,\"heap_free\":%u,\"heap_min_free\":%u,\"heap_total\":%u,"
         "\"heap_largest_free_block\":%u,\"dma_free\":%u,\"dma_largest_free_block\":%u,"
+        "\"rx_max_loop_interval_us\":%lld,\"rx_max_read_duration_us\":%lld,"
+        "\"rx_max_broadcast_duration_us\":%lld,\"rx_loop_count\":%u,"
         "\"tasks\":%s}",
         cpu_monitor_get_freq_mhz(),
         (unsigned)heap.free_bytes, (unsigned)heap.min_free_bytes, (unsigned)heap.total_bytes,
         (unsigned)heap.largest_free_block_bytes,
         (unsigned)heap.dma_free_bytes, (unsigned)heap.dma_largest_free_block_bytes,
+        (long long)rx_timing.max_loop_interval_us, (long long)rx_timing.max_read_duration_us,
+        (long long)rx_timing.max_broadcast_duration_us, (unsigned)rx_timing.loop_count,
         tasks_json);
     if (n < 0 || (size_t)n >= sizeof(body)) {
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "system-stats body truncated");

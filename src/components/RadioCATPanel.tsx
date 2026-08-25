@@ -1502,9 +1502,35 @@ function BridgeStatusPanel(props: {
       <Show
         when={status()}
         fallback={
-          <p class="text-[10px] text-[#f0883e]">
-            {loading() ? 'Querying bridge…' : failed() ? 'Could not reach the bridge at ' + props.wsUrl + '.' : ''}
-          </p>
+          <div class="flex flex-col gap-2">
+            <p class="text-[10px] text-[#f0883e]">
+              {loading() ? 'Querying bridge…' : failed() ? 'Could not reach the bridge at ' + props.wsUrl + '.' : ''}
+            </p>
+            <Show when={!loading() && failed()}>
+              <label class="flex items-center gap-2 text-[10px] text-[#8b949e]">
+                <input
+                  type="checkbox"
+                  checked={props.iqBridge.state().forceIQMode}
+                  onChange={(e) => props.iqBridge.setForceIQMode(e.currentTarget.checked)}
+                />
+                Force I/Q mode (this bridge has no /status — e.g. a minimal single-purpose test firmware)
+              </label>
+              <Show when={props.iqBridge.state().forceIQMode}>
+                <label class="flex items-center gap-2 text-[10px] text-[#8b949e]">
+                  Sample rate (Hz)
+                  <input
+                    type="number"
+                    class="w-20 bg-[#0d1117] border border-[#30363d] rounded px-1.5 py-0.5 text-[#c9d1d9]"
+                    value={props.iqBridge.state().forceSampleRateHz ?? 48000}
+                    onChange={(e) => {
+                      const hz = Number(e.currentTarget.value)
+                      if (Number.isFinite(hz) && hz > 0) props.iqBridge.setForceSampleRateHz(hz)
+                    }}
+                  />
+                </label>
+              </Show>
+            </Show>
+          </div>
         }
       >
         {(s) => (

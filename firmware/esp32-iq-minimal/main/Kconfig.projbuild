@@ -1,0 +1,11 @@
+menu "I/Q Minimal Config"
+
+    config IQMIN_WIFI_SSID
+        string "Wi-Fi SSID"
+        default "myssid"
+
+    config IQMIN_WIFI_PASSWORD
+        string "Wi-Fi password"
+        default "mypassword"
+
+endmenu

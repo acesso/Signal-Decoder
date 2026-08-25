@@ -17,6 +17,7 @@ static const char *TAG = "bridge_settings";
 #define NVS_NAMESPACE "bridge_cfg"
 #define NVS_KEY_SSID     "wifi_ssid"
 #define NVS_KEY_PASSWORD "wifi_pass"
+#define NVS_KEY_BSSID    "wifi_bssid"
 #define NVS_KEY_CAT_BAUD "cat_baud"
 #define NVS_KEY_ADC_INPUT "adc_input"
 #define DEFAULT_ADC_INPUT_NAME "lin2"
@@ -102,6 +103,29 @@ bool bridge_settings_set_wifi(const char *ssid, const char *password) {
     nvs_close(h);
     bool ok = e1 == ESP_OK && e2 == ESP_OK && e3 == ESP_OK;
     ESP_LOGI(TAG, "saved new Wi-Fi credentials to NVS (ssid=%s): %s", ssid, ok ? "ok" : "FAILED");
+    return ok;
+}
+
+void bridge_settings_get_wifi_bssid(char *bssid_out, size_t out_sz) {
+    nvs_handle_t h;
+    bool have_it = false;
+    if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &h) == ESP_OK) {
+        size_t len = out_sz;
+        have_it = nvs_get_str(h, NVS_KEY_BSSID, bssid_out, &len) == ESP_OK;
+        nvs_close(h);
+    }
+    if (!have_it) strncpy(bssid_out, CONFIG_BRIDGE_WIFI_BSSID, out_sz - 1);
+    bssid_out[out_sz - 1] = '\0';
+}
+
+bool bridge_settings_set_wifi_bssid(const char *bssid) {
+    nvs_handle_t h;
+    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h) != ESP_OK) return false;
+    esp_err_t e1 = nvs_set_str(h, NVS_KEY_BSSID, bssid);
+    esp_err_t e2 = nvs_commit(h);
+    nvs_close(h);
+    bool ok = e1 == ESP_OK && e2 == ESP_OK;
+    ESP_LOGI(TAG, "saved Wi-Fi BSSID pin to NVS (%s): %s", bssid[0] ? bssid : "(cleared)", ok ? "ok" : "FAILED");
     return ok;
 }
 
