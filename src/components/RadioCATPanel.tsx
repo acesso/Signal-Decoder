@@ -1213,7 +1213,7 @@ function BridgeInputModeControl(props: {
           swapped ADC left/right wiring needs "Swap I/Q", but a single inverted channel (mixer or
           single-ended-to-differential stage) needs "Negate I" or "Negate Q" instead; swapping wouldn't fix that
           case. All three undo the same mirroring symptom but only one matches the real cause — try them against a
-          real signal to see which one actually clears it. "None" by default; not persisted across reloads.
+          real signal to see which one actually clears it. "None" by default; persisted across reloads once changed.
         </p>
         <label class="flex items-center gap-2 text-[10px] text-[#8b949e]">
           <input
