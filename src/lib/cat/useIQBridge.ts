@@ -36,6 +36,48 @@ function log(level: 'info' | 'warn' | 'error', ...args: unknown[]) {
 // time (both reboot to apply).
 const FALLBACK_SAMPLE_RATE = 96000
 
+// ── localStorage persistence — the I/Q diagnostic toggles below used to be
+// deliberately session-only ("confirm/rule out a wiring theory, don't let a
+// stale browser-side workaround silently mask a real firmware/hardware
+// fix"), but in practice an operator who found a setting that actually
+// helps their specific hardware wants it to survive a reload, not to
+// re-discover and re-apply it every session. Same LS_ naming convention as
+// useFTTransmit.ts.
+const LS_IQ_CORRECTION = 'iq_correction'
+const LS_DC_REMOVAL = 'iq_dc_removal'
+const LS_IMBALANCE_CORRECTION = 'iq_imbalance_correction'
+const LS_PLAY_THROUGH_SPEAKERS = 'iq_play_through_speakers'
+
+function loadIQCorrection(): IQCorrection {
+  if (typeof window === 'undefined') return 'none'
+  const stored = localStorage.getItem(LS_IQ_CORRECTION)
+  return stored === 'swap' || stored === 'negateI' || stored === 'negateQ' ? stored : 'none'
+}
+function saveIQCorrection(v: IQCorrection) {
+  if (typeof window !== 'undefined') localStorage.setItem(LS_IQ_CORRECTION, v)
+}
+function loadDCRemoval(): boolean {
+  if (typeof window === 'undefined') return false
+  return localStorage.getItem(LS_DC_REMOVAL) === 'true'
+}
+function saveDCRemoval(v: boolean) {
+  if (typeof window !== 'undefined') localStorage.setItem(LS_DC_REMOVAL, String(v))
+}
+function loadImbalanceCorrection(): boolean {
+  if (typeof window === 'undefined') return false
+  return localStorage.getItem(LS_IMBALANCE_CORRECTION) === 'true'
+}
+function saveImbalanceCorrection(v: boolean) {
+  if (typeof window !== 'undefined') localStorage.setItem(LS_IMBALANCE_CORRECTION, String(v))
+}
+function loadPlayThroughSpeakers(): boolean {
+  if (typeof window === 'undefined') return false
+  return localStorage.getItem(LS_PLAY_THROUGH_SPEAKERS) === 'true'
+}
+function savePlayThroughSpeakers(v: boolean) {
+  if (typeof window !== 'undefined') localStorage.setItem(LS_PLAY_THROUGH_SPEAKERS, String(v))
+}
+
 // ws://host/cat -> ws://host/iq-data — same transform philosophy as
 // useAudioBridge.ts's bridgeAudioWsUrl().
 function bridgeIQWsUrl(catWsUrl: string): string | null {
@@ -662,10 +704,10 @@ export function useIQBridge() {
     passbandCenterHz: 0,
     passbandBandwidthHz: 2700,
     error: null,
-    playThroughSpeakers: false,
-    iqCorrection: 'none',
-    dcRemovalEnabled: false,
-    imbalanceCorrectionEnabled: false,
+    playThroughSpeakers: loadPlayThroughSpeakers(),
+    iqCorrection: loadIQCorrection(),
+    dcRemovalEnabled: loadDCRemoval(),
+    imbalanceCorrectionEnabled: loadImbalanceCorrection(),
   })
 
   let ws: WebSocket | null = null
@@ -677,14 +719,15 @@ export function useIQBridge() {
   // Applied to every incoming frame before either the spectrum display or
   // the demodulator sees it — see onmessage's own comment for exactly
   // where, and IQCorrection's own comment for what each mode means and
-  // why there are four. Session-only (not persisted), same as
-  // playThroughSpeakers below — this is a diagnostic control for
-  // confirming/ruling out a wiring theory, not a setting that should
-  // silently survive to a future session if the real fix turns out to be
-  // on the firmware/hardware side instead.
-  let iqCorrection: IQCorrection = 'none'
+  // why there are four. Persisted across reloads — this started as a
+  // session-only diagnostic control (so a stale browser-side workaround
+  // couldn't silently mask a real firmware/hardware fix), but an operator
+  // who finds a setting that actually helps their specific hardware wants
+  // it to survive a reload rather than re-discovering it every session.
+  let iqCorrection: IQCorrection = loadIQCorrection()
   function setIQCorrection(mode: IQCorrection) {
     iqCorrection = mode
+    saveIQCorrection(mode)
     setState((s) => ({ ...s, iqCorrection: mode }))
   }
 
@@ -692,14 +735,16 @@ export function useIQBridge() {
   // need any combination (e.g. a real hardware swap AND genuine DC
   // leakage AND some residual imbalance, all at once). See
   // DCRemover/ImbalanceCorrector's own comments.
-  let dcRemovalEnabled = false
+  let dcRemovalEnabled = loadDCRemoval()
   function setDCRemoval(enabled: boolean) {
     dcRemovalEnabled = enabled
+    saveDCRemoval(enabled)
     setState((s) => ({ ...s, dcRemovalEnabled: enabled }))
   }
-  let imbalanceCorrectionEnabled = false
+  let imbalanceCorrectionEnabled = loadImbalanceCorrection()
   function setImbalanceCorrection(enabled: boolean) {
     imbalanceCorrectionEnabled = enabled
+    saveImbalanceCorrection(enabled)
     setState((s) => ({ ...s, imbalanceCorrectionEnabled: enabled }))
   }
 
@@ -739,7 +784,7 @@ export function useIQBridge() {
   // it mid-stream doesn't click, same reasoning as other mute-via-gain
   // spots in this codebase (e.g. useFTTransmit.ts's TX gain node).
   let speakersGainNode: GainNode | null = null
-  let speakersOn = false
+  let speakersOn = loadPlayThroughSpeakers()
 
   function teardownPlayback() {
     playCtx?.close().catch(() => null)
@@ -938,6 +983,7 @@ export function useIQBridge() {
   // behavior as setCatMode()/setPassband() above.
   function setPlayThroughSpeakers(enabled: boolean) {
     speakersOn = enabled
+    savePlayThroughSpeakers(enabled)
     if (speakersGainNode) speakersGainNode.gain.value = enabled ? 1 : 0
     setState((s) => ({ ...s, playThroughSpeakers: enabled }))
   }
