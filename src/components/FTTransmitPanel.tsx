@@ -1365,6 +1365,45 @@ export default function FTTransmitPanel(props: FTTransmitPanelProps): JSX.Elemen
 
         {/* ── Right: queue + sent log ── */}
         <div class="space-y-3">
+          {/* Bridge TX slot pool — only meaningful once the bridge is
+              actually the TX output; see useFTTransmit.ts's
+              BridgeSlotInfo/uploadIfBridgeSink() comments for why this is
+              browser-tracked (the firmware itself has no concept of
+              message text, only raw PCM + a hash). Shows what's actually
+              staged in each of the ESP32's 4 PSRAM slots so an operator
+              can see (and clear) what would play if that slot were
+              triggered, without having to trust it's still accurate. */}
+          <Show when={audioSinkKind() === 'bridge'}>
+            <div class="rounded border border-[#21262d] bg-[#0d1117] p-2">
+              <div class="text-[#8b949e] text-[10px] font-semibold uppercase tracking-wide mb-1.5">
+                Bridge TX Slots
+              </div>
+              <div class="space-y-1">
+                <For each={tx.state().bridgeSlots}>
+                  {(slot) => (
+                    <div class={`flex items-center gap-2 rounded px-1.5 py-1 border ${
+                      slot.uploaded ? 'border-[#30363d]' : 'border-[#21262d] opacity-50'
+                    }`}>
+                      <span class="text-[9px] font-mono text-[#484f58] w-3 shrink-0">{slot.slot}</span>
+                      <div class="flex-1 min-w-0">
+                        <div class="font-mono text-[10px] text-[#c9d1d9] truncate">
+                          {slot.uploaded ? slot.message : '— empty —'}
+                        </div>
+                        <Show when={slot.uploaded}>
+                          <div class="text-[#484f58] text-[9px] truncate">{slot.label}</div>
+                        </Show>
+                      </div>
+                      <Show when={slot.uploaded}>
+                        <button onClick={() => void tx.clearBridgeSlot(slot.slot)}
+                          class="text-[#484f58] hover:text-[#f85149] text-xs px-1 shrink-0" title="Remove from bridge">✕</button>
+                      </Show>
+                    </div>
+                  )}
+                </For>
+              </div>
+            </div>
+          </Show>
+
           <div class="text-[#8b949e] text-[10px] font-semibold uppercase tracking-wide flex items-center justify-between">
             <span>TX Queue</span>
             <span class="text-[#484f58]">{tx.state().queue.length} pending</span>

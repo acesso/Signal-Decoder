@@ -60,6 +60,27 @@ export interface FTTransmitState {
    *  cycle rather than resetting at a boundary nothing sends on, only to
    *  restart the countdown a full window later. */
   nextTxAtMs: number | null;
+  /** What's actually cached in each of the bridge's TX_SLOT_COUNT buffer
+   *  pool slots, for a "what's staged for bridge TX" panel — see
+   *  bridgeSlotInfo()'s own comment for why this is browser-tracked state
+   *  (the firmware only knows raw PCM + a hash, never message text).
+   *  Always TX_SLOT_COUNT entries, index === slot; message is '' for a
+   *  slot nothing has been assigned to yet. */
+  bridgeSlots: BridgeSlotInfo[];
+}
+
+export interface BridgeSlotInfo {
+  slot: number;
+  message: string;
+  label: string;
+  /** Set the moment an upload is issued for this (message, slot) pair —
+   *  NOT re-checked against the hash-skip cache, so this can be true even
+   *  when uploadToBridgeSlot() ends up skipping the actual HTTP call
+   *  because the content was already there; "uploaded" here means "this
+   *  slot's stated message/label are believed accurate," which holds
+   *  either way. False only for a slot that's never been assigned a
+   *  message at all (the initial state, or right after POST /tx-clear). */
+  uploaded: boolean;
 }
 
 // ── localStorage persistence ──────────────────────────────────────────────────
@@ -310,8 +331,18 @@ function bridgeHttpUrl(catWsUrl: string, pathname: string, query?: string): stri
 // below, so 2 lookahead slots is comfortably more than the common case
 // needs), 3 is spare headroom for a future use (e.g. a manually-pinned
 // "reply" slot) rather than actively assigned today.
+// Matches the firmware's TX_SLOT_COUNT (audio_monitor.h) — not fetched
+// dynamically, same "fixed, not negotiated" reasoning as
+// BRIDGE_PLAYBACK_RATE_HZ above; a firmware old enough to have a different
+// count wouldn't have the /tx-* endpoints at all (see the wire-protocol
+// versioning note on BRIDGE_FIRMWARE_VERSION 0.6.0 in bridge_config.h).
+const TX_SLOT_COUNT = 4;
 const TX_SLOT_AUTOCQ = 0;
 const TX_SLOT_QUEUE_LOOKAHEAD = [1, 2] as const;
+
+function emptyBridgeSlots(): BridgeSlotInfo[] {
+  return Array.from({ length: TX_SLOT_COUNT }, (_, slot) => ({ slot, message: '', label: '', uploaded: false }));
+}
 
 // Matches the firmware's esp_rom_crc32_le() exactly (standard zlib/PNG/
 // IEEE-802.3 CRC32, poly 0xEDB88320, init/final XOR 0xFFFFFFFF) — needed
@@ -508,6 +539,7 @@ export function createFTTransmit(
     preKeyMs: loadPreKeyMs(),
     postKeyMs: loadPostKeyMs(),
     nextTxAtMs: null,
+    bridgeSlots: emptyBridgeSlots(),
   });
 
   let isRunning          = false;
@@ -557,11 +589,27 @@ export function createFTTransmit(
   // the hash-skip check means re-uploading identical content (e.g. an
   // unchanged auto-CQ waveform every cycle) costs nothing beyond the
   // GET-status-free comparison already done client-side.
-  function uploadIfBridgeSink(slot: number, samples: Float32Array, sourceRateHz: number) {
+  function uploadIfBridgeSink(slot: number, message: string, label: string, samples: Float32Array, sourceRateHz: number) {
+    setBridgeSlotInfo(slot, message, label, true);
     if (getAudioSinkKind() !== 'bridge') return;
     const wsUrl = getBridgeWsUrl();
     if (!wsUrl) return;
     void uploadToBridgeSlot(wsUrl, slot, samples, sourceRateHz, gain);
+  }
+
+  // Updates state.bridgeSlots for one slot — see BridgeSlotInfo's own
+  // comment for why this is tracked here rather than read back from the
+  // firmware (it has no concept of message text, only raw PCM + a hash).
+  // Called unconditionally from uploadIfBridgeSink() regardless of the
+  // CURRENT sink kind, deliberately: an operator watching the slot panel
+  // while on 'speaker' should still see what WOULD be staged if they
+  // switched to 'bridge' — the label reflects "what this slot is assigned
+  // to," not "what's currently sitting in the device's PSRAM."
+  function setBridgeSlotInfo(slot: number, message: string, label: string, uploaded: boolean) {
+    setState(prev => ({
+      ...prev,
+      bridgeSlots: prev.bridgeSlots.map(s => s.slot === slot ? { slot, message, label, uploaded } : s),
+    }));
   }
 
   // Which lookahead slot (see TX_SLOT_QUEUE_LOOKAHEAD's own comment) a
@@ -587,7 +635,7 @@ export function createFTTransmit(
     encodeAsync(entry.message, getMode(), ENC_RATE, entry.audioHz ?? getBaseFrequency())
       .then(samples => {
         const slot = lookaheadSlotForQueuePosition(entry.id);
-        if (slot !== null) uploadIfBridgeSink(slot, samples, ENC_RATE);
+        if (slot !== null) uploadIfBridgeSink(slot, entry.message, entry.label, samples, ENC_RATE);
         setState(prev => {
           const q = prev.queue.map(e =>
             e.id === entry.id ? { ...e, samples, encodeStatus: 'ready' as const } : e
@@ -634,7 +682,7 @@ export function createFTTransmit(
           autoCQFreqCached === getBaseFrequency()
         ) {
           autoCQSamples = samples;
-          uploadIfBridgeSink(TX_SLOT_AUTOCQ, samples, 12000);
+          uploadIfBridgeSink(TX_SLOT_AUTOCQ, msg, 'CQ (auto)', samples, 12000);
         }
       })
       .catch(() => { autoCQSamples = null; });
@@ -839,7 +887,10 @@ export function createFTTransmit(
       if (getAudioSinkKind() === 'bridge') {
         const wsUrl = getBridgeWsUrl();
         const slot = useAutoCQ ? TX_SLOT_AUTOCQ : TX_SLOT_QUEUE_LOOKAHEAD[0];
-        if (wsUrl) await uploadToBridgeSlot(wsUrl, slot, samples, 12000, gain);
+        if (wsUrl) {
+          setBridgeSlotInfo(slot, txMessage, txLabel, true);
+          await uploadToBridgeSlot(wsUrl, slot, samples, 12000, gain);
+        }
         const ok = wsUrl && await playBridgeSlotAndWait(wsUrl, slot, () => isRunning);
         if (!ok) {
           setState(prev => ({ ...prev, error: 'Bridge playback failed — falling back requires switching output to Local speaker' }));
@@ -1130,6 +1181,31 @@ export function createFTTransmit(
     setState(prev => ({ ...prev, sent: [] }));
   }
 
+  // Removes a slot's cached message — see BridgeSlotInfo's own comment for
+  // why this needs a real firmware call (POST /tx-clear), not just wiping
+  // the local label: without it, the device would still happily play
+  // stale audio for a slot the operator explicitly asked to forget. Clears
+  // the local hash cache too so a later re-upload to this slot (e.g. the
+  // queue reassigning it to a new entry) isn't skipped on a stale "already
+  // matches" comparison against content that no longer exists on-device.
+  // Best-effort against the bridge (same fallback shape as every other
+  // /tx-* call in this file) — the local state clears either way, since an
+  // operator clicking "remove" wants the panel to reflect that regardless
+  // of whether the bridge round-trip itself succeeds.
+  async function clearBridgeSlot(slot: number): Promise<void> {
+    setBridgeSlotInfo(slot, '', '', false);
+    const wsUrl = getBridgeWsUrl();
+    if (!wsUrl) return;
+    slotHashCacheFor(wsUrl).delete(slot);
+    const url = bridgeHttpUrl(wsUrl, '/tx-clear', `slot=${slot}`);
+    if (!url) return;
+    try {
+      await fetch(url, { method: 'POST' });
+    } catch {
+      // Best-effort — see this function's own comment.
+    }
+  }
+
   function destroy() {
     stop();
   }
@@ -1152,6 +1228,7 @@ export function createFTTransmit(
     setPreKeyMs,
     setPostKeyMs,
     clearSent,
+    clearBridgeSlot,
     syncParams,
     destroy,
     get isRunning() { return isRunning; },
