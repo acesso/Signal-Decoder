@@ -372,11 +372,18 @@ export interface IQPassband {
 }
 
 interface Props {
-  /** Real-valued FFT source (decoders' demodulated audio) — mutually
-   *  exclusive with iqSource; exactly one should be non-null/set. */
+  /** Real-valued FFT source (decoders' demodulated audio). When iqSource is
+   *  ALSO given (I/Q mode), this is the pipeline's FINAL output — after
+   *  every correction/AGC/highpass/noise-reduction stage useIQBridge.ts
+   *  applies — and a "Signal source" toggle lets the operator pick between
+   *  the two instead of only ever seeing the raw wideband view. When
+   *  iqSource is absent (Audio mode), this is the only source and no
+   *  toggle is shown. */
   analyser: AnalyserNode | null
-  /** Raw wideband I/Q source (useIQBridge.ts) — mutually exclusive with
-   *  analyser. Span is always -sampleRateHz()/2..+sampleRateHz()/2. */
+  /** Raw wideband I/Q source (useIQBridge.ts), i.e. the pipeline's INPUT —
+   *  before DC removal/imbalance correction/swap-negate even runs, let
+   *  alone demodulation. See analyser's own comment for how the two
+   *  combine. Span is always -sampleRateHz()/2..+sampleRateHz()/2. */
   iqSource?: {
     computer: { magBytes: Uint8Array }
     sampleRateHz: () => number
@@ -405,21 +412,42 @@ interface Props {
   storageKeyPrefix?: string
 }
 
+type IQTapPoint = 'raw' | 'processed'
+const IQ_TAP_POINTS: IQTapPoint[] = ['raw', 'processed']
+
 export default function SignalAnalysisPanel(props: Props): JSX.Element {
+  // Only meaningful when BOTH iqSource and analyser are given (I/Q mode) —
+  // see analyser's own comment on what each tap point actually shows.
+  // Persisted per-mode like colormap below, since an operator's
+  // preference plausibly differs between e.g. FT8 (probably wants to see
+  // the raw band to find signals) and a mode where they're mainly
+  // diagnosing THIS pipeline's own effect.
+  const lsIqTap = props.storageKeyPrefix ? `${props.storageKeyPrefix}_sg_iq_tap` : 'sg_iq_tap'
+  const [iqTap, setIqTap] = createSignal<IQTapPoint>(loadString(lsIqTap, 'raw', IQ_TAP_POINTS))
+  createEffect(() => saveString(lsIqTap, iqTap()))
+  const hasBothTaps = createMemo(() => !!props.iqSource && !!props.analyser)
+
   const source = createMemo<SpectrumSource | null>(() => {
-    if (props.iqSource) return new IQSpectrumSourceAdapter(props.iqSource.computer, props.iqSource.sampleRateHz, props.iqSource.active)
+    if (props.iqSource && (iqTap() === 'raw' || !props.analyser)) {
+      return new IQSpectrumSourceAdapter(props.iqSource.computer, props.iqSource.sampleRateHz, props.iqSource.active)
+    }
     return props.analyser ? new AnalyserSpectrumSource(props.analyser) : null
   })
   // I/Q mode's passband marker is presented through the exact same
   // drawChannelMarker/MarkerGrips path as a regular AudioMarker — appended
   // to (never replacing) props.markers so a decoder could in principle show
   // both, though in practice a component only ever passes one or the other.
+  // Only meaningful on the RAW I/Q tap — centerHz is an offset within the
+  // wideband I/Q spectrum, which has no equivalent position on the
+  // "processed" tap (that view is already the post-demodulation baseband
+  // audio the passband setting PRODUCED, not something the passband
+  // marker itself could still be dragged within).
   const effectiveMarkers = createMemo<AudioMarker[]>(() => {
     const base = props.markers ?? []
-    if (!props.passband) return base
+    if (!props.passband || (hasBothTaps() && iqTap() !== 'raw')) return base
     return [...base, { freq: props.passband.centerHz, color: '#58a6ff', label: 'Passband', bandwidthHz: props.passband.bandwidthHz }]
   })
-  const isPassbandMarkerIndex = (i: number) => props.passband != null && i === (props.markers ?? []).length
+  const isPassbandMarkerIndex = (i: number) => props.passband != null && !(hasBothTaps() && iqTap() !== 'raw') && i === (props.markers ?? []).length
   const handleMarkerDrag = (index: number, newFreq: number, shiftKey?: boolean) => {
     if (isPassbandMarkerIndex(index)) {
       props.onPassbandChange?.({ centerHz: newFreq, bandwidthHz: props.passband!.bandwidthHz })
@@ -854,6 +882,30 @@ export default function SignalAnalysisPanel(props: Props): JSX.Element {
               />
             )}
             <span class="shrink-0 text-[#484f58]">{props.vfoFrequency ? 'kHz' : 'Hz'}</span>
+            {/* Bandwidth — separate from the generic marker-drag machinery
+                above (that only ever moves a marker's CENTER frequency,
+                for any AudioMarker including plain tone markers other
+                decoders use — bandwidth only makes sense for the
+                passband specifically). Real gap this fills: there was
+                previously NO way to widen/narrow the demodulated audio
+                band at all — the center field and marker drag both only
+                ever changed centerHz, confirmed directly against a real
+                report of "changed the passband value, audio bandwidth
+                didn't change" (true: that value only ever WAS centerHz). */}
+            {props.passband && props.onPassbandChange && !(hasBothTaps() && iqTap() !== 'raw') && (
+              <>
+                <span class="shrink-0 ml-2">Width</span>
+                <NumberField
+                  value={props.passband.bandwidthHz}
+                  min={50}
+                  max={sourceMaxHz() - sourceMinHz()}
+                  step={50}
+                  onCommit={(hz) => props.onPassbandChange!({ centerHz: props.passband!.centerHz, bandwidthHz: Math.round(hz) })}
+                  class="w-16 rounded border border-[#30363d] bg-[#0d1117] px-2 py-0.5 font-mono text-[#c9d1d9] focus:border-[#2ea043] focus:outline-none"
+                />
+                <span class="shrink-0 text-[#484f58]">Hz</span>
+              </>
+            )}
             <span class="ml-auto text-[10px] text-[#484f58]">
               {effectiveMarkers().length} marker{effectiveMarkers().length !== 1 ? 's' : ''}
             </span>
@@ -1022,6 +1074,26 @@ export default function SignalAnalysisPanel(props: Props): JSX.Element {
           <FreqRuler minHz={displayMinHz()} maxHz={displayMaxHz()} vfoHz={props.vfoFrequency} />
         )}
         <div class="flex flex-wrap items-center gap-3 text-xs text-[#8b949e]">
+          {/* Only shown when there's genuinely a choice — I/Q mode with a
+              live decoded-audio graph to compare against. See analyser's
+              own Props comment for what each tap point shows; this is the
+              first of what's meant to grow into more pipeline-stage taps
+              (raw I/Q and the final post-processing output today — AGC/
+              highpass/noise-reduction all happen strictly BETWEEN these
+              two and aren't independently exposed yet). */}
+          {hasBothTaps() && (
+            <label class="flex items-center gap-1.5" title="Where in the I/Q processing pipeline this view taps the signal">
+              Signal source
+              <select
+                value={iqTap()}
+                onChange={(e) => setIqTap(e.currentTarget.value as IQTapPoint)}
+                class="cursor-pointer rounded border border-[#30363d] bg-[#0d1117] px-1.5 py-0.5 text-[#c9d1d9] focus:border-[#2ea043] focus:outline-none"
+              >
+                <option value="raw">Raw I/Q (before demodulation)</option>
+                <option value="processed">Decoded audio (after AGC/filters/NR)</option>
+              </select>
+            </label>
+          )}
           <label class="flex items-center gap-1.5">
             View
             <select

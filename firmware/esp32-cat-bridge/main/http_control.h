@@ -42,7 +42,8 @@
 //                              "alc_control","noise_gate_control","cpu_monitor",
 //                              "wifi_tx_power_control","adc_hpf_control",
 //                              "sample_rate_select","speaker_amp_control",
-//                              "cat_log","audio_mic_sniff"]} —
+//                              "cat_log","audio_mic_sniff","input_mode_select",
+//                              "tx_buffer_playback"]} —
 //                       see the versioning note in bridge_config.h.
 // GET  /wifi-scan    -> JSON: {"networks":[{"ssid":"...","rssi":-58},...]}
 //                       Blocking active scan (~1-3s), deduped by SSID
@@ -219,6 +220,85 @@
 //                       this persists to NVS AND REBOOTS to apply, rather
 //                       than live-starting/stopping the background task.
 //                       Response: "saved, restarting" (text/plain).
+// POST /tx-audio    -> body: raw Int16 PCM bytes (NOT JSON — a binary
+//                       body), mono, fixed at 16000Hz (TX_BUFFER_SAMPLE_RATE_HZ
+//                       in audio_monitor.h) — the exact wire format /audio's
+//                       live mic-send path already uses. Uploads a WHOLE
+//                       pre-encoded TX message (e.g. an FT8/FT4 waveform)
+//                       in one shot, replacing the /audio WebSocket's
+//                       chunk-by-chunk live streaming for this use case —
+//                       real-hardware testing found that path "noisy,
+//                       cutting and full of unwanted artifacts" whenever
+//                       any single ~2048-sample chunk's Wi-Fi delivery
+//                       jittered even slightly, an unavoidable property of
+//                       feeding a real-time codec write rate from
+//                       network-timed packets. Uploading the whole buffer
+//                       first (this handler doesn't return until every
+//                       byte has actually arrived) converts that into a
+//                       one-shot transfer problem: playback (POST
+//                       /tx-play below) then walks a known-good local
+//                       buffer at the codec's own pace, with the network
+//                       no longer any part of the timing picture. Stored
+//                       in PSRAM (see audio_monitor.h's "One-shot
+//                       pre-encoded TX buffer playback" comment for why —
+//                       the same previously-fixed real bug as
+//                       s_tx_stereo_scratch/s_tx_upsample_scratch in
+//                       audio_monitor.c: nothing downstream ever needs
+//                       DMA-capable source memory, and this buffer is too
+//                       large to reliably survive internal RAM's normal
+//                       fragmentation). Rejects with 400 if a playback is
+//                       currently in progress (POST /tx-stop it first) —
+//                       an upload mid-playback would clobber the buffer
+//                       the playback task is actively reading from. Also
+//                       rejects with 400 for an odd byte count (not valid
+//                       Int16 PCM) or a body over 5 minutes' worth (a loose
+//                       sanity cap, not a tuned limit — both FT8 and FT4
+//                       top out well under 20s). Response:
+//                       {"bytes":123456,"duration_ms":12640,"saved":true}
+//                       (duration_ms derived from byte count at the fixed
+//                       16000Hz mono rate).
+// POST /tx-play     -> no body. Starts a dedicated FreeRTOS task
+//                       (audio_monitor.c's tx_play_task(), pinned to
+//                       RELAY_TASK_CORE at AUDIO_MONITOR_TASK_PRIO — see
+//                       bridge_config.h's TX_PLAY_TASK_CORE/PRIO comment)
+//                       that feeds the uploaded buffer into
+//                       audio_monitor_report_out_samples() — the SAME
+//                       DAC-write/RMS/LED pipeline /audio's live mic-send
+//                       path uses, reused rather than duplicated — in
+//                       READ_WINDOW_MS-cadence chunks (the same chunk
+//                       size/timing audio_task's own RX read loop already
+//                       uses at this rate), paced with vTaskDelay rather
+//                       than dumped in one call. CRITICAL implementation
+//                       detail, not just a style preference: this runs as
+//                       a genuinely separate task, never inline in this
+//                       httpd worker's own request-handling context —
+//                       there's a real documented prior incident (see the
+//                       UPSAMPLE_SINC_HALF_WIDTH comment block in
+//                       audio_monitor.c) where CPU-heavy work landed in
+//                       that shared httpd worker context during TX and
+//                       starved IDLE0 long enough to trip the task
+//                       watchdog and force a full device reboot mid-
+//                       transmission — exactly the failure this
+//                       architecture exists to make structurally
+//                       impossible here. Rejects with 400 if no buffer has
+//                       been uploaded yet (POST /tx-audio first) or a
+//                       playback is already running. Response:
+//                       {"playing":true,"duration_ms":12640}.
+// GET  /tx-status   -> JSON: {"playing":true,"position_ms":1234,
+//                       "duration_ms":12640}. Deliberately cheap and
+//                       poll-friendly — just reads shared atomic state the
+//                       playback task itself updates once per chunk, no
+//                       I/O, safe for a browser progress bar to poll every
+//                       few hundred ms for an entire playback's duration.
+// POST /tx-stop     -> no body. Sets a flag the playback task checks once
+//                       per chunk (so it stops at the next chunk boundary,
+//                       not instantly) and blocks briefly (bounded at 1s)
+//                       until the task has actually exited before
+//                       replying — never leaves the caller unsure whether
+//                       playback (and therefore TX) is really still live.
+//                       Always returns 200, including the trivial case
+//                       where nothing was playing. Response:
+//                       {"stopped":true}.
 // GET  /system-stats -> JSON: {"cpu_freq_mhz":160,"heap_free":123456,
 //                              "heap_min_free":98765,"heap_total":327680,
 //                              "heap_largest_free_block":65432,"dma_free":54321,

@@ -343,21 +343,24 @@ void ws_server_start(void) {
     config.keep_alive_idle = 5;
     config.keep_alive_interval = 5;
     config.keep_alive_count = 3;
-    // Default is 8 — this server now registers 24 URI handlers (/cat,
-    // /audio, /status, /info, /wifi-scan, /reset, /wifi-config, /cat-baud,
-    // /pa-emergency-clear, /audio-input, /mic-gain, /wifi-tx-power,
-    // /rx-slot, /led-enable, /alc, /noise-gate, /cpu-freq, /system-stats,
-    // /adc-hpf, /adc-oversample, /* OPTIONS, plus control_page's /,
-    // /style.css, /app.js), so the default silently overflows
-    // (ESP_ERR_HTTPD_HANDLERS_FULL, a boot-loop on real hardware — this
-    // cap has now been hit and bumped THREE times: first when
-    // control_page.c was added, again when the audio-input/mic-gain/rx-
-    // slot/led-enable diagnostics landed, again for alc/noise-gate/cpu-
-    // freq/system-stats). The 40 headroom chosen back then still covers
-    // this addition (/adc-hpf, /adc-oversample) with room to spare —
-    // cheap insurance (this only costs a bit of static handler-table
-    // memory, not a scarce resource worth rationing tightly).
-    config.max_uri_handlers = 40;
+    // Default is 8 — this server now registers roughly 30 URI handlers
+    // (/cat, /audio, /status, /info, /wifi-scan, /reset, /wifi-config,
+    // /cat-baud, /pa-emergency-clear, /audio-input, /mic-gain,
+    // /wifi-tx-power, /rx-slot, /led-enable, /alc, /noise-gate, /cpu-freq,
+    // /system-stats, /adc-hpf, /sample-rate, /input-mode, /cat-log-enable,
+    // /speaker-amp, /cat-log, /cat-log/clear, /tx-audio, /tx-play,
+    // /tx-status, /tx-stop, /* OPTIONS, plus control_page's /, /style.css,
+    // /app.js, plus /iq-data and /audio-mic-sniff), so the default
+    // silently overflows (ESP_ERR_HTTPD_HANDLERS_FULL, a boot-loop on real
+    // hardware — this cap has already been hit and bumped multiple times:
+    // first when control_page.c was added, again for the audio-input/
+    // mic-gain/rx-slot/led-enable diagnostics, again for alc/noise-gate/
+    // cpu-freq/system-stats). Bumped from 40 to 48 for the tx-audio/
+    // tx-play/tx-status/tx-stop addition, with real headroom left again
+    // rather than inching it up by exactly 4 — cheap insurance (this only
+    // costs a bit of static handler-table memory, not a scarce resource
+    // worth rationing tightly).
+    config.max_uri_handlers = 48;
     // Wildcard matching so http_control.c can register a single "/*" OPTIONS
     // handler for CORS preflight instead of one per concrete route — exact
     // routes (/cat, /status, /reset) still match themselves first under this

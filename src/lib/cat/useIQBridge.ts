@@ -46,9 +46,15 @@ const FALLBACK_SAMPLE_RATE = 96000
 const LS_IQ_CORRECTION = 'iq_correction'
 const LS_DC_REMOVAL = 'iq_dc_removal'
 const LS_IMBALANCE_CORRECTION = 'iq_imbalance_correction'
+const LS_AGC_ENABLED = 'iq_agc_enabled'
+const LS_AGC_LEVEL = 'iq_agc_level'
+const LS_HIGHPASS_ENABLED = 'iq_highpass_enabled'
+const LS_NOISE_REDUCER_ENABLED = 'iq_noise_reducer_enabled'
 const LS_PLAY_THROUGH_SPEAKERS = 'iq_play_through_speakers'
 const LS_FORCE_IQ_MODE = 'iq_force_mode'
 const LS_FORCE_SAMPLE_RATE = 'iq_force_sample_rate'
+const LS_PASSBAND_CENTER_HZ = 'iq_passband_center_hz'
+const LS_PASSBAND_BANDWIDTH_HZ = 'iq_passband_bandwidth_hz'
 
 function loadIQCorrection(): IQCorrection {
   if (typeof window === 'undefined') return 'none'
@@ -72,12 +78,109 @@ function loadImbalanceCorrection(): boolean {
 function saveImbalanceCorrection(v: boolean) {
   if (typeof window !== 'undefined') localStorage.setItem(LS_IMBALANCE_CORRECTION, String(v))
 }
+// Defaults ON. Reverted back from a same-session attempt at defaulting
+// this OFF (the reasoning: this AGC is a direct port of the uSDX
+// firmware's own per-sample gain-riding compressor, exactly right for a
+// human listening to voice/CW on speakers but seemingly unnecessary for
+// this app's data-only modes) — that reasoning doesn't hold up as a
+// PROVEN mechanism (ft8mon normalizes internally against its own
+// per-window noise-floor estimate, so overall input gain alone shouldn't
+// change its decode count either way), and real-world testing after
+// flipping the default found MORE noise and FEWER FT8 decodes with AGC
+// off, not more. Left ON pending an actual root-caused explanation for
+// that observation — reverting on an unconfirmed hypothesis while a real
+// regression is still unexplained is worse than leaving the previously-
+// working default in place. Still fully toggleable either way.
+function loadAGCEnabled(): boolean {
+  if (typeof window === 'undefined') return true
+  return localStorage.getItem(LS_AGC_ENABLED) !== 'false'
+}
+function saveAGCEnabled(v: boolean) {
+  if (typeof window !== 'undefined') localStorage.setItem(LS_AGC_ENABLED, String(v))
+}
+// [1,14], default 4 — see AGC_LEVEL_MIN/MAX/DEFAULT's own comment (matches
+// the uSDX firmware's agc_lvl menu item exactly). Literal 4 here rather
+// than referencing AGC_LEVEL_DEFAULT since that constant is declared later
+// in this file, alongside the AGC class itself — kept in sync by hand,
+// same as this codebase's other small forward-reference-avoiding literals.
+function loadAGCLevel(): number {
+  if (typeof window === 'undefined') return 4
+  const stored = Number(localStorage.getItem(LS_AGC_LEVEL))
+  return Number.isFinite(stored) && stored >= 1 && stored <= 14 ? stored : 4
+}
+function saveAGCLevel(v: number) {
+  if (typeof window !== 'undefined') localStorage.setItem(LS_AGC_LEVEL, String(v))
+}
+// Defaults OFF — see the same reasoning as loadAGCEnabled() above. This
+// fixed 300Hz corner matches the uSDX firmware's own voice/CW filt_var
+// stage, but every one of this app's modes can legitimately carry content
+// below 300Hz: FT8/MFSK tones are commonly tuned close to the passband's
+// low edge (the whole point of a wide, per-mode passband — see App.tsx's
+// IQ_PASSBAND_DEFAULTS), and this filter was confirmed on real signal to
+// cut real tones there, not just DC/hum. Opt-in for whoever specifically
+// wants it (e.g. listening to CW/voice-like content where sub-300Hz really
+// is just rumble), not opt-out for every decode.
+function loadHighpassEnabled(): boolean {
+  if (typeof window === 'undefined') return false
+  return localStorage.getItem(LS_HIGHPASS_ENABLED) === 'true'
+}
+function saveHighpassEnabled(v: boolean) {
+  if (typeof window !== 'undefined') localStorage.setItem(LS_HIGHPASS_ENABLED, String(v))
+}
+// Defaults OFF — unlike agcEnabled/highpassEnabled above (both direct
+// ports of a real radio's own long-proven DSP), NoiseReducer is genuinely
+// NEW, unproven-on-real-signal DSP (see its own header comment) with real,
+// well-documented failure modes (musical noise, added latency) that a
+// firmware port doesn't carry — opt-in until validated against real HF
+// conditions, not opt-out like the other two.
+function loadNoiseReducerEnabled(): boolean {
+  if (typeof window === 'undefined') return false
+  return localStorage.getItem(LS_NOISE_REDUCER_ENABLED) === 'true'
+}
+function saveNoiseReducerEnabled(v: boolean) {
+  if (typeof window !== 'undefined') localStorage.setItem(LS_NOISE_REDUCER_ENABLED, String(v))
+}
 function loadPlayThroughSpeakers(): boolean {
   if (typeof window === 'undefined') return false
   return localStorage.getItem(LS_PLAY_THROUGH_SPEAKERS) === 'true'
 }
 function savePlayThroughSpeakers(v: boolean) {
   if (typeof window !== 'undefined') localStorage.setItem(LS_PLAY_THROUGH_SPEAKERS, String(v))
+}
+// Persisted for the same reason as the diagnostic toggles above — an
+// operator who's tuned into a specific signal doesn't want the marker
+// snapping back to 0Hz/2700Hz on every reload; every decoder reads this
+// via iqBridge.state().passbandCenterHz/passbandBandwidthHz (see
+// SignalAnalysisPanel's passband marker), so persisting it here at the
+// source covers all of them at once. null center means "never set" (kept
+// distinct from a legitimate 0Hz center) so the initial state below can
+// fall back to its own default instead of a stored zero.
+// NOTE: App.tsx now ALSO persists a passband setting PER DECODER MODE
+// (IQ_PASSBAND_DEFAULTS/loadPassbandByMode()) and applies its own
+// mode-specific value via setPassband() on mount and on every mode
+// switch — that call runs almost immediately and supersedes whatever this
+// single, mode-agnostic value seeded the demodulator with at
+// construction. This single-value fallback is kept anyway as the sane
+// default for any hypothetical future caller of useIQBridge() outside
+// App.tsx's own orchestration, not because both are meant to be the
+// active source of truth simultaneously.
+function loadPassbandCenterHz(): number | null {
+  if (typeof window === 'undefined') return null
+  const stored = localStorage.getItem(LS_PASSBAND_CENTER_HZ)
+  const n = stored !== null ? Number(stored) : NaN
+  return Number.isFinite(n) ? n : null
+}
+function savePassbandCenterHz(v: number) {
+  if (typeof window !== 'undefined') localStorage.setItem(LS_PASSBAND_CENTER_HZ, String(v))
+}
+function loadPassbandBandwidthHz(): number | null {
+  if (typeof window === 'undefined') return null
+  const stored = localStorage.getItem(LS_PASSBAND_BANDWIDTH_HZ)
+  const n = stored !== null ? Number(stored) : NaN
+  return Number.isFinite(n) && n > 0 ? n : null
+}
+function savePassbandBandwidthHz(v: number) {
+  if (typeof window !== 'undefined') localStorage.setItem(LS_PASSBAND_BANDWIDTH_HZ, String(v))
 }
 // Bypasses GET /status entirely — for a bridge that doesn't serve /status
 // at all (e.g. firmware/esp32-iq-minimal, a deliberately status-less
@@ -158,6 +261,15 @@ async function fetchBridgeIQInfo(catWsUrl: string): Promise<{ inputMode: InputMo
 
 export interface IQBridgeState {
   connected: boolean
+  // True while a PREVIOUSLY-connected socket has dropped and an automatic
+  // reconnect is scheduled/in flight (see openSocket()'s onclose) — false
+  // once reconnected, and false (not true) for the very first connect()
+  // attempt, a genuine unrecoverable failure, or an operator-initiated
+  // disconnect(). Distinct from !connected, which is also true in all of
+  // those other cases — this exists so the UI can show "reconnecting…"
+  // specifically for the case a bridge reboot/Wi-Fi hiccup causes, without
+  // also lighting up on every ordinary "not connected yet" state.
+  reconnecting: boolean
   // Mirrors GET /status's input_mode, refreshed on every (re)connect — lets
   // the UI tell "connected, but the bridge is in audio mode so nothing
   // meaningful will ever arrive" apart from "connected and actually
@@ -192,6 +304,27 @@ export interface IQBridgeState {
   // toggles rather than folded into iqCorrection's options.
   dcRemovalEnabled: boolean
   imbalanceCorrectionEnabled: boolean
+  // Automatic gain control on demodulated audio — see the AGC class's own
+  // comment (ported from the uSDX radio firmware's "M0PUB" AGC). Applied
+  // AFTER demodulation, unlike the three flags above (all pre-demod, on
+  // raw I/Q) — kept in this same state object for a consistent single
+  // place to look for every I/Q-mode signal-processing toggle.
+  agcEnabled: boolean
+  // Target level, [1,14] — matches the radio's own AGC Level control
+  // exactly (same range, same "higher = louder before it clamps"
+  // semantics) so an operator already familiar with that CAT control
+  // reads this one the same way. See AGC.setLevel()'s comment.
+  agcLevel: number
+  // 300Hz highpass on demodulated audio — see SSBDemodulator's own
+  // `highpass` field comment (ported from the uSDX firmware's own
+  // filt_var corner). Also post-demod, alongside agcEnabled above.
+  highpassEnabled: boolean
+  // Spectral noise reduction (FFT-overlap-add, Wiener gain) — see
+  // NoiseReducer's own header comment. Last stage in the post-demod
+  // chain, after agcEnabled/highpassEnabled above. Off by default — see
+  // loadNoiseReducerEnabled()'s comment for why (new, unproven-on-air
+  // DSP, unlike the two ports above).
+  noiseReducerEnabled: boolean
   // See setForceIQMode()'s comment — when true, inputMode above is always
   // reported as "iq" regardless of what (or whether) GET /status answers.
   forceIQMode: boolean
@@ -199,6 +332,17 @@ export interface IQBridgeState {
   // number pins sampleRateHz above to that value regardless of what (or
   // whether) GET /status answers.
   forceSampleRateHz: number | null
+  // RMS power of the demodulated audio, in dBFS (0 = full-scale), measured
+  // BEFORE agcEnabled's AGC.process() runs — see playDemodulatedFrame()'s
+  // comment for why pre-AGC is the only tap point that means anything as a
+  // signal-strength reading (AGC's whole job is to flatten this out).
+  // Unlike the radio's own CAT `sMeter` reading (measured across uSDX's
+  // entire analog RX chain, independent of whatever narrow slice of the
+  // wideband I/Q spectrum this app is actually tuned to — see
+  // firmware/usdxBLACKBRICK/usdxBLACKBRICK.ino's smeter()), this reflects
+  // only the passband actually selected here. null until the first frame
+  // is demodulated.
+  iqSignalDbfs: number | null
 }
 
 // A mirrored spectrum (signals above the tuned frequency appearing as if
@@ -463,6 +607,355 @@ class ImbalanceCorrector {
   }
 }
 
+// Automatic gain control on the DEMODULATED AUDIO (applied to
+// SSBDemodulator's output, not the raw I/Q — see playDemodulatedFrame()'s
+// call site) — ported from the uSDX BLACK_BRICK radio firmware's own
+// "M0PUB" AGC (usdxBLACKBRICK.ino's process_agc(), the algorithm an actual
+// SSB radio ships with), NOT from any browser-DSP-project source: this
+// fills a gap neither this app nor BrowSDR ever had — there was no gain
+// leveling on decoded audio at all before this, so a strong signal could
+// clip while a weak one sat inaudibly quiet.
+//
+// Ported behavior, not mechanics: the firmware's version is fixed-point
+// int16 arithmetic (centiGain, HI()/LO() byte-shift tricks) built for an
+// FPU-less AVR — none of that has any value on a browser with a real
+// float64 ALU, so this reimplements the same THREE-PART shape in plain
+// floats against this app's [-1,1]-normalized sample scale instead of the
+// firmware's int16 one:
+//   1. Fast attack: the moment a peak exceeds the upper threshold, cut
+//      gain by a fixed fraction immediately (per-sample, no delay).
+//   2. Slow, WINDOWED decay: gain only adjusts once per AGC_WINDOW_SAMPLES
+//      samples, not per-sample — this "settle, don't hunt" behavior (the
+//      firmware's own comment, process_agc() line ~2782) is what
+//      distinguishes this from a naive peak-follower AGC (e.g. BrowSDR's
+//      3-line version, which lacks windowing and pumps more visibly).
+//   3. A target WINDOW (not a single setpoint) between lowerThreshold and
+//      upperThreshold — gain only ramps up if EVERY sample in a whole
+//      window stayed below the lower threshold, and eases back down
+//      (at half the up-rate, matching the firmware) if any sample in the
+//      window reached the target range or above.
+// gainMin/gainMax bound the same way CENTIGAIN_MAX does in the firmware
+// (never below 0.25x, matching the firmware's 32/128 floor; capped well
+// above what any real headroom needs so a dead/silent band can't have its
+// noise floor amplified into a loud hiss).
+const AGC_ATTACK_FACTOR = 1 - 1 / 16 // matches centiGain -= centiGain>>4
+const AGC_DECAY_UP_FACTOR = 1 + 1 / 16 // matches centiGain += centiGain>>4
+const AGC_DECAY_DOWN_FACTOR = 1 - 1 / 32 // half the up-rate, matches the firmware's own comment
+const AGC_WINDOW_SAMPLES = 400 // matches DECAY_FACTOR
+const AGC_GAIN_MIN = 0.25
+const AGC_GAIN_MAX = 255
+// Matches the firmware's own agc_lvl menu item exactly: [1,14], default 4
+// (see usdxBLACKBRICK.ino's "agc_lvl" comment — "higher = louder output
+// before AGC clamps"). Target window (as a fraction of this app's [-1,1]
+// full-scale) is agcLevel/128 .. agcLevel*1.5/128, the same
+// agc_lvl*256/384-out-of-32768 relationship the firmware uses, just
+// re-expressed on a float scale instead of int16.
+export const AGC_LEVEL_MIN = 1
+export const AGC_LEVEL_MAX = 14
+export const AGC_LEVEL_DEFAULT = 4
+export class AGC {
+  private gain = 1
+  private decayCount = AGC_WINDOW_SAMPLES
+  private staySmall = true // true until any sample in the current window reaches the lower threshold
+  private lowerThreshold: number
+  private upperThreshold: number
+
+  constructor(agcLevel: number = AGC_LEVEL_DEFAULT) {
+    this.lowerThreshold = agcLevel / 128
+    this.upperThreshold = (agcLevel * 1.5) / 128
+  }
+
+  // Same "remembered until changed again" pattern as the other I/Q
+  // controls — does not reset gain/decay state, so adjusting the target
+  // mid-session doesn't cause an audible glitch, just a smoother retarget
+  // over the next few decay windows.
+  setLevel(agcLevel: number): void {
+    const clamped = Math.max(AGC_LEVEL_MIN, Math.min(AGC_LEVEL_MAX, agcLevel))
+    this.lowerThreshold = clamped / 128
+    this.upperThreshold = (clamped * 1.5) / 128
+  }
+
+  // samples: demodulated audio, modified in place.
+  process(samples: Float32Array): void {
+    for (let n = 0; n < samples.length; n++) {
+      const out = samples[n] * this.gain
+      samples[n] = out
+      const mag = Math.abs(out)
+
+      if (mag > this.upperThreshold) {
+        this.gain *= AGC_ATTACK_FACTOR // fast attack, every sample while over threshold
+      } else {
+        if (mag > this.lowerThreshold) this.staySmall = false
+        if (--this.decayCount === 0) {
+          if (this.staySmall) {
+            this.gain = Math.min(AGC_GAIN_MAX, this.gain * AGC_DECAY_UP_FACTOR)
+          } else if (this.gain > AGC_GAIN_MIN) {
+            this.gain = Math.max(AGC_GAIN_MIN, this.gain * AGC_DECAY_DOWN_FACTOR)
+          }
+          this.decayCount = AGC_WINDOW_SAMPLES
+          this.staySmall = true
+        }
+      }
+    }
+  }
+}
+
+// ── Spectral noise reduction ─────────────────────────────────────────────
+// FFT-overlap-add spectral subtraction on the DEMODULATED AUDIO — applied
+// after AGC/highpass (see playDemodulatedFrame()'s call site), the last
+// stage before playback/decode. This is NEW work, not a port: neither the
+// uSDX firmware nor jLynx/BrowSDR implement spectral/Wiener-style noise
+// reduction anywhere (confirmed directly against both — the firmware's own
+// "NR" levels are just fixed-cutoff audio-bandwidth narrowing, see
+// process_nr()'s own comment in usdxBLACKBRICK.ino; BrowSDR's DSP chain has
+// no noise-reduction stage at all beyond AGC/squelch/DC-blocking). This
+// fills a gap neither reference implementation covers.
+//
+// Algorithm (rewritten 2026-08-25 — see PER-FRAME MEDIAN note below for
+// why): overlap-add spectral subtraction against a PER-FRAME median noise
+// estimate, not a cross-frame minimum-statistics history —
+//   1. Frame the input into NR_FFT_SIZE-sample windows, NR_HOP_SIZE apart
+//      (50% overlap — NR_HOP_SIZE = NR_FFT_SIZE/2), each windowed with a
+//      Hann window. 50% overlap with a Hann window is the standard choice
+//      because summing two Hann-windowed, half-overlapped frames
+//      reconstructs a FLAT unity gain — no separate normalization step
+//      needed at the overlap-add stage.
+//   2. Forward FFT (reusing fftRadix2 above) to get a complex spectrum per
+//      frame.
+//   3. Take the MEDIAN magnitude across all bins in THIS SINGLE FRAME as
+//      the noise-floor estimate, scaled by NR_MEDIAN_MULT. No cross-frame
+//      history at all — every frame is normalized independently against
+//      its own median. This is a real, different failure-mode profile
+//      than the earlier minimum-statistics-over-time approach it replaces
+//      (see PER-FRAME MEDIAN note).
+//   4. Apply a Wiener-style gain per bin: gain = signalPower / (signalPower
+//      + noisePower), soft-floored at NR_GAIN_FLOOR rather than allowed to
+//      hit zero — a hard zero-gain bin is exactly what produces "musical
+//      noise" (isolated tone-like artifacts as bins randomly hit the noise
+//      floor and get muted then unmuted) — the classic, well-documented
+//      failure mode of naive spectral subtraction. The soft floor trades a
+//      little residual noise for avoiding that artifact entirely.
+//   5. Inverse FFT, re-window (Hann again — matched analysis/synthesis
+//      windowing, standard for overlap-add), overlap-add into the output.
+//
+// PER-FRAME MEDIAN, not cross-frame minimum-statistics: an earlier version
+// of this class tracked each bin's noise floor as the minimum magnitude
+// seen over a sliding history of past frames (the standard minimum-
+// statistics technique) — real-world testing (2026-08-25) found it made
+// live FT8 audio sound "eerie/blurred," and a synthetic multi-station
+// FT8-like signal (several simultaneous stations, each hopping among 8
+// tones roughly every 160ms) proved why: any bin carrying a SUSTAINED real
+// tone over several seconds eventually has its own recent history —
+// including its own tone — become the "minimum ever seen," so the
+// estimator's inflation factor pushed the inferred noise floor ABOVE the
+// tone's own magnitude, and the resulting decision-directed feedback loop
+// (needed to protect real signal from single-frame noise spikes) then
+// ground that bin's gain down toward zero over several seconds — a
+// continuous 700kHz-style test tone measured fine at 1 second in (matching
+// the OLD test suite's 1-second-duration check) but was crushed to ~15% of
+// its original amplitude by 15 seconds in, exactly FT8's own window
+// length. No tuning of that history/bias approach's constants fixed this
+// without also destroying its actual noise suppression (see
+// noiseReducer.test.ts's git history for the tuning sweep). A per-frame
+// median has no history to poison in the first place — verified directly
+// against both the original single-tone test AND the new multi-station
+// test, with STABLE tone preservation from 1 second through 15 seconds.
+const NR_FFT_SIZE = 1024
+const NR_HOP_SIZE = NR_FFT_SIZE / 2 // 50% overlap
+const NR_GAIN_FLOOR = 0.15 // soft floor — see algorithm step 4's comment on why this isn't 0
+// How far above the per-frame median a bin's magnitude must sit to read as
+// mostly-signal rather than mostly-noise — see noiseFloor()'s own comment.
+// Tuned empirically (noiseReducer.test.ts) against the synthetic
+// multi-station FT8-like signal (want: output RMS stays a healthy fraction
+// of input, i.e. real tone energy survives) and pure-noise-floor
+// suppression (want: a clear, measurable RMS reduction) simultaneously.
+const NR_MEDIAN_MULT = 3.0
+
+function hannWindow(n: number, size: number): number {
+  return 0.5 - 0.5 * Math.cos((2 * Math.PI * n) / (size - 1))
+}
+
+// In-place median of a Float64Array via a full sort — binCount is small
+// (513 for NR_FFT_SIZE=1024) and this runs once per hop (~10.7ms of audio
+// at 48kHz), not per-sample, so an O(n log n) sort here is negligible next
+// to the FFT this class already does every frame.
+function median(sorted: Float64Array): number {
+  sorted.sort()
+  const mid = sorted.length >> 1
+  return sorted.length % 2 === 1 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2
+}
+
+export class NoiseReducer {
+  private readonly window = new Float64Array(NR_FFT_SIZE)
+  // Analysis frame buffer — holds the last NR_FFT_SIZE samples seen, laid
+  // out oldest-first. Since a new frame is only ever assembled once a full
+  // NR_HOP_SIZE (= NR_FFT_SIZE/2) of new samples has arrived, this can be
+  // rebuilt each time by keeping the OLD frame's second half (which is
+  // exactly the previous hop's new samples) and appending the new hop's
+  // samples — two Float64Array.set() block copies per frame, not a
+  // per-sample shift (an earlier draft of this class shifted the whole
+  // buffer one sample at a time here, an O(N) operation PER INPUT SAMPLE
+  // — O(N²) overall for a 1024-sample frame, easily 10s of millions of
+  // wasted array-copy operations per second of real audio; caught before
+  // this ever ran against real audio, fixed by only ever moving whole
+  // half-frame blocks).
+  private inputBuf = new Float64Array(NR_FFT_SIZE)
+  // Accumulates new samples until a full hop is ready to assemble a frame.
+  private readonly pendingHop = new Float64Array(NR_HOP_SIZE)
+  private pendingFill = 0
+  // Output overlap-add accumulator — one frame's inverse-FFT result is
+  // added into this buffer at the current write position, then
+  // NR_HOP_SIZE samples are drained from the front once ready.
+  private outputAcc = new Float64Array(NR_FFT_SIZE)
+  private readonly binCount = NR_FFT_SIZE / 2 + 1 // real-signal FFT has this many independent bins (0..Nyquist)
+  // Scratch buffer for this frame's per-bin magnitudes, indexed by bin —
+  // read back by processFrame()'s second loop, so must survive
+  // noiseFloor()'s median() call unmodified.
+  private readonly magScratch = new Float64Array(this.binCount)
+  // Separate scratch median() actually sorts in place — kept distinct from
+  // magScratch (a copy taken each frame) specifically so sorting for the
+  // median doesn't scramble magScratch's bin-index ordering, which the
+  // second loop still needs.
+  private readonly sortScratch = new Float64Array(this.binCount)
+
+  private readonly fftRe = new Float64Array(NR_FFT_SIZE)
+  private readonly fftIm = new Float64Array(NR_FFT_SIZE)
+
+  constructor() {
+    for (let n = 0; n < NR_FFT_SIZE; n++) this.window[n] = hannWindow(n, NR_FFT_SIZE)
+  }
+
+  // Estimates THIS FRAME's noise floor as the median magnitude across all
+  // bins, scaled by NR_MEDIAN_MULT — see this section's header comment for
+  // why per-frame median replaced the earlier cross-frame minimum-
+  // statistics approach. A multiplier above 1 is needed because the raw
+  // median alone barely suppresses stationary noise at all (roughly half
+  // of any bin population sits above its own median by definition) — a
+  // bin sitting exactly AT the median reads as "typical for this
+  // instant," not automatically "real signal," so gain needs the
+  // multiplier's headroom before the Wiener formula meaningfully favors
+  // passing a bin through.
+  private noiseFloor(): number {
+    this.sortScratch.set(this.magScratch)
+    return median(this.sortScratch) * NR_MEDIAN_MULT
+  }
+
+  private processFrame(): void {
+    // Analysis: window the current NR_FFT_SIZE input frame, forward FFT.
+    for (let n = 0; n < NR_FFT_SIZE; n++) {
+      this.fftRe[n] = this.inputBuf[n] * this.window[n]
+      this.fftIm[n] = 0
+    }
+    fftRadix2(this.fftRe, this.fftIm)
+
+    // Only the independent bins (0..Nyquist) need computing; bin k's
+    // magnitude mirrors bin (N-k) for a real input, and fftRadix2 leaves
+    // that conjugate symmetry intact automatically since fftIm started at
+    // 0. Magnitudes are computed once up front (into magScratch) so
+    // noiseFloor() can take THIS FRAME's median before any bin's gain is
+    // applied — order matters: applying gain to fftRe/fftIm in the same
+    // pass would corrupt later bins' magnitude if read from there instead.
+    for (let bin = 0; bin < this.binCount; bin++) {
+      const re = this.fftRe[bin]
+      const im = this.fftIm[bin]
+      this.magScratch[bin] = Math.sqrt(re * re + im * im)
+    }
+    const noiseMag = this.noiseFloor()
+    const noisePower = noiseMag * noiseMag
+
+    for (let bin = 0; bin < this.binCount; bin++) {
+      const mag = this.magScratch[bin]
+      const signalPower = mag * mag
+      // Wiener gain: gain = signalPower / (signalPower + noisePower) ==
+      // snr / (1 + snr) — no cross-frame smoothing needed (see this
+      // section's header comment for why a per-frame estimate replaced
+      // the earlier decision-directed approach entirely, not just its
+      // bias constant).
+      const snr = noisePower > 0 ? signalPower / noisePower : signalPower > 0 ? Infinity : 0
+      const rawGain = snr / (1 + snr)
+      // Floor applied only to the gain actually used to scale this bin —
+      // see algorithm step 4's comment on why 0 would be wrong here.
+      const gain = NR_GAIN_FLOOR + (1 - NR_GAIN_FLOOR) * rawGain
+
+      this.fftRe[bin] *= gain
+      this.fftIm[bin] *= gain
+      if (bin > 0 && bin < NR_FFT_SIZE - bin) {
+        // Mirror bin (conjugate) — keep the inverse FFT's output real by
+        // applying the SAME real-valued gain to both halves of the pair.
+        const mirror = NR_FFT_SIZE - bin
+        this.fftRe[mirror] *= gain
+        this.fftIm[mirror] *= gain
+      }
+    }
+
+    // Synthesis: inverse FFT (conjugate trick: forward-FFT the conjugated
+    // spectrum, conjugate and scale the result — avoids a second,
+    // separately-tested inverse-transform implementation), re-window, and
+    // overlap-add into the output accumulator.
+    for (let n = 0; n < NR_FFT_SIZE; n++) this.fftIm[n] = -this.fftIm[n]
+    fftRadix2(this.fftRe, this.fftIm)
+    for (let n = 0; n < NR_FFT_SIZE; n++) {
+      const sample = (this.fftRe[n] / NR_FFT_SIZE) * this.window[n]
+      this.outputAcc[n] += sample
+    }
+  }
+
+  // samples: demodulated audio (post-AGC/highpass). Returns a NEW
+  // Float32Array of however many fully-reconstructed output samples are
+  // ready this call — 0 length is normal (and expected on early calls,
+  // before the first NR_FFT_SIZE-sample frame has even accumulated) since
+  // this stage adds real latency, same as any block-based FFT technique.
+  // Return type explicitly pinned to Float32Array<ArrayBuffer> — the
+  // underlying array is always constructed via `new Float32Array(number)`
+  // (see maxOutLen below), which TypeScript's own typed-array constructor
+  // overload types as exactly this, but .subarray()'s return type widens
+  // to the more general ArrayBufferLike-backed form regardless of what it
+  // was actually called on. AudioBuffer.copyToChannel() (this class's only
+  // real caller, via playDemodulatedFrame()) requires the narrower type.
+  process(samples: Float32Array): Float32Array<ArrayBuffer> {
+    // Pre-allocated against the worst case (a hop fully completes on
+    // every single input sample) rather than an unbounded number[] +
+    // Float32Array conversion at the end — that intermediate array both
+    // costs an extra allocation/boxing pass AND (the reason this changed)
+    // produces a Float32Array backed by a plain ArrayBufferLike, not the
+    // concrete ArrayBuffer type AudioBuffer.copyToChannel() requires,
+    // which TypeScript's typed-array generics now distinguish.
+    const maxOutLen = Math.ceil(samples.length / NR_HOP_SIZE) * NR_HOP_SIZE
+    const out = new Float32Array(maxOutLen)
+    let outLen = 0
+
+    let offset = 0
+    while (offset < samples.length) {
+      const take = Math.min(NR_HOP_SIZE - this.pendingFill, samples.length - offset)
+      for (let i = 0; i < take; i++) this.pendingHop[this.pendingFill + i] = samples[offset + i]
+      this.pendingFill += take
+      offset += take
+
+      if (this.pendingFill >= NR_HOP_SIZE) {
+        this.pendingFill = 0
+        // Assemble the new analysis frame: the OLD frame's second half
+        // (already exactly the previous hop's samples) becomes the new
+        // frame's first half, and this hop's new samples become the
+        // second half — two block copies, no per-sample work.
+        this.inputBuf.copyWithin(0, NR_HOP_SIZE)
+        for (let i = 0; i < NR_HOP_SIZE; i++) this.inputBuf[NR_HOP_SIZE + i] = this.pendingHop[i]
+
+        this.processFrame()
+        // Drain the first NR_HOP_SIZE samples of the overlap-add
+        // accumulator — those positions have now received their full
+        // contribution from every overlapping frame (this frame's tail
+        // half, and the previous frame's head half), and shift the
+        // remainder down to make room for the next frame's contribution.
+        for (let n = 0; n < NR_HOP_SIZE; n++) out[outLen + n] = this.outputAcc[n]
+        outLen += NR_HOP_SIZE
+        this.outputAcc.copyWithin(0, NR_HOP_SIZE)
+        this.outputAcc.fill(0, NR_FFT_SIZE - NR_HOP_SIZE)
+      }
+    }
+    return out.subarray(0, outLen)
+  }
+}
+
 // ── FIR filter math — ported from jLynx/BrowSDR (github.com/jLynx/BrowSDR),
 // src/client/worker/dsp-pipeline.ts, itself modeled on SDR++'s dsp/taps &
 // dsp/window. Copyright (c) 2026, jLynx <https://github.com/jLynx>; BSD-3-
@@ -528,6 +1021,25 @@ export const lowPassTaps = (cutoff: number, transWidth: number, samplerate: numb
   const count = estimateTapCount(transWidth, samplerate)
   const omega = hzToRads(cutoff, samplerate)
   return windowedSincBase(count, omega, (n, N) => nuttall(n, N))
+}
+
+// Spectral inversion of a lowpass kernel — negate every tap, then add 1 to
+// the CENTER tap (a highpass = an all-pass delta minus the lowpass; the
+// delta is 1 at the center sample, 0 elsewhere). Same technique BrowSDR
+// uses for its own highpass — deferred in this app's earlier BrowSDR
+// import pass ("hold off until the FIR rewrite is stable"), unblocked now
+// that FIRFilter has been in production a while. Requires an ODD tap
+// count so there's a single unambiguous center index — lowPassTaps'
+// estimateTapCount() has no odd/even guarantee, so this bumps by one if
+// needed (harmless: one extra tap is immaterial to the filter's shape).
+export const highPassTaps = (cutoff: number, transWidth: number, samplerate: number): Float64Array => {
+  const low = lowPassTaps(cutoff, transWidth, samplerate)
+  const count = low.length % 2 === 1 ? low.length : low.length + 1
+  const omega = hzToRads(cutoff, samplerate)
+  const taps = windowedSincBase(count, omega, (n, N) => nuttall(n, N))
+  for (let i = 0; i < taps.length; i++) taps[i] = -taps[i]
+  taps[(taps.length - 1) / 2] += 1
+  return taps
 }
 
 // Genuinely causal, per-sample FIR — see this section's header comment for
@@ -643,6 +1155,12 @@ function buildDelayTaps(count: number): Float64Array {
 }
 const HILBERT_TAPS = 129 // odd; ~64-tap-equivalent transition band either side, plenty for a 2.7kHz-ish SSB passband well under any of this bridge's I/Q sample rates
 
+// Fixed transition-band width for the passband lowpass — see
+// SSBDemodulator.setPassband()'s comment for why this is an absolute Hz
+// value (not scaled to the requested bandwidth) and why it's placed AFTER
+// the requested edge rather than centered on it.
+const PASSBAND_GUARD_HZ = 300
+
 export class SSBDemodulator {
   private centerHz = 0
   private bandwidthHz = 2700 // a typical SSB voice passband width; overridden by setPassband()
@@ -653,6 +1171,20 @@ export class SSBDemodulator {
   private lowpassQ = new FIRFilter()
   private hilbertDelay = new FIRFilter(buildDelayTaps(HILBERT_TAPS))
   private hilbertQ = new FIRFilter(buildHilbertTaps(HILBERT_TAPS))
+  // Applied to the DEMODULATED AUDIO (post-combine), matching the uSDX
+  // radio firmware's own filt_var stage — a fixed 300Hz highpass corner
+  // (usdxBLACKBRICK.ino). Off by default here (see loadHighpassEnabled()'s
+  // comment) — this app has no voice mode, and real-signal testing found
+  // this cutting genuine FT8/digital tone content, not just DC/hum. Built
+  // via highPassTaps' spectral inversion of the SAME lowPassTaps machinery
+  // already used for the main passband filter — see that function's own
+  // comment for why this was deferred until now. The literal default below
+  // is immediately overridden by useIQBridge()'s own
+  // setHighpassEnabled(loadHighpassEnabled()) call at construction; kept
+  // false here too so this class's OWN default matches, in case anything
+  // ever constructs one directly without going through that hook.
+  private highpass = new FIRFilter()
+  private highpassEnabled = false
 
   // centerHz: how far the desired signal sits from the I/Q capture's own
   // 0Hz (baseband) center — positive/negative, driven by dragging the
@@ -664,24 +1196,48 @@ export class SSBDemodulator {
     if (bw === this.bandwidthHz && sampleRateHz === this.lowpassSampleRateHz) return
     this.bandwidthHz = bw
     this.lowpassSampleRateHz = sampleRateHz
-    // Cutoff at HALF the requested bandwidth (a lowpass from -bw/2..+bw/2
-    // around the mixed-to-zero center) — same convention as before this
-    // rewrite. transWidth (BrowSDR's estimateTapCount() input) set equal
-    // to the cutoff itself (a 100%-relative transition width) — a real
-    // bug was found and fixed here: an earlier attempt at 10% of the
+    // Cutoff at the FULL requested bandwidth, not half of it. This is a
+    // phasing-method SSB demod: after the complex mixer shifts centerHz to
+    // baseband 0Hz, the desired sideband's audio content occupies baseband
+    // 0Hz..+bw (or 0Hz..-bw for LSB) — entirely on ONE side of zero, not
+    // split symmetrically around it the way a DSB/AM signal would be. A
+    // real bug lived here: this filter used to cut off at bw/2, which — for
+    // a 3000Hz-wide passband — meant baseband content above +1500Hz (i.e.
+    // audio above 1500Hz post-demod) was already deep in the transition
+    // band or fully attenuated, silently capping every mode's decoded
+    // audio bandwidth at roughly half of whatever width was configured
+    // regardless of the per-mode default (see App.tsx's
+    // IQ_PASSBAND_DEFAULTS) or this control's own Width field.
+    //
+    // transWidth is a FIXED absolute guard band (PASSBAND_GUARD_HZ),
+    // placed just past the edge, rather than scaled relative to the
+    // cutoff itself. A relative transition width (tried previously, see
+    // below) makes sense for a voice/SSB passband, where a soft several-
+    // hundred-Hz rolloff right at the nominal edge is inaudible and not
+    // decode-relevant. It's the wrong shape for FT8/MFSK: many
+    // simultaneous weak stations are decoded from tones spread across the
+    // WHOLE nominal passband (down to real signals right at the edge WSJT-
+    // X-style software tunes to), so a transition band that eats into the
+    // last 30-50% of the passband (as `transWidth == cutoff` did) tilts
+    // decode sensitivity against exactly the weak/edge signals a wideband
+    // digital-mode passband exists to capture. Anchoring the guard band
+    // AFTER bw instead keeps the entire requested passband flat to within
+    // a few hundredths of a dB and pushes all the rolloff into a narrow
+    // guard strip the operator never asked to receive in the first place.
+    // A fixed (not bw-relative) guard also keeps tap count — and therefore
+    // settling time — from scaling with bw: at 96kHz, this comes out to
+    // ~1200 taps / ~12.5ms regardless of whether bw is CW's 500Hz or FT's
+    // 3000Hz, comfortably inside this app's ~50ms/2400-sample frame
+    // cadence (the constraint that ruled out an EARLIER, since-superseded
+    // attempt at a relative transition width here: 10% of the old bw/2
     // cutoff produced estimateTapCount(135, 48000) = 1351 taps for a
-    // typical 2700Hz-wide SSB passband, whose filter settling time (many
-    // tens of thousands of samples for a sinc this long) is far longer
-    // than this app's ~50ms/2400-sample processing frames — the
-    // demodulated audio never actually reached steady state in normal
-    // operation, which is exactly the kind of "sounds thin/cuts out"
-    // symptom this whole rewrite was meant to fix, not reproduce with a
-    // different mechanism. 100%-relative transition width keeps the tap
-    // count in the same ballpark (~130-270 taps across this app's typical
-    // 8-96kHz sample rates) as the pre-rewrite hand-rolled filter (65-129
-    // taps), which was known to settle acceptably fast.
-    const cutoffHz = bw / 2
-    const taps = lowPassTaps(cutoffHz, cutoffHz, sampleRateHz)
+    // typical 2700Hz-wide SSB passband, whose settling time — many tens of
+    // thousands of samples for a sinc that long — badly exceeded one
+    // frame, which is why a relative width was adopted in the first place;
+    // a FIXED guard sidesteps that failure mode entirely instead of
+    // reproducing it at a different ratio).
+    const cutoffHz = bw + PASSBAND_GUARD_HZ / 2
+    const taps = lowPassTaps(cutoffHz, PASSBAND_GUARD_HZ, sampleRateHz)
     this.lowpassI.setTaps(taps)
     // Q needs its OWN FIRFilter instance (not the same taps object shared
     // by reference issue — setTaps() already copies into a fresh history
@@ -689,6 +1245,16 @@ export class SSBDemodulator {
     // independent of I's, even though the tap coefficients themselves are
     // identical real values applied to both rails.
     this.lowpassQ.setTaps(taps)
+    // 300Hz highpass, same fixed corner as the uSDX firmware's own
+    // filt_var stage — see this.highpass's own comment. transWidth equal
+    // to the cutoff itself, same 100%-relative reasoning as the lowpass
+    // above (a narrow transition here would need a very long kernel for
+    // essentially no audible benefit at this specific corner).
+    this.highpass.setTaps(highPassTaps(300, 300, sampleRateHz))
+  }
+
+  setHighpassEnabled(enabled: boolean): void {
+    this.highpassEnabled = enabled
   }
 
   // sideband: true = USB, false = LSB — matches the uSDX's own mode==USB
@@ -731,7 +1297,8 @@ export class SSBDemodulator {
       // Hilbert(Q), sign by sideband.
       const delayedI = this.hilbertDelay.processOne(filtI)
       const hilbertQ = this.hilbertQ.processOne(filtQ)
-      out[n] = delayedI + sign * hilbertQ
+      const combined = delayedI + sign * hilbertQ
+      out[n] = this.highpassEnabled ? this.highpass.processOne(combined) : combined
     }
 
     // Wrap to keep phase from growing unbounded over a long-running session
@@ -745,18 +1312,24 @@ export class SSBDemodulator {
 export function useIQBridge() {
   const [state, setState] = createSignal<IQBridgeState>({
     connected: false,
+    reconnecting: false,
     inputMode: 'audio',
     sampleRateHz: FALLBACK_SAMPLE_RATE,
     lastFramePairs: 0,
-    passbandCenterHz: 0,
-    passbandBandwidthHz: 2700,
+    passbandCenterHz: loadPassbandCenterHz() ?? 0,
+    passbandBandwidthHz: loadPassbandBandwidthHz() ?? 2700,
     error: null,
     playThroughSpeakers: loadPlayThroughSpeakers(),
     iqCorrection: loadIQCorrection(),
     dcRemovalEnabled: loadDCRemoval(),
     imbalanceCorrectionEnabled: loadImbalanceCorrection(),
+    agcEnabled: loadAGCEnabled(),
+    agcLevel: loadAGCLevel(),
+    highpassEnabled: loadHighpassEnabled(),
+    noiseReducerEnabled: loadNoiseReducerEnabled(),
     forceIQMode: loadForceIQMode(),
     forceSampleRateHz: loadForceSampleRateHz(),
+    iqSignalDbfs: null,
   })
 
   let ws: WebSocket | null = null
@@ -764,6 +1337,8 @@ export function useIQBridge() {
   const demod = new SSBDemodulator()
   const dcRemover = new DCRemover()
   const imbalanceCorrector = new ImbalanceCorrector()
+  const agc = new AGC(loadAGCLevel())
+  const noiseReducer = new NoiseReducer()
 
   // Applied to every incoming frame before either the spectrum display or
   // the demodulator sees it — see onmessage's own comment for exactly
@@ -796,6 +1371,34 @@ export function useIQBridge() {
     saveImbalanceCorrection(enabled)
     setState((s) => ({ ...s, imbalanceCorrectionEnabled: enabled }))
   }
+  // Applied to demodulated AUDIO, not raw I/Q (see loadAGCEnabled()'s own
+  // comment for why it defaults OFF) — independent of the three above,
+  // which all operate on I/Q.
+  let agcEnabled = loadAGCEnabled()
+  function setAGCEnabled(enabled: boolean) {
+    agcEnabled = enabled
+    saveAGCEnabled(enabled)
+    setState((s) => ({ ...s, agcEnabled: enabled }))
+  }
+  // See AGC.setLevel()'s comment — [1,14], matching the radio's own AGC
+  // Level control.
+  function setAGCLevel(level: number) {
+    agc.setLevel(level)
+    saveAGCLevel(level)
+    setState((s) => ({ ...s, agcLevel: Math.max(AGC_LEVEL_MIN, Math.min(AGC_LEVEL_MAX, level)) }))
+  }
+  demod.setHighpassEnabled(loadHighpassEnabled())
+  function setHighpassEnabled(enabled: boolean) {
+    demod.setHighpassEnabled(enabled)
+    saveHighpassEnabled(enabled)
+    setState((s) => ({ ...s, highpassEnabled: enabled }))
+  }
+  let noiseReducerEnabled = loadNoiseReducerEnabled()
+  function setNoiseReducerEnabled(enabled: boolean) {
+    noiseReducerEnabled = enabled
+    saveNoiseReducerEnabled(enabled)
+    setState((s) => ({ ...s, noiseReducerEnabled: enabled }))
+  }
 
   // USB unless told otherwise — see setCatMode()/SSBDemodulator's own
   // comment on why CW/RTTY/AM/FM all fall back to the USB branch here.
@@ -808,8 +1411,16 @@ export function useIQBridge() {
   // Driven by SignalAnalysisPanel's draggable bandwidth marker in I/Q mode
   // — centerHz is the marker's offset from the I/Q capture's own 0Hz
   // (baseband) center, bandwidthHz its width. See SSBDemodulator.setPassband().
+  // Persisted across reloads (see savePassbandCenterHz/BandwidthHz's own
+  // comment) — seed demod with the SAME persisted values state() already
+  // initialized from, so the demodulator and the reactive marker position
+  // agree from the very first frame instead of only syncing once the
+  // operator drags the marker again after a reload.
+  demod.setPassband(state().passbandCenterHz, state().passbandBandwidthHz, state().sampleRateHz)
   function setPassband(centerHz: number, bandwidthHz: number) {
     demod.setPassband(centerHz, bandwidthHz, state().sampleRateHz)
+    savePassbandCenterHz(centerHz)
+    savePassbandBandwidthHz(bandwidthHz)
     setState((s) => ({ ...s, passbandCenterHz: centerHz, passbandBandwidthHz: bandwidthHz }))
   }
 
@@ -843,10 +1454,42 @@ export function useIQBridge() {
     nextPlayTime = 0
   }
 
+  // Peak-hold with exponential decay, same shape as the uSDX firmware's own
+  // max_absavg256 (see usdxBLACKBRICK.ino's smeter()) but on a real-time
+  // decay per call rather than a fixed sample-count cadence, since this
+  // runs once per received I/Q frame (frame size varies with the bridge's
+  // configured sample rate) rather than once per audio sample. Holds the
+  // peak briefly so a short burst (a few characters of CW/data) is still
+  // readable rather than needing a continuous tone to register, then decays
+  // back down so a meter reading from ten seconds ago doesn't linger.
+  let meterPeakRms = 0
+  function updateSignalMeter(samples: Float32Array): void {
+    let sumSq = 0
+    for (let i = 0; i < samples.length; i++) sumSq += samples[i] * samples[i]
+    const rms = Math.sqrt(sumSq / samples.length)
+    meterPeakRms = Math.max(rms, meterPeakRms * 0.85)
+    const dbfs = 20 * Math.log10(Math.max(meterPeakRms, 1e-9))
+    setState((s) => ({ ...s, iqSignalDbfs: dbfs }))
+  }
+
   function playDemodulatedFrame(iq: Float64Array, sampleRateHz: number) {
     if (!playCtx) return
-    const floatSamples = demod.demodulate(iq, sideband, sampleRateHz)
+    let floatSamples: Float32Array<ArrayBuffer> = demod.demodulate(iq, sideband, sampleRateHz)
     if (floatSamples.length === 0) return
+    updateSignalMeter(floatSamples)
+    if (agcEnabled) agc.process(floatSamples)
+    // Last stage — see NoiseReducer's own header comment. Its
+    // FFT-overlap-add pipeline is BLOCK-based, not per-sample like every
+    // stage before it: a given call's input rarely lines up exactly with
+    // one internal analysis frame, so the number of samples it actually
+    // has ready to emit varies call to call — often 0 (still
+    // accumulating), sometimes a full block at once. Skip playback
+    // entirely for a call that has nothing ready yet, same as the
+    // existing "floatSamples.length === 0" guard above.
+    if (noiseReducerEnabled) {
+      floatSamples = noiseReducer.process(floatSamples)
+      if (floatSamples.length === 0) return
+    }
 
     const buffer = playCtx.createBuffer(1, floatSamples.length, sampleRateHz)
     buffer.copyToChannel(floatSamples, 0)
@@ -881,6 +1524,36 @@ export function useIQBridge() {
     }
   }
 
+  // Silence watchdog — a plain receive-only WebSocket has no way to notice
+  // the PEER died without a clean close handshake, which an ESP32 reboot
+  // (power blip, watchdog reset, crash) never performs: no FIN/RST is ever
+  // sent, so the browser's TCP stack can sit on a half-open socket for
+  // MINUTES before onclose fires on its own — confirmed as the actual
+  // cause of "I/Q never shows reconnecting" (CAT's own reconnect works
+  // because its poll loop actively sends requests and times out waiting
+  // for a reply; this socket only ever passively waits for data). Frames
+  // normally arrive every ~50ms, so IQ_SILENCE_TIMEOUT_MS is a generous
+  // multiple of that — comfortably above any real jitter this investigation
+  // measured (worst case ~340ms) but far below "wait for the OS to notice."
+  // Resets on every message; if it ever fires, force-closing the socket is
+  // enough — that alone triggers the SAME onclose/reconnect path a real
+  // network-level close would, so no separate reconnect logic is needed.
+  const IQ_SILENCE_TIMEOUT_MS = 5000
+  let silenceTimer: ReturnType<typeof setTimeout> | null = null
+  function clearSilenceTimer() {
+    if (silenceTimer !== null) {
+      clearTimeout(silenceTimer)
+      silenceTimer = null
+    }
+  }
+  function armSilenceTimer(socket: WebSocket) {
+    clearSilenceTimer()
+    silenceTimer = setTimeout(() => {
+      log('warn', `no I/Q frame in ${IQ_SILENCE_TIMEOUT_MS}ms — assuming the connection is dead, forcing reconnect`)
+      socket.close() // triggers onclose, which does the actual reconnect scheduling
+    }, IQ_SILENCE_TIMEOUT_MS)
+  }
+
   // Same exponential backoff as useAudioBridge.ts/useRadioCAT.ts — see
   // either file's comment for the real-hardware retry-storm history this
   // prevents. A THIRD socket sharing this pattern independently (rather
@@ -898,12 +1571,24 @@ export function useIQBridge() {
     wantConnected = false
     connectGeneration++
     reconnectAttempt = 0
+    hasConnectedOnce = false
     clearReconnectTimer()
+    clearSilenceTimer()
     ws?.close()
     ws = null
     teardownPlayback()
-    setState((s) => ({ ...s, connected: false, lastFramePairs: 0 }))
+    meterPeakRms = 0
+    setState((s) => ({ ...s, connected: false, reconnecting: false, lastFramePairs: 0, iqSignalDbfs: null }))
   }
+
+  // True once this connect() session's socket has opened successfully at
+  // least once — see IQBridgeState.reconnecting's comment for why this is
+  // tracked separately from wantConnected: the FIRST connect attempt
+  // failing is an ordinary "couldn't connect" case (surfaced via `error`),
+  // not a "was working, now reconnecting" case, even though both look
+  // identical from onclose's point of view (wantConnected is true, the
+  // socket just closed) without this flag.
+  let hasConnectedOnce = false
 
   function openSocket(iqUrl: string, catWsUrl: string, generation: number, resolveFirstAttempt?: (ok: boolean) => void) {
     void fetchBridgeIQInfo(catWsUrl).then(({ inputMode, sampleRateHz }) => {
@@ -923,24 +1608,20 @@ export function useIQBridge() {
       if (generation !== connectGeneration) return
       log('info', `connected — ${iqUrl}`)
       reconnectAttempt = 0
+      hasConnectedOnce = true
       ws = socket
-      teardownPlayback()
-      playCtx = new AudioContext()
-      playAnalyserNode = playCtx.createAnalyser()
-      playAnalyserNode.fftSize = 2048
-      // playAnalyserNode itself is NOT connected to playCtx.destination —
-      // unlike useAudioBridge.ts's "Listen to Radio" (whose whole point is
-      // speaker output), THIS graph primarily exists to feed decoders (via
-      // getPlaybackSource()) and hasFramePairs-style liveness. An
-      // AnalyserNode reads its input whether or not it's connected onward,
-      // so decoders/visualizers tapping it here still work regardless of
-      // the speaker path below. speakersGainNode is the optional, muted-
-      // by-default speaker tap — see setPlayThroughSpeakers().
-      speakersGainNode = playCtx.createGain()
-      speakersGainNode.gain.value = speakersOn ? 1 : 0
-      playAnalyserNode.connect(speakersGainNode)
-      speakersGainNode.connect(playCtx.destination)
-      setState((s) => ({ ...s, connected: true, error: null }))
+      // playCtx/playAnalyserNode/speakersGainNode are built once in
+      // connect(), NOT recreated here on every (re)open — see connect()'s
+      // own comment for why. This graph primarily exists to feed decoders
+      // (via getPlaybackSource()) and hasFramePairs-style liveness, which
+      // is also why playAnalyserNode isn't wired straight to
+      // playCtx.destination the way useAudioBridge.ts's "Listen to Radio"
+      // graph is: an AnalyserNode reads its input whether or not it's
+      // connected onward, so decoders/visualizers tapping it work
+      // regardless of the speaker path — speakersGainNode is the optional,
+      // muted-by-default speaker tap (see setPlayThroughSpeakers()).
+      armSilenceTimer(socket)
+      setState((s) => ({ ...s, connected: true, reconnecting: false, error: null }))
       resolveFirstAttempt?.(true)
     }
     socket.onerror = () => {
@@ -951,17 +1632,29 @@ export function useIQBridge() {
     }
     socket.onclose = () => {
       if (generation !== connectGeneration) return
+      clearSilenceTimer()
       const delay = Math.min(RECONNECT_BASE_DELAY_MS * 2 ** reconnectAttempt, RECONNECT_MAX_DELAY_MS)
       log('info', `closed — ${iqUrl}${wantConnected ? `, retrying in ${delay}ms (attempt ${reconnectAttempt + 1})` : ''}`)
       ws = null
-      setState((s) => ({ ...s, connected: false, lastFramePairs: 0 }))
+      // See IQBridgeState.reconnecting's comment — only true once this
+      // session has actually connected before; a still-failing FIRST
+      // attempt keeps reconnecting false so the UI shows the plain
+      // "not connected"/error state instead.
+      setState((s) => ({ ...s, connected: false, reconnecting: wantConnected && hasConnectedOnce, lastFramePairs: 0 }))
       if (!wantConnected) return
+      // Keep retrying — the operator asked to decode and hasn't said
+      // otherwise; a reboot/hiccup shouldn't require reloading the whole
+      // page. playCtx/playAnalyserNode are left alone (not torn down —
+      // see connect()'s comment) so any decoder holding a reference via
+      // getPlaybackSource() keeps working once we reopen; onmessage just
+      // has nothing to feed it until then.
       clearReconnectTimer()
       reconnectAttempt++
       reconnectTimer = setTimeout(() => openSocket(iqUrl, catWsUrl, generation), delay)
     }
     socket.onmessage = (ev: MessageEvent<ArrayBuffer>) => {
       if (generation !== connectGeneration) return
+      armSilenceTimer(socket)
       if (!(ev.data instanceof ArrayBuffer)) return
       const int16 = new Int16Array(ev.data)
       // Convert to float once, here, then run every correction stage on
@@ -1014,6 +1707,31 @@ export function useIQBridge() {
     }
     log('info', `connecting — ${iqUrl}`)
     wantConnected = true
+
+    // Built ONCE here, not in openSocket()'s onopen — see that handler's
+    // own comment for the real bug this fixes: a decoder that calls
+    // getPlaybackSource() (via acquireBridgeSource()) captures this
+    // ctx/node pair once, at decode-start, and holds onto it for its whole
+    // session. Recreating them on every reconnect (the previous behavior)
+    // left that decoder silently pointing at a closed AudioContext after
+    // any bridge reboot/Wi-Fi hiccup — the UI still showed "connected"
+    // once the socket reopened, but no audio ever reached the decoder
+    // again without a full page reload. Matches useAudioBridge.ts's own
+    // connect()/onclose split, which already gets this right.
+    try {
+      playCtx = new AudioContext()
+      playAnalyserNode = playCtx.createAnalyser()
+      playAnalyserNode.fftSize = 2048
+      speakersGainNode = playCtx.createGain()
+      speakersGainNode.gain.value = speakersOn ? 1 : 0
+      playAnalyserNode.connect(speakersGainNode)
+      speakersGainNode.connect(playCtx.destination)
+    } catch (err) {
+      log('error', 'AudioContext creation failed:', err)
+      setState((s) => ({ ...s, error: err instanceof Error ? err.message : 'AudioContext failed' }))
+      return false
+    }
+
     const generation = connectGeneration
     return new Promise((resolve) => openSocket(iqUrl, catWsUrl, generation, resolve))
   }
@@ -1090,7 +1808,7 @@ export function useIQBridge() {
   return {
     state, connect, disconnect, refreshInfo, spectrum, setCatMode, setPassband, getPlaybackSource,
     setPlayThroughSpeakers, setIQCorrection, setDCRemoval, setImbalanceCorrection, setForceIQMode,
-    setForceSampleRateHz,
+    setForceSampleRateHz, setAGCEnabled, setAGCLevel, setHighpassEnabled, setNoiseReducerEnabled,
   }
 }
 

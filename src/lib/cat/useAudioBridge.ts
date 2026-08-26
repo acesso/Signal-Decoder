@@ -358,7 +358,7 @@ export function downsampleBandlimited(
   return new Float32Array(out)
 }
 
-function floatToInt16(samples: Float32Array<ArrayBufferLike>): Int16Array<ArrayBuffer> {
+export function floatToInt16(samples: Float32Array<ArrayBufferLike>): Int16Array<ArrayBuffer> {
   const out = new Int16Array(samples.length)
   for (let i = 0; i < samples.length; i++) {
     const clamped = Math.max(-1, Math.min(1, samples[i]))
@@ -420,6 +420,12 @@ export function micStopAllowed(currentOwner: MicOwner | null, requiredOwner?: Mi
 
 export interface AudioBridgeState {
   connected: boolean
+  // True while a PREVIOUSLY-connected socket has dropped and an automatic
+  // reconnect is scheduled/in flight (see openSocket()'s onclose) — see
+  // useIQBridge.ts's identical field for the full reasoning (distinct from
+  // !connected, which is also true for an ordinary not-yet-connected or
+  // genuinely-failed state).
+  reconnecting: boolean
   micActive: boolean
   micOwner: MicOwner | null
   playbackActive: boolean
@@ -431,6 +437,7 @@ export interface AudioBridgeState {
 export function useAudioBridge() {
   const [state, setState] = createSignal<AudioBridgeState>({
     connected: false,
+    reconnecting: false,
     micActive: false,
     micOwner: null,
     playbackActive: false,
@@ -488,11 +495,35 @@ export function useAudioBridge() {
     }
   }
 
+  // Silence watchdog — see useIQBridge.ts's identical field for the full
+  // reasoning (a receive-only WebSocket's onclose doesn't reliably fire
+  // when the ESP32 reboots without a clean close handshake; frames going
+  // silent for AUDIO_SILENCE_TIMEOUT_MS is what actually proves the
+  // connection is dead). /audio's frame cadence matches /iq-data's
+  // (~50ms), so the same timeout value applies.
+  const AUDIO_SILENCE_TIMEOUT_MS = 5000
+  let silenceTimer: ReturnType<typeof setTimeout> | null = null
+  function clearSilenceTimer() {
+    if (silenceTimer !== null) {
+      clearTimeout(silenceTimer)
+      silenceTimer = null
+    }
+  }
+  function armSilenceTimer(socket: WebSocket) {
+    clearSilenceTimer()
+    silenceTimer = setTimeout(() => {
+      log('warn', `no audio frame in ${AUDIO_SILENCE_TIMEOUT_MS}ms — assuming the connection is dead, forcing reconnect`)
+      socket.close() // triggers onclose, which does the actual reconnect scheduling
+    }, AUDIO_SILENCE_TIMEOUT_MS)
+  }
+
   function disconnect() {
     wantConnected = false
     connectGeneration++ // invalidate any in-flight/reconnecting socket's callbacks
     reconnectAttempt = 0 // a fresh connect() afterward should start at the fast end of the backoff, not inherit a stale count
+    hasConnectedOnce = false
     clearReconnectTimer()
+    clearSilenceTimer()
     ws?.close()
     ws = null
     stopMic()
@@ -501,8 +532,11 @@ export function useAudioBridge() {
     playAnalyserNode = null
     nextPlayTime = 0
     setAnalyserIn(null)
-    setState((s) => ({ ...s, connected: false, playbackActive: false, levelIn: 0 }))
+    setState((s) => ({ ...s, connected: false, reconnecting: false, playbackActive: false, levelIn: 0 }))
   }
+
+  // See AudioBridgeState.reconnecting's comment.
+  let hasConnectedOnce = false
 
   // requireOwner: if given, only stops the session when it's actually held
   // by that owner — a no-op otherwise, so e.g. FT8 TX switching away from
@@ -620,8 +654,10 @@ export function useAudioBridge() {
       if (generation !== connectGeneration) return
       log('info', `connected — ${audioUrl}`)
       reconnectAttempt = 0
+      hasConnectedOnce = true
       ws = socket
-      setState((s) => ({ ...s, connected: true, playbackActive: true, error: null }))
+      armSilenceTimer(socket)
+      setState((s) => ({ ...s, connected: true, reconnecting: false, playbackActive: true, error: null }))
       resolveFirstAttempt?.(true)
     }
     socket.onerror = () => {
@@ -632,10 +668,13 @@ export function useAudioBridge() {
     }
     socket.onclose = () => {
       if (generation !== connectGeneration) return
+      clearSilenceTimer()
       const delay = Math.min(RECONNECT_BASE_DELAY_MS * 2 ** reconnectAttempt, RECONNECT_MAX_DELAY_MS)
       log('info', `closed — ${audioUrl}${wantConnected ? `, retrying in ${delay}ms (attempt ${reconnectAttempt + 1})` : ''}`)
       ws = null
-      setState((s) => ({ ...s, connected: false, playbackActive: false }))
+      // See AudioBridgeState.reconnecting's comment — only true once this
+      // session has actually connected before.
+      setState((s) => ({ ...s, connected: false, reconnecting: wantConnected && hasConnectedOnce, playbackActive: false }))
       if (!wantConnected) return
       // Keep retrying — the operator asked to listen and hasn't said
       // otherwise; a reboot/hiccup shouldn't require reloading the whole
@@ -648,6 +687,7 @@ export function useAudioBridge() {
     }
     socket.onmessage = (ev: MessageEvent<ArrayBuffer>) => {
       if (generation !== connectGeneration) return
+      armSilenceTimer(socket)
       if (!(ev.data instanceof ArrayBuffer)) return
       playFrame(new Int16Array(ev.data))
     }

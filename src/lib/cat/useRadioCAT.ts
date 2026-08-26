@@ -62,6 +62,13 @@ export interface CATConnectionConfig {
 
 export interface RadioState {
   connected: boolean;
+  // True while a PREVIOUSLY-connected WEBSOCKET session (bridge transport
+  // only — see the read loop's own comment on why serial has no
+  // equivalent) has dropped and an automatic reconnect is scheduled/in
+  // flight. Same reasoning as useIQBridge.ts's/useAudioBridge.ts's
+  // identical field: distinct from !connected, which is also true for an
+  // ordinary not-yet-connected or genuinely-failed state.
+  reconnecting: boolean;
   frequency: number | null;
   mode: CATMode | null;
   ptt: boolean;
@@ -213,6 +220,20 @@ export interface RadioCATControls {
    *  includes "backlight". Resolves the duty the bridge confirmed (its
    *  echo) and whether the save to flash succeeded, or null on failure. */
   setBridgeBacklight: (wsUrl: string, duty: number) => Promise<{ duty: number; saved: boolean } | null>;
+  /** GET /status's mic_gain_db — the ES8388 MIC preamp (PGA) gain, in dB.
+   *  The I/Q-mode counterpart of the radio's own Volume/AG control: shown
+   *  next to it in BlackBrickControls, mutually exclusive by input mode
+   *  (see setBridgeMicGain's own comment). Returns null on failure. */
+  getBridgeMicGain: (wsUrl: string) => Promise<number | null>;
+  /** POST /mic-gain — live-adjusts the ES8388 MIC preamp (PGA) gain (dB,
+   *  db<=0 drives it to minimum) AND persists it as the new boot default.
+   *  This is I/Q mode's equivalent of the radio's own AF gain (Volume,
+   *  audio mode) — I/Q mode reads the raw pre-demodulation signal and
+   *  never touches the radio's AF chain, so the two controls affect
+   *  disjoint signal paths and are never both meaningful at once.
+   *  Resolves the db the bridge confirmed and whether the save to flash
+   *  succeeded, or null on failure. */
+  setBridgeMicGain: (wsUrl: string, db: number) => Promise<{ db: number; saved: boolean } | null>;
   /** POST /wifi-config — persists a new Wi-Fi SSID/password to the bridge's
    *  NVS flash and reboots it to apply (the bridge drops off the current
    *  Wi-Fi network entirely once it restarts onto the new one — this
@@ -445,7 +466,7 @@ const SILENCE_RECHECK_MS = 15_000;
 
 export function useRadioCAT(): RadioCATControls {
   const [state, setState] = createSignal<RadioState>({
-    connected: false, frequency: null, mode: null,
+    connected: false, reconnecting: false, frequency: null, mode: null,
     ptt: false, error: null,
     isSupported: typeof navigator !== 'undefined' && 'serial' in navigator,
     volume: null, att1: null, att2: null, nr: null,
@@ -519,6 +540,8 @@ export function useRadioCAT(): RadioCATControls {
   const RECONNECT_MAX_DELAY_MS = 30000;
   let reconnectAttempt = 0;
   const nextReconnectDelayMs = () => Math.min(RECONNECT_BASE_DELAY_MS * 2 ** reconnectAttempt++, RECONNECT_MAX_DELAY_MS);
+  // See RadioState.reconnecting's comment.
+  let hasConnectedOnce = false;
 
   const lastSet = {
     frequency: 0, mode: 0, volume: 0, att1: 0, att2: 0, nr: 0, agc: 0, agcLevel: 0, filter: 0, drive: 0, backlight: 0,
@@ -827,6 +850,11 @@ export function useRadioCAT(): RadioCATControls {
         if (generation === connectGeneration && !closing && (port || ws)) {
           const wasWebSocket = ws !== null;
           const configToRetry = lastWsConfig;
+          // Captured BEFORE disconnect() below, which resets it — see
+          // RadioState.reconnecting's comment: only true once this session
+          // actually connected before, same distinction useIQBridge.ts/
+          // useAudioBridge.ts make.
+          const wasEverConnected = hasConnectedOnce;
           log('warn', wasWebSocket
             ? 'CAT bridge connection lost (Wi-Fi dropped / bridge rebooted)'
             : 'serial port lost unexpectedly (cable unplugged / device re-enumerated)');
@@ -841,6 +869,7 @@ export function useRadioCAT(): RadioCATControls {
             // keeps the existing manual-reconnect behavior below.
             setState(prev => ({
               ...prev,
+              reconnecting: wasEverConnected,
               error: 'CAT bridge connection lost — reconnecting automatically...',
             }));
             const retryGeneration = connectGeneration; // disconnect() just bumped it; capture post-bump
@@ -1082,6 +1111,7 @@ export function useRadioCAT(): RadioCATControls {
     if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
     connectGeneration++;
     reconnectAttempt = 0; // a fresh connect() afterward should start at the fast end of the backoff, not inherit a stale count
+    hasConnectedOnce = false;
     lastWsConfig = null;
     if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
     pollRunning = false;
@@ -1107,7 +1137,7 @@ export function useRadioCAT(): RadioCATControls {
     rxBuf  = '';
     autoReportActive = false;
     setState(prev => ({
-      ...prev, connected: false, frequency: null, mode: null, ptt: false, error: null,
+      ...prev, connected: false, reconnecting: false, frequency: null, mode: null, ptt: false, error: null,
       volume: null, att1: null, att2: null, nr: null, agc: null, agcLevel: null, filter: null, sMeter: null, drive: null,
       backlight: null, firmwareVersion: null, autoReport: null, pttConfirmAlarm: false,
     }));
@@ -1182,7 +1212,8 @@ export function useRadioCAT(): RadioCATControls {
         startReadLoop(r, generation);
       }
       reconnectAttempt = 0;
-      setState(prev => ({ ...prev, connected: true, error: null }));
+      hasConnectedOnce = true;
+      setState(prev => ({ ...prev, connected: true, reconnecting: false, error: null }));
       log('info', 'polling every', config.pollIntervalMs + 'ms');
       schedulePoll();
       if (config.rigProfile === 'usdx-blackbrick') {
@@ -1531,6 +1562,50 @@ export function useRadioCAT(): RadioCATControls {
     }
   };
 
+  // The ES8388's MIC preamp (PGA) gain, in dB — the I/Q-mode equivalent of
+  // the uSDX's own Volume control (BlackBrickControls' NumberStepper),
+  // hence shown right next to it: on THIS board, "how loud is the signal
+  // reaching the decoder" is either the radio's own AF gain (audio mode,
+  // AG; via CAT) or this ADC-side PGA (I/Q mode, POST /mic-gain) — never
+  // both meaningfully at once, since I/Q mode reads the raw pre-
+  // demodulation signal and never touches the radio's own AF chain at
+  // all. Reads straight from GET /status's mic_gain_db (unlike backlight/
+  // contrast, which have no readback at all — see BridgeStatusPanel's own
+  // comment on that) since the firmware DOES report this value.
+  const getBridgeMicGain = async (wsUrl: string): Promise<number | null> => {
+    const base = bridgeHttpBase(wsUrl);
+    if (!base) return null;
+    try {
+      const resp = await fetch(base + '/status', { signal: AbortSignal.timeout(5000) });
+      if (!resp.ok) return null;
+      const j = await resp.json();
+      return typeof j.mic_gain_db === 'number' ? j.mic_gain_db : null;
+    } catch (err) {
+      log('warn', 'getBridgeMicGain failed:', err);
+      return null;
+    }
+  };
+
+  const setBridgeMicGain = async (wsUrl: string, db: number): Promise<{ db: number; saved: boolean } | null> => {
+    const base = bridgeHttpBase(wsUrl);
+    if (!base) return null;
+    log('info', 'setBridgeMicGain →', db);
+    try {
+      const resp = await fetch(base + '/mic-gain', {
+        method: 'POST', signal: AbortSignal.timeout(5000),
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ db }),
+      });
+      if (!resp.ok) return null;
+      const j = await resp.json();
+      if (typeof j.db !== 'number') return null;
+      return { db: j.db, saved: j.saved === true };
+    } catch (err) {
+      log('warn', 'setBridgeMicGain failed:', err);
+      return null;
+    }
+  };
+
   const setBridgeWifiConfig = async (wsUrl: string, ssid: string, password: string): Promise<boolean> => {
     const base = bridgeHttpBase(wsUrl);
     if (!base) return false;
@@ -1638,6 +1713,6 @@ export function useRadioCAT(): RadioCATControls {
     setBacklight, getPABias, setPABias, getTxTimeout, setTxTimeout, resetRadio,
     getFactoryDefaults, factoryResetRadio, getRefFreq, setRefFreq,
     getBridgeStatus, resetBridge, getBridgeInfo, setBridgeBacklight, setBridgeWifiConfig, setBridgeContrast,
-    setBridgeCatBaud, clearBridgePaEmergency, setBridgeInputMode,
+    setBridgeCatBaud, clearBridgePaEmergency, setBridgeInputMode, getBridgeMicGain, setBridgeMicGain,
   };
 }

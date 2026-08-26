@@ -13,7 +13,6 @@ import {
 } from '../lib/cat/useRadioCAT'
 import type { AudioBridge } from '../lib/cat/useAudioBridge'
 import type { IQBridge } from '../lib/cat/useIQBridge'
-import { loadSuspendIQDuringTx, saveSuspendIQDuringTx } from '../lib/ft/useFTTransmit'
 import CalibrationWizard from './CalibrationWizard'
 import NumberField from './NumberField'
 import { loadObject, saveObject } from '../lib/storage'
@@ -28,7 +27,11 @@ const CAT_CONFIG_STORAGE_KEY = 'signal-decoder:cat-connection-config';
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
-const MODES: CATMode[] = ['USB', 'LSB', 'AM', 'FM', 'CW', 'RTTY']
+// RTTY excluded — not a mode the uSDX BLACK_BRICK firmware actually supports,
+// so it isn't offered as a selectable chip here even though the underlying
+// Kenwood CAT protocol (and CATMode type) still recognizes it if some other
+// radio reports it.
+const MODES: CATMode[] = ['USB', 'LSB', 'AM', 'FM', 'CW']
 
 const BAUD_RATES = [1200, 2400, 4800, 9600, 19200, 38400, 57600, 115200]
 
@@ -488,6 +491,14 @@ function NumberStepper(props: {
   max: number
   valueLabels?: string[]
   onChange: (n: number) => void
+  // True while this control genuinely doesn't apply right now (e.g. an
+  // I/Q-mode-only setting while the bridge is in Audio mode, or vice
+  // versa) — actually disables both buttons rather than only dimming
+  // them via a wrapping div's opacity class, so a setting that can't
+  // take effect can't be fiddled with either. Distinct from
+  // `value === null` (unfetched/unsupported), which already disables via
+  // its own check below regardless of this prop.
+  disabled?: boolean
 }) {
   const v = () => props.value ?? props.min
   const step = (delta: number) => props.onChange(Math.max(props.min, Math.min(props.max, v() + delta)))
@@ -497,7 +508,7 @@ function NumberStepper(props: {
       <span class="text-[10px] font-semibold text-[#8b949e] whitespace-nowrap">{props.label}</span>
       <button
         onClick={() => step(-1)}
-        disabled={props.value === null || v() <= props.min}
+        disabled={props.disabled || props.value === null || v() <= props.min}
         class="w-5 h-5 flex items-center justify-center text-xs rounded bg-[#21262d] border border-[#30363d] text-[#8b949e] hover:text-[#c9d1d9] hover:border-[#8b949e] disabled:opacity-30 disabled:hover:border-[#30363d]"
       >
         −
@@ -505,7 +516,7 @@ function NumberStepper(props: {
       <span class="text-xs font-mono tabular-nums w-12 text-center text-[#c9d1d9]">{display()}</span>
       <button
         onClick={() => step(1)}
-        disabled={props.value === null || v() >= props.max}
+        disabled={props.disabled || props.value === null || v() >= props.max}
         class="w-5 h-5 flex items-center justify-center text-xs rounded bg-[#21262d] border border-[#30363d] text-[#8b949e] hover:text-[#c9d1d9] hover:border-[#8b949e] disabled:opacity-30 disabled:hover:border-[#30363d]"
       >
         +
@@ -542,13 +553,48 @@ const AGC_LEVEL_MAX = 14
 
 // ── SMeterDisplay ─────────────────────────────────────────────────────────────
 // Read-only dBm readout — no +/- controls, since there is no SM SET command.
+// The radio's own CAT `SM;` reading is measured across uSDX's entire analog
+// RX chain — it does NOT reflect whatever narrow slice of the wideband I/Q
+// spectrum this app is actually tuned to, so it's misleading while in I/Q
+// mode (see useIQBridge.ts's `iqSignalDbfs` field comment). Below, an
+// operator can tell the two apart: this stays the radio's own reading, and
+// a separate IQSignalMeterDisplay (rendered alongside, only in I/Q mode)
+// shows the passband-specific one instead.
 
 function SMeterDisplay(props: { dbm: number | null }) {
   return (
-    <div class="flex items-center gap-1.5" title="S-Meter (signal strength)">
+    <div class="flex items-center gap-1.5" title="S-Meter (signal strength) — radio's own reading, across its full RX passband, not specific to the tuned I/Q passband">
       <span class="text-[10px] font-semibold text-[#8b949e] whitespace-nowrap">S-Meter</span>
-      <span class="text-xs font-mono tabular-nums w-16 text-center text-[#79c0ff] bg-[#0d1117] border border-[#30363d] rounded px-1.5 py-0.5">
+      <span class="text-xs font-mono tabular-nums w-20 whitespace-nowrap text-center text-[#79c0ff] bg-[#0d1117] border border-[#30363d] rounded px-1.5 py-0.5">
         {props.dbm === null ? '—' : `${props.dbm} dBm`}
+      </span>
+    </div>
+  )
+}
+
+// dBFS-to-S-unit convention: S9 pinned at -30dBFS (a strong, near-full-scale
+// demodulated tone through a normally-configured RX chain), 6dB/S-unit
+// below S9 and 10dB/10dB above — same shape as the firmware's own dBm-to-S
+// mapping (see usdxBLACKBRICK.ino's smeter()), just re-anchored to this
+// app's dBFS scale since there's no meaningful dBm reference for a
+// software-normalized I/Q stream.
+const IQ_S9_DBFS = -30
+function dbfsToSUnitLabel(dbfs: number): string {
+  if (dbfs >= IQ_S9_DBFS) return `S9+${Math.round(dbfs - IQ_S9_DBFS)}`
+  const s = Math.max(0, Math.round(9 - (IQ_S9_DBFS - dbfs) / 6))
+  return `S${s}`
+}
+
+// Signal strength measured from the ACTUAL tuned I/Q passband (pre-AGC,
+// post band-limiting demodulation) — see useIQBridge.ts's `iqSignalDbfs`
+// field comment for why this exists alongside (not replacing) the radio's
+// own CAT S-meter.
+function IQSignalMeterDisplay(props: { dbfs: number | null }) {
+  return (
+    <div class="flex items-center gap-1.5" title="Signal strength measured from the I/Q passband actually tuned here — unlike the radio's own S-Meter, this reflects only the selected signal, not the whole RX band">
+      <span class="text-[10px] font-semibold text-[#8b949e] whitespace-nowrap">I/Q Signal</span>
+      <span class="text-xs font-mono tabular-nums w-32 whitespace-nowrap text-center text-[#79c0ff] bg-[#0d1117] border border-[#30363d] rounded px-1.5 py-0.5">
+        {props.dbfs === null ? '—' : `${dbfsToSUnitLabel(props.dbfs)} ${Math.round(props.dbfs)}dB`}
       </span>
     </div>
   )
@@ -648,6 +694,31 @@ function BlackBrickControls(props: {
   backlight: number | null
   firmwareVersion: string | null
   paOpen: boolean
+  // True while the bridge is in I/Q mode — decoders read the raw
+  // pre-demodulation signal directly in that mode, so the radio's own
+  // receiver-chain settings below (volume/filter/NR/AGC/attenuators) have
+  // no effect on what gets decoded, even though every one of them still
+  // genuinely changes the radio's hardware over CAT and stays in effect
+  // if the operator switches back to Audio mode or listens on the radio
+  // itself. Greyed out (not disabled) to make that distinction visible
+  // without blocking a real, still-applied change.
+  iqModeActive: boolean
+  // ES8388 MIC preamp (PGA) gain, in dB — I/Q mode's counterpart to Volume
+  // above (see micGainDb's own comment on the panel below for the full
+  // reasoning). null while unfetched/unsupported — same "hidden until we
+  // actually have a value" convention as firmwareVersion.
+  micGainDb: number | null
+  // I/Q mode's own AGC — useIQBridge.ts's AGC class, the counterpart to
+  // the radio's own Auto Gain Control button+level above. Shown in its
+  // OWN row below (see the basis-full div at the end of this component)
+  // rather than interleaved with the radio's controls, alongside the
+  // relocated MIC Preamp — both are I/Q-mode-specific settings that only
+  // make sense grouped together, near the audio-mode settings that do
+  // the analogous job. null iqAgcLevel means "unknown yet" (mirrors
+  // micGainDb's own null convention); iqAgcEnabled false + a remembered
+  // level otherwise.
+  iqAgcEnabled: boolean
+  iqAgcLevel: number
   onVolume: (n: number) => void
   onAtt1: (n: number) => void
   onAtt2: (n: number) => void
@@ -657,24 +728,49 @@ function BlackBrickControls(props: {
   onFilter: (n: number) => void
   onDrive: (n: number) => void
   onBacklight: (n: number) => void
+  onMicGain: (db: number) => void
+  onIqAgc: (enabled: boolean, level: number) => void
   onTogglePA: () => void
   onReset: () => void
 }) {
   const agcOn = () => props.agc === AGC_ON
+  // Dims (not disables) a control that has no effect on I/Q-mode
+  // decoding — see iqModeActive's own comment.
+  const noEffectInIQMode = () => (props.iqModeActive ? 'opacity-40' : '')
+  const noEffectTitle = (label: string) =>
+    props.iqModeActive ? `${label} — no effect on I/Q-mode decoding (still applies to the radio itself)` : undefined
+  // Mirror of the above for the PGA control, which is I/Q mode's own gain
+  // stage — greyed out in Audio mode instead, where the radio's own
+  // Volume/AG chain is what actually matters. The two are mutually
+  // exclusive by input mode, never both live at once, which is why PGA is
+  // placed right next to Volume rather than off in some separate section.
+  const noEffectInAudioMode = () => (props.iqModeActive ? '' : 'opacity-40')
+  const noEffectInAudioTitle = (label: string) =>
+    props.iqModeActive ? undefined : `${label} — no effect in Audio mode (still applies to the ADC itself, takes effect once I/Q mode is selected)`
   return (
     <div class="basis-full flex items-center gap-3 flex-wrap pt-2 mt-1 border-t border-[#21262d]">
-      <NumberStepper label="Volume" value={props.volume} min={-1} max={16} onChange={props.onVolume} />
-      <NumberStepper label="Analog Attenuator" value={props.att1} min={0} max={7} valueLabels={ANALOG_ATTENUATOR_DB_LABELS} onChange={props.onAtt1} />
-      <NumberStepper label="Digital Attenuator" value={props.att2} min={0} max={16} valueLabels={DIGITAL_ATTENUATOR_DB_LABELS} onChange={props.onAtt2} />
-      <NumberStepper label="Noise Reduction" value={props.nr} min={0} max={8} onChange={props.onNR} />
-      <NumberStepper label="Filter Bandwidth" value={props.filter} min={0} max={7} valueLabels={FILTER_LABELS} onChange={props.onFilter} />
+      <div class={noEffectInIQMode()} title={noEffectTitle('Volume')}>
+        <NumberStepper label="Volume" value={props.volume} min={-1} max={16} onChange={props.onVolume} disabled={props.iqModeActive} />
+      </div>
+      <div class={noEffectInIQMode()} title={noEffectTitle('Analog Attenuator')}>
+        <NumberStepper label="Analog Attenuator" value={props.att1} min={0} max={7} valueLabels={ANALOG_ATTENUATOR_DB_LABELS} onChange={props.onAtt1} disabled={props.iqModeActive} />
+      </div>
+      <div class={noEffectInIQMode()} title={noEffectTitle('Digital Attenuator')}>
+        <NumberStepper label="Digital Attenuator" value={props.att2} min={0} max={16} valueLabels={DIGITAL_ATTENUATOR_DB_LABELS} onChange={props.onAtt2} disabled={props.iqModeActive} />
+      </div>
+      <div class={noEffectInIQMode()} title={noEffectTitle('Noise Reduction')}>
+        <NumberStepper label="Noise Reduction" value={props.nr} min={0} max={8} onChange={props.onNR} disabled={props.iqModeActive} />
+      </div>
+      <div class={noEffectInIQMode()} title={noEffectTitle('Filter Bandwidth')}>
+        <NumberStepper label="Filter Bandwidth" value={props.filter} min={0} max={7} valueLabels={FILTER_LABELS} onChange={props.onFilter} disabled={props.iqModeActive} />
+      </div>
       <NumberStepper label="TX Driver" value={props.drive} min={0} max={8} onChange={props.onDrive} />
 
-      <div class="flex items-center gap-1.5" title="Auto Gain Control">
+      <div class={`flex items-center gap-1.5 ${noEffectInIQMode()}`} title={noEffectTitle('Auto Gain Control')}>
         <span class="text-[10px] font-semibold text-[#8b949e] whitespace-nowrap">Auto Gain Control</span>
         <button
           onClick={() => props.onAGC(agcOn() ? AGC_OFF : AGC_ON)}
-          disabled={props.agc === null}
+          disabled={props.agc === null || props.iqModeActive}
           class={`text-[10px] font-semibold px-2 py-1 rounded transition-colors border disabled:opacity-30
             ${agcOn()
               ? 'bg-[#238636] border-[#238636] text-white'
@@ -687,7 +783,9 @@ function BlackBrickControls(props: {
 
       {/* AGC target level (AL command) — only meaningful while AGC is on */}
       <Show when={agcOn()}>
-        <NumberStepper label="AGC Level" value={props.agcLevel} min={AGC_LEVEL_MIN} max={AGC_LEVEL_MAX} onChange={props.onAgcLevel} />
+        <div class={noEffectInIQMode()} title={noEffectTitle('AGC Level')}>
+          <NumberStepper label="AGC Level" value={props.agcLevel} min={AGC_LEVEL_MIN} max={AGC_LEVEL_MAX} onChange={props.onAgcLevel} disabled={props.iqModeActive} />
+        </div>
       </Show>
 
       <BacklightToggle backlight={props.backlight} onToggle={props.onBacklight} />
@@ -716,6 +814,39 @@ function BlackBrickControls(props: {
             <path d="M5 4a1 1 0 00-2 0v7.268a2 2 0 000 3.464V16a1 1 0 102 0v-1.268a2 2 0 000-3.464V4zM11 4a1 1 0 10-2 0v1.268a2 2 0 000 3.464V16a1 1 0 102 0V8.732a2 2 0 000-3.464V4zM16 3a1 1 0 011 1v7.268a2 2 0 010 3.464V16a1 1 0 11-2 0v-1.268a2 2 0 010-3.464V4a1 1 0 011-1z" />
           </svg>
         </button>
+      </div>
+
+      {/* Third row — I/Q-mode-specific settings, grouped here (near the
+          audio-mode controls above that do the analogous job) rather than
+          buried in the Bridge status sub-panel, so an operator switching
+          between Audio and I/Q mode finds "how loud" (Volume/PGA) and
+          "how leveled" (radio AGC/I/Q AGC) in the same place either way. */}
+      <div class="basis-full flex items-center gap-3 flex-wrap pt-2 mt-1 border-t border-[#21262d]">
+        <Show when={props.micGainDb !== null}>
+          <div class={noEffectInAudioMode()} title={noEffectInAudioTitle('MIC Preamp (PGA)')}>
+            <NumberStepper label="MIC Preamp (PGA)" value={Math.round((props.micGainDb ?? 0) / 3)} min={0} max={11}
+              valueLabels={Array.from({ length: 12 }, (_, i) => `${i * 3}dB`)}
+              onChange={(step) => props.onMicGain(step * 3)}
+              disabled={!props.iqModeActive} />
+          </div>
+        </Show>
+        <div class={noEffectInAudioMode()} title={noEffectInAudioTitle('AGC Level (I/Q)')}>
+          {/* Unified enable+level control — 0 means "off" (calls onIqAgc
+              with enabled=false) rather than a separate ON/OFF button
+              like the radio's own AGC above: useIQBridge.ts's AGC class
+              only has a real [1,14] level range (matching the firmware
+              exactly, see AGC_LEVEL_MIN/MAX there), so 0 here is a
+              UI-only sentinel, never passed through to setAGCLevel(). */}
+          <NumberStepper
+            label="AGC Level (I/Q)"
+            value={props.iqAgcEnabled ? props.iqAgcLevel : 0}
+            min={0}
+            max={AGC_LEVEL_MAX}
+            valueLabels={['OFF', ...Array.from({ length: AGC_LEVEL_MAX }, (_, i) => String(i + 1))]}
+            onChange={(n) => props.onIqAgc(n > 0, n > 0 ? n : props.iqAgcLevel)}
+            disabled={!props.iqModeActive}
+          />
+        </div>
       </div>
     </div>
   )
@@ -1090,12 +1221,6 @@ function BridgeInputModeControl(props: {
 }) {
   const iq = props.iqBridge
   const [busy, setBusy] = createSignal(false)
-  // Persisted via useFTTransmit.ts's load/save pair (co-located with the
-  // other TX-related settings) even though this checkbox lives here, not
-  // in FTTransmitPanel — App.tsx reads loadSuspendIQDuringTx() fresh at
-  // the moment each TX window starts, rather than needing this threaded
-  // through as reactive props across three component layers.
-  const [suspendDuringTx, setSuspendDuringTx] = createSignal(loadSuspendIQDuringTx())
 
   // Mirrors the firmware's own rejection (http_control.c's input_mode_handler):
   // switching to "audio" while the saved rate is 96000 (I/Q-only) is
@@ -1159,21 +1284,6 @@ function BridgeInputModeControl(props: {
         </p>
       </Show>
       <Show when={iq.state().inputMode === 'iq'}>
-        <label class="flex items-center gap-2 text-[10px] text-[#8b949e]">
-          <input
-            type="checkbox"
-            checked={suspendDuringTx()}
-            onChange={(e) => {
-              setSuspendDuringTx(e.currentTarget.checked)
-              saveSuspendIQDuringTx(e.currentTarget.checked)
-            }}
-          />
-          Suspend I/Q spectrum during TX
-        </label>
-        <p class="text-[10px] text-[#8b949e]">
-          Streaming I/Q while transmitting shares WiFi/I2S DMA memory on this hardware and measurably degrades TX
-          audio quality — leave this on unless you're specifically testing that tradeoff.
-        </p>
         <label class="flex items-center gap-2 text-[10px] text-[#8b949e]">
           <input
             type="checkbox"
@@ -1241,6 +1351,38 @@ function BridgeInputModeControl(props: {
           mirror — that's what the correction above fixes), the two channels likely aren't exactly equal-amplitude
           and exactly 90° apart. This continuously estimates and corrects that from the live signal itself; works
           best combined with DC removal above.
+        </p>
+        <p class="text-[10px] text-[#8b949e]">
+          Automatic gain control (levels the demodulated audio so a strong signal doesn't clip and a weak one isn't
+          too quiet) moved to the main toolbar's third row, next to the radio's own AGC control it mirrors — see
+          "AGC Level (I/Q)" there (0 = off).
+        </p>
+        <label class="flex items-center gap-2 text-[10px] text-[#8b949e]">
+          <input
+            type="checkbox"
+            checked={iq.state().highpassEnabled}
+            onChange={(e) => iq.setHighpassEnabled(e.currentTarget.checked)}
+          />
+          300Hz highpass on decoded audio
+        </label>
+        <p class="text-[10px] text-[#8b949e]">
+          Same fixed 300Hz corner the radio's own firmware uses for voice/CW — but FT8/MFSK tones are often tuned
+          close to the passband's low edge, so this can cut real signal, not just DC/hum. Off by default.
+        </p>
+        <label class="flex items-center gap-2 text-[10px] text-[#8b949e]">
+          <input
+            type="checkbox"
+            checked={iq.state().noiseReducerEnabled}
+            onChange={(e) => iq.setNoiseReducerEnabled(e.currentTarget.checked)}
+          />
+          Spectral noise reduction (experimental)
+        </label>
+        <p class="text-[10px] text-[#8b949e]">
+          Estimates the noise floor per frequency bin (from that instant's own spectrum, not a running history) and
+          suppresses it — unlike the radio's own "NR" (which just narrows the audio bandwidth), this targets noise
+          directly. New, not a port of anything proven on real HF traffic yet — adds a small amount of latency
+          (roughly 20ms) and, like any spectral noise reduction, can introduce faint artifacts on some signals. Off
+          by default; try it and compare.
         </p>
       </Show>
       <Show when={iq.state().error}>
@@ -1502,35 +1644,9 @@ function BridgeStatusPanel(props: {
       <Show
         when={status()}
         fallback={
-          <div class="flex flex-col gap-2">
-            <p class="text-[10px] text-[#f0883e]">
-              {loading() ? 'Querying bridge…' : failed() ? 'Could not reach the bridge at ' + props.wsUrl + '.' : ''}
-            </p>
-            <Show when={!loading() && failed()}>
-              <label class="flex items-center gap-2 text-[10px] text-[#8b949e]">
-                <input
-                  type="checkbox"
-                  checked={props.iqBridge.state().forceIQMode}
-                  onChange={(e) => props.iqBridge.setForceIQMode(e.currentTarget.checked)}
-                />
-                Force I/Q mode (this bridge has no /status — e.g. a minimal single-purpose test firmware)
-              </label>
-              <Show when={props.iqBridge.state().forceIQMode}>
-                <label class="flex items-center gap-2 text-[10px] text-[#8b949e]">
-                  Sample rate (Hz)
-                  <input
-                    type="number"
-                    class="w-20 bg-[#0d1117] border border-[#30363d] rounded px-1.5 py-0.5 text-[#c9d1d9]"
-                    value={props.iqBridge.state().forceSampleRateHz ?? 48000}
-                    onChange={(e) => {
-                      const hz = Number(e.currentTarget.value)
-                      if (Number.isFinite(hz) && hz > 0) props.iqBridge.setForceSampleRateHz(hz)
-                    }}
-                  />
-                </label>
-              </Show>
-            </Show>
-          </div>
+          <p class="text-[10px] text-[#f0883e]">
+            {loading() ? 'Querying bridge…' : failed() ? 'Could not reach the bridge at ' + props.wsUrl + '.' : ''}
+          </p>
         }
       >
         {(s) => (
@@ -1637,6 +1753,41 @@ function BridgeStatusPanel(props: {
           <BridgeAudioControl wsUrl={props.wsUrl} audioBridge={props.audioBridge} />
         </div>
       </Show>
+
+      {/* Deliberately UNCONDITIONAL, not tucked inside the failed()
+          fallback above — this used to only render when GET /status
+          failed, which meant a real bridge (that DOES serve /status)
+          gave no way to see or clear this override once turned on. That
+          silently locked the whole app onto inputMode:"iq" forever,
+          disagreeing with whatever the bridge's OWN control page actually
+          showed — a real, confusing bug, not a hypothetical one. Always
+          showing it here, clearly labeled as a diagnostic override, means
+          it can never get stuck invisible again. */}
+      <div class="border-t border-[#21262d] pt-3 flex flex-col gap-2">
+        <span class="text-[10px] font-bold uppercase tracking-widest text-[#8b949e]">Diagnostic override</span>
+        <label class="flex items-center gap-2 text-[10px] text-[#8b949e]">
+          <input
+            type="checkbox"
+            checked={props.iqBridge.state().forceIQMode}
+            onChange={(e) => props.iqBridge.setForceIQMode(e.currentTarget.checked)}
+          />
+          Force I/Q mode regardless of what GET /status reports (only for a bridge with no /status at all, e.g. a minimal single-purpose test firmware — leave off otherwise)
+        </label>
+        <Show when={props.iqBridge.state().forceIQMode}>
+          <label class="flex items-center gap-2 text-[10px] text-[#8b949e]">
+            Sample rate (Hz)
+            <input
+              type="number"
+              class="w-20 bg-[#0d1117] border border-[#30363d] rounded px-1.5 py-0.5 text-[#c9d1d9]"
+              value={props.iqBridge.state().forceSampleRateHz ?? 48000}
+              onChange={(e) => {
+                const hz = Number(e.currentTarget.value)
+                if (Number.isFinite(hz) && hz > 0) props.iqBridge.setForceSampleRateHz(hz)
+              }}
+            />
+          </label>
+        </Show>
+      </div>
     </div>
   )
 }
@@ -1708,6 +1859,21 @@ export default function RadioCATPanel(props: {
   })
   const [config, setConfig] = createSignal(loadInitialConfig())
 
+  // ES8388 MIC preamp (PGA) gain — shown in BlackBrickControls right next
+  // to Volume, see that component's own comment for why. Only meaningful
+  // over the WebSocket (bridge) transport — a plain serial CAT link has no
+  // HTTP control surface to read/set this from at all. null until fetched
+  // (or if the fetch fails/isn't applicable), which BlackBrickControls
+  // treats as "hide the control" rather than showing a misleading value.
+  const [micGainDb, setMicGainDb] = createSignal<number | null>(null)
+  createEffect(() => {
+    if (state().connected && config().transport === 'websocket' && config().wsUrl) {
+      void cat.getBridgeMicGain(config().wsUrl!).then(setMicGainDb)
+    } else {
+      setMicGainDb(null)
+    }
+  })
+
   // Persist on every change — matches the load side: everything is saved,
   // but only presetIdx/transport/wsUrl (plus the re-derivable serial fields)
   // are meaningfully restored on the next load via loadInitialConfig().
@@ -1731,6 +1897,11 @@ export default function RadioCATPanel(props: {
   const handleFilter     = (n: number) => { cat.setFilter(n).catch(() => {}) }
   const handleDrive      = (n: number) => { cat.setDrive(n).catch(() => {}) }
   const handleBacklight  = (n: number) => { cat.setBacklight(n).catch(() => {}) }
+  const handleMicGain    = (db: number) => {
+    const wsUrl = config().wsUrl
+    if (!wsUrl) return
+    void cat.setBridgeMicGain(wsUrl, db).then((r) => { if (r) setMicGainDb(r.db) })
+  }
   const handleTogglePA   = () => { setShowPABias((s) => !s) }
   const handleReset      = () => { setShowPABias(false); cat.resetRadio().catch(() => {}) }
   const handleFactoryReset = () => { setShowPABias(false); cat.factoryResetRadio().catch(() => {}) }
@@ -1780,6 +1951,17 @@ export default function RadioCATPanel(props: {
                   </svg>
                 </button>
               </Show>
+              <Show when={state().reconnecting}>
+                <span
+                  class="flex items-center gap-1.5 text-xs font-semibold px-3 py-1.5 rounded-md text-[#d29922] shrink-0"
+                  title="The CAT connection dropped (Wi-Fi hiccup or bridge reboot) — retrying automatically"
+                >
+                  <svg xmlns="http://www.w3.org/2000/svg" class="h-3.5 w-3.5 animate-spin" viewBox="0 0 20 20" fill="currentColor">
+                    <path fill-rule="evenodd" d="M4 2a1 1 0 011 1v2.101a7.002 7.002 0 0111.601 2.566 1 1 0 11-1.885.666A5.002 5.002 0 005.999 7H9a1 1 0 010 2H4a1 1 0 01-1-1V3a1 1 0 011-1zm.008 9.057a1 1 0 011.276.61A5.002 5.002 0 0014.001 13H11a1 1 0 110-2h5a1 1 0 011 1v5a1 1 0 11-2 0v-2.101a7.002 7.002 0 01-11.601-2.566 1 1 0 01.61-1.276z" clip-rule="evenodd" />
+                  </svg>
+                  Reconnecting…
+                </span>
+              </Show>
               <button
                 onClick={handleConnect}
                 class="flex items-center gap-1.5 bg-[#238636] hover:bg-[#2ea043] text-white text-xs font-semibold px-3 py-1.5 rounded-md transition-colors shrink-0"
@@ -1819,8 +2001,15 @@ export default function RadioCATPanel(props: {
         <Show when={state().connected}>
           <Show when={config().rigProfile === 'usdx-blackbrick' && state().firmwareVersion !== null}>
             <div class="w-px h-6 bg-[#30363d] shrink-0" />
-            {/* S-Meter — read-only, shown right after Connect/Disconnect */}
+            {/* S-Meter — read-only, shown right after Connect/Disconnect. In
+                I/Q mode the radio's own reading covers its whole RX chain,
+                not the tuned passband, so a second passband-specific meter
+                is shown alongside it rather than replacing it (see
+                SMeterDisplay/IQSignalMeterDisplay's own comments). */}
             <SMeterDisplay dbm={state().sMeter} />
+            <Show when={props.iqBridge.state().inputMode === 'iq'}>
+              <IQSignalMeterDisplay dbfs={props.iqBridge.state().iqSignalDbfs} />
+            </Show>
           </Show>
 
           <div class="w-px h-6 bg-[#30363d] shrink-0" />
@@ -1844,10 +2033,16 @@ export default function RadioCATPanel(props: {
               volume={state().volume} att1={state().att1} att2={state().att2} nr={state().nr}
               agc={state().agc} agcLevel={state().agcLevel} filter={state().filter} drive={state().drive} backlight={state().backlight} firmwareVersion={state().firmwareVersion}
               paOpen={showPABias()}
+              iqModeActive={props.iqBridge.state().inputMode === 'iq'}
+              micGainDb={micGainDb()}
+              iqAgcEnabled={props.iqBridge.state().agcEnabled}
+              iqAgcLevel={props.iqBridge.state().agcLevel}
               onVolume={handleVolume} onAtt1={handleAtt1} onAtt2={handleAtt2}
               onNR={handleNR}
               onAGC={handleAGC} onAgcLevel={handleAgcLevel} onFilter={handleFilter} onDrive={handleDrive}
-              onBacklight={handleBacklight} onTogglePA={handleTogglePA}
+              onBacklight={handleBacklight} onMicGain={handleMicGain}
+              onIqAgc={(enabled, level) => { props.iqBridge.setAGCEnabled(enabled); props.iqBridge.setAGCLevel(level) }}
+              onTogglePA={handleTogglePA}
               onReset={handleReset}
             />
           </Show>
