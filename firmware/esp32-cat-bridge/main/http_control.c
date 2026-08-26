@@ -115,11 +115,18 @@ static const char *TAG = "http_control";
 // TX_BUFFER_SAMPLE_RATE_HZ in audio_monitor.h) and play it back from an
 // in-PSRAM buffer instead of streaming it live over /audio, avoiding the
 // Wi-Fi-jitter-causes-audible-glitch problem that streaming has on real
-// hardware (see audio_monitor.h's "One-shot pre-encoded TX buffer
-// playback" comment for the full reasoning). Browser code should check
-// for this feature before using those endpoints, same pattern as
-// input_mode_select above — an older bridge without this feature simply
-// doesn't register those routes at all.
+// hardware (see audio_monitor.h's TX buffer playback pool comment for the
+// full reasoning). Browser code should check for this feature before using
+// those endpoints, same pattern as input_mode_select above — an older
+// bridge without this feature simply doesn't register those routes at all.
+// NOTE: as of BRIDGE_FIRMWARE_VERSION 0.6.0 this is a 4-slot POOL (see
+// audio_monitor.h's TX_SLOT_COUNT), not the single global buffer this
+// feature originally shipped with — /tx-audio and /tx-play now REQUIRE a
+// ?slot=N query param and GET /tx-status's response shape changed to
+// report all slots. The feature string is left unchanged (still the same
+// underlying capability, additive per this file's versioning policy) —
+// gate on BRIDGE_FIRMWARE_VERSION >= 0.6.0 (GET /info) if a browser client
+// needs to distinguish the single-buffer wire shape from the pooled one.
 static const char *const BRIDGE_FEATURES[] = {
     "cat", "wifi_config", "wifi_scan", "reset", "audio", "cat_baud", "pa_watchdog",
     "audio_input_select", "mic_gain", "rx_slot_select", "led_enable",
@@ -1054,16 +1061,47 @@ static esp_err_t cpu_freq_handler(httpd_req_t *req) {
     return httpd_resp_send(req, resp_body, n);
 }
 
-// POST /tx-audio — body: raw Int16 PCM bytes (NOT JSON — a binary body),
-// mono, fixed at MIC_SEND_SAMPLE_RATE_HZ (16000 Hz), the exact same wire
-// format /audio's live mic-send path already uses (see that constant's
-// comment in audio_monitor.c). See audio_monitor.h's "One-shot pre-encoded
-// TX buffer playback" comment for why this whole feature exists: streaming
-// TX audio live, chunk by chunk over /audio, means any single chunk's
-// Wi-Fi jitter is instantly audible in the transmitted signal — uploading
-// the WHOLE message once up front and playing it back from a local buffer
-// removes the network from the timing picture entirely for the rest of
-// the transmission.
+// Shared by all four /tx-* handlers below — parses the mandatory ?slot=N
+// query param via httpd_query_key_value() (ESP-IDF's plain query-string
+// parser; no wildcard URI registration needed since the path itself never
+// varies, only the query string does). Sends its own 400 and returns false
+// on anything wrong (missing param, non-numeric, out of [0, TX_SLOT_COUNT))
+// so every caller can just do `if (!tx_parse_slot_param(req, &slot)) return
+// ESP_FAIL;` without duplicating the error response.
+static bool tx_parse_slot_param(httpd_req_t *req, int *slot_out) {
+    char query[32];
+    if (httpd_req_get_url_query_str(req, query, sizeof(query)) != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "missing ?slot=N query parameter");
+        return false;
+    }
+    char slot_str[8];
+    if (httpd_query_key_value(query, "slot", slot_str, sizeof(slot_str)) != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "missing ?slot=N query parameter");
+        return false;
+    }
+    char *end;
+    long v = strtol(slot_str, &end, 10);
+    if (end == slot_str || v < 0 || v >= TX_SLOT_COUNT) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "slot must be an integer in [0, 4)");
+        return false;
+    }
+    *slot_out = (int)v;
+    return true;
+}
+
+// POST /tx-audio?slot=N — body: raw Int16 PCM bytes (NOT JSON — a binary
+// body), mono, fixed at MIC_SEND_SAMPLE_RATE_HZ (16000 Hz), the exact same
+// wire format /audio's live mic-send path already uses (see that constant's
+// comment in audio_monitor.c). See audio_monitor.h's TX buffer playback
+// pool comment for why this whole feature exists: streaming TX audio live,
+// chunk by chunk over /audio, means any single chunk's Wi-Fi jitter is
+// instantly audible in the transmitted signal — uploading the WHOLE message
+// once up front and playing it back from a local buffer removes the network
+// from the timing picture entirely for the rest of the transmission. slot
+// (0..TX_SLOT_COUNT-1, see tx_parse_slot_param() above) selects which of the
+// TX_SLOT_COUNT independent buffers this upload lands in — see
+// audio_monitor.h for why the pool exists (one global buffer meant an
+// auto-CQ loop and a queued reply silently clobbered each other).
 //
 // Reads the body with a plain loop over httpd_req_recv() rather than this
 // file's usual read_request_body() helper — that helper's whole design
@@ -1078,10 +1116,13 @@ static esp_err_t cpu_freq_handler(httpd_req_t *req) {
 // done by hand here since httpd_req_recv() is the plain-HTTP-POST
 // equivalent and doesn't do that looping itself.
 static esp_err_t tx_audio_handler(httpd_req_t *req) {
+    int slot;
+    if (!tx_parse_slot_param(req, &slot)) return ESP_FAIL;
+
     audio_monitor_tx_status_t status;
     audio_monitor_tx_get_status(&status);
-    if (status.playing) {
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "playback in progress — call POST /tx-stop first");
+    if (status.playing && status.playing_slot == slot) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "this slot is currently playing — call POST /tx-stop first");
         return ESP_FAIL;
     }
 
@@ -1097,12 +1138,14 @@ static esp_err_t tx_audio_handler(httpd_req_t *req) {
         return ESP_FAIL;
     }
     // Loose sanity cap, not a precisely-tuned limit — 5 minutes at 16kHz
-    // mono Int16 is already far beyond any realistic FT8/FT4 message (both
-    // protocols top out well under 20s) and comfortably inside the 8MB
-    // PSRAM budget; this exists purely to reject a garbled/misdirected
-    // request with a clear 400 instead of a multi-megabyte allocation
-    // attempt that either succeeds pointlessly or fails confusingly deep
-    // inside audio_monitor_tx_buffer_upload().
+    // mono Int16 per slot is already far beyond any realistic FT8/FT4
+    // message (both protocols top out well under 20s) and comfortably
+    // inside the 8MB PSRAM budget even across all TX_SLOT_COUNT slots (see
+    // audio_monitor.h's audio_monitor_tx_buffer_upload() comment for the
+    // full worst-case-vs-realistic arithmetic); this exists purely to
+    // reject a garbled/misdirected request with a clear 400 instead of a
+    // multi-megabyte allocation attempt that either succeeds pointlessly or
+    // fails confusingly deep inside audio_monitor_tx_buffer_upload().
     size_t max_bytes = (size_t)TX_BUFFER_SAMPLE_RATE_HZ * sizeof(int16_t) * 300;
     if (content_len > max_bytes) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "body too large — must be under 5 minutes of audio");
@@ -1127,7 +1170,7 @@ static esp_err_t tx_audio_handler(httpd_req_t *req) {
         int received = httpd_req_recv(req, (char *)recv_buf + received_total, content_len - received_total);
         if (received <= 0) {
             if (received == HTTPD_SOCK_ERR_TIMEOUT) continue; // recv_wait_timeout hit mid-transfer — retry, same as esp-idf's own upload examples
-            ESP_LOGW(TAG, "tx-audio body recv failed at %u/%u bytes", (unsigned)received_total, (unsigned)content_len);
+            ESP_LOGW(TAG, "tx-audio body recv failed at %u/%u bytes (slot %d)", (unsigned)received_total, (unsigned)content_len, slot);
             free(recv_buf);
             httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "failed to read full body");
             return ESP_FAIL;
@@ -1135,7 +1178,7 @@ static esp_err_t tx_audio_handler(httpd_req_t *req) {
         received_total += (size_t)received;
     }
 
-    bool saved = audio_monitor_tx_buffer_upload((const int16_t *)recv_buf, received_total);
+    bool saved = audio_monitor_tx_buffer_upload(slot, (const int16_t *)recv_buf, received_total);
     free(recv_buf);
     if (!saved) {
         // Only real failure path left here is a PSRAM allocation failure
@@ -1148,64 +1191,88 @@ static esp_err_t tx_audio_handler(httpd_req_t *req) {
 
     httpd_resp_set_type(req, "application/json");
     set_cors(req);
-    char resp_body[80];
-    int n = snprintf(resp_body, sizeof(resp_body), "{\"bytes\":%u,\"duration_ms\":%u,\"saved\":true}",
-                      (unsigned)audio_monitor_tx_buffer_byte_count(), (unsigned)audio_monitor_tx_buffer_duration_ms());
+    char resp_body[112];
+    int n = snprintf(resp_body, sizeof(resp_body), "{\"slot\":%d,\"bytes\":%u,\"duration_ms\":%u,\"hash\":\"%08x\",\"saved\":true}",
+                      slot, (unsigned)audio_monitor_tx_buffer_byte_count(slot),
+                      (unsigned)audio_monitor_tx_buffer_duration_ms(slot), (unsigned)audio_monitor_tx_slot_hash(slot));
     return httpd_resp_send(req, resp_body, n);
 }
 
-// POST /tx-play — no body. Starts the dedicated playback task (see
+// POST /tx-play?slot=N — no body. Starts the dedicated playback task (see
 // audio_monitor_tx_play()'s own comment for why this MUST be a genuinely
 // separate FreeRTOS task, not more work stuffed into this httpd worker
-// context). Rejects with 400 if no buffer has been uploaded yet or a
-// playback is already running — audio_monitor_tx_play() itself makes both
-// checks atomically enough to avoid a double-start race from two
-// back-to-back POSTs.
+// context) reading from slot. Rejects with 400 if slot has no buffer
+// uploaded, or ANY slot (not just this one) is already playing/starting —
+// this board has exactly one audio output path, so two slots can never
+// play "simultaneously" — audio_monitor_tx_play() itself makes both checks
+// atomically enough to avoid a double-start race from two back-to-back
+// POSTs (see s_tx_play_task_alive_slot's comment in audio_monitor.c).
 static esp_err_t tx_play_handler(httpd_req_t *req) {
-    if (!audio_monitor_tx_buffer_ready()) {
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "no TX buffer uploaded — call POST /tx-audio first");
+    int slot;
+    if (!tx_parse_slot_param(req, &slot)) return ESP_FAIL;
+
+    if (!audio_monitor_tx_buffer_ready(slot)) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "no TX buffer uploaded to this slot — call POST /tx-audio first");
         return ESP_FAIL;
     }
-    if (!audio_monitor_tx_play()) {
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "playback already in progress");
+    if (!audio_monitor_tx_play(slot)) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "a slot is already playing — only one slot can play at a time");
         return ESP_FAIL;
     }
 
     httpd_resp_set_type(req, "application/json");
     set_cors(req);
-    char resp_body[48];
-    int n = snprintf(resp_body, sizeof(resp_body), "{\"playing\":true,\"duration_ms\":%u}",
-                      (unsigned)audio_monitor_tx_buffer_duration_ms());
+    char resp_body[64];
+    int n = snprintf(resp_body, sizeof(resp_body), "{\"slot\":%d,\"playing\":true,\"duration_ms\":%u}",
+                      slot, (unsigned)audio_monitor_tx_buffer_duration_ms(slot));
     return httpd_resp_send(req, resp_body, n);
 }
 
-// GET /tx-status — no body. Deliberately cheap: audio_monitor_tx_get_status()
-// only reads already-computed atomics, no I/O, safe for a browser progress
-// bar to poll every few hundred ms for the duration of a playback.
+// GET /tx-status — no body, no query params (reports ALL slots at once —
+// see audio_monitor_tx_get_status()). Deliberately cheap: that call only
+// reads already-computed atomics plus TX_SLOT_COUNT small per-slot structs,
+// no I/O, safe for a browser progress bar / queue-lookahead panel to poll
+// every few hundred ms continuously.
 static esp_err_t tx_status_handler(httpd_req_t *req) {
     audio_monitor_tx_status_t status;
     audio_monitor_tx_get_status(&status);
 
+    // Sized generously above the worst case (all 4 slots at the loose
+    // 5-minute/slot sanity cap: "bytes" up to 7 digits, "duration_ms" up to
+    // 6 digits) rather than tightly — this is a poll-friendly status
+    // endpoint, not a hot path where a few dozen spare stack bytes matter.
+    char resp_body[512];
+    int n = snprintf(resp_body, sizeof(resp_body),
+                      "{\"slots\":[{\"slot\":0,\"ready\":%s,\"bytes\":%u,\"duration_ms\":%u,\"hash\":\"%08x\"},"
+                      "{\"slot\":1,\"ready\":%s,\"bytes\":%u,\"duration_ms\":%u,\"hash\":\"%08x\"},"
+                      "{\"slot\":2,\"ready\":%s,\"bytes\":%u,\"duration_ms\":%u,\"hash\":\"%08x\"},"
+                      "{\"slot\":3,\"ready\":%s,\"bytes\":%u,\"duration_ms\":%u,\"hash\":\"%08x\"}],"
+                      "\"playing_slot\":%d,\"playing\":%s,\"position_ms\":%u,\"duration_ms\":%u}",
+                      status.slots[0].ready ? "true" : "false", (unsigned)status.slots[0].byte_count, (unsigned)status.slots[0].duration_ms, (unsigned)status.slots[0].hash,
+                      status.slots[1].ready ? "true" : "false", (unsigned)status.slots[1].byte_count, (unsigned)status.slots[1].duration_ms, (unsigned)status.slots[1].hash,
+                      status.slots[2].ready ? "true" : "false", (unsigned)status.slots[2].byte_count, (unsigned)status.slots[2].duration_ms, (unsigned)status.slots[2].hash,
+                      status.slots[3].ready ? "true" : "false", (unsigned)status.slots[3].byte_count, (unsigned)status.slots[3].duration_ms, (unsigned)status.slots[3].hash,
+                      status.playing_slot, status.playing ? "true" : "false",
+                      (unsigned)status.position_ms, (unsigned)status.duration_ms);
     httpd_resp_set_type(req, "application/json");
     set_cors(req);
-    char resp_body[80];
-    int n = snprintf(resp_body, sizeof(resp_body), "{\"playing\":%s,\"position_ms\":%u,\"duration_ms\":%u}",
-                      status.playing ? "true" : "false", (unsigned)status.position_ms, (unsigned)status.duration_ms);
     return httpd_resp_send(req, resp_body, n);
 }
 
-// POST /tx-stop — no body. Signals the playback task to stop at its next
+// POST /tx-stop — no body, no query params (stops whatever is playing,
+// regardless of which slot). Signals the playback task to stop at its next
 // chunk boundary and blocks briefly until it actually has (see
 // audio_monitor_tx_stop()'s own bounded-wait comment) — always returns 200
 // with the resulting state, including the trivial "nothing was playing"
-// case, rather than treating that as an error.
+// case (stopped_slot -1), rather than treating that as an error.
 static esp_err_t tx_stop_handler(httpd_req_t *req) {
-    bool stopped = audio_monitor_tx_stop();
+    int stopped_slot = -1;
+    bool stopped = audio_monitor_tx_stop(&stopped_slot);
 
     httpd_resp_set_type(req, "application/json");
     set_cors(req);
-    char resp_body[32];
-    int n = snprintf(resp_body, sizeof(resp_body), "{\"stopped\":%s}", stopped ? "true" : "false");
+    char resp_body[48];
+    int n = snprintf(resp_body, sizeof(resp_body), "{\"stopped\":%s,\"slot\":%d}", stopped ? "true" : "false", stopped_slot);
     return httpd_resp_send(req, resp_body, n);
 }
 

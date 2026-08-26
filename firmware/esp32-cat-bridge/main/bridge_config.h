@@ -28,7 +28,7 @@
 // capability lands (e.g. "audio" once WebRTC firmware exists) — features are
 // additive and never removed once shipped, so an older web app talking to a
 // newer bridge just ignores flags it doesn't recognize.
-#define BRIDGE_FIRMWARE_VERSION "0.5.0"
+#define BRIDGE_FIRMWARE_VERSION "0.6.0"
 
 // ── Wi-Fi (station mode) ────────────────────────────────────────────────────
 // Credentials come from Kconfig (idf.py menuconfig -> "CAT Bridge Config"),

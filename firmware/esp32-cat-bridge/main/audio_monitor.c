@@ -11,6 +11,7 @@
 #include "esp_codec_dev_defaults.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_rom_crc.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -621,8 +622,8 @@ void audio_monitor_report_out_samples(const int16_t *samples, size_t count) {
     audio_rx_callback(samples, count);
 }
 
-// ── One-shot TX buffer playback (POST /tx-audio, /tx-play, /tx-status,
-//    /tx-stop) ─────────────────────────────────────────────────────────────
+// ── TX buffer playback pool (POST /tx-audio, /tx-play, GET /tx-status,
+//    POST /tx-stop) ─────────────────────────────────────────────────────────
 // The whole point of this feature: /audio's live mic-send path glitches on
 // real hardware whenever a single ~2048-sample WebSocket chunk arrives late
 // (any Wi-Fi jitter on that one chunk is instantly audible in the
@@ -634,70 +635,113 @@ void audio_monitor_report_out_samples(const int16_t *samples, size_t count) {
 // once httpd_req_recv() has the whole thing), THEN walk it out to the
 // codec locally, where the only remaining timing source is this device's
 // own task scheduler rather than the network.
+//
+// TX_SLOT_COUNT independent slots (audio_monitor.h) rather than one global
+// buffer, since 2026-08-25: a single buffer meant an auto-CQ loop and a
+// queued reply competed for the same storage, so whichever POST /tx-audio
+// landed last silently clobbered the other — a real gap that forced a
+// re-upload right at the TX window boundary, exactly the WiFi-latency-in-
+// critical-path problem this feature exists to avoid.
 
-// PSRAM (MALLOC_CAP_SPIRAM) — identical reasoning to s_tx_stereo_scratch/
-// s_tx_upsample_scratch above: esp_codec_dev_write() never uses its source
-// pointer as a DMA source (i2s_channel_write() memcpy()s into its OWN DMA
-// descriptors), so nothing here has a DMA-capability requirement, and a
-// single ~480KB allocation (15s of 16kHz mono Int16) has effectively no
-// chance of succeeding against internal RAM's normal fragmentation level —
-// the same class of "heap_free looks fine, heap_largest_free_block doesn't"
-// failure that silently dropped every /audio mic-send frame before those
-// buffers moved to PSRAM.
-static int16_t *s_tx_buffer = NULL;
-static size_t s_tx_buffer_cap_bytes = 0;   // heap_caps_realloc()'d capacity — may exceed s_tx_buffer_len_bytes after a later, smaller upload
-static size_t s_tx_buffer_len_bytes = 0;   // actual uploaded length; 0 means "no buffer uploaded yet"
+// Per-slot storage — PSRAM (MALLOC_CAP_SPIRAM) — identical reasoning to
+// s_tx_stereo_scratch/s_tx_upsample_scratch above: esp_codec_dev_write()
+// never uses its source pointer as a DMA source (i2s_channel_write()
+// memcpy()s into its OWN DMA descriptors), so nothing here has a DMA-
+// capability requirement, and a single ~480KB allocation (15s of 16kHz mono
+// Int16) has effectively no chance of succeeding against internal RAM's
+// normal fragmentation level — the same class of "heap_free looks fine,
+// heap_largest_free_block doesn't" failure that silently dropped every
+// /audio mic-send frame before those buffers moved to PSRAM. See
+// audio_monitor.h's audio_monitor_tx_buffer_upload() comment for the
+// worst-case-vs-realistic PSRAM budget arithmetic across all 4 slots.
+typedef struct {
+    int16_t *buf;
+    size_t cap_bytes;   // heap_caps_realloc()'d capacity — may exceed len_bytes after a later, smaller upload
+    size_t len_bytes;   // actual uploaded length; 0 means "no buffer uploaded yet"
+    uint32_t hash;      // esp_rom_crc32_le() over the uploaded bytes — see audio_monitor_tx_slot_hash()
+} tx_slot_t;
+static tx_slot_t s_tx_slots[TX_SLOT_COUNT];
 
 // Playback state, read by GET /tx-status and written only by tx_play_task()
 // (plus s_tx_play_stop_requested, written by POST /tx-stop) — atomics
 // rather than a mutex since every field is independently meaningful and
 // GET /tx-status is explicitly meant to be cheap/poll-friendly with no
-// blocking, same reasoning as the RX-timing stats above.
+// blocking, same reasoning as the RX-timing stats above. Shared ACROSS all
+// slots, deliberately not per-slot state: this board has exactly one audio
+// output path, so only one slot can ever be playing at a time regardless of
+// how many have buffers uploaded and ready.
 static _Atomic bool s_tx_playing = false;
+static _Atomic int s_tx_playing_slot = -1; // which slot is playing; -1 when s_tx_playing is false
 static _Atomic uint32_t s_tx_position_ms = 0;
 static _Atomic bool s_tx_play_stop_requested = false;
-// Distinct from s_tx_playing: set true the moment tx_play_task() is
-// spawned, cleared only once that task has actually exited — closes the
-// real race where POST /tx-play is called twice back-to-back before the
-// first task's very first loop iteration has run (s_tx_playing itself is
-// set true from INSIDE the task, not by the xTaskCreatePinnedToCore() call
-// site, so there'd otherwise be a window where audio_monitor_tx_play()
-// could see s_tx_playing == false and spawn a second task on top of one
-// that's already starting up).
-static _Atomic bool s_tx_play_task_alive = false;
+// Distinct from s_tx_playing: set to the target slot the moment
+// tx_play_task() is spawned, reset to -1 only once that task has actually
+// exited — closes the real race where POST /tx-play is called twice
+// back-to-back before the first task's very first loop iteration has run
+// (s_tx_playing itself is set true from INSIDE the task, not by the
+// xTaskCreatePinnedToCore() call site, so there'd otherwise be a window
+// where audio_monitor_tx_play() could see s_tx_playing == false and spawn a
+// second task on top of one that's already starting up). Also doubles as
+// "which slot is about to start" for the same double-start check, since a
+// second call targeting a DIFFERENT slot must be rejected too — only one
+// task, and therefore one slot, may ever be starting/running at a time.
+static _Atomic int s_tx_play_task_alive_slot = -1; // -1 == no task alive/starting
 
-bool audio_monitor_tx_buffer_upload(const int16_t *data, size_t byte_count) {
-    if (atomic_load(&s_tx_playing)) return false; // don't clobber a buffer the playback task is mid-read on
+static bool tx_slot_valid(int slot) {
+    return slot >= 0 && slot < TX_SLOT_COUNT;
+}
 
-    if (s_tx_buffer_cap_bytes < byte_count) {
-        int16_t *grown = heap_caps_realloc(s_tx_buffer, byte_count, MALLOC_CAP_SPIRAM);
+bool audio_monitor_tx_buffer_upload(int slot, const int16_t *data, size_t byte_count) {
+    if (!tx_slot_valid(slot)) return false;
+    // Only refuse if THIS slot is the one currently playing — the playback
+    // task only ever reads s_tx_slots[s_tx_playing_slot], so any other slot
+    // is safe to overwrite mid-playback (that's the entire point of having
+    // independent slots: a queued reply can be staged while auto-CQ plays).
+    if (atomic_load(&s_tx_playing) && atomic_load(&s_tx_playing_slot) == slot) return false;
+
+    tx_slot_t *s = &s_tx_slots[slot];
+    if (s->cap_bytes < byte_count) {
+        int16_t *grown = heap_caps_realloc(s->buf, byte_count, MALLOC_CAP_SPIRAM);
         if (!grown) {
-            ESP_LOGW(TAG, "failed to grow TX playback buffer to %u bytes", (unsigned)byte_count);
+            ESP_LOGW(TAG, "failed to grow TX playback buffer (slot %d) to %u bytes", slot, (unsigned)byte_count);
             return false;
         }
-        s_tx_buffer = grown;
-        s_tx_buffer_cap_bytes = byte_count;
+        s->buf = grown;
+        s->cap_bytes = byte_count;
     }
-    memcpy(s_tx_buffer, data, byte_count);
-    s_tx_buffer_len_bytes = byte_count;
-    ESP_LOGI(TAG, "TX playback buffer uploaded: %u bytes (%u ms @ %dHz)",
-              (unsigned)byte_count, (unsigned)audio_monitor_tx_buffer_duration_ms(), MIC_SEND_SAMPLE_RATE_HZ);
+    memcpy(s->buf, data, byte_count);
+    s->len_bytes = byte_count;
+    // esp_rom_crc32_le() is ROM-resident (esp_rom_crc.h) — zero flash cost,
+    // and cheap enough at these sizes (sub-ms for hundreds of KB) to compute
+    // unconditionally on every upload rather than making it optional. Lets
+    // the browser GET /tx-status and skip a re-POST for a slot (e.g. a
+    // standing auto-CQ waveform re-derived every cycle) whose content hash
+    // hasn't actually changed since the last upload.
+    s->hash = esp_rom_crc32_le(0, (const uint8_t *)data, byte_count);
+    ESP_LOGI(TAG, "TX playback buffer uploaded (slot %d): %u bytes (%u ms @ %dHz), hash %08x",
+              slot, (unsigned)byte_count, (unsigned)audio_monitor_tx_buffer_duration_ms(slot),
+              MIC_SEND_SAMPLE_RATE_HZ, (unsigned)s->hash);
     return true;
 }
 
-bool audio_monitor_tx_buffer_ready(void) {
-    return s_tx_buffer_len_bytes > 0;
+bool audio_monitor_tx_buffer_ready(int slot) {
+    return tx_slot_valid(slot) && s_tx_slots[slot].len_bytes > 0;
 }
 
-size_t audio_monitor_tx_buffer_byte_count(void) {
-    return s_tx_buffer_len_bytes;
+size_t audio_monitor_tx_buffer_byte_count(int slot) {
+    return tx_slot_valid(slot) ? s_tx_slots[slot].len_bytes : 0;
 }
 
-uint32_t audio_monitor_tx_buffer_duration_ms(void) {
+uint32_t audio_monitor_tx_buffer_duration_ms(int slot) {
+    if (!tx_slot_valid(slot)) return 0;
     // bytes -> samples (2 bytes/sample, mono) -> ms, at the fixed wire rate
     // this buffer is always stored at (see MIC_SEND_SAMPLE_RATE_HZ's own
     // comment for why this never varies with the codec's configured rate).
-    return (uint32_t)(((uint64_t)s_tx_buffer_len_bytes / 2) * 1000 / MIC_SEND_SAMPLE_RATE_HZ);
+    return (uint32_t)(((uint64_t)s_tx_slots[slot].len_bytes / 2) * 1000 / MIC_SEND_SAMPLE_RATE_HZ);
+}
+
+uint32_t audio_monitor_tx_slot_hash(int slot) {
+    return tx_slot_valid(slot) ? s_tx_slots[slot].hash : 0;
 }
 
 // Chunk size/cadence matches READ_WINDOW_MS exactly — not a new, separately
@@ -711,25 +755,30 @@ uint32_t audio_monitor_tx_buffer_duration_ms(void) {
 // fine (needless task-wake overhead for no benefit).
 #define TX_PLAY_CHUNK_SAMPLES ((size_t)((uint64_t)MIC_SEND_SAMPLE_RATE_HZ * READ_WINDOW_MS / 1000))
 
-// No task-arg struct needed (unlike a generic FreeRTOS task that takes
-// caller-specific parameters) — every value this task needs
-// (s_tx_buffer/s_tx_buffer_len_bytes) is already file-scope state, stable
-// for the task's whole run since audio_monitor_tx_buffer_upload() refuses
-// to touch it while s_tx_playing is true (set true below before this task
-// does anything else observable).
+// Task-arg is just the slot index (boxed in a static int array, not the
+// stack/heap, since xTaskCreatePinnedToCore()'s caller returns before the
+// new task is guaranteed to have read a stack-local arg) — everything else
+// this task needs (s_tx_slots[slot].buf/len_bytes) is file-scope state,
+// stable for the task's whole run since audio_monitor_tx_buffer_upload()
+// refuses to touch THIS slot while it's the one playing (s_tx_playing_slot
+// set below before this task does anything else observable).
+static int s_tx_play_task_arg_slot;
+
 static void tx_play_task(void *arg) {
-    (void)arg;
-    uint32_t duration_ms = audio_monitor_tx_buffer_duration_ms();
-    size_t total_samples = s_tx_buffer_len_bytes / sizeof(int16_t);
+    int slot = *(int *)arg;
+    tx_slot_t *s = &s_tx_slots[slot];
+    uint32_t duration_ms = audio_monitor_tx_buffer_duration_ms(slot);
+    size_t total_samples = s->len_bytes / sizeof(int16_t);
     size_t pos_samples = 0;
     atomic_store(&s_tx_position_ms, 0);
+    atomic_store(&s_tx_playing_slot, slot);
     atomic_store(&s_tx_playing, true);
 
-    ESP_LOGI(TAG, "TX playback started: %u samples, %u ms", (unsigned)total_samples, (unsigned)duration_ms);
+    ESP_LOGI(TAG, "TX playback started (slot %d): %u samples, %u ms", slot, (unsigned)total_samples, (unsigned)duration_ms);
 
     while (pos_samples < total_samples) {
         if (atomic_load(&s_tx_play_stop_requested)) {
-            ESP_LOGI(TAG, "TX playback stopped early at %u/%u samples", (unsigned)pos_samples, (unsigned)total_samples);
+            ESP_LOGI(TAG, "TX playback stopped early (slot %d) at %u/%u samples", slot, (unsigned)pos_samples, (unsigned)total_samples);
             break;
         }
         size_t chunk = total_samples - pos_samples;
@@ -740,7 +789,7 @@ static void tx_play_task(void *arg) {
         // this is the one and only sink to feed rather than re-deriving
         // audio_rx_callback()'s upsample/stereo-duplication/
         // esp_codec_dev_write() logic a second time here.
-        audio_monitor_report_out_samples(s_tx_buffer + pos_samples, chunk);
+        audio_monitor_report_out_samples(s->buf + pos_samples, chunk);
 
         pos_samples += chunk;
         atomic_store(&s_tx_position_ms, (uint32_t)(((uint64_t)pos_samples * 1000) / MIC_SEND_SAMPLE_RATE_HZ));
@@ -767,17 +816,23 @@ static void tx_play_task(void *arg) {
     }
 
     atomic_store(&s_tx_playing, false);
+    atomic_store(&s_tx_playing_slot, -1);
     atomic_store(&s_tx_play_stop_requested, false);
-    ESP_LOGI(TAG, "TX playback finished");
-    atomic_store(&s_tx_play_task_alive, false);
+    ESP_LOGI(TAG, "TX playback finished (slot %d)", slot);
+    atomic_store(&s_tx_play_task_alive_slot, -1);
     vTaskDelete(NULL);
 }
 
-bool audio_monitor_tx_play(void) {
-    if (!audio_monitor_tx_buffer_ready()) return false;
-    if (atomic_load(&s_tx_playing) || atomic_load(&s_tx_play_task_alive)) return false;
+bool audio_monitor_tx_play(int slot) {
+    if (!audio_monitor_tx_buffer_ready(slot)) return false;
+    // ANY slot already playing or starting (not just this one) blocks a new
+    // start — this board has exactly one audio output path, so "is anything
+    // playing" is shared global state, same reasoning as s_tx_playing_slot's
+    // own comment above.
+    if (atomic_load(&s_tx_playing) || atomic_load(&s_tx_play_task_alive_slot) != -1) return false;
 
-    atomic_store(&s_tx_play_task_alive, true);
+    atomic_store(&s_tx_play_task_alive_slot, slot);
+    s_tx_play_task_arg_slot = slot;
     // Pinned to RELAY_TASK_CORE at AUDIO_MONITOR_TASK_PRIO (see
     // bridge_config.h's TX_PLAY_TASK_CORE/TX_PLAY_TASK_PRIO comment) — a
     // GENUINELY SEPARATE task from the httpd worker that answered this very
@@ -789,11 +844,11 @@ bool audio_monitor_tx_play(void) {
     // reboot mid-transmission — exactly the failure this architecture
     // exists to make structurally impossible for this feature, not just
     // unlikely.
-    BaseType_t created = xTaskCreatePinnedToCore(tx_play_task, "tx_play", 4096, NULL,
+    BaseType_t created = xTaskCreatePinnedToCore(tx_play_task, "tx_play", 4096, &s_tx_play_task_arg_slot,
                                                   TX_PLAY_TASK_PRIO, NULL, TX_PLAY_TASK_CORE);
     if (created != pdPASS) {
-        ESP_LOGW(TAG, "failed to create TX playback task");
-        atomic_store(&s_tx_play_task_alive, false);
+        ESP_LOGW(TAG, "failed to create TX playback task (slot %d)", slot);
+        atomic_store(&s_tx_play_task_alive_slot, -1);
         return false;
     }
     return true;
@@ -801,8 +856,15 @@ bool audio_monitor_tx_play(void) {
 
 void audio_monitor_tx_get_status(audio_monitor_tx_status_t *out) {
     out->playing = atomic_load(&s_tx_playing);
+    out->playing_slot = atomic_load(&s_tx_playing_slot);
     out->position_ms = atomic_load(&s_tx_position_ms);
-    out->duration_ms = audio_monitor_tx_buffer_duration_ms();
+    out->duration_ms = out->playing ? audio_monitor_tx_buffer_duration_ms(out->playing_slot) : 0;
+    for (int i = 0; i < TX_SLOT_COUNT; i++) {
+        out->slots[i].ready = audio_monitor_tx_buffer_ready(i);
+        out->slots[i].byte_count = s_tx_slots[i].len_bytes;
+        out->slots[i].duration_ms = audio_monitor_tx_buffer_duration_ms(i);
+        out->slots[i].hash = s_tx_slots[i].hash;
+    }
 }
 
 // Bounded wait rather than an unbounded one — tx_play_task() checks
@@ -817,7 +879,9 @@ void audio_monitor_tx_get_status(audio_monitor_tx_status_t *out) {
 #define TX_STOP_WAIT_TIMEOUT_MS 1000
 #define TX_STOP_WAIT_POLL_MS 20
 
-bool audio_monitor_tx_stop(void) {
+bool audio_monitor_tx_stop(int *stopped_slot_out) {
+    int slot = atomic_load(&s_tx_playing_slot); // read BEFORE the stop, since it resets to -1 once stopped
+    if (stopped_slot_out) *stopped_slot_out = slot;
     if (!atomic_load(&s_tx_playing)) return true; // nothing playing — trivially "stopped"
 
     atomic_store(&s_tx_play_stop_requested, true);
@@ -832,7 +896,7 @@ bool audio_monitor_tx_stop(void) {
         // than silently reported as success so a genuinely stuck task
         // would leave a trace to investigate, instead of POST /tx-stop
         // quietly lying about having actually stopped it.
-        ESP_LOGW(TAG, "TX playback did not stop within %dms of a stop request", TX_STOP_WAIT_TIMEOUT_MS);
+        ESP_LOGW(TAG, "TX playback did not stop within %dms of a stop request (slot %d)", TX_STOP_WAIT_TIMEOUT_MS, slot);
     }
     return stopped;
 }
