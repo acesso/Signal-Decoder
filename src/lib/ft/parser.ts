@@ -55,6 +55,19 @@ function standardPrefix(w: string): string | null {
   if (m[1].length === 1 && w.length >= 2 && /[0-9]/.test(w[1]) && isExactKnownPrefix(w.slice(0, 2))) {
     return w.slice(0, 2);
   }
+  // Same ambiguity one prefix-length up: a handful of real DXCC entities
+  // (VP2 Anguilla, VP5 Turks & Caicos, VP9 Bermuda, ...) are allocated as a
+  // 2-LETTER prefix + DIGIT triple, not the bare 2-letter block — "VP" alone
+  // isn't allocated at all, only "VP2"/"VP5"/"VP9" specifically (see
+  // prefixes.ts's own comment on why these need explicit 3-char entries).
+  // The regex's greedy {1,2} group already resolved m[1] to the correct
+  // "VP" text, but that's the WRONG substring to check for allocation —
+  // retry with the 3-char letter+letter+digit reading (m[1] + the digit the
+  // regex consumed separately) and prefer it when THAT's the one actually
+  // allocated. Real report: "VP2MAA" was rejected as an invalid callsign.
+  if (m[1].length === 2 && w.length >= 3 && /[0-9]/.test(w[2]) && isExactKnownPrefix(w.slice(0, 3))) {
+    return w.slice(0, 3);
+  }
   return m[1];
 }
 // Nonstandard/58-bit shape (no slash): everything real that doesn't fit the

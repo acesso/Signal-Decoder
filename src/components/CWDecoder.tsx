@@ -576,6 +576,7 @@ export default function CWDecoder(props: DecoderProps): JSX.Element {
               computer: props.iqBridge!.spectrum,
               sampleRateHz: () => props.iqBridge!.state().sampleRateHz,
               active: () => props.iqBridge!.state().connected,
+              signalDbfs: () => props.iqBridge!.state().iqSignalDbfs,
             }}
             isRecording={processor.state().isRecording}
             vfoFrequency={props.vfoFrequency}
@@ -584,6 +585,24 @@ export default function CWDecoder(props: DecoderProps): JSX.Element {
             passband={{ centerHz: props.iqBridge!.state().passbandCenterHz, bandwidthHz: props.iqBridge!.state().passbandBandwidthHz }}
             onPassbandChange={(p) => props.iqBridge!.setPassband(p.centerHz, p.bandwidthHz)}
             markerFieldLabel="Passband"
+            /* Tone marker(s) — only meaningful against already-demodulated
+               audio, same as the fallback branch above. Passing them here
+               too (not previously done) lets them reappear once the
+               operator picks "Decoded audio" in the Signal source selector
+               (only shown when analyser+iqSource are both given, as here);
+               effectiveMarkers/handleMarkerDrag in SignalAnalysisPanel
+               already only surface these on the processed tap. */
+            markers={[
+              { freq: toneFreq(), color: '#f85149', label: 'T', bandwidthHz: filterBandwidth() },
+              ...(dualMode() ? [{ freq: toneFreq2(), color: '#ffa657', label: 'T2', bandwidthHz: filterBandwidth() }] : []),
+            ]}
+            onMarkerDrag={(idx, newHz) => {
+              const f = Math.max(50, newHz)
+              if (idx === 0) setToneFreq(f)
+              else setToneFreq2(f)
+            }}
+            squelch={squelch()}
+            onSquelchChange={setSquelch}
             class="min-w-0"
             style={{ flex: panelWeights()[1] }}
           />

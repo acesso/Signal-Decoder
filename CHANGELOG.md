@@ -12,6 +12,8 @@ them into a version section when cutting a release.
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-08-26
+
 ### Fixed
 
 - Fixed intermittent multi-second I/Q stream stalls (heard as metallic crackling, decode-breaking) on the ESP32 bridge's `/iq-data` WebSocket: the bridge's Wi-Fi network broadcasts one SSID from multiple same-channel APs, and the bridge could roam between them mid-session — added an optional BSSID pin (Kconfig default + `POST /wifi-config`) to keep it associated with one AP. Also gave `/iq-data` a small per-client ring buffer (was a single reused slot) so a brief send stall becomes added latency instead of a dropped frame.
@@ -23,6 +25,17 @@ them into a version section when cutting a release.
 - Fixed the web app's TX audio defaulting to the local speaker instead of the ESP32 bridge even when the bridge was connected.
 - Fixed a reconnect storm on weak Wi-Fi: the CAT and audio bridge sockets now back off exponentially (2s–30s) instead of retrying every 2s indefinitely.
 - Fixed `GET /cat-log` failing once the log filled, due to a single large heap allocation for the response.
+- Fixed the Signal Analysis panel's spectrum/waterfall graphs slowing down since I/Q mode was introduced (most noticeable zoomed into a small slice of a wide I/Q band, or while viewing "Decoded audio"): the I/Q spectrum FFT ran on every incoming frame regardless of whether anything on screen was actually reading it. It now only runs while a panel is genuinely displaying the raw I/Q tap.
+- Fixed the Signal Analysis panel's "View" zoom-preset chips (1k/2k/3k/6k etc.) silently reverting the moment they were clicked whenever the preset's range didn't fully fit the current source's bounds. Replaced with 1k/2k/3k/6k presets plus one dynamic preset for the full currently-available span, each capped so it can never request a range wider than the source.
+- Fixed CW/RTTY/MFSK's own tone/channel markers no longer appearing on the Signal Analysis panel once I/Q mode was introduced — they were never wired into that code path at all. They now reappear when "Decoded audio" is selected as the panel's signal source (and stay hidden on "Raw I/Q", where they don't correspond to anything).
+- Fixed a real decoded callsign, `VP2MAA` (Anguilla), being rejected as invalid: the callsign-shape parser preferred a 2-letter prefix reading ("VP") that isn't itself an ITU allocation, when the correct reading is the 2-letter+digit prefix ("VP2") — same class of ambiguity already handled for D2/V2/A2/T7, just one prefix-length further. Also fixes VP5 (Turks & Caicos) and VP9 (Bermuda).
+
+### Changed
+
+- Signal Analysis panel: numeric Hz fields (Center/Width/View range) no longer clamp or show spinner arrows while typing — a value could get silently snapped back mid-edit before the operator finished entering it.
+- Signal Analysis panel: switching the "Signal source" between Raw I/Q and Decoded audio no longer resets the current zoom/pan range back to a default; it's preserved unless the current view is entirely outside what the new source can show.
+- Signal Analysis panel: added an icon-only signal-strength meter next to the panel title (I/Q mode only), and moved the "Signal source" selector up next to the title instead of at the bottom of the panel.
+- Transmit panel: reworked the top control row for less wasted vertical space — Output device selection, OutputSelector, and "Suspend I/Q spectrum during TX" are one row instead of three; the always-on/off toggles (Auto-CQ, Auto-PTT, Consecutive TX, Auto-Reply) are grouped into a compact 2-column grid; removed the "Output selection requires Chrome 110+" fallback text, which broke the row's alignment on unsupported browsers; and the Auto-CQ interval field is now labeled and sits with the panel's other numeric fields instead of floating unlabeled next to Start TX.
 
 ### Added
 

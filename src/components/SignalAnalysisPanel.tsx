@@ -7,7 +7,7 @@
 // useIQBridge.ts's setPassband()). Retires IQSpectrumPanel.tsx, whose
 // job (an I/Q-aware GLSpectrogram view) this component now covers with a
 // real marker/bandwidth system instead of that panel's plain zoom slider.
-import { createEffect, createMemo, createSignal, onCleanup, onMount, type JSX } from 'solid-js'
+import { createEffect, createMemo, createSignal, For, onCleanup, onMount, type JSX } from 'solid-js'
 import GLSpectrogram, { type GLSpectrogramHandle, type SpectroBand } from './GLSpectrogram'
 import { loadNumber, saveNumber, loadString, saveString } from '$decoder-lib/storage'
 import { buildColormapLUT, COLORMAPS, COLORMAP_LABEL, type ColormapName } from '$decoder-lib/colormaps'
@@ -385,9 +385,13 @@ interface Props {
    *  alone demodulation. See analyser's own comment for how the two
    *  combine. Span is always -sampleRateHz()/2..+sampleRateHz()/2. */
   iqSource?: {
-    computer: { magBytes: Uint8Array }
+    computer: { magBytes: Uint8Array; setActive?: (active: boolean) => void }
     sampleRateHz: () => number
     active: () => boolean
+    /** Pre-AGC signal strength (dBFS) — useIQBridge.ts's IQBridgeState.iqSignalDbfs.
+     *  Drives the icon-only meter next to the panel title; null until the
+     *  first I/Q frame is demodulated. */
+    signalDbfs?: () => number | null
   }
   isRecording: boolean
   markers?: AudioMarker[]
@@ -415,6 +419,49 @@ interface Props {
 type IQTapPoint = 'raw' | 'processed'
 const IQ_TAP_POINTS: IQTapPoint[] = ['raw', 'processed']
 
+// Icon-only signal-strength meter (bars, no numeric/text readout by
+// design — the existing IQSignalMeterDisplay in RadioCATPanel.tsx already
+// covers the numeric "S9+12 -18dB" case). Floor/ceiling are coarse, not the
+// precise S-unit scale RadioCATPanel's own dbfsToSUnitLabel uses (-30dBFS =
+// S9, ~6dB/S-unit) — this is meant for an at-a-glance glance, not a report.
+const SIGNAL_METER_FLOOR_DBFS = -80
+const SIGNAL_METER_CEIL_DBFS = -20
+function SignalStrengthMeter(props: { dbfs: number | null }): JSX.Element {
+  const fraction = createMemo(() => {
+    if (props.dbfs === null) return null
+    const span = SIGNAL_METER_CEIL_DBFS - SIGNAL_METER_FLOOR_DBFS
+    return Math.max(0, Math.min(1, (props.dbfs - SIGNAL_METER_FLOOR_DBFS) / span))
+  })
+  const BAR_COUNT = 4
+  return (
+    <div class="flex items-end gap-[1.5px] h-3.5" title={props.dbfs === null ? 'Signal strength: no signal yet' : `Signal strength: ${Math.round(props.dbfs)} dBFS`}>
+      <For each={Array.from({ length: BAR_COUNT }, (_, i) => i)}>
+        {(i) => {
+          const lit = () => fraction() !== null && fraction()! >= (i + 1) / BAR_COUNT
+          return (
+            <div
+              class={`w-[3px] rounded-sm transition-colors ${lit() ? 'bg-[#2ea043]' : 'bg-[#30363d]'}`}
+              style={{ height: `${((i + 1) / BAR_COUNT) * 100}%` }}
+            />
+          )
+        }}
+      </For>
+    </div>
+  )
+}
+
+// Plain parseFloat, no min/max clamp — the frequency NumberFields in this
+// panel used to clamp on every keystroke (NumberField's own defaultParse),
+// which fought the operator mid-typing (e.g. clearing a field to type a
+// bigger number got immediately snapped back to the old max). Whatever gets
+// committed here still flows through the same drag/passband-change logic a
+// real out-of-range value would hit via mouse drag, so nothing downstream
+// relies on this field enforcing bounds itself.
+function rawFreqParse(raw: string): number | null {
+  const n = parseFloat(raw)
+  return Number.isFinite(n) ? n : null
+}
+
 export default function SignalAnalysisPanel(props: Props): JSX.Element {
   // Only meaningful when BOTH iqSource and analyser are given (I/Q mode) —
   // see analyser's own comment on what each tap point actually shows.
@@ -433,6 +480,19 @@ export default function SignalAnalysisPanel(props: Props): JSX.Element {
     }
     return props.analyser ? new AnalyserSpectrumSource(props.analyser) : null
   })
+  // Tells useIQBridge.ts's IQSpectrumComputer whether this panel is actually
+  // displaying the raw I/Q tap right now, so it can skip its own per-frame
+  // FFT/magnitude work (a real, fixed cost — see setActive's own comment)
+  // whenever nothing on screen reads magBytes. Reference-counted on the
+  // computer's side, so this only needs to report ITS OWN true/false — not
+  // worry about other mounted panels. Runs whenever `source()` changes
+  // identity (tap switch, iqSource appearing/disappearing) and once more
+  // on cleanup to release this panel's own count.
+  createEffect(() => {
+    const isRaw = source() instanceof IQSpectrumSourceAdapter
+    props.iqSource?.computer.setActive?.(isRaw)
+    onCleanup(() => props.iqSource?.computer.setActive?.(false))
+  })
   // I/Q mode's passband marker is presented through the exact same
   // drawChannelMarker/MarkerGrips path as a regular AudioMarker — appended
   // to (never replacing) props.markers so a decoder could in principle show
@@ -442,12 +502,29 @@ export default function SignalAnalysisPanel(props: Props): JSX.Element {
   // "processed" tap (that view is already the post-demodulation baseband
   // audio the passband setting PRODUCED, not something the passband
   // marker itself could still be dragged within).
+  // onRawTap: are we actually looking at the raw I/Q spectrum right now?
+  // false whenever there's no I/Q tap choice at all (ordinary audio-mode
+  // decoders, hasBothTaps()===false) OR the operator picked "processed".
+  const onRawTap = createMemo(() => hasBothTaps() && iqTap() === 'raw')
   const effectiveMarkers = createMemo<AudioMarker[]>(() => {
-    const base = props.markers ?? []
-    if (!props.passband || (hasBothTaps() && iqTap() !== 'raw')) return base
+    // props.markers (tone/channel markers) describe positions in
+    // DEMODULATED AUDIO — meaningless on the raw wideband I/Q spectrum, so
+    // suppressed there exactly like the passband marker below (which is
+    // the opposite case: meaningful only on raw I/Q, since centerHz is an
+    // offset within that wideband spectrum with no equivalent on
+    // already-demodulated "processed" audio). Confirmed via a real report
+    // that these were unintentionally never shown at all once a decoder
+    // started passing iqSource — passing them back in is the fix; this
+    // onRawTap() guard is what keeps them from also cluttering the raw view
+    // once they ARE passed in.
+    const base = onRawTap() ? [] : (props.markers ?? [])
+    if (!props.passband || !onRawTap()) return base
     return [...base, { freq: props.passband.centerHz, color: '#58a6ff', label: 'Passband', bandwidthHz: props.passband.bandwidthHz }]
   })
-  const isPassbandMarkerIndex = (i: number) => props.passband != null && !(hasBothTaps() && iqTap() !== 'raw') && i === (props.markers ?? []).length
+  // The passband marker is the ONLY thing effectiveMarkers ever includes on
+  // the raw tap (base is forced empty there — see effectiveMarkers' own
+  // comment), so it's always at index 0 when this is true.
+  const isPassbandMarkerIndex = (i: number) => props.passband != null && onRawTap() && i === 0
   const handleMarkerDrag = (index: number, newFreq: number, shiftKey?: boolean) => {
     if (isPassbandMarkerIndex(index)) {
       props.onPassbandChange?.({ centerHz: newFreq, bandwidthHz: props.passband!.bandwidthHz })
@@ -469,15 +546,42 @@ export default function SignalAnalysisPanel(props: Props): JSX.Element {
 
   const [displayMinHz, setDisplayMinHz] = createSignal(lsMinHz ? loadNumber(lsMinHz, sourceMinHz()) : sourceMinHz())
   const [displayMaxHz, setDisplayMaxHz] = createSignal(lsMaxHz ? loadNumber(lsMaxHz, defaultMaxHz()) : defaultMaxHz())
-  // iqSource's span is only known once sampleRateHz() resolves (e.g. after
-  // GET /status returns) — re-clamp the persisted/default View range into
-  // it whenever the source's own bounds change, rather than leaving a
-  // real-FFT-era 0-floored range stuck on screen after switching to I/Q.
+  // Re-clamps the View range only when it's genuinely UNREACHABLE on the
+  // current source — i.e. the whole [displayMinHz,displayMaxHz] window now
+  // sits entirely outside [sourceMinHz,sourceMaxHz] (would show nothing at
+  // all), which only happens from a real sample-rate change (e.g.
+  // GET /status resolving after mount). Deliberately does NOT clamp on
+  // every tap switch: the raw-I/Q source's span is -Nyquist..+Nyquist while
+  // the processed/decoded-audio source is 0-floored (see
+  // AnalyserSpectrumSource.minHz), so a naive "snap into [lo,hi]" on every
+  // switch fought the operator's own chosen zoom — e.g. picking "Decoded
+  // audio" while viewing -2000..2000Hz on raw I/Q used to force the view
+  // back to 0..something, discarding the operator's zoom for no reason
+  // other than the new source's span technically starting at 0. Confirmed
+  // report: "when I select decoded audio as source, the view goes to 0, it
+  // should be kept the same for all signal source." A merely PARTIALLY
+  // out-of-range window (e.g. min dips slightly below the new source's 0)
+  // is left alone — drawSpectrum's own bin-clamping (Math.max(0, bin0))
+  // already renders a partial/empty edge gracefully instead of garbage.
   createEffect(() => {
     const lo = sourceMinHz()
     const hi = sourceMaxHz()
-    if (displayMinHz() < lo) setDisplayMinHz(lo)
-    if (displayMaxHz() > hi) setDisplayMaxHz(hi)
+    if (displayMaxHz() <= lo || displayMinHz() >= hi) {
+      setDisplayMinHz(lo)
+      setDisplayMaxHz(hi === lo ? lo + 100 : hi)
+    }
+  })
+  // Enforces min < max — the View min/max fields used to be native
+  // <input type=number> with min/max attributes tying each field to the
+  // OTHER field's current value, giving that ordering guarantee live as the
+  // operator typed. Switching those to NumberField (so typing a new value
+  // isn't fought by a clamp on every keystroke — see rawFreqParse's own
+  // comment) dropped that live cross-field constraint; this effect is the
+  // replacement, applied once after a value actually commits rather than
+  // per keystroke — independent of the source-reachability effect above,
+  // which must NOT run on every tap switch (see its own comment).
+  createEffect(() => {
+    if (displayMinHz() >= displayMaxHz()) setDisplayMinHz(Math.max(sourceMinHz(), displayMaxHz() - 100))
   })
   const [sgView, setSgView] = createSignal<SpectrogramView>(loadString(LS_SG_VIEW, 'waterfall', SPECTROGRAM_VIEWS))
   // WebGL init/shader failure → swap the spectrogram to the CPU 2D pipeline.
@@ -792,7 +896,10 @@ export default function SignalAnalysisPanel(props: Props): JSX.Element {
   })
 
   const glBandsComputed = createMemo<SpectroBand[]>(() =>
-    props.glBands
+    // Same reasoning as effectiveMarkers' own onRawTap() guard: glBands (MFSK's
+    // per-channel highlight bands) describes demodulated-audio channel
+    // positions, meaningless on the raw wideband I/Q spectrum.
+    props.glBands && !onRawTap()
       ? props.glBands.map((ch) => {
           const halfBw = 40
           return { fromHz: ch.freq - halfBw, toHz: ch.freq + halfBw, color: ch.color }
@@ -850,8 +957,31 @@ export default function SignalAnalysisPanel(props: Props): JSX.Element {
       class={`flex flex-col rounded-lg border border-[#30363d] bg-[#161b22] p-3 sm:p-4${props.class ? ` ${props.class}` : ''}`}
       style={props.style}
     >
-      <div class="mb-2 shrink-0">
-        <h2 class="text-lg font-semibold sm:text-xl">Signal Analysis</h2>
+      <div class="mb-2 shrink-0 flex items-center justify-between gap-3">
+        <div class="flex items-center gap-3">
+          <h2 class="text-lg font-semibold sm:text-xl">Signal Analysis</h2>
+          {/* Moved here from the Spectrogram controls row (bottom of the
+              panel) — right after the title is a much more discoverable
+              spot for "which pipeline stage am I even looking at" than
+              buried among Colors/Range/Contrast/Speed. Only shown when
+              there's genuinely a choice — see hasBothTaps's own comment. */}
+          {hasBothTaps() && (
+            <label class="flex items-center gap-1.5 text-xs text-[#8b949e]" title="Where in the I/Q processing pipeline this view taps the signal">
+              Signal source
+              <select
+                value={iqTap()}
+                onChange={(e) => setIqTap(e.currentTarget.value as IQTapPoint)}
+                class="cursor-pointer rounded border border-[#30363d] bg-[#0d1117] px-1.5 py-0.5 text-[#c9d1d9] focus:border-[#2ea043] focus:outline-none"
+              >
+                <option value="raw">Raw I/Q (before demodulation)</option>
+                <option value="processed">Decoded audio (after AGC/filters/NR)</option>
+              </select>
+            </label>
+          )}
+        </div>
+        {/* Icon-only (bars, no number/text — RadioCATPanel.tsx's
+            IQSignalMeterDisplay already covers that) — I/Q mode only. */}
+        {props.iqSource?.signalDbfs && <SignalStrengthMeter dbfs={props.iqSource.signalDbfs()} />}
       </div>
 
       <div class="shrink-0">
@@ -864,9 +994,12 @@ export default function SignalAnalysisPanel(props: Props): JSX.Element {
               // audio-offset shift of the markers.
               <NumberField
                 value={Math.round(props.vfoFrequency + centerFreq()) / 1000}
-                min={(props.vfoFrequency + 50) / 1000}
-                max={(props.vfoFrequency + displayMaxHz()) / 1000}
-                step={0.01}
+                // No min/max/step here — a strict live clamp made it hard to
+                // type a new value at all (each keystroke got clamped before
+                // the next digit landed). onCommit still gets whatever was
+                // actually typed; out-of-range results are the marker
+                // drag/drop logic's own business, not this field's.
+                parse={rawFreqParse}
                 onCommit={(khz) => applyCenterShift(Math.round(khz * 1000) - props.vfoFrequency!)}
                 readOnly={!hasMarkerDrag()}
                 class={`w-28 rounded border border-[#30363d] bg-[#0d1117] px-2 py-0.5 font-mono text-xs text-[#c9d1d9] focus:border-[#2ea043] focus:outline-none ${!hasMarkerDrag() ? 'cursor-default opacity-60' : ''}`}
@@ -874,8 +1007,7 @@ export default function SignalAnalysisPanel(props: Props): JSX.Element {
             ) : (
               <NumberField
                 value={centerFreq()}
-                min={displayMinHz()}
-                max={displayMaxHz()}
+                parse={rawFreqParse}
                 onCommit={applyCenterShift}
                 readOnly={!hasMarkerDrag()}
                 class={`w-20 rounded border border-[#30363d] bg-[#0d1117] px-2 py-0.5 font-mono text-[#c9d1d9] focus:border-[#2ea043] focus:outline-none ${!hasMarkerDrag() ? 'cursor-default opacity-60' : ''}`}
@@ -892,14 +1024,15 @@ export default function SignalAnalysisPanel(props: Props): JSX.Element {
                 ever changed centerHz, confirmed directly against a real
                 report of "changed the passband value, audio bandwidth
                 didn't change" (true: that value only ever WAS centerHz). */}
-            {props.passband && props.onPassbandChange && !(hasBothTaps() && iqTap() !== 'raw') && (
+            {props.passband && props.onPassbandChange && onRawTap() && (
               <>
                 <span class="shrink-0 ml-2">Width</span>
                 <NumberField
                   value={props.passband.bandwidthHz}
-                  min={50}
-                  max={sourceMaxHz() - sourceMinHz()}
-                  step={50}
+                  // No min/max/step — see the Center field's own comment
+                  // above for why a live clamp/spinner made this hard to
+                  // type into.
+                  parse={rawFreqParse}
                   onCommit={(hz) => props.onPassbandChange!({ centerHz: props.passband!.centerHz, bandwidthHz: Math.round(hz) })}
                   class="w-16 rounded border border-[#30363d] bg-[#0d1117] px-2 py-0.5 font-mono text-[#c9d1d9] focus:border-[#2ea043] focus:outline-none"
                 />
@@ -949,57 +1082,66 @@ export default function SignalAnalysisPanel(props: Props): JSX.Element {
 
         <div class="mt-1 flex items-center gap-1.5 text-[10px] text-[#8b949e]">
           <span class="shrink-0">View</span>
-          <input
-            type="number"
-            min={sourceMinHz()}
-            max={displayMaxHz() - 100}
-            step={100}
+          {/* NumberField, not a raw <input type=number> — that native
+              version clamped on every keystroke (same "can't type a new
+              value" complaint as the Center/Width fields above) AND was a
+              CONTROLLED input bound straight to the signal, which is exactly
+              the Firefox mid-edit-focus-loss bug NumberField's own header
+              comment documents. parse={rawFreqParse} skips the clamp;
+              final min/max enforcement still happens via the existing
+              sourceMinHz/sourceMaxHz clamp effect below. */}
+          <NumberField
             value={displayMinHz()}
-            onInput={(e) => {
-              const v = parseInt(e.currentTarget.value)
-              if (!isNaN(v)) setDisplayMinHz(Math.max(sourceMinHz(), Math.min(displayMaxHz() - 100, v)))
-            }}
+            parse={rawFreqParse}
+            onCommit={setDisplayMinHz}
             class="w-16 rounded border border-[#30363d] bg-[#0d1117] px-1.5 py-0.5 font-mono text-[#c9d1d9] focus:border-[#2ea043] focus:outline-none"
           />
           <span class="shrink-0 text-[#484f58]">–</span>
-          <input
-            type="number"
-            min={displayMinHz() + 100}
-            max={sourceMaxHz()}
-            step={100}
+          <NumberField
             value={displayMaxHz()}
-            onInput={(e) => {
-              const v = parseInt(e.currentTarget.value)
-              if (!isNaN(v)) setDisplayMaxHz(Math.max(displayMinHz() + 100, Math.min(sourceMaxHz(), v)))
-            }}
+            parse={rawFreqParse}
+            onCommit={setDisplayMaxHz}
             class="w-16 rounded border border-[#30363d] bg-[#0d1117] px-1.5 py-0.5 font-mono text-[#c9d1d9] focus:border-[#2ea043] focus:outline-none"
           />
           <span class="shrink-0 text-[#484f58]">Hz</span>
-          {(props.iqSource
-            ? [
-                { lo: -1000, hi: 1000 },
-                { lo: -4000, hi: 4000 },
-                { lo: sourceMinHz(), hi: sourceMaxHz() },
-              ]
-            : [
-                { lo: 0, hi: 1000 },
-                { lo: 0, hi: 2000 },
-                { lo: 0, hi: 3000 },
-                { lo: 0, hi: 4000 },
-              ]
-          ).map(({ lo, hi }) => (
+          {/* Quick-set zoom presets — 1k/2k/3k/6k fixed, plus one dynamic
+              chip for the full currently-available span (sourceMaxHz(),
+              e.g. half the I/Q sample rate). All share lo=0: unlike the
+              previous ± presets, these describe the same [0,hi] shape as
+              the manual Hz fields' own natural reading, and — critically —
+              each hi is capped to sourceMaxHz() so a fixed preset can never
+              ask for a range wider than the actual source, which is what
+              made these silently get bounced back to [sourceMinHz(),
+              sourceMaxHz()] by the reachability-clamp effect above the
+              instant they were clicked (a fixed 6k chip on a source whose
+              real span tops out at 2400Hz, for instance). The manual Hz
+              input fields remain for any custom/wider value the operator
+              wants — these are only ever a convenience on top of them. */}
+          {(() => {
+            const cap = sourceMaxHz()
+            const fixed = [1000, 2000, 3000, 6000]
+              .filter(hi => hi <= cap)
+              .map(hi => ({ hi, label: `${hi / 1000}k` }))
+            // Only add the dynamic "full span" chip when it's not already
+            // exactly one of the fixed presets above (e.g. a 3000Hz-wide
+            // I/Q source would otherwise show a redundant "3k" twice).
+            const dynamic = fixed.some(f => f.hi === cap)
+              ? []
+              : [{ hi: cap, label: `${(cap / 1000).toFixed(cap % 1000 === 0 ? 0 : 1)}k (full)` }]
+            return [...fixed, ...dynamic]
+          })().map(({ hi, label }) => (
             <button
               onClick={() => {
-                setDisplayMinHz(lo)
+                setDisplayMinHz(0)
                 setDisplayMaxHz(hi)
               }}
               class={`rounded border px-1.5 py-0.5 text-[9px] transition-colors ${
-                displayMinHz() === lo && displayMaxHz() === hi
+                displayMinHz() === 0 && displayMaxHz() === hi
                   ? 'border-[#2ea043]/50 bg-[#238636]/20 text-[#2ea043]'
                   : 'border-[#30363d] text-[#484f58] hover:text-[#8b949e]'
               }`}
             >
-              {props.iqSource ? `±${Math.round(hi / 1000)}k` : `${hi / 1000}k`}
+              {label}
             </button>
           ))}
         </div>
@@ -1074,26 +1216,6 @@ export default function SignalAnalysisPanel(props: Props): JSX.Element {
           <FreqRuler minHz={displayMinHz()} maxHz={displayMaxHz()} vfoHz={props.vfoFrequency} />
         )}
         <div class="flex flex-wrap items-center gap-3 text-xs text-[#8b949e]">
-          {/* Only shown when there's genuinely a choice — I/Q mode with a
-              live decoded-audio graph to compare against. See analyser's
-              own Props comment for what each tap point shows; this is the
-              first of what's meant to grow into more pipeline-stage taps
-              (raw I/Q and the final post-processing output today — AGC/
-              highpass/noise-reduction all happen strictly BETWEEN these
-              two and aren't independently exposed yet). */}
-          {hasBothTaps() && (
-            <label class="flex items-center gap-1.5" title="Where in the I/Q processing pipeline this view taps the signal">
-              Signal source
-              <select
-                value={iqTap()}
-                onChange={(e) => setIqTap(e.currentTarget.value as IQTapPoint)}
-                class="cursor-pointer rounded border border-[#30363d] bg-[#0d1117] px-1.5 py-0.5 text-[#c9d1d9] focus:border-[#2ea043] focus:outline-none"
-              >
-                <option value="raw">Raw I/Q (before demodulation)</option>
-                <option value="processed">Decoded audio (after AGC/filters/NR)</option>
-              </select>
-            </label>
-          )}
           <label class="flex items-center gap-1.5">
             View
             <select

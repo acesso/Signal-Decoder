@@ -1,4 +1,4 @@
-import { SSBDemodulator } from '../useIQBridge'
+import { SSBDemodulator, IQSpectrumComputer, IQ_FFT_SIZE } from '../useIQBridge'
 
 // A single-tone SSB (USB) signal at RF offset f0 from baseband is exactly a
 // complex exponential e^{j*2*pi*f0*n/fs} — the simplest synthetic case that
@@ -239,4 +239,62 @@ describe('SSBDemodulator', () => {
     expect(magWithoutHighpass).toBeGreaterThan(0.3)
     expect(magWithHighpass).toBeLessThan(magWithoutHighpass * 0.3)
   })
+})
+
+// Regression guard for a real report: the Signal Analysis panel's graphs
+// felt slower after I/Q mode was introduced, especially when zoomed into a
+// small slice of a wide I/Q band or while viewing "decoded audio" — traced
+// to IQSpectrumComputer always running a full IQ_FFT_SIZE-point FFT +
+// magnitude scan on every incoming frame, even when nothing on screen was
+// reading magBytes. setActive()/isActive gate that work; feed() below must
+// still be safe to call while inactive (a real caller keeps calling it
+// every incoming frame regardless of what the UI currently shows).
+describe('IQSpectrumComputer — active gating', () => {
+  function makeFrame(sampleCount: number): Float64Array {
+    const iq = new Float64Array(sampleCount * 2)
+    for (let n = 0; n < sampleCount; n++) {
+      iq[n * 2] = Math.sin(n * 0.1)
+      iq[n * 2 + 1] = Math.cos(n * 0.1)
+    }
+    return iq
+  }
+
+  it('does not update magBytes while inactive (no watchers)', () => {
+    const spectrum = new IQSpectrumComputer()
+    const before = spectrum.magBytes.slice()
+    spectrum.feed(makeFrame(IQ_FFT_SIZE)) // a full window's worth, no active watcher
+    expect(spectrum.magBytes).toEqual(before) // untouched — feed() returned early
+  });
+
+  it('resumes updating magBytes once a watcher activates', () => {
+    const spectrum = new IQSpectrumComputer()
+    spectrum.setActive(true)
+    spectrum.feed(makeFrame(IQ_FFT_SIZE))
+    const someBinIsNonzero = spectrum.magBytes.some(b => b > 0)
+    expect(someBinIsNonzero).toBe(true)
+  });
+
+  it('reference-counts multiple watchers — only fully inactive once ALL release', () => {
+    const spectrum = new IQSpectrumComputer()
+    spectrum.setActive(true) // watcher A
+    spectrum.setActive(true) // watcher B
+    spectrum.setActive(false) // A releases — B still active
+    spectrum.feed(makeFrame(IQ_FFT_SIZE))
+    expect(spectrum.magBytes.some(b => b > 0)).toBe(true)
+
+    spectrum.setActive(false) // B releases — now nobody's watching
+    const before = spectrum.magBytes.slice()
+    spectrum.magBytes.fill(0) // clear so the next assertion can't pass by coincidence
+    spectrum.feed(makeFrame(IQ_FFT_SIZE))
+    expect(spectrum.magBytes).toEqual(new Uint8Array(IQ_FFT_SIZE)) // still all zero — feed() was a no-op
+    expect(before.some(b => b > 0)).toBe(true) // sanity: it really had real data before clearing
+  });
+
+  it('never lets the watcher count go negative on an extra release', () => {
+    const spectrum = new IQSpectrumComputer()
+    spectrum.setActive(false) // release with no matching activate — must not underflow
+    spectrum.setActive(true)
+    spectrum.feed(makeFrame(IQ_FFT_SIZE))
+    expect(spectrum.magBytes.some(b => b > 0)).toBe(true)
+  });
 })
