@@ -728,6 +728,30 @@ bool audio_monitor_tx_buffer_ready(int slot) {
     return tx_slot_valid(slot) && s_tx_slots[slot].len_bytes > 0;
 }
 
+// POST /tx-clear's handler: marks a slot empty (len_bytes = 0, hash = 0 —
+// the exact same "never uploaded" state audio_monitor_tx_buffer_ready()
+// checks) without freeing/shrinking its PSRAM allocation, which stays
+// around for the next upload to reuse via the cap_bytes check in
+// audio_monitor_tx_buffer_upload() — same "don't free just to immediately
+// realloc" reasoning as every other growable buffer in this file. Exists
+// so the browser's slot-pool UI can show an honest "nothing cached here"
+// instead of a stale ready:true/hash left over from a message the
+// operator explicitly asked to forget (see http_control.h's own comment
+// for why a plain client-side "hide the label" isn't good enough: the
+// firmware would still happily play that stale audio if
+// POST /tx-play?slot=N ever hit it another way). Same "refuse only if
+// THIS slot is playing" rule as upload — clearing a different slot mid-
+// playback is safe and always allowed.
+bool audio_monitor_tx_buffer_clear(int slot) {
+    if (!tx_slot_valid(slot)) return false;
+    if (atomic_load(&s_tx_playing) && atomic_load(&s_tx_playing_slot) == slot) return false;
+    tx_slot_t *s = &s_tx_slots[slot];
+    s->len_bytes = 0;
+    s->hash = 0;
+    ESP_LOGI(TAG, "TX playback buffer cleared (slot %d)", slot);
+    return true;
+}
+
 size_t audio_monitor_tx_buffer_byte_count(int slot) {
     return tx_slot_valid(slot) ? s_tx_slots[slot].len_bytes : 0;
 }

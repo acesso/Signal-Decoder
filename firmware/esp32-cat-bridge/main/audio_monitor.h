@@ -266,6 +266,15 @@ size_t audio_monitor_tx_buffer_byte_count(int slot);
 uint32_t audio_monitor_tx_buffer_duration_ms(int slot);
 uint32_t audio_monitor_tx_slot_hash(int slot);
 
+// POST /tx-clear's handler: marks slot empty (as if never uploaded) without
+// freeing its PSRAM allocation — see audio_monitor.c's own comment for why
+// this exists (an honest "remove" for a browser slot-pool UI, not just a
+// client-side label hide) and why the allocation itself is kept around.
+// Returns false if slot is out of range or slot is the one currently
+// playing (same rule as audio_monitor_tx_buffer_upload() — clearing a
+// DIFFERENT slot mid-playback is always allowed).
+bool audio_monitor_tx_buffer_clear(int slot);
+
 // POST /tx-play's handler: starts the dedicated playback task (see
 // audio_monitor.c's tx_play_task() for why this MUST be its own
 // xTaskCreatePinnedToCore task rather than work done inline on the httpd

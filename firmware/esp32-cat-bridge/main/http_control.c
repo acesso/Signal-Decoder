@@ -1228,6 +1228,31 @@ static esp_err_t tx_play_handler(httpd_req_t *req) {
     return httpd_resp_send(req, resp_body, n);
 }
 
+// POST /tx-clear?slot=N — no body. Marks slot empty (as if never uploaded)
+// — see audio_monitor_tx_buffer_clear()'s own comment for why this exists
+// as a real firmware call rather than something the browser fakes purely
+// client-side: a slot-pool UI showing "removed" for a message that's
+// actually still sitting in the device's PSRAM, ready to play the moment
+// anything hits POST /tx-play against it, would be actively misleading.
+// Rejects with 400 if slot is the one currently playing (matching
+// POST /tx-audio's identical rule) — clearing a DIFFERENT slot mid-
+// playback is always allowed.
+static esp_err_t tx_clear_handler(httpd_req_t *req) {
+    int slot;
+    if (!tx_parse_slot_param(req, &slot)) return ESP_FAIL;
+
+    if (!audio_monitor_tx_buffer_clear(slot)) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "this slot is currently playing — call POST /tx-stop first");
+        return ESP_FAIL;
+    }
+
+    httpd_resp_set_type(req, "application/json");
+    set_cors(req);
+    char resp_body[32];
+    int n = snprintf(resp_body, sizeof(resp_body), "{\"slot\":%d,\"cleared\":true}", slot);
+    return httpd_resp_send(req, resp_body, n);
+}
+
 // GET /tx-status — no body, no query params (reports ALL slots at once —
 // see audio_monitor_tx_get_status()). Deliberately cheap: that call only
 // reads already-computed atomics plus TX_SLOT_COUNT small per-slot structs,
@@ -1365,6 +1390,7 @@ void http_control_start(void) {
     httpd_uri_t tx_play_uri      = { .uri = "/tx-play",    .method = HTTP_POST, .handler = tx_play_handler };
     httpd_uri_t tx_status_uri    = { .uri = "/tx-status",  .method = HTTP_GET,  .handler = tx_status_handler };
     httpd_uri_t tx_stop_uri      = { .uri = "/tx-stop",    .method = HTTP_POST, .handler = tx_stop_handler };
+    httpd_uri_t tx_clear_uri     = { .uri = "/tx-clear",   .method = HTTP_POST, .handler = tx_clear_handler };
     httpd_uri_t options_uri      = { .uri = "/*",           .method = HTTP_OPTIONS, .handler = options_handler };
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &status_uri));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &info_uri));
@@ -1393,6 +1419,7 @@ void http_control_start(void) {
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &tx_play_uri));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &tx_status_uri));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &tx_stop_uri));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &tx_clear_uri));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &options_uri));
 
     ESP_LOGI(TAG, "control endpoints ready: GET /status, GET /info, GET /wifi-scan, POST /reset, "
