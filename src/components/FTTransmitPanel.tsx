@@ -419,7 +419,7 @@ interface FTTransmitPanelProps {
    *  endpoints (not opened as a second WebSocket) so selecting "ESP32
    *  Bridge" as the TX output can upload the encoded message and trigger
    *  remote playback — see useFTTransmit.ts's uploadIfBridgeSink()/
-   *  playBridgeBufferAndWait(). */
+   *  playBridgeSlotAndWait(). */
   bridgeWsUrl?: string;
   onMyCallChange?: (call: string) => void;
   onMyGridChange?: (grid: string) => void;
