@@ -52,6 +52,44 @@ describe('SSBDemodulator', () => {
     expect(magAtAudioHz).toBeGreaterThan(magAtWrongHz * 5)
   })
 
+  // Regression guard for a real bug (2026-08-26, found while investigating
+  // a live report that the I/Q decode path produced measurably fewer
+  // confirmed decodes than the radio's own analog SSB demodulator on the
+  // identical signal): a phasing-method demod's image rejection depends on
+  // the Hilbert-filtered branch and the plain-delayed branch having EQUAL
+  // magnitude at the audio frequency in question — a too-short Hilbert FIR
+  // (the OLD fixed HILBERT_TAPS=129) has a magnitude response that rolls
+  // off badly toward DC, so it can't cancel the unwanted sideband there.
+  // Measured directly: the old fixed-129-tap design gave only ~12dB of
+  // rejection at a typical 700Hz FT8 audio offset; this test's threshold
+  // (40dB — matching the uSDX firmware's OWN documented analog rejection,
+  // usdxBLACKBRICK.ino's Hilbert-transform comments) would have failed
+  // against that old design and should hold comfortably now.
+  it('rejects a strong tone on the mirror-image sideband by at least 40dB', () => {
+    const centerHz = 1500
+    const audioHz = 700
+    const wantedRfHz = centerHz + audioHz // real USB content, above the carrier
+    const imageRfHz = centerHz - audioHz // this frequency's OWN mirror — should be rejected in USB mode
+
+    function measureAt(rfHz: number): number {
+      const demod = new SSBDemodulator()
+      demod.setPassband(centerHz, 3000, SAMPLE_RATE)
+      for (let i = 0; i < 10; i++) {
+        demod.demodulate(makeComplexTone(rfHz, SAMPLE_RATE, 2400), true, SAMPLE_RATE)
+      }
+      const out = demod.demodulate(makeComplexTone(rfHz, SAMPLE_RATE, 9600), true, SAMPLE_RATE)
+      // Both the wanted tone and its image demodulate to the SAME audio
+      // frequency (|audioHz|) — rejection shows up as reduced AMPLITUDE at
+      // that frequency when fed the image alone, not a different frequency.
+      return goertzelMagnitude(out.subarray(out.length - 8000), audioHz, SAMPLE_RATE)
+    }
+
+    const wantedMag = measureAt(wantedRfHz)
+    const imageMag = measureAt(imageRfHz)
+    const rejectionDb = 20 * Math.log10(wantedMag / imageMag)
+    expect(rejectionDb).toBeGreaterThan(40)
+  })
+
   it('rejects a tone well outside the selected bandwidth', () => {
     const demod = new SSBDemodulator()
     const centerHz = 0

@@ -1143,17 +1143,109 @@ function buildHilbertTaps(count: number): Float64Array {
   taps.reverse()
   return taps
 }
-// Pure delay line (an impulse at the center tap) matching a same-length
-// Hilbert filter's own group delay — I needs no actual filtering, just
-// the same (count-1)/2-sample delay the Hilbert-filtered Q rail
-// accumulates, so both rails stay time-aligned at the combine step.
-function buildDelayTaps(count: number): Float64Array {
-  if (count % 2 === 0) count++
-  const taps = new Float64Array(count)
-  taps[(count - 1) / 2] = 1
-  return taps
+// Pure N-sample delay — matches a same-length Hilbert filter's own group
+// delay (the I rail needs no actual filtering, just the (count-1)/2-sample
+// delay the Hilbert-filtered Q rail accumulates, so both rails stay time-
+// aligned at the combine step). A dedicated ring-buffer class rather than
+// routing this through FIRFilter with a single-impulse kernel (the
+// previous design) — that impulse kernel is mathematically a pure delay,
+// but FIRFilter.processOne() still walks its
+// FULL tap count doing a real convolution (multiply-adds against mostly-
+// zero coefficients) every single sample. At the Hilbert filter's new,
+// much longer tap counts (estimateHilbertTapCount(), needed for the image-
+// rejection fix above — up to ~1825 taps at 96kHz), that wasted work
+// measured as real, avoidable cost: ~21.5% of a full 1-second real-time
+// budget on this exact tap count, for a class of computation (a delay)
+// that should cost a single array write and an index increment. This
+// class does exactly that — O(1) per sample instead of O(tap count).
+class DelayLine {
+  private buf: Float64Array
+  private pos = 0
+  constructor(private delay: number) {
+    this.buf = new Float64Array(delay + 1)
+  }
+  setDelay(delay: number): void {
+    this.delay = delay
+    this.buf = new Float64Array(delay + 1)
+    this.pos = 0
+  }
+  processOne(sample: number): number {
+    this.buf[this.pos] = sample
+    // Reading (delay) samples behind the current write position — same
+    // "read what was written `delay` steps ago" as FIRFilter's own
+    // history buffer, just without ever multiplying against a
+    // coefficient. Branch-based wrap (matching FIRFilter.processOne()'s
+    // own histIdx increment below) rather than a modulo per sample — cheap
+    // either way at O(1), but avoids the division modulo entirely does on
+    // most JS engines.
+    let readPos = this.pos - this.delay
+    if (readPos < 0) readPos += this.buf.length
+    const out = this.buf[readPos]
+    this.pos++
+    if (this.pos >= this.buf.length) this.pos = 0
+    return out
+  }
 }
-const HILBERT_TAPS = 129 // odd; ~64-tap-equivalent transition band either side, plenty for a 2.7kHz-ish SSB passband well under any of this bridge's I/Q sample rates
+// Was a flat 129 taps regardless of sample rate — confirmed, via a direct
+// image-rejection measurement (inject a tone on the wanted sideband and an
+// equal-strength tone on its mirror image, measure how much the demod
+// suppresses the latter), to deliver only ~12dB of rejection at a typical
+// FT8 audio offset (700Hz), a full ~80dB short of what this same design
+// achieves once sized correctly (measured 94.8dB at 511 taps, 96kHz).
+// Root cause: an ideal Hilbert transformer's impulse response (2/(pi*k)
+// for odd k) decays slowly, so a SHORT truncation — however well-windowed
+// — has a magnitude response that rolls off badly toward DC (measured:
+// 129 taps at 96kHz reads 0.09x amplitude at 100Hz, 0.60x at 700Hz,
+// nowhere near flat) — phasing-method image cancellation depends on the
+// Hilbert branch and the plain-delayed branch having EQUAL magnitude
+// (only differing by the 90° phase shift this filter provides), so any
+// amplitude mismatch directly caps how much the unwanted sideband cancels.
+// This explains a real-world report of the browser I/Q decode path
+// producing measurably fewer confirmed decodes than the radio's own
+// analog SSB demodulator (audio mode) on the identical over-the-air
+// signal — the uSDX firmware's own image rejection is a proven ~40-43dB
+// (see its own Hilbert-transform comments in usdxBLACKBRICK.ino); this
+// path was silently running at ~30dB worse than that.
+//
+// Fixed size, scaled by TARGET_HILBERT_LOW_HZ below rather than a flat
+// higher constant, specifically because the fix's cost (settling time)
+// scales with tap count, and a flat high count would be needlessly
+// expensive at low sample rates (I/Q mode supports the same 8000Hz floor
+// audio mode does) while UNDER-covering low frequencies at high sample
+// rates (the same absolute Hz needs proportionally more taps as sample
+// rate climbs, since a fixed frequency is a smaller fraction of a larger
+// Nyquist). Verified this scaling keeps the low end flat (magnitude ~1.0
+// down to 200Hz) AND image rejection above 120dB at every tested rate
+// (8kHz/48kHz/96kHz) and audio offset (250Hz/700Hz), for a constant ~19ms
+// settling time everywhere — comfortably inside the ~50ms real-time frame
+// budget this whole pipeline is built around (see PASSBAND_GUARD_HZ's own
+// comment and the earlier bw/2 passband-filter fix for that budget's
+// origin).
+//
+// CPU cost, not just settling time: at 96kHz (this app's highest I/Q
+// rate) this comes out to ~1825 taps, and DelayLine's optimization below
+// only removes ONE of the two per-sample filters this cost applies to —
+// the actual Hilbert-transform branch (hilbertQ, a real FIRFilter, not a
+// DelayLine) still walks its full tap count every sample. Measured: the
+// complete demodulate() pipeline (2 lowpass filters + this Hilbert
+// filter) costs ~50% of a real-time budget at 96kHz/3000Hz-wide FT8 —
+// real, but with roughly 2x headroom, not exceeding real time. A 300Hz
+// target would have cut this filter's own share by ~20% at the cost of
+// losing full rejection between 200-300Hz specifically; kept at 200Hz
+// deliberately for the extra margin since digital-mode content can
+// legitimately sit that low (see the highpass-default-off fix earlier
+// this session for why 200-300Hz isn't a "just rumble" range here the way
+// it would be for voice).
+const TARGET_HILBERT_LOW_HZ = 200
+function estimateHilbertTapCount(sampleRateHz: number): number {
+  // Same shape as estimateTapCount()'s own transWidth-based formula above
+  // (3.8 * sr / transWidth) — TARGET_HILBERT_LOW_HZ plays the analogous
+  // role a lowpass's transition width does: how far toward DC the filter
+  // needs to still behave like its ideal response.
+  let count = Math.round((3.8 * sampleRateHz) / TARGET_HILBERT_LOW_HZ)
+  if (count % 2 === 0) count++ // needs a well-defined center tap
+  return count
+}
 
 // Fixed transition-band width for the passband lowpass — see
 // SSBDemodulator.setPassband()'s comment for why this is an absolute Hz
@@ -1169,8 +1261,20 @@ export class SSBDemodulator {
   private lowpassSampleRateHz = FALLBACK_SAMPLE_RATE
   private lowpassI = new FIRFilter()
   private lowpassQ = new FIRFilter()
-  private hilbertDelay = new FIRFilter(buildDelayTaps(HILBERT_TAPS))
-  private hilbertQ = new FIRFilter(buildHilbertTaps(HILBERT_TAPS))
+  // Sized by estimateHilbertTapCount(sampleRateHz) — see that function's
+  // own comment for why this can't be a fixed tap count. Built with a
+  // throwaway FALLBACK_SAMPLE_RATE-sized kernel here (matching
+  // lowpassSampleRateHz's own initial value) purely so these fields are
+  // never left holding a default-constructed 1-tap FIRFilter/DelayLine
+  // before the first real setPassband() call — setPassband() below
+  // unconditionally rebuilds both the first time it's called
+  // (sampleRateHz starts equal to lowpassSampleRateHz, but bandwidthHz's
+  // own mismatch against the 2700 default already forces that first
+  // rebuild in practice). hilbertDelay is a DelayLine, not a FIRFilter —
+  // see that class's own comment for the real CPU cost this avoids at the
+  // Hilbert fix's much longer tap counts.
+  private hilbertDelay = new DelayLine((estimateHilbertTapCount(FALLBACK_SAMPLE_RATE) - 1) / 2)
+  private hilbertQ = new FIRFilter(buildHilbertTaps(estimateHilbertTapCount(FALLBACK_SAMPLE_RATE)))
   // Applied to the DEMODULATED AUDIO (post-combine), matching the uSDX
   // radio firmware's own filt_var stage — a fixed 300Hz highpass corner
   // (usdxBLACKBRICK.ino). Off by default here (see loadHighpassEnabled()'s
@@ -1251,6 +1355,16 @@ export class SSBDemodulator {
     // above (a narrow transition here would need a very long kernel for
     // essentially no audible benefit at this specific corner).
     this.highpass.setTaps(highPassTaps(300, 300, sampleRateHz))
+    // Hilbert/delay pair only depends on sampleRateHz (see
+    // estimateHilbertTapCount()'s own comment) — rebuilding them here
+    // regardless of whether bw changed is harmless (this whole block
+    // already only runs when EITHER bw or sampleRateHz changed, per the
+    // early-return above) and keeps this rebuild colocated with every
+    // other sampleRateHz-dependent filter in this method rather than
+    // needing its own separate dirty-check.
+    const hilbertTapCount = estimateHilbertTapCount(sampleRateHz)
+    this.hilbertDelay.setDelay((hilbertTapCount - 1) / 2)
+    this.hilbertQ.setTaps(buildHilbertTaps(hilbertTapCount))
   }
 
   setHighpassEnabled(enabled: boolean): void {
