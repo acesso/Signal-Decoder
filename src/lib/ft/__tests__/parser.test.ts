@@ -205,6 +205,18 @@ describe('isValidCallsign — ITU prefix + shape', () => {
     // allocated. Must prefer the 2-char reading that IS allocated.
     expect(isValidCallsign('9A60CBM')).toBe(true);
   });
+
+  // Regression: a real decode of "VP2MAA" (Anguilla) was rejected as
+  // invalid. CS_STANDARD's greedy {1,2} group correctly read the prefix
+  // letters as "VP" (2 chars) + digit "2" + suffix "MAA" — but "VP" alone
+  // isn't an ITU allocation; only "VP2"/"VP5"/"VP9" specifically are (see
+  // prefixes.ts's own comment on why these need explicit 3-char entries).
+  // Same class of ambiguity as the D2UY case above, one prefix-length up.
+  it('accepts a 2-LETTER+DIGIT allocation whose bare 2-letter prefix is not itself allocated (VP2/VP5/VP9)', () => {
+    expect(isValidCallsign('VP2MAA')).toBe(true);  // Anguilla
+    expect(isValidCallsign('VP5ABC')).toBe(true);  // Turks & Caicos
+    expect(isValidCallsign('VP9XYZ')).toBe(true);  // Bermuda
+  });
 });
 
 describe('classifyCallsign', () => {

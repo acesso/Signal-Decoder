@@ -1538,6 +1538,7 @@ export default function MFSKDecoder(props: DecoderProps): JSX.Element {
               computer: props.iqBridge!.spectrum,
               sampleRateHz: () => props.iqBridge!.state().sampleRateHz,
               active: () => props.iqBridge!.state().connected,
+              signalDbfs: () => props.iqBridge!.state().iqSignalDbfs,
             }}
             isRecording={processor.state().isRecording}
             vfoFrequency={props.vfoFrequency}
@@ -1546,6 +1547,34 @@ export default function MFSKDecoder(props: DecoderProps): JSX.Element {
             passband={{ centerHz: props.iqBridge!.state().passbandCenterHz, bandwidthHz: props.iqBridge!.state().passbandBandwidthHz }}
             onPassbandChange={(p) => props.iqBridge!.setPassband(p.centerHz, p.bandwidthHz)}
             markerFieldLabel="Passband"
+            /* Per-channel tone markers + grid/glBands — see this Show
+               block's own header comment; only meaningful against
+               demodulated audio, so passed here too (previously omitted)
+               to reappear once the operator picks "Decoded audio" in the
+               Signal source selector. SignalAnalysisPanel's own
+               onRawTap() guards (effectiveMarkers/glBandsComputed) keep
+               these from also cluttering the raw I/Q view. */
+            markers={channels().map((ch) => ({ freq: ch.freq, color: ch.color, label: ch.label }))}
+            onMarkerDrag={(idx, newHz, shiftKey) => {
+              const ch = channels()[idx]
+              if (!ch) return
+              if (shiftKey) {
+                const f = Math.max(50, Math.min(24000, Math.round(newHz)))
+                if (f !== ch.freq) setChannels((p) => p.map((c) => (c.id === ch.id ? { ...c, freq: f } : c)))
+                return
+              }
+              let delta = Math.round(newHz) - ch.freq
+              const minFreq = Math.min(...channels().map((c) => c.freq))
+              const maxFreq = Math.max(...channels().map((c) => c.freq))
+              delta = Math.max(50 - minFreq, Math.min(24000 - maxFreq, delta))
+              if (delta === 0) return
+              setChannels((p) => p.map((c) => ({ ...c, freq: c.freq + delta })))
+            }}
+            showGrid={showGrid()}
+            gridSize={gridSize()}
+            squelch={squelch()}
+            onSquelchChange={setSquelch}
+            glBands={channels()}
             class="min-w-0"
             style={{ flex: pW()[1] }}
           />

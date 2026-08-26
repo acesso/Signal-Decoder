@@ -326,6 +326,7 @@ export default function RTTYDecoder(props: RTTYDecoderProps): JSX.Element {
               computer: props.iqBridge!.spectrum,
               sampleRateHz: () => props.iqBridge!.state().sampleRateHz,
               active: () => props.iqBridge!.state().connected,
+              signalDbfs: () => props.iqBridge!.state().iqSignalDbfs,
             }}
             isRecording={processor.state().isRecording}
             vfoFrequency={props.vfoFrequency}
@@ -334,6 +335,27 @@ export default function RTTYDecoder(props: RTTYDecoderProps): JSX.Element {
             passband={{ centerHz: props.iqBridge!.state().passbandCenterHz, bandwidthHz: props.iqBridge!.state().passbandBandwidthHz }}
             onPassbandChange={(p) => props.iqBridge!.setPassband(p.centerHz, p.bandwidthHz)}
             markerFieldLabel="Passband"
+            /* Mark/space tone markers — see this Show block's own header
+               comment; only meaningful against demodulated audio, so
+               passed here too (previously omitted) to reappear once the
+               operator picks "Decoded audio" in the Signal source
+               selector. SignalAnalysisPanel's own onRawTap() guard keeps
+               these from also cluttering the raw I/Q view. */
+            markers={spectrumMarkers()}
+            onMarkerDrag={(idx, newHz) => {
+              const half = activeConfig().carrierShift / 2
+              const newCenter =
+                idx === 0
+                  ? activeConfig().reverseShift
+                    ? newHz - half
+                    : newHz + half
+                  : activeConfig().reverseShift
+                    ? newHz + half
+                    : newHz - half
+              updateSessionConfig(sessions.state().activeSessionId, { centerFreq: Math.round(newCenter) })
+            }}
+            squelch={squelch()}
+            onSquelchChange={setSquelch}
             class="min-w-0"
             style={{ flex: panelWeights()[1] }}
           />

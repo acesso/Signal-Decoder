@@ -1011,6 +1011,7 @@ export default function FTDecoder(props: Props): JSX.Element {
               computer: props.iqBridge!.spectrum,
               sampleRateHz: () => props.iqBridge!.state().sampleRateHz,
               active: () => props.iqBridge!.state().connected,
+              signalDbfs: () => props.iqBridge!.state().iqSignalDbfs,
             }}
             isRecording={processor.state().isRecording}
             vfoFrequency={props.vfoFrequency}

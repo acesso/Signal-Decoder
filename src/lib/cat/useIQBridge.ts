@@ -423,6 +423,30 @@ export class IQSpectrumComputer {
   magBytes = new Uint8Array(IQ_FFT_SIZE)
   peakDb = -Infinity
   private hasFreshWindow = false
+  // Reference-counted, not a plain boolean — more than one mounted
+  // SignalAnalysisPanel instance could in principle be viewing the raw I/Q
+  // tap at once (e.g. two decoder tabs), and neither should be able to
+  // silently turn off the other's data by unmounting. 0 = nobody's
+  // watching the raw spectrum right now (e.g. every mounted panel is on
+  // the "processed"/decoded-audio tap, or none are I/Q-connected at all) —
+  // skip the actual per-window FFT/magnitude work in processWindow() below,
+  // which is a measurable fixed cost (a full 4096-point FFT + a 4096-
+  // iteration magnitude/dB scan) run on every incoming I/Q frame batch
+  // regardless of whether anything on screen currently reads magBytes.
+  // Confirmed via investigation: this cost is CONSTANT regardless of the
+  // UI's zoom level (the panel's own drawSpectrum/pushRow already scale
+  // down correctly when zoomed in), so it was becoming a proportionally
+  // larger share of total per-frame cost the more the operator zoomed in —
+  // matching a real report of the graphs feeling slower when zoomed into a
+  // small sub-range of a wide I/Q band, and also slower in "decoded audio"
+  // mode, where this FFT was running for a view that never reads it at all.
+  private watcherCount = 0
+  setActive(active: boolean): void {
+    this.watcherCount = Math.max(0, this.watcherCount + (active ? 1 : -1))
+  }
+  private get isActive(): boolean {
+    return this.watcherCount > 0
+  }
 
   // Feeds one incoming interleaved I/Q Int16Array frame (I,Q,I,Q,...) into
   // the accumulator, running the FFT every time a full IQ_FFT_SIZE window
@@ -443,6 +467,14 @@ export class IQSpectrumComputer {
   // stream (this, and SSBDemodulator.demodulate()) agrees on exactly the
   // same corrected values.
   feed(iq: Float64Array): void {
+    // Nobody's displaying the raw I/Q spectrum right now — see
+    // setActive()'s own comment. Skips the accumulation copy too, not just
+    // processWindow()'s FFT: there's no reason to keep filling a buffer
+    // nothing will read, and accumCount simply resumes where it left off
+    // (mid-window or not) once a real watcher shows up again — the next
+    // completed window after that point is a perfectly valid fresh FFT,
+    // same as any other window boundary.
+    if (!this.isActive) return
     let offset = 0
     const pairCount = iq.length >> 1
     while (offset < pairCount) {

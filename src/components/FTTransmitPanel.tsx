@@ -172,9 +172,11 @@ function OutputSelector(props: { value: string; onChange: (id: string) => void; 
   })
 
   return (
-    <Show when={props.supported} fallback={
-      <span class="text-[#484f58] text-xs font-mono">Output selection requires Chrome 110+</span>
-    }>
+    // No fallback text when unsupported (Firefox, older Chrome) — that text
+    // used to break the row's alignment wherever this renders; rendering
+    // nothing keeps the layout intact, and "System default" output is
+    // already the behavior when there's no device selection at all.
+    <Show when={props.supported}>
       <select value={props.value} onChange={e => props.onChange(e.target.value)}
         class="bg-[#0d1117] border border-[#30363d] rounded px-2 py-1 text-xs text-[#c9d1d9] font-mono focus:outline-none focus:border-[#388bfd]">
         <option value="">System default</option>
@@ -841,9 +843,9 @@ export default function FTTransmitPanel(props: FTTransmitPanelProps): JSX.Elemen
   const secToWindow = useWindowCountdown(windowSec)
 
   return (
-    <div class="space-y-4">
+    <div class="space-y-3">
 
-      {/* ── Top row: identity + ring + controls ── */}
+      {/* ── Top row: identity + ring + Output ── */}
       <div class="flex flex-wrap gap-3 items-end">
 
         {/* TX window ring */}
@@ -898,157 +900,173 @@ export default function FTTransmitPanel(props: FTTransmitPanelProps): JSX.Elemen
           </div>
         </div>
 
-        {/* Output device */}
+        {/* Output device — sink select + OutputSelector + the I/Q-suspend
+            checkbox all combined onto one row (were three stacked rows,
+            taking noticeably more vertical space than the panel's other
+            same-height blocks). The conditional warning paragraph is the
+            one thing still allowed to wrap onto its own line below, since
+            it's real text that needs room, not a compact control. */}
         <div class="flex flex-col gap-1">
           <label class="text-[#8b949e] text-[10px] font-semibold tracking-wide">Output</label>
-          <Show when={props.audioBridge}>
-            {/* The Bridge panel's own "Send Mic to Radio" and this TX sink both
-                claim the SAME underlying bridge mic-send session (one bridge
-                connection, one useAudioBridge instance) — whichever one stops
-                first would otherwise silently kill the other's audio path.
-                Block picking "ESP32 Bridge" here while the MANUAL session
-                (not our own TX sink) already holds it, rather than letting
-                them fight over it. */}
-            <select
-              value={audioSinkKind()}
-              onChange={(e) => setAudioSinkKind(e.currentTarget.value as AudioSinkKind)}
-              disabled={audioSinkKind() === 'speaker' && micHeldByManual()}
-              class="bg-[#0d1117] border border-[#30363d] rounded px-2 py-1 text-xs text-[#c9d1d9] font-mono focus:outline-none focus:border-[#388bfd] mb-1 disabled:opacity-50"
-            >
-              <option value="speaker">Local speaker</option>
-              <option value="bridge">ESP32 Bridge (radio mic-in)</option>
-            </select>
-            <Show when={audioSinkKind() === 'speaker' && micHeldByManual()}>
-              <p class="text-[9px] text-[#f0883e] max-w-[14rem]">
-                "Send Mic to Radio" is active in the Bridge panel &mdash; stop it there first to free up the bridge's mic-send session for TX.
-              </p>
+          <div class="flex items-center gap-2 flex-wrap">
+            <Show when={props.audioBridge}>
+              {/* The Bridge panel's own "Send Mic to Radio" and this TX sink both
+                  claim the SAME underlying bridge mic-send session (one bridge
+                  connection, one useAudioBridge instance) — whichever one stops
+                  first would otherwise silently kill the other's audio path.
+                  Block picking "ESP32 Bridge" here while the MANUAL session
+                  (not our own TX sink) already holds it, rather than letting
+                  them fight over it. */}
+              <select
+                value={audioSinkKind()}
+                onChange={(e) => setAudioSinkKind(e.currentTarget.value as AudioSinkKind)}
+                disabled={audioSinkKind() === 'speaker' && micHeldByManual()}
+                class="bg-[#0d1117] border border-[#30363d] rounded px-2 py-1 text-xs text-[#c9d1d9] font-mono focus:outline-none focus:border-[#388bfd] disabled:opacity-50"
+              >
+                <option value="speaker">Local speaker</option>
+                <option value="bridge">ESP32 Bridge (radio mic-in)</option>
+              </select>
             </Show>
-          </Show>
-          <div class={audioSinkKind() === 'bridge' ? 'opacity-40 pointer-events-none' : ''}>
-            <OutputSelector value={tx.state().outputDeviceId} onChange={tx.setOutputDevice} supported={tx.state().sinkIdSupported} />
+            <div class={audioSinkKind() === 'bridge' ? 'opacity-40 pointer-events-none' : ''}>
+              <OutputSelector value={tx.state().outputDeviceId} onChange={tx.setOutputDevice} supported={tx.state().sinkIdSupported} />
+            </div>
+            <Show when={props.iqBridge?.state().inputMode === 'iq'}>
+              <label class="flex items-center gap-1.5 text-[10px] text-[#8b949e] whitespace-nowrap">
+                <input
+                  type="checkbox"
+                  checked={suspendDuringTx()}
+                  onChange={(e) => {
+                    setSuspendDuringTx(e.currentTarget.checked)
+                    saveSuspendIQDuringTx(e.currentTarget.checked)
+                  }}
+                />
+                Suspend I/Q spectrum during TX
+              </label>
+            </Show>
           </div>
-          <Show when={props.iqBridge?.state().inputMode === 'iq'}>
-            <label class="flex items-center gap-2 text-[10px] text-[#8b949e] mt-1">
-              <input
-                type="checkbox"
-                checked={suspendDuringTx()}
-                onChange={(e) => {
-                  setSuspendDuringTx(e.currentTarget.checked)
-                  saveSuspendIQDuringTx(e.currentTarget.checked)
-                }}
-              />
-              Suspend I/Q spectrum during TX
-            </label>
+          <Show when={audioSinkKind() === 'speaker' && micHeldByManual()}>
+            <p class="text-[9px] text-[#f0883e] max-w-[24rem]">
+              "Send Mic to Radio" is active in the Bridge panel &mdash; stop it there first to free up the bridge's mic-send session for TX.
+            </p>
           </Show>
         </div>
 
-        {/* TX Engine + all toggles — grouped together */}
-        <div class="flex flex-col gap-1 ml-auto">
-          <label class="text-[#8b949e] text-[10px] font-semibold tracking-wide">TX Engine</label>
-          <div class="flex items-center gap-2 flex-wrap">
-            <Show when={!isRunning()} fallback={
-              <button onClick={handleStop}
-                class="px-3 py-1.5 rounded text-xs font-semibold bg-[#da3633] text-white hover:bg-[#f85149] transition-colors">
-                Stop TX
-              </button>
-            }>
-              <button onClick={handleStart} disabled={!canOperate()}
-                class="px-3 py-1.5 rounded text-xs font-semibold bg-[#238636] text-white hover:bg-[#2ea043] disabled:opacity-40 disabled:cursor-not-allowed transition-colors">
-                Start TX
-              </button>
-            </Show>
-            {/* Auto-CQ */}
-            <div onClick={() => tx.setAutoCQ(!tx.state().autoCQ)}
-              title="Automatically send CQ when the queue is empty"
-              class="flex items-center gap-1.5 cursor-pointer select-none px-2 py-1.5 rounded border transition-colors"
-              style={{
-                'border-color': tx.state().autoCQ ? 'rgba(46,160,67,0.5)' : 'rgba(48,54,61,1)',
-                background:  tx.state().autoCQ ? 'rgba(46,160,67,0.08)' : 'transparent',
-              }}>
-              <div class={`w-6 h-3 rounded-full transition-colors relative shrink-0 ${tx.state().autoCQ ? 'bg-[#238636]' : 'bg-[#30363d]'}`}>
-                <div class={`absolute top-0.5 w-2 h-2 rounded-full bg-white transition-transform ${tx.state().autoCQ ? 'translate-x-3' : 'translate-x-0.5'}`} />
-              </div>
-              <span class="text-[10px] text-[#8b949e] whitespace-nowrap">Auto-CQ</span>
+        {/* Start/Stop + the two auto-PTT timing fields — the parts of "TX
+            Engine" that are ordinary controls, not on/off toggle chips (see
+            the 2-column chip grid below, pushed to the row's far right via
+            ml-auto). */}
+        <div class="flex items-end gap-2 flex-wrap">
+          <Show when={!isRunning()} fallback={
+            <button onClick={handleStop}
+              class="px-3 py-1.5 rounded text-xs font-semibold bg-[#da3633] text-white hover:bg-[#f85149] transition-colors">
+              Stop TX
+            </button>
+          }>
+            <button onClick={handleStart} disabled={!canOperate()}
+              class="px-3 py-1.5 rounded text-xs font-semibold bg-[#238636] text-white hover:bg-[#2ea043] disabled:opacity-40 disabled:cursor-not-allowed transition-colors">
+              Start TX
+            </button>
+          </Show>
+          {/* Pre-key (warm-up) delay — only meaningful with Auto-PTT */}
+          <div class={`flex items-center gap-1 ${!tx.state().autoPTT ? 'opacity-40' : ''}`}
+            title="Key PTT this many ms before the transmission starts, to let an external PA/relay warm up">
+            <span class="text-[10px] text-[#8b949e] whitespace-nowrap">Pre-key</span>
+            <NumberField value={tx.state().preKeyMs}
+              onCommit={tx.setPreKeyMs}
+              disabled={!tx.state().autoPTT}
+              min={0} max={2000} step={10}
+              class="bg-[#0d1117] border border-[#30363d] rounded px-1.5 py-1 text-xs font-mono text-[#c9d1d9] w-14 focus:outline-none focus:border-[#388bfd] disabled:cursor-not-allowed" />
+            <span class="text-[10px] text-[#8b949e] whitespace-nowrap">ms</span>
+          </div>
+          {/* Post-key (cool-down/hang) delay — only meaningful with Auto-PTT */}
+          <div class={`flex items-center gap-1 ${!tx.state().autoPTT ? 'opacity-40' : ''}`}
+            title="Hold PTT this many ms after the transmission ends before unkeying, to let an external PA/relay settle">
+            <span class="text-[10px] text-[#8b949e] whitespace-nowrap">Post-key</span>
+            <NumberField value={tx.state().postKeyMs}
+              onCommit={tx.setPostKeyMs}
+              disabled={!tx.state().autoPTT}
+              min={0} max={2000} step={10}
+              class="bg-[#0d1117] border border-[#30363d] rounded px-1.5 py-1 text-xs font-mono text-[#c9d1d9] w-14 focus:outline-none focus:border-[#388bfd] disabled:cursor-not-allowed" />
+            <span class="text-[10px] text-[#8b949e] whitespace-nowrap">ms</span>
+          </div>
+          {/* Auto-CQ interval — minimum minutes between unattended CQ
+              transmissions. Was unlabeled and sat right after Start TX,
+              far from its own Auto-CQ toggle (now in the chip grid to the
+              right) — labeled and moved to the end of this row instead. */}
+          <div class={`flex items-center gap-1 ${!tx.state().autoCQ ? 'opacity-40' : ''}`}
+            title="Minimum time between automatic CQ transmissions">
+            <span class="text-[10px] text-[#8b949e] whitespace-nowrap">Auto-CQ every</span>
+            <NumberField value={tx.state().autoCQIntervalMin}
+              onCommit={tx.setAutoCQIntervalMin}
+              disabled={!tx.state().autoCQ}
+              min={1} max={60} step={1}
+              class="bg-[#0d1117] border border-[#30363d] rounded px-1.5 py-1 text-xs font-mono text-[#c9d1d9] w-12 focus:outline-none focus:border-[#388bfd] disabled:cursor-not-allowed" />
+            <span class="text-[10px] text-[#8b949e] whitespace-nowrap">min</span>
+          </div>
+        </div>
+
+        {/* Toggle chips — 2 columns x 2 rows, pushed to the row's far right.
+            Was one long horizontal strip of 4 chips; grouping into a compact
+            grid keeps the whole top row single-line instead of wrapping. */}
+        <div class="grid grid-cols-2 gap-1.5 ml-auto">
+          {/* Auto-CQ */}
+          <div onClick={() => tx.setAutoCQ(!tx.state().autoCQ)}
+            title="Automatically send CQ when the queue is empty"
+            class="flex items-center gap-1.5 cursor-pointer select-none px-2 py-1 rounded border transition-colors"
+            style={{
+              'border-color': tx.state().autoCQ ? 'rgba(46,160,67,0.5)' : 'rgba(48,54,61,1)',
+              background:  tx.state().autoCQ ? 'rgba(46,160,67,0.08)' : 'transparent',
+            }}>
+            <div class={`w-6 h-3 rounded-full transition-colors relative shrink-0 ${tx.state().autoCQ ? 'bg-[#238636]' : 'bg-[#30363d]'}`}>
+              <div class={`absolute top-0.5 w-2 h-2 rounded-full bg-white transition-transform ${tx.state().autoCQ ? 'translate-x-3' : 'translate-x-0.5'}`} />
             </div>
-            {/* Auto-CQ interval — minimum minutes between unattended CQ transmissions */}
-            <div class={`flex items-center gap-1 ${!tx.state().autoCQ ? 'opacity-40' : ''}`}
-              title="Minimum time between automatic CQ transmissions">
-              <NumberField value={tx.state().autoCQIntervalMin}
-                onCommit={tx.setAutoCQIntervalMin}
-                disabled={!tx.state().autoCQ}
-                min={1} max={60} step={1}
-                class="bg-[#0d1117] border border-[#30363d] rounded px-1.5 py-1 text-xs font-mono text-[#c9d1d9] w-12 focus:outline-none focus:border-[#388bfd] disabled:cursor-not-allowed" />
-              <span class="text-[10px] text-[#8b949e] whitespace-nowrap">min</span>
+            <span class="text-[10px] text-[#8b949e] whitespace-nowrap">Auto-CQ</span>
+          </div>
+          {/* Auto-PTT */}
+          <div onClick={() => tx.setAutoPTT(!tx.state().autoPTT)}
+            title={props.onSetPTT ? 'Automatically key radio PTT via CAT while transmitting' : 'Auto-PTT requires CAT connection'}
+            class={`flex items-center gap-1.5 cursor-pointer select-none px-2 py-1 rounded border transition-colors ${!props.onSetPTT ? 'opacity-40' : ''}`}
+            style={{
+              'border-color': tx.state().autoPTT ? 'rgba(227,179,65,0.5)' : 'rgba(48,54,61,1)',
+              background:  tx.state().autoPTT ? 'rgba(227,179,65,0.08)' : 'transparent',
+            }}>
+            <div class={`w-6 h-3 rounded-full transition-colors relative shrink-0 ${tx.state().autoPTT ? 'bg-[#e3b341]' : 'bg-[#30363d]'}`}>
+              <div class={`absolute top-0.5 w-2 h-2 rounded-full bg-white transition-transform ${tx.state().autoPTT ? 'translate-x-3' : 'translate-x-0.5'}`} />
             </div>
-            {/* Auto-PTT */}
-            <div onClick={() => tx.setAutoPTT(!tx.state().autoPTT)}
-              title={props.onSetPTT ? 'Automatically key radio PTT via CAT while transmitting' : 'Auto-PTT requires CAT connection'}
-              class={`flex items-center gap-1.5 cursor-pointer select-none px-2 py-1.5 rounded border transition-colors ${!props.onSetPTT ? 'opacity-40' : ''}`}
-              style={{
-                'border-color': tx.state().autoPTT ? 'rgba(227,179,65,0.5)' : 'rgba(48,54,61,1)',
-                background:  tx.state().autoPTT ? 'rgba(227,179,65,0.08)' : 'transparent',
-              }}>
-              <div class={`w-6 h-3 rounded-full transition-colors relative shrink-0 ${tx.state().autoPTT ? 'bg-[#e3b341]' : 'bg-[#30363d]'}`}>
-                <div class={`absolute top-0.5 w-2 h-2 rounded-full bg-white transition-transform ${tx.state().autoPTT ? 'translate-x-3' : 'translate-x-0.5'}`} />
-              </div>
-              <span class="text-[10px] text-[#8b949e] whitespace-nowrap">Auto-PTT</span>
+            <span class="text-[10px] text-[#8b949e] whitespace-nowrap">Auto-PTT</span>
+          </div>
+          {/* Consecutive TX */}
+          <div onClick={() => tx.setAllowConsecutiveTx(!tx.state().allowConsecutiveTx)}
+            title={tx.state().allowConsecutiveTx
+              ? 'Consecutive TX on — transmits every window (turn off for single RX/TX radios)'
+              : 'Consecutive TX off — one listen window between transmissions'}
+            class="flex items-center gap-1.5 cursor-pointer select-none px-2 py-1 rounded border transition-colors"
+            style={{
+              'border-color': tx.state().allowConsecutiveTx ? 'rgba(248,81,73,0.5)' : 'rgba(48,54,61,1)',
+              background:  tx.state().allowConsecutiveTx ? 'rgba(248,81,73,0.08)' : 'transparent',
+            }}>
+            <div class={`w-6 h-3 rounded-full transition-colors relative shrink-0 ${tx.state().allowConsecutiveTx ? 'bg-[#f85149]' : 'bg-[#30363d]'}`}>
+              <div class={`absolute top-0.5 w-2 h-2 rounded-full bg-white transition-transform ${tx.state().allowConsecutiveTx ? 'translate-x-3' : 'translate-x-0.5'}`} />
             </div>
-            {/* Pre-key (warm-up) delay — only meaningful with Auto-PTT */}
-            <div class={`flex items-center gap-1 ${!tx.state().autoPTT ? 'opacity-40' : ''}`}
-              title="Key PTT this many ms before the transmission starts, to let an external PA/relay warm up">
-              <span class="text-[10px] text-[#8b949e] whitespace-nowrap">Pre-key</span>
-              <NumberField value={tx.state().preKeyMs}
-                onCommit={tx.setPreKeyMs}
-                disabled={!tx.state().autoPTT}
-                min={0} max={2000} step={10}
-                class="bg-[#0d1117] border border-[#30363d] rounded px-1.5 py-1 text-xs font-mono text-[#c9d1d9] w-14 focus:outline-none focus:border-[#388bfd] disabled:cursor-not-allowed" />
-              <span class="text-[10px] text-[#8b949e] whitespace-nowrap">ms</span>
+            <span class="text-[10px] text-[#8b949e] whitespace-nowrap">Consecutive TX</span>
+          </div>
+          {/* Auto-Reply */}
+          <div onClick={() => setAutoReply(!autoReply())}
+            title={autoReply()
+              ? 'Auto-Reply on — automatically enqueues a reply when someone responds to your CQ'
+              : 'Auto-Reply off — manually pick replies from suggestions'}
+            class="flex items-center gap-1.5 cursor-pointer select-none px-2 py-1 rounded border transition-colors"
+            style={{
+              'border-color': autoReply() ? 'rgba(88,166,255,0.5)' : 'rgba(48,54,61,1)',
+              background:  autoReply() ? 'rgba(88,166,255,0.08)' : 'transparent',
+            }}>
+            <div class={`w-6 h-3 rounded-full transition-colors relative shrink-0 ${autoReply() ? 'bg-[#58a6ff]' : 'bg-[#30363d]'}`}>
+              <div class={`absolute top-0.5 w-2 h-2 rounded-full bg-white transition-transform ${autoReply() ? 'translate-x-3' : 'translate-x-0.5'}`} />
             </div>
-            {/* Post-key (cool-down/hang) delay — only meaningful with Auto-PTT */}
-            <div class={`flex items-center gap-1 ${!tx.state().autoPTT ? 'opacity-40' : ''}`}
-              title="Hold PTT this many ms after the transmission ends before unkeying, to let an external PA/relay settle">
-              <span class="text-[10px] text-[#8b949e] whitespace-nowrap">Post-key</span>
-              <NumberField value={tx.state().postKeyMs}
-                onCommit={tx.setPostKeyMs}
-                disabled={!tx.state().autoPTT}
-                min={0} max={2000} step={10}
-                class="bg-[#0d1117] border border-[#30363d] rounded px-1.5 py-1 text-xs font-mono text-[#c9d1d9] w-14 focus:outline-none focus:border-[#388bfd] disabled:cursor-not-allowed" />
-              <span class="text-[10px] text-[#8b949e] whitespace-nowrap">ms</span>
-            </div>
-            {/* Consecutive TX */}
-            <div onClick={() => tx.setAllowConsecutiveTx(!tx.state().allowConsecutiveTx)}
-              title={tx.state().allowConsecutiveTx
-                ? 'Consecutive TX on — transmits every window (turn off for single RX/TX radios)'
-                : 'Consecutive TX off — one listen window between transmissions'}
-              class="flex items-center gap-1.5 cursor-pointer select-none px-2 py-1.5 rounded border transition-colors"
-              style={{
-                'border-color': tx.state().allowConsecutiveTx ? 'rgba(248,81,73,0.5)' : 'rgba(48,54,61,1)',
-                background:  tx.state().allowConsecutiveTx ? 'rgba(248,81,73,0.08)' : 'transparent',
-              }}>
-              <div class={`w-6 h-3 rounded-full transition-colors relative shrink-0 ${tx.state().allowConsecutiveTx ? 'bg-[#f85149]' : 'bg-[#30363d]'}`}>
-                <div class={`absolute top-0.5 w-2 h-2 rounded-full bg-white transition-transform ${tx.state().allowConsecutiveTx ? 'translate-x-3' : 'translate-x-0.5'}`} />
-              </div>
-              <span class="text-[10px] text-[#8b949e] whitespace-nowrap">Consecutive TX</span>
-            </div>
-            {/* Auto-Reply */}
-            <div onClick={() => setAutoReply(!autoReply())}
-              title={autoReply()
-                ? 'Auto-Reply on — automatically enqueues a reply when someone responds to your CQ'
-                : 'Auto-Reply off — manually pick replies from suggestions'}
-              class="flex items-center gap-1.5 cursor-pointer select-none px-2 py-1.5 rounded border transition-colors"
-              style={{
-                'border-color': autoReply() ? 'rgba(88,166,255,0.5)' : 'rgba(48,54,61,1)',
-                background:  autoReply() ? 'rgba(88,166,255,0.08)' : 'transparent',
-              }}>
-              <div class={`w-6 h-3 rounded-full transition-colors relative shrink-0 ${autoReply() ? 'bg-[#58a6ff]' : 'bg-[#30363d]'}`}>
-                <div class={`absolute top-0.5 w-2 h-2 rounded-full bg-white transition-transform ${autoReply() ? 'translate-x-3' : 'translate-x-0.5'}`} />
-              </div>
-              <span class="text-[10px] text-[#8b949e] whitespace-nowrap">Auto-Reply</span>
-            </div>
+            <span class="text-[10px] text-[#8b949e] whitespace-nowrap">Auto-Reply</span>
           </div>
         </div>
       </div>
-
       {/* ── Active TX banner ── */}
       <Show when={isPlaying()}>
         <div class="flex items-center gap-3 bg-[#2ea043]/10 border border-[#2ea043]/40 rounded px-3 py-2">
