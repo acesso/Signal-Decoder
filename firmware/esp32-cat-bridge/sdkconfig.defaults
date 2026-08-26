@@ -47,6 +47,34 @@ CONFIG_SPIRAM_SPEED_40M=y
 # the choice, which is what this does.)
 CONFIG_SPIRAM_USE_CAPS_ALLOC=y
 
+# WiFi/lwIP's OWN internal buffers (TCP send/receive windows, WiFi driver
+# RX/TX buffers, AMPDU RX reorder window) are a separate case from this
+# codebase's own malloc() calls above — they're allocated deep inside
+# esp_wifi/lwIP itself, with no per-call-site opt-in available to this
+# project's code at all. A real-hardware measurement (2026-08-25, GET
+# /system-stats) found these buffers were the actual dominant consumer of
+# internal RAM at steady state: fresh boot with zero clients connected
+# showed ~100KB free; with the CAT + I/Q + mic-sniff WebSocket connections
+# this app normally holds open simultaneously, that dropped to ~20-40KB
+# free (heap_largest_free_block as low as ~16-18KB) — tight enough that
+# the boot-time I2S DMA descriptor allocation was already warning "only 9
+# fit, wanted 10 for full anti-jitter headroom" even before any client
+# connected. Enabling this tries PSRAM FIRST for those buffers (falling
+# back to internal RAM only if PSRAM allocation fails), which measured
+# ~103KB free / ~82KB largest block / ~98KB DMA-free with the SAME three
+# connections held open AND a full TX-buffer-playback cycle running
+# concurrently — essentially eliminating this as a constraint. ESP-IDF's
+# own Kconfig help text (esp_psram/Kconfig.spiram.common) warns this can
+# cause memory exhaustion unless paired with disabling
+# ESP_WIFI_AMSDU_TX_ENABLED (already off in this project) and using
+# dynamic (not static) WiFi TX buffers (already the case here too, via
+# ESP_WIFI_DYNAMIC_TX_BUFFER) — this project already matched the safe
+# pairing before this flag was even added, and reconfigure (idf.py
+# reconfigure) picks up this flag's own cascaded PSRAM-aware defaults for
+# ESP_WIFI_STATIC_RX_BUFFER_NUM/ESP_WIFI_RX_BA_WIN/etc. automatically —
+# don't hardcode those elsewhere, they're meant to track this flag.
+CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
+
 # esp_http_server + mdns + wifi together need more than the default 4KB
 # main-task stack during init (mdns_init/httpd_start allocate on the
 # calling task's stack in places).

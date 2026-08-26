@@ -394,7 +394,21 @@ void cat_log_init(void) {
     }
 
     s_ram_mutex = xSemaphoreCreateMutex();
-    s_ram_ring = malloc(sizeof(cat_log_entry_t) * CAT_LOG_CAPACITY);
+    // PSRAM, not internal RAM — this is a one-shot ~13KB boot-time
+    // allocation (CAT_LOG_CAPACITY * sizeof(cat_log_entry_t)), touched at
+    // most once per CAT frame (tens of ms apart, nowhere near the audio
+    // pipeline's real-time budget) and bulk-read only on the rare, operator-
+    // triggered GET /cat-log. Internal RAM is the genuinely scarce resource
+    // on this board (lwIP's per-connection TCP buffers alone are a fixed,
+    // non-relocatable cost — see bridge_config.h's WS_MAX_CLIENTS/
+    // AUDIO_WS_MAX_CLIENTS comments), so anything without a tight real-time
+    // access pattern should free up that headroom rather than compete for
+    // it. NOT the same tradeoff as audio_monitor.c's upsample scratch
+    // buffer (see that file's own comment) — that one is reallocated fresh
+    // every ~50ms inside a real-time audio path, where PSRAM's added
+    // per-access latency was confirmed to make things worse; this ring is
+    // allocated once and never touched at anything close to that rate.
+    s_ram_ring = heap_caps_malloc(sizeof(cat_log_entry_t) * CAT_LOG_CAPACITY, MALLOC_CAP_SPIRAM);
     if (!s_ram_ring) {
         ESP_LOGE(TAG, "malloc for RAM log shadow failed — persistent CAT log disabled");
         s_partition = NULL;
