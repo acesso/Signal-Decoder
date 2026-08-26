@@ -285,62 +285,157 @@ const BRIDGE_PLAYBACK_RATE_HZ = 16000;
 // independently; duplicated locally rather than shared for the same reason
 // noted in those files (this hook has no natural shared-module boundary
 // with either).
-function bridgeHttpUrl(catWsUrl: string, pathname: string): string | null {
+function bridgeHttpUrl(catWsUrl: string, pathname: string, query?: string): string | null {
   try {
     const u = new URL(catWsUrl);
     if (u.protocol !== 'ws:' && u.protocol !== 'wss:') return null;
     u.protocol = u.protocol === 'wss:' ? 'https:' : 'http:';
     u.pathname = pathname;
+    if (query) u.search = query;
     return u.toString();
   } catch {
     return null;
   }
 }
 
-// Resolves once the upload actually completes — the caller doesn't need to
-// know or care whether it succeeded (see uploadForBridgePlayback()'s own
-// comment: a failed upload just means the eventual /tx-play call 400s,
-// which the play loop already treats as "nothing to send").
-//
-// gain: applied here — encodeAsync()'s raw output (via @e04/ft8ts's
-// generateFT8Waveform()) is a bare Math.sin() waveform, already at FULL
-// SCALE (±1.0) with zero headroom. The local-speaker path always had
-// "TX Level" (this same gain, via gainNode.gain.value) between that raw
-// waveform and any real output; this path had NOTHING — real-hardware
-// testing (2026-08-25) confirmed exactly the symptom that predicts: the
-// bridge's own audio-quality sniffer measured hundreds of clip events in
-// a 10s window. Applied BEFORE resampling (not after) so the windowed-
-// sinc kernel's own ringing/overshoot on a full-scale input has less
-// headroom to exceed [-1,1] itself before floatToInt16()'s clamp; either
-// order is mathematically equivalent gain-wise (both stages are linear),
-// this just gives the resample step some margin to work with instead of
-// scaling its output back down after the fact.
-async function uploadForBridgePlayback(wsUrl: string, samples: Float32Array, fromRateHz: number, gain: number): Promise<void> {
-  const url = bridgeHttpUrl(wsUrl, '/tx-audio');
-  if (!url) return;
+// The firmware's TX buffer pool (v0.6.0+, see http_control.h's POST
+// /tx-audio doc comment) — 4 independent slots so the browser can
+// pre-stage several candidate messages without one upload clobbering
+// another. Slot roles are fixed, not dynamically negotiated: 0 is the
+// standing auto-CQ buffer (re-checked, not blindly re-uploaded, every
+// cycle — see uploadAutoCQIfBridgeSink()'s own comment for why), 1-2 are
+// queue lookahead (the head of the queue and the one behind it — realistic
+// FT8/FT4 operation rarely has more than one "about to transmit soon"
+// queued entry at a time, per the play loop's own queue[0]-only logic
+// below, so 2 lookahead slots is comfortably more than the common case
+// needs), 3 is spare headroom for a future use (e.g. a manually-pinned
+// "reply" slot) rather than actively assigned today.
+const TX_SLOT_AUTOCQ = 0;
+const TX_SLOT_QUEUE_LOOKAHEAD = [1, 2] as const;
+
+// Matches the firmware's esp_rom_crc32_le() exactly (standard zlib/PNG/
+// IEEE-802.3 CRC32, poly 0xEDB88320, init/final XOR 0xFFFFFFFF) — needed
+// so the browser can compare against a slot's already-uploaded hash
+// (GET /tx-status) and skip re-uploading identical content, not for any
+// cryptographic purpose. Table-driven for speed on a ~480KB buffer; the
+// table itself is tiny (256 * 4 bytes) and built once, lazily, on first use.
+let crc32Table: Uint32Array | null = null;
+function crc32(bytes: Uint8Array): number {
+  if (!crc32Table) {
+    const t = new Uint32Array(256);
+    for (let n = 0; n < 256; n++) {
+      let c = n;
+      for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+      t[n] = c;
+    }
+    crc32Table = t;
+  }
+  let crc = 0xffffffff;
+  for (let i = 0; i < bytes.length; i++) crc = crc32Table[(crc ^ bytes[i]) & 0xff] ^ (crc >>> 8);
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
+function hex8(n: number): string {
+  return n.toString(16).padStart(8, '0');
+}
+
+// Converts already-gained, already-resampled samples to the wire format
+// (Int16, BRIDGE_PLAYBACK_RATE_HZ) — split out from uploadToBridgeSlot() so
+// the hash can be computed and compared against a slot's already-uploaded
+// content BEFORE paying for an HTTP round-trip, not just before the
+// conversion work.
+function toBridgeWireFormat(samples: Float32Array, fromRateHz: number, gain: number): Int16Array<ArrayBuffer> {
+  // gain: applied here — encodeAsync()'s raw output (via @e04/ft8ts's
+  // generateFT8Waveform()) is a bare Math.sin() waveform, already at FULL
+  // SCALE (±1.0) with zero headroom. The local-speaker path always had
+  // "TX Level" (this same gain, via gainNode.gain.value) between that raw
+  // waveform and any real output; this path had NOTHING — real-hardware
+  // testing (2026-08-25) confirmed exactly the symptom that predicts: the
+  // bridge's own audio-quality sniffer measured hundreds of clip events in
+  // a 10s window. Applied BEFORE resampling (not after) so the windowed-
+  // sinc kernel's own ringing/overshoot on a full-scale input has less
+  // headroom to exceed [-1,1] itself before floatToInt16()'s clamp; either
+  // order is mathematically equivalent gain-wise (both stages are linear),
+  // this just gives the resample step some margin to work with instead of
+  // scaling its output back down after the fact.
   const gained = gain === 1 ? samples : samples.map(s => s * gain);
   const resampled = fromRateHz === BRIDGE_PLAYBACK_RATE_HZ
     ? gained
     : downsampleBandlimited(gained, fromRateHz, BRIDGE_PLAYBACK_RATE_HZ, makeBandlimitedResampleState());
-  const int16 = floatToInt16(resampled);
+  return floatToInt16(resampled);
+}
+
+// Per-slot last-known-uploaded hash, keyed by wsUrl (a session can only
+// ever be talking to one bridge at a time in practice, but keying by URL
+// rather than a bare array avoids a stale cache surviving a bridge switch
+// mid-session). Populated from either this function's own successful
+// upload or a GET /tx-status read (see refreshSlotHashCache() below) —
+// either way, "what does the device currently have in this slot" per
+// TX_SLOT_AUTOCQ/TX_SLOT_QUEUE_LOOKAHEAD's own comment.
+const slotHashCache = new Map<string, Map<number, string>>();
+function slotHashCacheFor(wsUrl: string): Map<number, string> {
+  let m = slotHashCache.get(wsUrl);
+  if (!m) { m = new Map(); slotHashCache.set(wsUrl, m); }
+  return m;
+}
+
+// Resolves once the upload actually completes (or was skipped because the
+// slot already holds identical content) — the caller doesn't need to know
+// or care whether it succeeded (see this function's own comment history: a
+// failed upload just means the eventual /tx-play call 400s, which the play
+// loop already treats as "nothing to send").
+async function uploadToBridgeSlot(wsUrl: string, slot: number, samples: Float32Array, fromRateHz: number, gain: number): Promise<void> {
+  const url = bridgeHttpUrl(wsUrl, '/tx-audio', `slot=${slot}`);
+  if (!url) return;
+  const int16 = toBridgeWireFormat(samples, fromRateHz, gain);
+  const hash = hex8(crc32(new Uint8Array(int16.buffer, int16.byteOffset, int16.byteLength)));
+  const cache = slotHashCacheFor(wsUrl);
+  if (cache.get(slot) === hash) return; // this slot already has exactly this content — skip the upload entirely
   try {
-    await fetch(url, { method: 'POST', body: int16.buffer });
+    const res = await fetch(url, { method: 'POST', body: int16.buffer });
+    if (res.ok) cache.set(slot, hash);
+    else cache.delete(slot); // unknown state — don't skip a future retry based on a stale/wrong assumption
   } catch {
-    // Best-effort — see this function's own comment. A dropped upload
-    // surfaces later as /tx-play failing, not silently here.
+    cache.delete(slot);
   }
 }
 
-// Triggers remote playback and resolves once the firmware reports it's no
-// longer playing (either finished naturally or was stopped) — polls
-// /tx-status rather than trying to predict playback duration client-side,
-// so this stays correct even if the firmware's actual playback rate drifts
-// slightly from the nominal BRIDGE_PLAYBACK_RATE_HZ. Returns false if
-// nothing could be played at all (no buffer uploaded, bridge unreachable,
-// or the /tx-play call itself failed) — the caller treats that the same as
-// "audio playback failed" on the local-speaker path.
-async function playBridgeBufferAndWait(wsUrl: string, isRunning: () => boolean): Promise<boolean> {
-  const playUrl = bridgeHttpUrl(wsUrl, '/tx-play');
+// One-shot GET /tx-status read used to seed slotHashCache with whatever
+// the bridge ACTUALLY has right now — without this, a page reload (or a
+// mid-session bridge reconnect) would have no way to know slot 0 already
+// holds the exact auto-CQ waveform from before, and would re-upload it on
+// the very next cycle even though nothing changed. Best-effort: a failed
+// read just means the cache stays cold and the next upload attempt pays
+// for one real round-trip instead of skipping — same fallback shape as
+// every other best-effort call in this file.
+async function refreshSlotHashCache(wsUrl: string): Promise<void> {
+  const url = bridgeHttpUrl(wsUrl, '/tx-status');
+  if (!url) return;
+  try {
+    const res = await fetch(url);
+    if (!res.ok) return;
+    const data = await res.json() as { slots?: { slot: number; ready: boolean; hash: string }[] };
+    const cache = slotHashCacheFor(wsUrl);
+    for (const s of data.slots ?? []) {
+      if (s.ready) cache.set(s.slot, s.hash);
+      else cache.delete(s.slot);
+    }
+  } catch {
+    // Best-effort — see this function's own comment.
+  }
+}
+
+// Triggers remote playback of a specific slot and resolves once the
+// firmware reports it's no longer playing (either finished naturally or
+// was stopped) — polls /tx-status rather than trying to predict playback
+// duration client-side, so this stays correct even if the firmware's
+// actual playback rate drifts slightly from the nominal
+// BRIDGE_PLAYBACK_RATE_HZ. Returns false if nothing could be played at all
+// (no buffer uploaded to this slot, bridge unreachable, another slot
+// already playing, or the /tx-play call itself failed) — the caller treats
+// that the same as "audio playback failed" on the local-speaker path.
+async function playBridgeSlotAndWait(wsUrl: string, slot: number, isRunning: () => boolean): Promise<boolean> {
+  const playUrl = bridgeHttpUrl(wsUrl, '/tx-play', `slot=${slot}`);
   const statusUrl = bridgeHttpUrl(wsUrl, '/tx-status');
   if (!playUrl || !statusUrl) return false;
   try {
@@ -361,8 +456,8 @@ async function playBridgeBufferAndWait(wsUrl: string, isRunning: () => boolean):
     try {
       const res = await fetch(statusUrl);
       if (!res.ok) return true; // bridge dropped mid-playback — nothing more to wait for
-      const data = await res.json() as { playing?: boolean };
-      if (!data.playing) return true;
+      const data = await res.json() as { playing?: boolean; playing_slot?: number };
+      if (!data.playing || data.playing_slot !== slot) return true;
     } catch {
       return true; // same reasoning — a status-poll failure mid-playback isn't worth retrying indefinitely
     }
@@ -383,7 +478,7 @@ export function createFTTransmit(
   getOnSetPTT: () => ((tx: boolean) => Promise<void>) | undefined,
   // Where TX audio plays — the local speaker (default, matches all prior
   // behavior when omitted) or the ESP32 bridge, uploaded once and played
-  // from its own RAM (see uploadIfBridgeSink()/playBridgeBufferAndWait()'s
+  // from its own RAM (see uploadIfBridgeSink()/playBridgeSlotAndWait()'s
   // own comments). getBridgeWsUrl only needs to resolve when
   // getAudioSinkKind() returns 'bridge' — it's rewritten to the bridge's
   // plain HTTP control endpoints (bridgeHttpUrl()), not used to open a
@@ -451,20 +546,36 @@ export function createFTTransmit(
     });
   }
 
-  // Fire-and-forget upload of freshly-encoded samples to the bridge's TX
-  // buffer, only when the operator has actually selected the bridge as the
-  // TX output right now — see uploadForBridgePlayback()'s own comment for
-  // why "upload as soon as encoded" (here) rather than "upload at the
-  // moment of TX" was chosen: keeps the timing-critical PTT-key window free
-  // of any WiFi upload latency. A message that never actually gets
-  // transmitted (e.g. superseded before its window) still gets uploaded —
-  // acceptable; a 144-404KB POST over local WiFi is cheap, and the
-  // firmware's /tx-audio replaces its buffer on every upload anyway.
-  function uploadIfBridgeSink(samples: Float32Array, sourceRateHz: number) {
+  // Fire-and-forget upload of freshly-encoded samples to one of the
+  // bridge's 4 TX slots, only when the operator has actually selected the
+  // bridge as the TX output right now — see uploadToBridgeSlot()'s own
+  // comment for why "upload as soon as encoded" (here) rather than "upload
+  // at the moment of TX" was chosen: keeps the timing-critical PTT-key
+  // window free of any WiFi upload latency. A message that never actually
+  // gets transmitted (e.g. superseded before its window) still gets
+  // uploaded — acceptable; a 144-404KB POST over local WiFi is cheap, and
+  // the hash-skip check means re-uploading identical content (e.g. an
+  // unchanged auto-CQ waveform every cycle) costs nothing beyond the
+  // GET-status-free comparison already done client-side.
+  function uploadIfBridgeSink(slot: number, samples: Float32Array, sourceRateHz: number) {
     if (getAudioSinkKind() !== 'bridge') return;
     const wsUrl = getBridgeWsUrl();
     if (!wsUrl) return;
-    void uploadForBridgePlayback(wsUrl, samples, sourceRateHz, gain);
+    void uploadToBridgeSlot(wsUrl, slot, samples, sourceRateHz, gain);
+  }
+
+  // Which lookahead slot (see TX_SLOT_QUEUE_LOOKAHEAD's own comment) a
+  // just-encoded queue entry should upload to — its POSITION in the queue
+  // at the moment encoding finishes, not a role fixed at enqueue time,
+  // since entries ahead of it can be dequeued/transmitted before this one
+  // is. Returns null for any position beyond the lookahead pool's depth —
+  // those entries simply don't get a bridge pre-upload and fall back to
+  // uploading at actual TX time (see the play loop's own fallback below),
+  // same as this whole feature not existing for a queue deeper than 2.
+  function lookaheadSlotForQueuePosition(entryId: string): number | null {
+    const idx = queue.findIndex(e => e.id === entryId);
+    if (idx < 0 || idx >= TX_SLOT_QUEUE_LOOKAHEAD.length) return null;
+    return TX_SLOT_QUEUE_LOOKAHEAD[idx];
   }
 
   // ── Encode on enqueue ─────────────────────────────────────────────────────
@@ -475,7 +586,8 @@ export function createFTTransmit(
     const ENC_RATE = 12000;
     encodeAsync(entry.message, getMode(), ENC_RATE, entry.audioHz ?? getBaseFrequency())
       .then(samples => {
-        uploadIfBridgeSink(samples, ENC_RATE);
+        const slot = lookaheadSlotForQueuePosition(entry.id);
+        if (slot !== null) uploadIfBridgeSink(slot, samples, ENC_RATE);
         setState(prev => {
           const q = prev.queue.map(e =>
             e.id === entry.id ? { ...e, samples, encodeStatus: 'ready' as const } : e
@@ -522,7 +634,7 @@ export function createFTTransmit(
           autoCQFreqCached === getBaseFrequency()
         ) {
           autoCQSamples = samples;
-          uploadIfBridgeSink(samples, 12000);
+          uploadIfBridgeSink(TX_SLOT_AUTOCQ, samples, 12000);
         }
       })
       .catch(() => { autoCQSamples = null; });
@@ -702,16 +814,33 @@ export function createFTTransmit(
       if (preKeyMs > 0 && autoPTTOn && onSetPTT) await sleep(preKeyMs);
       if (!isRunning) break;
 
-      // Bridge sink: no local Web Audio playback at all — the whole message
-      // was already uploaded to the bridge's own RAM the moment it finished
-      // encoding (see uploadIfBridgeSink()), so TX here is just "tell the
-      // firmware to play what it already has, and wait" — see
-      // playBridgeBufferAndWait()'s own comment for why this polls /tx-status
-      // rather than the local AudioBufferSourceNode path below, which is
-      // ONLY for the 'speaker' sink now.
+      // Bridge sink: no local Web Audio playback at all — the message was
+      // already uploaded to one of the bridge's 4 TX slots the moment it
+      // finished encoding (see uploadIfBridgeSink()/
+      // lookaheadSlotForQueuePosition()), so TX here is normally just "tell
+      // the firmware to play what it already has, and wait" — see
+      // playBridgeSlotAndWait()'s own comment for why this polls
+      // /tx-status rather than the local AudioBufferSourceNode path below,
+      // which is ONLY for the 'speaker' sink now.
+      //
+      // slot resolution: useAutoCQ always maps to TX_SLOT_AUTOCQ. A queued
+      // entry is always queue[0] here (queuedEntry was read as queue[0]
+      // earlier this same iteration and nothing dequeues ahead of it
+      // between then and here), so it always maps to
+      // TX_SLOT_QUEUE_LOOKAHEAD[0] — EXCEPT the rare case this whole
+      // pre-upload scheme doesn't cover: the sink was 'speaker' (or no
+      // bridge wsUrl existed) at encode time and only switched to 'bridge'
+      // moments before this window, so nothing was ever uploaded. Rather
+      // than silently fail in that case, upload right here, at the cost of
+      // reintroducing this one transmission's upload latency into the
+      // critical path — exactly the tradeoff this feature exists to avoid
+      // in the COMMON case, accepted here only as a fallback for the
+      // uncommon one.
       if (getAudioSinkKind() === 'bridge') {
         const wsUrl = getBridgeWsUrl();
-        const ok = wsUrl && await playBridgeBufferAndWait(wsUrl, () => isRunning);
+        const slot = useAutoCQ ? TX_SLOT_AUTOCQ : TX_SLOT_QUEUE_LOOKAHEAD[0];
+        if (wsUrl) await uploadToBridgeSlot(wsUrl, slot, samples, 12000, gain);
+        const ok = wsUrl && await playBridgeSlotAndWait(wsUrl, slot, () => isRunning);
         if (!ok) {
           setState(prev => ({ ...prev, error: 'Bridge playback failed — falling back requires switching output to Local speaker' }));
         }
@@ -816,7 +945,7 @@ export function createFTTransmit(
 
   // ── Sink (speaker only now) ────────────────────────────────────────────────
   // The 'bridge' AudioSinkKind no longer routes through here at all — see
-  // uploadIfBridgeSink()/playBridgeBufferAndWait()'s own comments: bridge TX
+  // uploadIfBridgeSink()/playBridgeSlotAndWait()'s own comments: bridge TX
   // audio is uploaded once and played from the ESP32's own RAM, with no
   // local Web Audio graph involved (that's the whole point — no live stream
   // for WiFi jitter to glitch). This function only ever needs to build the
@@ -837,6 +966,15 @@ export function createFTTransmit(
   async function start() {
     if (isRunning) return;
     if (!FT_SUPPORTED[getMode()]) return;
+    // Best-effort seed of slotHashCache from whatever the bridge already
+    // has — see refreshSlotHashCache()'s own comment for why this matters
+    // (without it, a fresh page load has no way to know slot 0 already
+    // holds the exact auto-CQ waveform from a previous session, and
+    // re-uploads it needlessly on the very next cycle). Harmless to call
+    // even when the sink is 'speaker' or no bridge is configured —
+    // bridgeHttpUrl() itself no-ops on an invalid/missing wsUrl.
+    const wsUrlForCache = getBridgeWsUrl();
+    if (wsUrlForCache) void refreshSlotHashCache(wsUrlForCache);
     if (!audioCtx || audioCtx.state === 'closed') {
       audioCtx = new AudioContext();
       gainNode = audioCtx.createGain();

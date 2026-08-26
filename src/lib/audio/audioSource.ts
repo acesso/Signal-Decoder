@@ -99,7 +99,7 @@ export function speakerSink(ctx: AudioContext): AudioSinkHandle {
 // it). Replaced (2026-08-25) by upload-once-play-remotely: the whole
 // encoded message uploads to the ESP32's own PSRAM as soon as it's ready,
 // then the browser just triggers playback and polls for completion — see
-// useFTTransmit.ts's uploadIfBridgeSink()/playBridgeBufferAndWait() and the
+// useFTTransmit.ts's uploadIfBridgeSink()/playBridgeSlotAndWait() and the
 // firmware's /tx-audio, /tx-play, /tx-status, /tx-stop endpoints. The
 // 'bridge' AudioSinkKind no longer routes through an AudioSinkHandle at
 // all; FTTransmitPanel.tsx's sink selector still offers it as a choice, but
