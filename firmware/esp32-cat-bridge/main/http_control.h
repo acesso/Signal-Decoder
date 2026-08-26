@@ -341,6 +341,21 @@
 //                       still live. Always returns 200, including the
 //                       trivial case where nothing was playing (slot -1 in
 //                       that case). Response: {"stopped":true,"slot":0}.
+// POST /tx-clear    -> body {"slot":N} via ?slot=N query param (same
+//                       tx_parse_slot_param() as the other three /tx-*
+//                       endpoints above) — marks that slot empty (as if
+//                       never uploaded) WITHOUT freeing its PSRAM
+//                       allocation, which stays around for the next
+//                       upload to reuse. Exists specifically so a browser
+//                       slot-pool UI's "remove" action is honest: without
+//                       this, "removing" a cached message could only ever
+//                       be a client-side label hide, while the actual
+//                       audio stayed on the device, ready to play if
+//                       POST /tx-play ever hit that slot another way.
+//                       Rejects with 400 if slot is the one currently
+//                       playing (same rule as POST /tx-audio) — clearing a
+//                       DIFFERENT slot mid-playback is always allowed.
+//                       Response: {"slot":0,"cleared":true}.
 // GET  /system-stats -> JSON: {"cpu_freq_mhz":160,"heap_free":123456,
 //                              "heap_min_free":98765,"heap_total":327680,
 //                              "heap_largest_free_block":65432,"dma_free":54321,
