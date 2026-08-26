@@ -31,7 +31,23 @@ static const char *TAG = "audio_iq";
 // same class of stall as pure added latency instead: a frame only gets
 // dropped once ALL ring slots for a client are backed up, i.e. the client
 // has fallen behind by more than IQ_RING_DEPTH frames, not just one.
-#define IQ_RING_DEPTH 10
+//
+// Raised 10 -> 40 (2026-08-25) now that PSRAM is no longer the scarce
+// resource it looked like — see bridge_config.h's WS_MAX_CLIENTS/
+// AUDIO_WS_MAX_CLIENTS comment and sdkconfig.defaults'
+// SPIRAM_TRY_ALLOCATE_WIFI_LWIP comment for the real-hardware finding that
+// WiFi/lwIP's OWN internal buffers (not this codebase's) were the actual
+// internal-RAM constraint; this ring is already PSRAM-backed and costs
+// s_client_buf_cap * IQ_RING_DEPTH * AUDIO_IQ_MAX_CLIENTS bytes — at the
+// typical 9600 bytes/frame, 40 * 2 = ~768KB, under 1% of this board's 8MB
+// PSRAM. At audio_task's ~50ms broadcast cadence (READ_WINDOW_MS), this
+// buys roughly 2 seconds of WiFi-stall/scheduling-jitter tolerance before
+// a frame is actually dropped, up from ~500ms — directly targets the real-
+// hardware report of the I/Q stream cutting out during TX buffer uploads/
+// playback (concurrent PSRAM-bus/WiFi activity from a second core), where
+// the stall is real but transient, not a sustained overload that more
+// buffering would just mask.
+#define IQ_RING_DEPTH 40
 
 static httpd_handle_t s_server = NULL;
 static int s_client_fds[AUDIO_IQ_MAX_CLIENTS];
