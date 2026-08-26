@@ -11,6 +11,7 @@
 import { createSignal, createMemo, onCleanup, onMount, For, Show, type JSX } from 'solid-js'
 import {
   DEFAULT_DECODER_PARAMS,
+  MAX_SLICE_WIDTH_HZ,
   type FTDecoderActivity,
   type FTDecoderParams,
   type FTDecoderStats,
@@ -54,7 +55,10 @@ const SLIDERS: SliderSpec[] = [
   { key: 'ldpcIters', label: 'LDPC iters', min: 10, max: 60, step: 5, hint: 'belief-propagation iterations' },
   { key: 'osdLdpcThresh', label: 'OSD thresh', min: 40, max: 83, step: 1, hint: 'min correct parity bits before OSD is tried' },
   { key: 'minHz', label: 'Min Hz', min: 0, max: 1000, step: 50, hint: 'decode band lower bound' },
-  { key: 'maxHz', label: 'Max Hz', min: 2000, max: 6000, step: 100, hint: 'decode band upper bound' },
+  {
+    key: 'maxHz', label: 'Max Hz', min: 2000, max: 24000, step: 100,
+    hint: `decode band upper bound — bands wider than ${MAX_SLICE_WIDTH_HZ}Hz auto-split into multiple ${MAX_SLICE_WIDTH_HZ}Hz decode slices (see "Parallel workers" below); each extra slice beyond your worker count queues on an existing worker instead of running concurrently, so a wide band costs real CPU/wall-clock time — the demodulator's own passband width (Width field on the spectrum marker) must be widened to match, or the extra Hz here just searches silence`,
+  },
 ]
 
 // Animated elapsed-vs-budget bar shown while a decode is in flight.
@@ -183,6 +187,7 @@ export default function FTWasmPanel(props: { ftMode: string }): JSX.Element {
     return s && s.engine === 'ft8mon' ? Math.min(100, Math.round((s.decodeMs / 1000 / params().budgetSec) * 100)) : null
   })
   const loading = createMemo(() => status().engines.length === 0)
+  const requiredSlices = createMemo(() => Math.max(1, Math.ceil((params().maxHz - params().minHz) / MAX_SLICE_WIDTH_HZ)))
 
   return (
     <div class="bg-[#0d1117] border border-[#21262d] rounded-md text-xs">
@@ -290,6 +295,18 @@ export default function FTWasmPanel(props: { ftMode: string }): JSX.Element {
               }}
             </For>
           </div>
+          <Show when={props.ftMode === 'FT8'}>
+            <div
+              class="mt-1.5 text-[10px]"
+              classList={{ 'text-[#e3b341]': requiredSlices() > poolSize(), 'text-[#484f58]': requiredSlices() <= poolSize() }}
+              title={`(maxHz - minHz) / ${MAX_SLICE_WIDTH_HZ}Hz, rounded up — the number of ${MAX_SLICE_WIDTH_HZ}Hz decode slices this band needs each window, regardless of worker count.`}
+            >
+              {params().maxHz - params().minHz}Hz band needs {requiredSlices()} decode slice{requiredSlices() === 1 ? '' : 's'}/window
+              <Show when={requiredSlices() > poolSize()}>
+                {' '}— only {poolSize()} worker{poolSize() === 1 ? '' : 's'} available, {requiredSlices() - poolSize()} slice{requiredSlices() - poolSize() === 1 ? '' : 's'} will queue (slower per window); raise "Parallel workers" below to run them concurrently
+              </Show>
+            </div>
+          </Show>
           <div class="mt-2 pt-2 border-t border-[#21262d] flex items-center justify-between gap-2">
             <label
               class="flex items-center gap-2 min-w-0"

@@ -470,12 +470,36 @@ function dispatchToSlot(
 // windowing. Margin is generous relative to FT8's ~50Hz tone spacing.
 const SLICE_OVERLAP_HZ = 100;
 
-function sliceHzRange(minHz: number, maxHz: number, n: number): Array<{ min: number; max: number }> {
+// ft8mon's own internal decode rate is fixed at 12kHz (FT8MON_DECODE_RATE
+// below), which bounds a SINGLE _ftm_decode() call's usable content to well
+// under 6kHz — in practice this codebase has only ever validated one call
+// against bands up to ~3000Hz wide (the Hilbert-transform image-rejection
+// fix sized the demodulator's own filters around that same figure). Wider
+// requested bands are handled by SPLITTING into multiple ≤3000Hz slices and
+// running one _ftm_decode() call per slice against the SAME resampled audio
+// buffer (see the "wide band" branch in decodeFTAudio below) rather than by
+// widening any single call — ft8mon's reduce_rate() band-passes its input to
+// the slice's own [min,max] via FFT bin selection before ever running a
+// candidate search, so handing it the full wideband buffer and a narrow
+// slice range is architecturally correct (confirmed against ft8.cc's
+// reduce_rate()), unlike asking it to decode more than ~3000Hz in one call.
+export const MAX_SLICE_WIDTH_HZ = 3000;
+
+export function sliceHzRange(minHz: number, maxHz: number, n: number): Array<{ min: number; max: number }> {
   const width = (maxHz - minHz) / n;
   return Array.from({ length: n }, (_, i) => ({
     min: i === 0 ? minHz : minHz + i * width - SLICE_OVERLAP_HZ,
     max: i === n - 1 ? maxHz : minHz + (i + 1) * width + SLICE_OVERLAP_HZ,
   }));
+}
+
+// The larger of two independent reasons to slice a decode window — see the
+// call site in decodeFTAudio for the full rationale. Exported standalone
+// (rather than left inline) so it's unit-testable without spinning up the
+// real worker pool decodeFTAudio itself requires.
+export function computeSliceCount(minHz: number, maxHz: number, poolSize: number): number {
+  const widthSliceCount = Math.max(1, Math.ceil((maxHz - minHz) / MAX_SLICE_WIDTH_HZ));
+  return Math.max(poolSize > 1 ? poolSize : 1, widthSliceCount);
 }
 
 // ft8mon's fixed internal decode rate (see ft8mon_wasm.cc's DECODE_RATE) —
@@ -581,8 +605,25 @@ export async function decodeFTAudio(
   // is single-pass with no interference-subtraction loop to parallelize —
   // splitting it would add complexity for zero benefit (confirmed against
   // ft8_lib's source: no thread/candidate-independent structure to exploit).
-  if (mode === 'FT8' && slots.length > 1) {
-    const ranges = sliceHzRange(currentParams.minHz, currentParams.maxHz, slots.length);
+  //
+  // Slice count is the LARGER of two independent reasons to slice:
+  //  - throughput: split the (already ≤3000Hz-capable) band across every
+  //    pool slot so they all work the SAME window concurrently instead of
+  //    one slot doing it alone (the original reason this branch existed).
+  //  - width: a decode band wider than MAX_SLICE_WIDTH_HZ genuinely can't be
+  //    searched by one _ftm_decode() call (see that constant's own comment)
+  //    and MUST be split into ≤3000Hz-wide pieces regardless of pool size.
+  // When width demands more slices than there are pool slots, slices are
+  // round-robined across the available slots (a slot can have more than one
+  // slice in flight — see dispatchToSlot/pending, keyed by request id, not
+  // by slot) rather than capped: a wider band always gets fully searched,
+  // just with less real parallelism — and therefore more wall-clock time per
+  // window — until the operator raises pool size to match. This is the
+  // "wider passband costs more CPU threads, predictably" behavior: a slice
+  // never runs less than the ~3000Hz it was already validated against.
+  const sliceCount = computeSliceCount(currentParams.minHz, currentParams.maxHz, slots.length);
+  if (mode === 'FT8' && sliceCount > 1) {
+    const ranges = sliceHzRange(currentParams.minHz, currentParams.maxHz, sliceCount);
     // Dedup live partials across slices the same way the final merge does —
     // a message decoded by two overlapping slices should only stream once.
     const seenPartials = new Set<string>();
@@ -609,9 +650,16 @@ export async function decodeFTAudio(
     // comment on why the whole window is needed, not a time-trimmed slice).
     // Only the LAST dispatch can transfer (zero-copy); the rest must copy,
     // since transferring detaches the buffer after the first postMessage.
+    //
+    // Slot index is `i % slots.length`, not `i` — sliceCount can exceed pool
+    // size (width-driven slicing above), in which case multiple slices
+    // round-robin onto the same slot and queue there (dispatchToSlot/pending
+    // key by request id, so a slot handling >1 in-flight slice is already
+    // safe — see that map's own comment); it just costs that slot real
+    // wall-clock time serializing them instead of running concurrently.
     const perSlice = ranges.map((hzRange, i) =>
       dispatchToSlot(
-        i, slots,
+        i % slots.length, slots,
         i === ranges.length - 1 ? resampled : resampled.slice(),
         FT8MON_DECODE_RATE, mode, onSlicePartial, hzRange,
         i === ranges.length - 1,
