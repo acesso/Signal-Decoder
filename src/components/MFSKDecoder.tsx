@@ -1533,7 +1533,7 @@ export default function MFSKDecoder(props: DecoderProps): JSX.Element {
           }
         >
           <SignalAnalysisPanel
-            analyser={null}
+            analyser={props.analyser ?? null}
             iqSource={{
               computer: props.iqBridge!.spectrum,
               sampleRateHz: () => props.iqBridge!.state().sampleRateHz,

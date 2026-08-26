@@ -109,12 +109,23 @@ static const char *TAG = "http_control";
 // allows 96kHz, this feature's own default — see http_control.c's
 // SUPPORTED_IQ_SAMPLE_RATES_HZ for why that's unverified-but-selectable
 // rather than assumed to just work).
+// "tx_buffer_playback" means: POST /tx-audio, /tx-play, /tx-stop and
+// GET /tx-status exist — lets the browser upload a whole pre-encoded TX
+// message once (raw Int16 PCM, mono, 16000Hz — see
+// TX_BUFFER_SAMPLE_RATE_HZ in audio_monitor.h) and play it back from an
+// in-PSRAM buffer instead of streaming it live over /audio, avoiding the
+// Wi-Fi-jitter-causes-audible-glitch problem that streaming has on real
+// hardware (see audio_monitor.h's "One-shot pre-encoded TX buffer
+// playback" comment for the full reasoning). Browser code should check
+// for this feature before using those endpoints, same pattern as
+// input_mode_select above — an older bridge without this feature simply
+// doesn't register those routes at all.
 static const char *const BRIDGE_FEATURES[] = {
     "cat", "wifi_config", "wifi_scan", "reset", "audio", "cat_baud", "pa_watchdog",
     "audio_input_select", "mic_gain", "rx_slot_select", "led_enable",
     "alc_control", "noise_gate_control", "cpu_monitor", "wifi_tx_power_control",
     "adc_hpf_control", "sample_rate_select", "speaker_amp_control", "cat_log",
-    "audio_mic_sniff", "input_mode_select",
+    "audio_mic_sniff", "input_mode_select", "tx_buffer_playback",
 };
 
 // The uSDX firmware's own CAT_BAUD menu setting (usdxBLACKBRICK.ino) only
@@ -236,15 +247,16 @@ static esp_err_t status_handler(httpd_req_t *req) {
 static esp_err_t info_handler(httpd_req_t *req) {
     // 256 was enough when this handler was first written, but
     // BRIDGE_FEATURES[] is additive-only (see its own versioning comment)
-    // and has grown to 17 entries as of this comment — 256 bytes is no
-    // longer enough (needs ~288 as of writing) and this handler was
-    // silently returning "info body truncated" on every single call,
-    // which broke the control page's entire refreshStatus() (it
-    // Promise.all()s /status and /info together and awaits both .json()
-    // calls — a non-JSON error body here throws, and since the periodic
-    // auto-refresh always calls refreshStatus(true) [silent], that
-    // exception had been killing every subsequent status update with no
-    // visible error at all). Sized with real headroom this time so the
+    // and had grown to 17 entries by the time this was first bumped to
+    // 512 — 256 bytes wasn't enough by then (needed ~288) and this
+    // handler was silently returning "info body truncated" on every
+    // single call, which broke the control page's entire
+    // refreshStatus() (it Promise.all()s /status and /info together and
+    // awaits both .json() calls — a non-JSON error body here throws, and
+    // since the periodic auto-refresh always calls refreshStatus(true)
+    // [silent], that exception had been killing every subsequent status
+    // update with no visible error at all). Sized with real headroom
+    // (22 entries -> ~380 bytes as of tx_buffer_playback landing) so the
     // next several feature additions don't repeat this exact bug a
     // second time.
     char body[512];
@@ -1042,6 +1054,161 @@ static esp_err_t cpu_freq_handler(httpd_req_t *req) {
     return httpd_resp_send(req, resp_body, n);
 }
 
+// POST /tx-audio — body: raw Int16 PCM bytes (NOT JSON — a binary body),
+// mono, fixed at MIC_SEND_SAMPLE_RATE_HZ (16000 Hz), the exact same wire
+// format /audio's live mic-send path already uses (see that constant's
+// comment in audio_monitor.c). See audio_monitor.h's "One-shot pre-encoded
+// TX buffer playback" comment for why this whole feature exists: streaming
+// TX audio live, chunk by chunk over /audio, means any single chunk's
+// Wi-Fi jitter is instantly audible in the transmitted signal — uploading
+// the WHOLE message once up front and playing it back from a local buffer
+// removes the network from the timing picture entirely for the rest of
+// the transmission.
+//
+// Reads the body with a plain loop over httpd_req_recv() rather than this
+// file's usual read_request_body() helper — that helper's whole design
+// (bounded single recv into a small stack buffer) assumes a body of at
+// most a couple hundred bytes; this one can be very roughly 500KB (15s of
+// 16kHz mono Int16), both too big for any stack buffer this codebase uses
+// elsewhere and too big to guarantee arrives in one httpd_req_recv() call
+// (esp_http_server hands back whatever's currently in the socket's recv
+// buffer per call, which is bounded by the TCP window, not by
+// content_len) — the same "loop until you have it all" requirement
+// httpd_ws_recv_frame() already handles internally for WebSocket frames,
+// done by hand here since httpd_req_recv() is the plain-HTTP-POST
+// equivalent and doesn't do that looping itself.
+static esp_err_t tx_audio_handler(httpd_req_t *req) {
+    audio_monitor_tx_status_t status;
+    audio_monitor_tx_get_status(&status);
+    if (status.playing) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "playback in progress — call POST /tx-stop first");
+        return ESP_FAIL;
+    }
+
+    size_t content_len = req->content_len;
+    if (content_len == 0) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "empty body");
+        return ESP_FAIL;
+    }
+    // Odd byte counts can't be valid Int16 PCM — reject up front rather
+    // than silently truncating the last dangling byte.
+    if (content_len % sizeof(int16_t) != 0) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "body length must be a multiple of 2 (Int16 PCM)");
+        return ESP_FAIL;
+    }
+    // Loose sanity cap, not a precisely-tuned limit — 5 minutes at 16kHz
+    // mono Int16 is already far beyond any realistic FT8/FT4 message (both
+    // protocols top out well under 20s) and comfortably inside the 8MB
+    // PSRAM budget; this exists purely to reject a garbled/misdirected
+    // request with a clear 400 instead of a multi-megabyte allocation
+    // attempt that either succeeds pointlessly or fails confusingly deep
+    // inside audio_monitor_tx_buffer_upload().
+    size_t max_bytes = (size_t)TX_BUFFER_SAMPLE_RATE_HZ * sizeof(int16_t) * 300;
+    if (content_len > max_bytes) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "body too large — must be under 5 minutes of audio");
+        return ESP_FAIL;
+    }
+
+    // PSRAM (MALLOC_CAP_SPIRAM) — this is a plain socket-recv scratch
+    // buffer (httpd_req_recv() -> lwIP recv(), not a peripheral DMA
+    // transfer), same reasoning as ws_server.c's identical per-frame
+    // receive buffer; freed at the end of this handler regardless of
+    // outcome — audio_monitor_tx_buffer_upload() below makes its OWN
+    // separate PSRAM copy for long-term storage; this one only needs to
+    // live for the duration of this request.
+    uint8_t *recv_buf = heap_caps_malloc(content_len, MALLOC_CAP_SPIRAM);
+    if (!recv_buf) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "failed to allocate receive buffer");
+        return ESP_FAIL;
+    }
+
+    size_t received_total = 0;
+    while (received_total < content_len) {
+        int received = httpd_req_recv(req, (char *)recv_buf + received_total, content_len - received_total);
+        if (received <= 0) {
+            if (received == HTTPD_SOCK_ERR_TIMEOUT) continue; // recv_wait_timeout hit mid-transfer — retry, same as esp-idf's own upload examples
+            ESP_LOGW(TAG, "tx-audio body recv failed at %u/%u bytes", (unsigned)received_total, (unsigned)content_len);
+            free(recv_buf);
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "failed to read full body");
+            return ESP_FAIL;
+        }
+        received_total += (size_t)received;
+    }
+
+    bool saved = audio_monitor_tx_buffer_upload((const int16_t *)recv_buf, received_total);
+    free(recv_buf);
+    if (!saved) {
+        // Only real failure path left here is a PSRAM allocation failure
+        // inside audio_monitor_tx_buffer_upload() itself (the in-progress
+        // check above already ruled out the other false case) — genuinely
+        // out of PSRAM, not something retrying immediately would fix.
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "failed to store TX buffer (out of PSRAM?)");
+        return ESP_FAIL;
+    }
+
+    httpd_resp_set_type(req, "application/json");
+    set_cors(req);
+    char resp_body[80];
+    int n = snprintf(resp_body, sizeof(resp_body), "{\"bytes\":%u,\"duration_ms\":%u,\"saved\":true}",
+                      (unsigned)audio_monitor_tx_buffer_byte_count(), (unsigned)audio_monitor_tx_buffer_duration_ms());
+    return httpd_resp_send(req, resp_body, n);
+}
+
+// POST /tx-play — no body. Starts the dedicated playback task (see
+// audio_monitor_tx_play()'s own comment for why this MUST be a genuinely
+// separate FreeRTOS task, not more work stuffed into this httpd worker
+// context). Rejects with 400 if no buffer has been uploaded yet or a
+// playback is already running — audio_monitor_tx_play() itself makes both
+// checks atomically enough to avoid a double-start race from two
+// back-to-back POSTs.
+static esp_err_t tx_play_handler(httpd_req_t *req) {
+    if (!audio_monitor_tx_buffer_ready()) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "no TX buffer uploaded — call POST /tx-audio first");
+        return ESP_FAIL;
+    }
+    if (!audio_monitor_tx_play()) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "playback already in progress");
+        return ESP_FAIL;
+    }
+
+    httpd_resp_set_type(req, "application/json");
+    set_cors(req);
+    char resp_body[48];
+    int n = snprintf(resp_body, sizeof(resp_body), "{\"playing\":true,\"duration_ms\":%u}",
+                      (unsigned)audio_monitor_tx_buffer_duration_ms());
+    return httpd_resp_send(req, resp_body, n);
+}
+
+// GET /tx-status — no body. Deliberately cheap: audio_monitor_tx_get_status()
+// only reads already-computed atomics, no I/O, safe for a browser progress
+// bar to poll every few hundred ms for the duration of a playback.
+static esp_err_t tx_status_handler(httpd_req_t *req) {
+    audio_monitor_tx_status_t status;
+    audio_monitor_tx_get_status(&status);
+
+    httpd_resp_set_type(req, "application/json");
+    set_cors(req);
+    char resp_body[80];
+    int n = snprintf(resp_body, sizeof(resp_body), "{\"playing\":%s,\"position_ms\":%u,\"duration_ms\":%u}",
+                      status.playing ? "true" : "false", (unsigned)status.position_ms, (unsigned)status.duration_ms);
+    return httpd_resp_send(req, resp_body, n);
+}
+
+// POST /tx-stop — no body. Signals the playback task to stop at its next
+// chunk boundary and blocks briefly until it actually has (see
+// audio_monitor_tx_stop()'s own bounded-wait comment) — always returns 200
+// with the resulting state, including the trivial "nothing was playing"
+// case, rather than treating that as an error.
+static esp_err_t tx_stop_handler(httpd_req_t *req) {
+    bool stopped = audio_monitor_tx_stop();
+
+    httpd_resp_set_type(req, "application/json");
+    set_cors(req);
+    char resp_body[32];
+    int n = snprintf(resp_body, sizeof(resp_body), "{\"stopped\":%s}", stopped ? "true" : "false");
+    return httpd_resp_send(req, resp_body, n);
+}
+
 // GET /system-stats — heap usage + per-task CPU%/core/stack-headroom. Kept
 // as its own endpoint (not folded into GET /status) since it's meaningfully
 // larger and meant to be polled on its own cadence by a live-refreshing
@@ -1127,6 +1294,10 @@ void http_control_start(void) {
     httpd_uri_t speaker_amp_uri  = { .uri = "/speaker-amp",  .method = HTTP_POST, .handler = speaker_amp_handler };
     httpd_uri_t cat_log_uri       = { .uri = "/cat-log",       .method = HTTP_GET,  .handler = cat_log_handler };
     httpd_uri_t cat_log_clear_uri = { .uri = "/cat-log/clear", .method = HTTP_POST, .handler = cat_log_clear_handler };
+    httpd_uri_t tx_audio_uri     = { .uri = "/tx-audio",   .method = HTTP_POST, .handler = tx_audio_handler };
+    httpd_uri_t tx_play_uri      = { .uri = "/tx-play",    .method = HTTP_POST, .handler = tx_play_handler };
+    httpd_uri_t tx_status_uri    = { .uri = "/tx-status",  .method = HTTP_GET,  .handler = tx_status_handler };
+    httpd_uri_t tx_stop_uri      = { .uri = "/tx-stop",    .method = HTTP_POST, .handler = tx_stop_handler };
     httpd_uri_t options_uri      = { .uri = "/*",           .method = HTTP_OPTIONS, .handler = options_handler };
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &status_uri));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &info_uri));
@@ -1151,6 +1322,10 @@ void http_control_start(void) {
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &speaker_amp_uri));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &cat_log_uri));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &cat_log_clear_uri));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &tx_audio_uri));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &tx_play_uri));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &tx_status_uri));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &tx_stop_uri));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &options_uri));
 
     ESP_LOGI(TAG, "control endpoints ready: GET /status, GET /info, GET /wifi-scan, POST /reset, "

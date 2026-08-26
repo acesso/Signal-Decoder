@@ -28,7 +28,7 @@
 // capability lands (e.g. "audio" once WebRTC firmware exists) — features are
 // additive and never removed once shipped, so an older web app talking to a
 // newer bridge just ignores flags it doesn't recognize.
-#define BRIDGE_FIRMWARE_VERSION "0.4.0"
+#define BRIDGE_FIRMWARE_VERSION "0.5.0"
 
 // ── Wi-Fi (station mode) ────────────────────────────────────────────────────
 // Credentials come from Kconfig (idf.py menuconfig -> "CAT Bridge Config"),
@@ -196,3 +196,17 @@
 #define PA_WATCHDOG_TASK_PRIO    4
 #define AUDIO_MONITOR_TASK_CORE  RELAY_TASK_CORE
 #define AUDIO_MONITOR_TASK_PRIO  3
+
+// POST /tx-play's one-shot buffer-playback task (audio_monitor.c's
+// tx_play_task()) — same core as the rest of the real-time relay work and
+// the SAME priority as audio_task itself: it feeds
+// audio_monitor_report_out_samples() (-> esp_codec_dev_write()) at the
+// exact same READ_WINDOW_MS-scale cadence audio_task's RX side reads at,
+// so it's the same class of "steady, blocking-with-timeout, real-time
+// audio I/O" work, not busy-work that needs to be kept below it. Explicitly
+// NOT run on the httpd worker (core 0) — see UPSAMPLE_SINC_HALF_WIDTH's
+// comment in audio_monitor.c for the real watchdog-reboot incident that
+// happened the one time CPU-heavy work landed in that shared context
+// during TX.
+#define TX_PLAY_TASK_CORE        RELAY_TASK_CORE
+#define TX_PLAY_TASK_PRIO        AUDIO_MONITOR_TASK_PRIO

@@ -312,7 +312,7 @@ export default function SSTVDecoder(props: DecoderProps & { onReply?: (img: Capt
           }
         >
           <SignalAnalysisPanel
-            analyser={null}
+            analyser={props.analyser ?? null}
             iqSource={{
               computer: props.iqBridge!.spectrum,
               sampleRateHz: () => props.iqBridge!.state().sampleRateHz,

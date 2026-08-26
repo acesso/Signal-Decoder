@@ -173,4 +173,32 @@ describe('SSBDemodulator', () => {
     // noise, not at it.
     expect(maxDiff).toBeLessThan(1e-6)
   })
+
+  // Regression guard for the 300Hz highpass ported from the uSDX firmware's
+  // own filt_var stage (usdxBLACKBRICK.ino) — confirms it actually
+  // suppresses a sub-300Hz tone while passing a normal in-band tone
+  // through, and that disabling it (setHighpassEnabled(false)) restores
+  // the un-filtered behavior.
+  it('suppresses a sub-300Hz tone when the highpass is enabled, passes it when disabled', () => {
+    const centerHz = 3000
+    const lowAudioHz = 150 // below the 300Hz corner
+    const sampleCount = 24000
+
+    const withHighpass = new SSBDemodulator()
+    withHighpass.setPassband(centerHz, 2700, SAMPLE_RATE)
+    withHighpass.setHighpassEnabled(true)
+    for (let i = 0; i < 10; i++) withHighpass.demodulate(makeComplexTone(centerHz + lowAudioHz, SAMPLE_RATE, 2400), true, SAMPLE_RATE)
+    const outWithHighpass = withHighpass.demodulate(makeComplexTone(centerHz + lowAudioHz, SAMPLE_RATE, sampleCount), true, SAMPLE_RATE)
+    const magWithHighpass = goertzelMagnitude(outWithHighpass, lowAudioHz, SAMPLE_RATE)
+
+    const withoutHighpass = new SSBDemodulator()
+    withoutHighpass.setPassband(centerHz, 2700, SAMPLE_RATE)
+    withoutHighpass.setHighpassEnabled(false)
+    for (let i = 0; i < 10; i++) withoutHighpass.demodulate(makeComplexTone(centerHz + lowAudioHz, SAMPLE_RATE, 2400), true, SAMPLE_RATE)
+    const outWithoutHighpass = withoutHighpass.demodulate(makeComplexTone(centerHz + lowAudioHz, SAMPLE_RATE, sampleCount), true, SAMPLE_RATE)
+    const magWithoutHighpass = goertzelMagnitude(outWithoutHighpass, lowAudioHz, SAMPLE_RATE)
+
+    expect(magWithoutHighpass).toBeGreaterThan(0.3)
+    expect(magWithHighpass).toBeLessThan(magWithoutHighpass * 0.3)
+  })
 })

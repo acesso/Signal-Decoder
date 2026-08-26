@@ -8,8 +8,8 @@ import { createSignal } from 'solid-js'
 import { FTMode, FT_WINDOW_SECONDS, FT_SUPPORTED } from '$decoder-lib/ft/decoder'
 import { audioRecorder } from '$decoder-lib/audio/ringRecorder'
 import { createCaptureNode, type CaptureNode } from '$decoder-lib/audio/captureNode'
-import { speakerSink, bridgeSink, type AudioSinkKind, type AudioSinkHandle } from '$decoder-lib/audio/audioSource'
-import type { AudioBridge } from '$decoder-lib/cat/useAudioBridge'
+import { speakerSink, type AudioSinkKind, type AudioSinkHandle } from '$decoder-lib/audio/audioSource'
+import { downsampleBandlimited, makeBandlimitedResampleState, floatToInt16 } from '$decoder-lib/cat/useAudioBridge'
 
 export interface TxQueueEntry {
   id: string;
@@ -67,6 +67,7 @@ export interface FTTransmitState {
 const LS_CALL            = 'ft_mycall';
 const LS_GRID            = 'ft_mygrid';
 const LS_OUTPUT          = 'ft_output_device';
+const LS_AUDIO_SINK      = 'ft_audio_sink_kind';
 const LS_GAIN            = 'ft_tx_gain';
 const LS_AUTOPTT         = 'ft_auto_ptt';
 const LS_CONSECUTIVE_TX  = 'ft_consecutive_tx';
@@ -106,6 +107,17 @@ export function loadOutputDevice(): string {
 }
 export function saveOutputDevice(v: string) {
   if (typeof window !== 'undefined') localStorage.setItem(LS_OUTPUT, v);
+}
+// null = no explicit choice ever saved — callers use this to distinguish
+// "never touched" (still eligible for auto-pick-bridge-on-connect) from an
+// operator's deliberate choice of 'speaker' (which must stick).
+export function loadAudioSinkKind(): AudioSinkKind | null {
+  if (typeof window === 'undefined') return null;
+  const stored = localStorage.getItem(LS_AUDIO_SINK);
+  return stored === 'bridge' || stored === 'speaker' ? stored : null;
+}
+export function saveAudioSinkKind(v: AudioSinkKind) {
+  if (typeof window !== 'undefined') localStorage.setItem(LS_AUDIO_SINK, v);
 }
 const DEFAULT_GAIN = Math.pow(10, -50 / 20); // -50 dB
 export function loadTxGain(): number {
@@ -244,6 +256,119 @@ function encodeAsync(
   });
 }
 
+// ── Bridge buffer playback (uploads the whole message once, plays from the
+// ESP32's own RAM) ────────────────────────────────────────────────────────────
+// Replaces streaming TX audio live over /audio's WebSocket, chunk by chunk in
+// real time — confirmed on real hardware to be "noisy, cutting and full of
+// unwanted artifacts": any single WiFi-jitter-delayed chunk glitches the
+// audio at that exact instant, and there is no buffering margin on either
+// end to absorb it (see bridgeSink()'s own comment for how the old path
+// worked). Uploading the ENTIRE already-encoded message once turns TX audio
+// delivery into a one-shot transfer (which can tolerate ordinary WiFi
+// latency/retransmission just fine) instead of a live stream (which can't
+// tolerate ANY single chunk's delay). The firmware stores the upload in its
+// own PSRAM and plays it out from a dedicated task at the correct rate —
+// see the ESP32 firmware's /tx-audio, /tx-play, /tx-status, /tx-stop
+// endpoints (http_control.h's doc comment).
+//
+// Fixed at MIC_SEND_SAMPLE_RATE_HZ (16000), matching the wire rate the old
+// live-streaming path already used and the firmware's audio_rx_callback()
+// already upsamples from — encodeAsync() itself runs at 12000Hz (ENC_RATE
+// below), so this resamples once, up front, on the WHOLE message at once
+// (not per-chunk — there's no streaming state to carry across calls here,
+// unlike the live-mic path's makeBandlimitedResampleState() which really
+// does need per-chunk continuity).
+const BRIDGE_PLAYBACK_RATE_HZ = 16000;
+
+// ws://host/cat -> http://host/... — same rewrite useIQBridge.ts's
+// fetchBridgeIQInfo() and useRadioCAT.ts's BridgeStatus already do
+// independently; duplicated locally rather than shared for the same reason
+// noted in those files (this hook has no natural shared-module boundary
+// with either).
+function bridgeHttpUrl(catWsUrl: string, pathname: string): string | null {
+  try {
+    const u = new URL(catWsUrl);
+    if (u.protocol !== 'ws:' && u.protocol !== 'wss:') return null;
+    u.protocol = u.protocol === 'wss:' ? 'https:' : 'http:';
+    u.pathname = pathname;
+    return u.toString();
+  } catch {
+    return null;
+  }
+}
+
+// Resolves once the upload actually completes — the caller doesn't need to
+// know or care whether it succeeded (see uploadForBridgePlayback()'s own
+// comment: a failed upload just means the eventual /tx-play call 400s,
+// which the play loop already treats as "nothing to send").
+//
+// gain: applied here — encodeAsync()'s raw output (via @e04/ft8ts's
+// generateFT8Waveform()) is a bare Math.sin() waveform, already at FULL
+// SCALE (±1.0) with zero headroom. The local-speaker path always had
+// "TX Level" (this same gain, via gainNode.gain.value) between that raw
+// waveform and any real output; this path had NOTHING — real-hardware
+// testing (2026-08-25) confirmed exactly the symptom that predicts: the
+// bridge's own audio-quality sniffer measured hundreds of clip events in
+// a 10s window. Applied BEFORE resampling (not after) so the windowed-
+// sinc kernel's own ringing/overshoot on a full-scale input has less
+// headroom to exceed [-1,1] itself before floatToInt16()'s clamp; either
+// order is mathematically equivalent gain-wise (both stages are linear),
+// this just gives the resample step some margin to work with instead of
+// scaling its output back down after the fact.
+async function uploadForBridgePlayback(wsUrl: string, samples: Float32Array, fromRateHz: number, gain: number): Promise<void> {
+  const url = bridgeHttpUrl(wsUrl, '/tx-audio');
+  if (!url) return;
+  const gained = gain === 1 ? samples : samples.map(s => s * gain);
+  const resampled = fromRateHz === BRIDGE_PLAYBACK_RATE_HZ
+    ? gained
+    : downsampleBandlimited(gained, fromRateHz, BRIDGE_PLAYBACK_RATE_HZ, makeBandlimitedResampleState());
+  const int16 = floatToInt16(resampled);
+  try {
+    await fetch(url, { method: 'POST', body: int16.buffer });
+  } catch {
+    // Best-effort — see this function's own comment. A dropped upload
+    // surfaces later as /tx-play failing, not silently here.
+  }
+}
+
+// Triggers remote playback and resolves once the firmware reports it's no
+// longer playing (either finished naturally or was stopped) — polls
+// /tx-status rather than trying to predict playback duration client-side,
+// so this stays correct even if the firmware's actual playback rate drifts
+// slightly from the nominal BRIDGE_PLAYBACK_RATE_HZ. Returns false if
+// nothing could be played at all (no buffer uploaded, bridge unreachable,
+// or the /tx-play call itself failed) — the caller treats that the same as
+// "audio playback failed" on the local-speaker path.
+async function playBridgeBufferAndWait(wsUrl: string, isRunning: () => boolean): Promise<boolean> {
+  const playUrl = bridgeHttpUrl(wsUrl, '/tx-play');
+  const statusUrl = bridgeHttpUrl(wsUrl, '/tx-status');
+  if (!playUrl || !statusUrl) return false;
+  try {
+    const playRes = await fetch(playUrl, { method: 'POST' });
+    if (!playRes.ok) return false;
+  } catch {
+    return false;
+  }
+  // Poll interval short enough that "how long did TX actually take" stays
+  // accurate to a fraction of a second (matters for this loop's own
+  // post-key-hold timing immediately after), long enough not to spam the
+  // bridge's httpd worker over what's otherwise an idle WiFi link for the
+  // whole ~1.4-15s a message plays.
+  const POLL_MS = 150;
+  for (;;) {
+    if (!isRunning()) return true; // caller is stopping — don't keep polling a session nobody's waiting on
+    await new Promise(resolve => setTimeout(resolve, POLL_MS));
+    try {
+      const res = await fetch(statusUrl);
+      if (!res.ok) return true; // bridge dropped mid-playback — nothing more to wait for
+      const data = await res.json() as { playing?: boolean };
+      if (!data.playing) return true;
+    } catch {
+      return true; // same reasoning — a status-poll failure mid-playback isn't worth retrying indefinitely
+    }
+  }
+}
+
 // ── Factory ───────────────────────────────────────────────────────────────────
 // React's useFTTransmit(mode, baseFrequency, vfoFrequency, onSetPTT) took its
 // params positionally and re-synced them via per-param useEffects in the
@@ -257,15 +382,13 @@ export function createFTTransmit(
   getVfoFrequency: () => number,
   getOnSetPTT: () => ((tx: boolean) => Promise<void>) | undefined,
   // Where TX audio plays — the local speaker (default, matches all prior
-  // behavior when omitted) or out through the ESP32 bridge's mic-send path
-  // (see audioSource.ts's speakerSink()/bridgeSink()). getAudioBridge/
-  // getBridgeWsUrl only need to resolve when getAudioSinkKind() returns
-  // 'bridge' — getBridgeWsUrl is what lets bridgeSink() auto-connect the
-  // bridge's /audio WebSocket if "Listen to Radio" was never separately
-  // clicked (see bridgeSink()'s own comment on the real-hardware bug this
-  // fixes: TX silently producing no audio at all otherwise).
+  // behavior when omitted) or the ESP32 bridge, uploaded once and played
+  // from its own RAM (see uploadIfBridgeSink()/playBridgeBufferAndWait()'s
+  // own comments). getBridgeWsUrl only needs to resolve when
+  // getAudioSinkKind() returns 'bridge' — it's rewritten to the bridge's
+  // plain HTTP control endpoints (bridgeHttpUrl()), not used to open a
+  // second WebSocket.
   getAudioSinkKind: () => AudioSinkKind = () => 'speaker',
-  getAudioBridge: () => AudioBridge | undefined = () => undefined,
   getBridgeWsUrl: () => string | undefined = () => undefined,
   // Brackets each keyed TX window (same span as onSetPTT true/false above)
   // so the caller can suspend/resume the bridge's I/Q spectrum connection —
@@ -328,6 +451,22 @@ export function createFTTransmit(
     });
   }
 
+  // Fire-and-forget upload of freshly-encoded samples to the bridge's TX
+  // buffer, only when the operator has actually selected the bridge as the
+  // TX output right now — see uploadForBridgePlayback()'s own comment for
+  // why "upload as soon as encoded" (here) rather than "upload at the
+  // moment of TX" was chosen: keeps the timing-critical PTT-key window free
+  // of any WiFi upload latency. A message that never actually gets
+  // transmitted (e.g. superseded before its window) still gets uploaded —
+  // acceptable; a 144-404KB POST over local WiFi is cheap, and the
+  // firmware's /tx-audio replaces its buffer on every upload anyway.
+  function uploadIfBridgeSink(samples: Float32Array, sourceRateHz: number) {
+    if (getAudioSinkKind() !== 'bridge') return;
+    const wsUrl = getBridgeWsUrl();
+    if (!wsUrl) return;
+    void uploadForBridgePlayback(wsUrl, samples, sourceRateHz, gain);
+  }
+
   // ── Encode on enqueue ─────────────────────────────────────────────────────
   // Start encoding the moment a message is added. By the time the window
   // arrives (~seconds away), samples are already ready in the entry.
@@ -336,6 +475,7 @@ export function createFTTransmit(
     const ENC_RATE = 12000;
     encodeAsync(entry.message, getMode(), ENC_RATE, entry.audioHz ?? getBaseFrequency())
       .then(samples => {
+        uploadIfBridgeSink(samples, ENC_RATE);
         setState(prev => {
           const q = prev.queue.map(e =>
             e.id === entry.id ? { ...e, samples, encodeStatus: 'ready' as const } : e
@@ -382,6 +522,7 @@ export function createFTTransmit(
           autoCQFreqCached === getBaseFrequency()
         ) {
           autoCQSamples = samples;
+          uploadIfBridgeSink(samples, 12000);
         }
       })
       .catch(() => { autoCQSamples = null; });
@@ -561,27 +702,42 @@ export function createFTTransmit(
       if (preKeyMs > 0 && autoPTTOn && onSetPTT) await sleep(preKeyMs);
       if (!isRunning) break;
 
-      try {
-        const ctx = await getAudioContext();
-        if (gainNode) ensureSink(ctx, gainNode);
-        const owned = new Float32Array(samples.length);
-        owned.set(samples);
-        const buf = ctx.createBuffer(1, owned.length, 12000);
-        buf.copyToChannel(owned, 0);
+      // Bridge sink: no local Web Audio playback at all — the whole message
+      // was already uploaded to the bridge's own RAM the moment it finished
+      // encoding (see uploadIfBridgeSink()), so TX here is just "tell the
+      // firmware to play what it already has, and wait" — see
+      // playBridgeBufferAndWait()'s own comment for why this polls /tx-status
+      // rather than the local AudioBufferSourceNode path below, which is
+      // ONLY for the 'speaker' sink now.
+      if (getAudioSinkKind() === 'bridge') {
+        const wsUrl = getBridgeWsUrl();
+        const ok = wsUrl && await playBridgeBufferAndWait(wsUrl, () => isRunning);
+        if (!ok) {
+          setState(prev => ({ ...prev, error: 'Bridge playback failed — falling back requires switching output to Local speaker' }));
+        }
+      } else {
+        try {
+          const ctx = await getAudioContext();
+          if (gainNode) ensureSink(ctx, gainNode);
+          const owned = new Float32Array(samples.length);
+          owned.set(samples);
+          const buf = ctx.createBuffer(1, owned.length, 12000);
+          buf.copyToChannel(owned, 0);
 
-        await new Promise<void>(resolve => {
-          const src = ctx.createBufferSource();
-          src.buffer = buf;
-          src.connect(gainNode ?? ctx.destination);
-          if (txTap) src.connect(txTap.node);
-          src.onended = () => resolve();
-          src.start(ctx.currentTime);
-        });
-      } catch (err) {
-        setState(prev => ({
-          ...prev,
-          error: err instanceof Error ? err.message : 'Audio playback failed',
-        }));
+          await new Promise<void>(resolve => {
+            const src = ctx.createBufferSource();
+            src.buffer = buf;
+            src.connect(gainNode ?? ctx.destination);
+            if (txTap) src.connect(txTap.node);
+            src.onended = () => resolve();
+            src.start(ctx.currentTime);
+          });
+        } catch (err) {
+          setState(prev => ({
+            ...prev,
+            error: err instanceof Error ? err.message : 'Audio playback failed',
+          }));
+        }
       }
 
       // Post-key hold (cool-down): keep PTT up briefly after audio ends before
@@ -658,33 +814,21 @@ export function createFTTransmit(
     }
   }
 
-  // ── Sink (speaker vs. bridge) ─────────────────────────────────────────────
-  // Re-checked before every transmission (not just once in start()), since
-  // the operator can switch sinks mid-session via the panel's own <select>.
-  // gainNode.connect() is additive in Web Audio (calling it again doesn't
-  // replace a prior connection) — disconnect explicitly before switching so
-  // audio doesn't keep going to BOTH the old and new sink at once.
+  // ── Sink (speaker only now) ────────────────────────────────────────────────
+  // The 'bridge' AudioSinkKind no longer routes through here at all — see
+  // uploadIfBridgeSink()/playBridgeBufferAndWait()'s own comments: bridge TX
+  // audio is uploaded once and played from the ESP32's own RAM, with no
+  // local Web Audio graph involved (that's the whole point — no live stream
+  // for WiFi jitter to glitch). This function only ever needs to build the
+  // speaker sink now, but is kept (rather than inlined) since start()/the
+  // play loop's speaker branch both still need somewhere to (re-)build it
+  // lazily on first real use.
   function ensureSink(ctx: AudioContext, node: GainNode): void {
-    const kind = getAudioSinkKind();
-    if (sink && sinkKind === kind) return;
+    if (sink && sinkKind === 'speaker') return;
     node.disconnect();
     sink?.release();
-    if (kind === 'bridge') {
-      const bridge = getAudioBridge();
-      if (!bridge) {
-        // No bridge instance available (shouldn't happen if the UI only
-        // offers this option when props.audioBridge exists) — fall back to
-        // the speaker rather than silently dropping the transmission.
-        sink = speakerSink(ctx);
-        sinkKind = 'speaker';
-        sink.connectSource(node);
-        return;
-      }
-      sink = bridgeSink(bridge, ctx, getBridgeWsUrl);
-    } else {
-      sink = speakerSink(ctx);
-    }
-    sinkKind = kind;
+    sink = speakerSink(ctx);
+    sinkKind = 'speaker';
     sink.connectSource(node);
   }
 

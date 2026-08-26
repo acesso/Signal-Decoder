@@ -24,6 +24,7 @@ import type { Contact } from '$decoder-lib/ft/parser'
 import { audioRecorder, REC_DURATION_CHOICES_SEC } from '$decoder-lib/audio/ringRecorder'
 import type { CapturedImage } from '$decoder-lib/sstv/audioProcessor'
 import { trackEvent } from '$decoder-lib/analytics'
+import { loadObject, saveObject } from '$decoder-lib/storage'
 
 type DecoderMode = 'rtty' | 'sstv' | 'cw' | 'ft' | 'mfsk'
 
@@ -47,6 +48,41 @@ function loadFTMode(): FTMode {
 }
 function saveFTMode(v: FTMode) {
   localStorage.setItem(LS_FT_MODE, v)
+}
+
+// ── I/Q passband width, per decoder mode ─────────────────────────────────
+// useIQBridge.ts's SSBDemodulator holds exactly ONE passband (centerHz/
+// bandwidthHz), shared across whichever decoder mode is currently active
+// — a real gap this surfaced: its own default (2700Hz, a generic
+// voice-SSB width) left FT8 missing roughly the top third of its actual
+// signal band (confirmed directly: FT8 stations spread across close to
+// the full 0-3000Hz audio passband, but a 2700Hz-wide passband centered
+// at 1370Hz only reaches ~2720Hz, and the demodulator's own lowpass
+// transition band erodes a few hundred Hz more before that — matching a
+// real report of visible signal energy cut off around 2-2.3kHz). Modes
+// genuinely differ in how wide a band they need (FT8/MFSK spread many
+// simultaneous signals across most of the audio band; CW is one narrow
+// tone; RTTY sits in a modest, well-known range — see RTTYDecoder.tsx's
+// own DISPLAY_MAX_HZ=1500 convention), so this remembers each mode's own
+// last-used {centerHz, bandwidthHz} and re-applies it via
+// iqBridge.setPassband() on every mode switch (see handleModeChange())
+// instead of leaving every mode fighting over one shared setting.
+const LS_IQ_PASSBAND_BY_MODE = 'iq_passband_by_mode'
+interface IQPassbandSetting { centerHz: number; bandwidthHz: number }
+const IQ_PASSBAND_DEFAULTS: Record<DecoderMode, IQPassbandSetting> = {
+  ft: { centerHz: 1500, bandwidthHz: 3000 }, // FT8/FT4/FT2: many simultaneous stations across ~0-3000Hz
+  mfsk: { centerHz: 1500, bandwidthHz: 3000 }, // same reasoning — multi-tone signals can spread across the band (see MFSKDecoder.tsx's own 3000Hz references)
+  sstv: { centerHz: 1500, bandwidthHz: 2700 }, // voice-bandwidth-ish audio
+  rtty: { centerHz: 1000, bandwidthHz: 1200 }, // covers RTTYDecoder.tsx's own DISPLAY_MAX_HZ=1500 range with margin
+  cw: { centerHz: 700, bandwidthHz: 500 }, // one narrow tone
+}
+function loadPassbandByMode(): Record<DecoderMode, IQPassbandSetting> {
+  return loadObject(LS_IQ_PASSBAND_BY_MODE, IQ_PASSBAND_DEFAULTS)
+}
+function savePassbandForMode(all: Record<DecoderMode, IQPassbandSetting>, mode: DecoderMode, setting: IQPassbandSetting) {
+  const next = { ...all, [mode]: setting }
+  saveObject(LS_IQ_PASSBAND_BY_MODE, next)
+  return next
 }
 
 const MODE_META: Record<DecoderMode, { label: string; description: string }> = {
@@ -176,6 +212,12 @@ function TopBar(props: {
   ftMode: FTMode
   onFTModeChange: (m: FTMode) => void
   audioSource: AudioSourceDisplay | null
+  // True while the bridge audio source currently feeding decode (whichever
+  // of iqBridge/audioBridge audioSource above reflects) has dropped and is
+  // retrying automatically — see useIQBridge.ts's/useAudioBridge.ts's
+  // reconnecting field. Shown next to Start Decoding/Stop so "why did
+  // decoding just go quiet" has an answer without opening the Bridge panel.
+  bridgeReconnecting: boolean
 }): JSX.Element {
   const isRecording = () => props.controls?.isRecording ?? false
   const isSupported = () => props.controls?.isSupported ?? true
@@ -225,6 +267,18 @@ function TopBar(props: {
             </svg>
             Start Decoding
           </button>
+        </Show>
+
+        <Show when={props.bridgeReconnecting}>
+          <span
+            class="flex items-center gap-1.5 text-xs font-semibold text-[#d29922]"
+            title="The bridge's audio/I-Q connection dropped (Wi-Fi hiccup or bridge reboot) — retrying automatically"
+          >
+            <svg xmlns="http://www.w3.org/2000/svg" class="h-3.5 w-3.5 animate-spin" viewBox="0 0 20 20" fill="currentColor">
+              <path fill-rule="evenodd" d="M4 2a1 1 0 011 1v2.101a7.002 7.002 0 0111.601 2.566 1 1 0 11-1.885.666A5.002 5.002 0 005.999 7H9a1 1 0 010 2H4a1 1 0 01-1-1V3a1 1 0 011-1zm.008 9.057a1 1 0 011.276.61A5.002 5.002 0 0014.001 13H11a1 1 0 110-2h5a1 1 0 011 1v5a1 1 0 11-2 0v-2.101a7.002 7.002 0 01-11.601-2.566 1 1 0 01.61-1.276z" clip-rule="evenodd" />
+            </svg>
+            Reconnecting to bridge…
+          </span>
         </Show>
 
         <button
@@ -564,6 +618,52 @@ function App(): JSX.Element {
   // (if empty) bridge audio connection instead of the "wrong mode" problem
   // it actually is.
   const iqBridge = useIQBridge()
+  // See IQ_PASSBAND_DEFAULTS' own comment. Loaded once; applied to
+  // iqBridge on mount (for whatever mode() already restored from its own
+  // localStorage key) and again on every handleModeChange() below.
+  const [passbandByMode, setPassbandByMode] = createSignal(loadPassbandByMode())
+  // Tracks which mode's passband setting iqBridge ACTUALLY reflects right
+  // now — see the persistence-back effect below for the real bug this
+  // fixes: a naive version of that effect fired once immediately on
+  // creation (SolidJS's createEffect runs synchronously at creation time,
+  // before onMount below ever gets a chance to run) with whatever
+  // useIQBridge()'s own hardcoded initial state was (centerHz:0), saw
+  // that it differed from the just-loaded per-mode value (e.g. FT8's
+  // {1500,3000}), and IMMEDIATELY overwrote the correct stored value with
+  // the wrong transient one — confirmed directly against a real report:
+  // localStorage showed bandwidthHz:3000 (the fix's OWN default did
+  // apply) but centerHz:0 (clobbered right back by this exact race),
+  // which put half the passband off-screen to the left of a 0-3000Hz
+  // display range and looked like "barely changed." appliedForMode being
+  // null until onMount's first real applyPassbandForMode() call is what
+  // lets the persistence effect below tell "iqBridge's state is still
+  // just its own generic default, not yet synced to this mode's real
+  // setting" apart from "the operator genuinely just changed it."
+  let appliedForMode: DecoderMode | null = null
+  function applyPassbandForMode(m: DecoderMode) {
+    const setting = passbandByMode()[m] ?? IQ_PASSBAND_DEFAULTS[m]
+    iqBridge.setPassband(setting.centerHz, setting.bandwidthHz)
+    appliedForMode = m
+  }
+  onMount(() => applyPassbandForMode(mode()))
+  // Every decoder's own onPassbandChange calls iqBridge.setPassband()
+  // directly (dragging the marker in SignalAnalysisPanel) rather than
+  // through a prop threaded from here — reacting to iqBridge's own state
+  // instead of adding a new prop to all 5 decoders captures a drag no
+  // matter which one triggered it, with no per-decoder plumbing needed.
+  createEffect(() => {
+    const centerHz = iqBridge.state().passbandCenterHz
+    const bandwidthHz = iqBridge.state().passbandBandwidthHz
+    const m = mode()
+    // Skip entirely until THIS mode's own setting has actually been
+    // applied at least once — otherwise this fires against iqBridge's
+    // bare construction-time default (see this field's own comment) and
+    // clobbers the real stored value before onMount ever runs.
+    if (appliedForMode !== m) return
+    const current = passbandByMode()[m] ?? IQ_PASSBAND_DEFAULTS[m]
+    if (current.centerHz === centerHz && current.bandwidthHz === bandwidthHz) return
+    setPassbandByMode((all) => savePassbandForMode(all, m, { centerHz, bandwidthHz }))
+  })
   // Reported by RadioCATPanel whenever its CAT transport/wsUrl changes —
   // undefined unless transport is 'websocket'. Lets handleStart() below
   // decide whether "Start Decoding" can auto-connect the bridge instead of
@@ -609,6 +709,10 @@ function App(): JSX.Element {
 
   const activeHandle = createMemo(() => handleForMode(mode()))
 
+  // See handleStart()'s own comment on where this is set/cleared, and the
+  // recovery effect below for why it exists.
+  const [decodingFromBridgeMode, setDecodingFromBridgeMode] = createSignal<'iq' | 'audio' | null>(null)
+
   // ── Unified start / stop ─────────────────────────────────────────────────
 
   async function handleStart() {
@@ -636,6 +740,14 @@ function App(): JSX.Element {
     }
 
     if (wsUrl && bridgeInIQMode) {
+      // The bridge just reported I/Q mode — if audioBridge still has a
+      // /audio socket open (e.g. this session started in audio mode and
+      // the bridge switched since), drop it: audio_iq.c and audio_ws.c are
+      // mutually exclusive on the firmware side, so a stale /audio
+      // connection left open here would never receive anything either,
+      // same class of "connected but silently dead" bug this whole
+      // recovery path exists to fix.
+      if (audioBridge.state().connected || audioBridge.state().playbackActive) audioBridge.disconnect()
       iqBridge.setCatMode(cat.state().mode)
       if (!iqBridge.state().connected) await iqBridge.connect(wsUrl)
       if (!iqBridge.state().connected) {
@@ -644,6 +756,9 @@ function App(): JSX.Element {
         )
       }
     } else if (wsUrl && !audioBridge.state().playbackActive) {
+      // Mirror of the I/Q-side cleanup above — dropping a now-stale
+      // iqBridge connection when the bridge has switched to audio mode.
+      if (iqBridge.state().connected) iqBridge.disconnect()
       await audioBridge.connect(wsUrl)
       // connect() failing used to fall through to the microphone with no
       // visible sign anything had gone wrong — a bridge/network hiccup on
@@ -659,6 +774,11 @@ function App(): JSX.Element {
     const useIQ = wsUrl && bridgeInIQMode && iqBridge.state().connected
     const useAudio = wsUrl && !bridgeInIQMode && audioBridge.state().playbackActive
     globalAudio.configureSource(useIQ ? 'bridge' : useAudio ? 'bridge' : 'microphone', useIQ ? iqBridge : useAudio ? audioBridge : undefined)
+    // Remembers which bridge (if any) THIS decode session actually locked
+    // onto, so the mismatch-recovery effect below can tell "the bridge
+    // switched mode out from under an active decode" apart from "the
+    // operator hasn't started decoding, or is intentionally on the mic."
+    setDecodingFromBridgeMode(useIQ ? 'iq' : useAudio ? 'audio' : null)
 
     const node = await globalAudio.start()
     if (node) {
@@ -667,9 +787,42 @@ function App(): JSX.Element {
     }
   }
   function handleStop() {
+    setDecodingFromBridgeMode(null)
     activeHandle().current?.stop()
     globalAudio.stop()
   }
+
+  // ── Bridge-mode mismatch recovery ─────────────────────────────────────────
+  // Real bug this fixes: input_mode_select lets the bridge's ADC mode
+  // (audio-demodulated vs. raw I/Q) change out from under an active decode
+  // session — via the operator's own toggle in the Bridge panel, the
+  // bridge's own standalone control page, or a settings restore — and the
+  // bridge REBOOTS to apply it (see http_control.c's input_mode_handler).
+  // That reboot drops iqBridge's WebSocket; its reconnect logic (see
+  // useIQBridge.ts) correctly reopens /iq-data and correctly refreshes
+  // inputMode in state — but the firmware's /iq-data route accepts a
+  // connection unconditionally even in audio mode (it just never has
+  // anything to broadcast there — see audio_iq.c) and useIQBridge.ts had no
+  // reason to know it should now be talking to /audio instead. Net effect
+  // without this: the socket looks "connected," decoding was already
+  // started, and nothing ever visibly breaks — it just silently stops
+  // producing anything, indefinitely, until the operator notices and
+  // manually stops/starts decoding again.
+  //
+  // This effect is the automatic version of that manual stop/start: while a
+  // decode session is running from one bridge mode, watch for the LIVE
+  // bridge state to disagree with what this session locked onto, and if so,
+  // restart decode (handleStart() already re-derives the correct source
+  // fresh — see its own comment) rather than continuing to feed a decoder
+  // audio that will never arrive.
+  createEffect(() => {
+    const lockedMode = decodingFromBridgeMode()
+    if (lockedMode === null) return
+    const liveMode = iqBridge.state().inputMode
+    if (lockedMode === liveMode) return
+    console.info(`[bridge-mode] decode was using "${lockedMode}" but the bridge is now in "${liveMode}" mode — restarting decode against the correct source`)
+    void handleStart()
+  })
 
   // Real-hardware profiling of the ESP32 bridge found WiFi's dynamic
   // packet buffers and I2S's DMA descriptors draw from the same physical
@@ -715,6 +868,7 @@ function App(): JSX.Element {
     if (wasRecording) prevHandle.current?.stop()
     setMode(newMode)
     saveMode(newMode)
+    applyPassbandForMode(newMode)
     trackEvent('decoder_mode_change', { mode: newMode })
     const nextHandle = handleForMode(newMode)
     if (wasRecording && globalAudio.analyser()) {
@@ -737,6 +891,13 @@ function App(): JSX.Element {
   const audioSourceDisplay = createMemo<AudioSourceDisplay | null>(() =>
     iqBridge.state().connected ? 'bridge-iq' : audioBridge.state().playbackActive ? 'bridge' : 'microphone'
   )
+  // Same precedence as audioSourceDisplay above — whichever bridge is
+  // actually the one feeding decode is the one whose reconnect state
+  // matters. Checked independently of audioSourceDisplay's own 'connected'/
+  // 'playbackActive' condition, since BOTH flip to false the moment a
+  // reconnect starts — reconnecting is what distinguishes "was working,
+  // now retrying" from "never connected"/"stopped."
+  const bridgeReconnecting = createMemo(() => iqBridge.state().reconnecting || audioBridge.state().reconnecting)
 
   const meta = createMemo(() => MODE_META[mode()])
 
@@ -768,7 +929,7 @@ function App(): JSX.Element {
 
       {/* Shared top bar — Start/Stop/Reset + FT sub-mode when active */}
       <div class="shrink-0 px-4 pb-2 sm:px-6 lg:px-8">
-        <TopBar controls={globalControls()} mode={mode()} ftMode={ftMode()} onFTModeChange={handleFTModeChange} audioSource={audioSourceDisplay()} />
+        <TopBar controls={globalControls()} mode={mode()} ftMode={ftMode()} onFTModeChange={handleFTModeChange} audioSource={audioSourceDisplay()} bridgeReconnecting={bridgeReconnecting()} />
       </div>
 
       {/* Scrollable body — CAT + TX panel + decoder content */}
@@ -813,6 +974,7 @@ function App(): JSX.Element {
                   contacts={ftContacts()}
                   vfoFrequency={vfoFrequency()}
                   audioBridge={audioBridge}
+                  iqBridge={iqBridge}
                   bridgeWsUrl={bridgeWsUrl()}
                   onMyCallChange={setFtMyCall}
                   onMyGridChange={setFtMyGrid}

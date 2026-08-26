@@ -3,6 +3,8 @@ import { createEffect, createMemo, createSignal, For, onCleanup, onMount, Show, 
 import {
   createFTTransmit, loadMyCall, saveMyCall, loadMyGrid, saveMyGrid,
   loadAutoReply, saveAutoReply, loadBaseFreq, saveBaseFreq,
+  loadAudioSinkKind, saveAudioSinkKind,
+  loadSuspendIQDuringTx, saveSuspendIQDuringTx,
 } from '../lib/ft/useFTTransmit'
 import {
   buildFTMessage, nextTxMsgType, parseFTMsg, isValidCallsign, needsHashedExchange, qsyAudioOffsetHz,
@@ -15,6 +17,7 @@ import { fmtAbsHz } from '$decoder-lib/formatFreq'
 import NumberField from './NumberField'
 import type { AudioBridge } from '$decoder-lib/cat/useAudioBridge'
 import type { AudioSinkKind } from '$decoder-lib/audio/audioSource'
+import type { IQBridge } from '$decoder-lib/cat/useIQBridge'
 
 // rAF-driven countdown: seconds until next window boundary, updated at ~4 Hz.
 // Uses epoch time (not Date.getSeconds()) so it matches useFTTransmit's own
@@ -408,10 +411,15 @@ interface FTTransmitPanelProps {
   contacts: Map<string, Contact>;
   vfoFrequency?: number;
   audioBridge?: AudioBridge;
-  /** CAT bridge WebSocket URL — needed so selecting "ESP32 Bridge" as the
-   *  TX output can auto-connect audioBridge's /audio WebSocket if
-   *  "Listen to Radio" was never separately clicked (see audioSource.ts's
-   *  bridgeSink() for the real-hardware bug this fixes). */
+  /** For the "Suspend I/Q spectrum during TX" toggle — only shown while the
+   *  bridge is actually in I/Q input mode (relocated here from
+   *  RadioCATPanel.tsx's BridgeInputModeControl). */
+  iqBridge?: IQBridge;
+  /** CAT bridge WebSocket URL — rewritten to the bridge's plain HTTP control
+   *  endpoints (not opened as a second WebSocket) so selecting "ESP32
+   *  Bridge" as the TX output can upload the encoded message and trigger
+   *  remote playback — see useFTTransmit.ts's uploadIfBridgeSink()/
+   *  playBridgeBufferAndWait(). */
   bridgeWsUrl?: string;
   onMyCallChange?: (call: string) => void;
   onMyGridChange?: (grid: string) => void;
@@ -450,7 +458,12 @@ export default function FTTransmitPanel(props: FTTransmitPanelProps): JSX.Elemen
   // local sound card/PA cabling needed). Only offered when a bridge
   // instance was actually passed in (App.tsx wires this up once
   // useRadioCAT/useAudioBridge are both lifted) — see audioSource.ts.
-  const [audioSinkKind, setAudioSinkKind] = createSignal<AudioSinkKind>('speaker')
+  const hadStoredSinkKind = loadAudioSinkKind() !== null
+  const [audioSinkKind, setAudioSinkKindState] = createSignal<AudioSinkKind>(loadAudioSinkKind() ?? 'speaker')
+  const setAudioSinkKind = (v: AudioSinkKind) => {
+    setAudioSinkKindState(v)
+    saveAudioSinkKind(v)
+  }
   // Auto-picks 'bridge' the moment the bridge's audio connects, same
   // principle as App.tsx's handleStart() auto-connecting bridge audio for
   // decode — if CAT is set up to use the bridge, TX should go out through
@@ -459,11 +472,19 @@ export default function FTTransmitPanel(props: FTTransmitPanelProps): JSX.Elemen
   // fires on the transition into "connected" (not on every render/re-check
   // of playbackActive), so an operator who deliberately switches back to
   // "Local speaker" mid-session doesn't get overridden the next time some
-  // other unrelated state change re-runs this effect.
+  // other unrelated state change re-runs this effect. Skipped entirely once
+  // a preference has ever been explicitly saved (including a prior
+  // auto-pick) — reload-persistence means this auto-pick should only ever
+  // happen once, the very first time a bridge is seen, not re-fire every
+  // session and override a deliberate "Local speaker" choice.
   let sawBridgeConnected = false
+  let autoPickedOnce = hadStoredSinkKind
   createEffect(() => {
     const connected = props.audioBridge?.state().playbackActive ?? false
-    if (connected && !sawBridgeConnected) setAudioSinkKind('bridge')
+    if (connected && !sawBridgeConnected && !autoPickedOnce) {
+      setAudioSinkKind('bridge')
+      autoPickedOnce = true
+    }
     sawBridgeConnected = connected
   })
   const micHeldByManual = () => {
@@ -471,13 +492,18 @@ export default function FTTransmitPanel(props: FTTransmitPanelProps): JSX.Elemen
     return !!s && s.micActive && s.micOwner === 'manual'
   }
 
+  // Relocated from RadioCATPanel.tsx's BridgeInputModeControl — persisted
+  // via useFTTransmit.ts's load/save pair since App.tsx reads
+  // loadSuspendIQDuringTx() fresh at the moment each TX window starts,
+  // rather than needing this threaded through as a reactive prop.
+  const [suspendDuringTx, setSuspendDuringTx] = createSignal(loadSuspendIQDuringTx())
+
   const tx = createFTTransmit(
     () => props.mode,
     baseFreq,
     vfoFrequency,
     () => props.onSetPTT,
     audioSinkKind,
-    () => props.audioBridge,
     () => props.bridgeWsUrl,
     () => props.onTxWindowStart,
     () => props.onTxWindowEnd,
@@ -901,6 +927,19 @@ export default function FTTransmitPanel(props: FTTransmitPanelProps): JSX.Elemen
           <div class={audioSinkKind() === 'bridge' ? 'opacity-40 pointer-events-none' : ''}>
             <OutputSelector value={tx.state().outputDeviceId} onChange={tx.setOutputDevice} supported={tx.state().sinkIdSupported} />
           </div>
+          <Show when={props.iqBridge?.state().inputMode === 'iq'}>
+            <label class="flex items-center gap-2 text-[10px] text-[#8b949e] mt-1">
+              <input
+                type="checkbox"
+                checked={suspendDuringTx()}
+                onChange={(e) => {
+                  setSuspendDuringTx(e.currentTarget.checked)
+                  saveSuspendIQDuringTx(e.currentTarget.checked)
+                }}
+              />
+              Suspend I/Q spectrum during TX
+            </label>
+          </Show>
         </div>
 
         {/* TX Engine + all toggles — grouped together */}
