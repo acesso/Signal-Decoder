@@ -22,7 +22,9 @@ static const char *TAG = "bridge_settings";
 #define NVS_KEY_ADC_INPUT "adc_input"
 #define DEFAULT_ADC_INPUT_NAME "lin2"
 #define NVS_KEY_RX_SLOT_RIGHT "rx_slot_r"
+#define NVS_KEY_TX_SLOT "tx_slot"
 #define NVS_KEY_MIC_GAIN_DB "mic_gain_db"
+#define NVS_KEY_SPEAKER_VOL "speaker_vol"
 #define NVS_KEY_WIFI_TX_POWER "wifi_tx_pwr"
 // 78, not 84 — 84 (21.0dBm) was never a real driver step. Confirmed by
 // sweeping POST /wifi-tx-power against real hardware (esp_wifi.h's own
@@ -57,7 +59,9 @@ static const char *TAG = "bridge_settings";
 // out to be a board-wiring issue no gain setting actually fixes, so there's
 // no reason to default away from unity gain.
 #define DEFAULT_RX_SLOT_IS_RIGHT true
+#define DEFAULT_TX_SLOT 2 // AUDIO_TX_SLOT_BOTH — see bridge_settings.h's own comment
 #define DEFAULT_MIC_GAIN_DB 0.0f
+#define DEFAULT_SPEAKER_VOL 80 // see bridge_settings.h's own comment — was silently 0 (near-silent) before this fix existed
 
 // nvs_flash_init() is already called once by wifi_net_start() (Wi-Fi driver
 // requires it) — but bridge_settings_init() runs first in app_main, before
@@ -197,6 +201,27 @@ bool bridge_settings_set_rx_slot_is_right(bool use_right) {
     return ok;
 }
 
+int8_t bridge_settings_get_tx_slot(void) {
+    nvs_handle_t h;
+    int8_t v = DEFAULT_TX_SLOT;
+    if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &h) == ESP_OK) {
+        nvs_get_i8(h, NVS_KEY_TX_SLOT, &v);
+        nvs_close(h);
+    }
+    return v;
+}
+
+bool bridge_settings_set_tx_slot(int8_t slot_value) {
+    nvs_handle_t h;
+    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h) != ESP_OK) return false;
+    esp_err_t e1 = nvs_set_i8(h, NVS_KEY_TX_SLOT, slot_value);
+    esp_err_t e2 = nvs_commit(h);
+    nvs_close(h);
+    bool ok = e1 == ESP_OK && e2 == ESP_OK;
+    ESP_LOGI(TAG, "saved TX slot selection to NVS (%d): %s", slot_value, ok ? "ok" : "FAILED");
+    return ok;
+}
+
 float bridge_settings_get_mic_gain_db(void) {
     nvs_handle_t h;
     float db = DEFAULT_MIC_GAIN_DB;
@@ -216,6 +241,27 @@ bool bridge_settings_set_mic_gain_db(float db_value) {
     nvs_close(h);
     bool ok = e1 == ESP_OK && e2 == ESP_OK;
     ESP_LOGI(TAG, "saved MIC gain to NVS (%.1f dB): %s", db_value, ok ? "ok" : "FAILED");
+    return ok;
+}
+
+int8_t bridge_settings_get_speaker_vol(void) {
+    nvs_handle_t h;
+    int8_t v = DEFAULT_SPEAKER_VOL;
+    if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &h) == ESP_OK) {
+        nvs_get_i8(h, NVS_KEY_SPEAKER_VOL, &v);
+        nvs_close(h);
+    }
+    return v;
+}
+
+bool bridge_settings_set_speaker_vol(int8_t vol_value) {
+    nvs_handle_t h;
+    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h) != ESP_OK) return false;
+    esp_err_t e1 = nvs_set_i8(h, NVS_KEY_SPEAKER_VOL, vol_value);
+    esp_err_t e2 = nvs_commit(h);
+    nvs_close(h);
+    bool ok = e1 == ESP_OK && e2 == ESP_OK;
+    ESP_LOGI(TAG, "saved speaker volume to NVS (%d): %s", vol_value, ok ? "ok" : "FAILED");
     return ok;
 }
 

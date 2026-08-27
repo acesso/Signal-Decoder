@@ -93,6 +93,8 @@ async function refreshStatus(silent) {
     if (typeof status.sample_rate_hz === 'number') updateSampleRateButtons(status.sample_rate_hz);
     if (typeof status.speaker_amp_enabled === 'boolean') updateSpeakerAmpButtons(status.speaker_amp_enabled);
     if (typeof status.mic_gain_db === 'number') updateMicGainSlider(status.mic_gain_db);
+    if (typeof status.speaker_vol === 'number') updateSpeakerVolSlider(status.speaker_vol);
+    if (typeof status.tx_slot === 'string') updateTxSlotButtons(status.tx_slot);
     if (typeof status.cat_log_enabled === 'boolean') updateCatLogEnableButtons(status.cat_log_enabled);
   } catch (err) {
     if (!silent) showMsg(`Failed to load status: ${err.message}`, 'error');
@@ -265,6 +267,86 @@ micGainSlider.addEventListener('input', () => {
   micGainReadout.textContent = `${db} dB`;
   clearTimeout(micGainDebounce);
   micGainDebounce = setTimeout(() => void setMicGain(db), 200);
+});
+
+// ── Speaker (DAC) output volume ──────────────────────────────────────────
+// The ES8388's own DAC output volume (0-100, esp_codec_dev's own volume-
+// curve scale) — separate from the speaker-amp on/off GPIO toggle above.
+// This firmware never set it before, so it silently inherited the driver's
+// zero-initialized default, which esp_codec_dev treats as its -96dB floor
+// (not the curve's 0% point) — real audio reached the DAC and the amp GPIO
+// read enabled, yet the jack stayed essentially silent regardless. Same
+// debounced-drag pattern as MIC gain above.
+const speakerVolSlider = document.getElementById('speaker-vol-slider');
+const speakerVolReadout = document.getElementById('speaker-vol-readout');
+let speakerVolDebounce = null;
+
+// Same "sync to the bridge's real live value, skip while focused" reasoning
+// as updateMicGainSlider() above.
+function updateSpeakerVolSlider(vol) {
+  if (document.activeElement === speakerVolSlider) return;
+  speakerVolSlider.value = String(vol);
+  speakerVolReadout.textContent = String(vol);
+}
+
+async function setSpeakerVol(vol) {
+  try {
+    const res = await fetch('/speaker-vol', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ vol }),
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const result = await res.json();
+    showMsg(result.applied ? `Speaker volume set to ${result.vol}.` : 'Failed to set speaker volume.',
+            result.applied ? 'ok' : 'error');
+  } catch (err) {
+    showMsg(`Failed to set speaker volume: ${err.message}`, 'error');
+  }
+}
+
+speakerVolSlider.addEventListener('input', () => {
+  const vol = Number(speakerVolSlider.value);
+  speakerVolReadout.textContent = String(vol);
+  clearTimeout(speakerVolDebounce);
+  speakerVolDebounce = setTimeout(() => void setSpeakerVol(vol), 200);
+});
+
+// ── TX/playback output channel ───────────────────────────────────────────
+// Real bug: TX (mic-send AND /tx-play) was always LEFT-only, regardless of
+// what the operator expected — this firmware never applied any output slot
+// selection to the TX I2S channel at all (see audio_monitor_set_tx_slot()'s
+// own comment). "Both" duplicates the always-mono TX source to both
+// channels IN HARDWARE (I2S_SLOT_MODE_MONO + slot_mask=BOTH), not a
+// software/CPU cost. Unlike RX slot, this is NOT gated by input mode — TX
+// audio has nothing to do with I/Q.
+const txSlotBtns = document.querySelectorAll('[data-tx-slot]');
+
+function updateTxSlotButtons(slot) {
+  txSlotBtns.forEach((btn) => {
+    btn.classList.toggle('active', btn.dataset.txSlot === slot);
+  });
+}
+
+async function setTxSlot(slot) {
+  try {
+    const res = await fetch('/tx-slot', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ slot }),
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const result = await res.json();
+    updateTxSlotButtons(result.slot);
+    showMsg(result.applied ? `TX output set to ${result.slot}.` : 'Failed to switch TX output (playback in progress?).',
+            result.applied ? 'ok' : 'error');
+  } catch (err) {
+    showMsg(`Failed to switch TX output: ${err.message}`, 'error');
+  }
+}
+
+txSlotBtns.forEach((btn) => {
+  btn.addEventListener('click', () => void setTxSlot(btn.dataset.txSlot));
 });
 
 // ── Status LED kill-switch ────────────────────────────────────────────────

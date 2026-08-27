@@ -80,6 +80,15 @@ bool bridge_settings_set_adc_input_name(const char *name);
 bool bridge_settings_get_rx_slot_is_right(void);
 bool bridge_settings_set_rx_slot_is_right(bool use_right);
 
+// I2S TX slot (which output(s) TX/playback audio reaches) — see
+// audio_monitor_set_tx_slot()'s comment (audio_monitor.h) for the real bug
+// this fixes (TX was always left-only). Defaults to AUDIO_TX_SLOT_BOTH
+// (int 2) — unlike RX, "both" is a genuinely correct default for TX: mono
+// FT8/mic-send audio has no reason to favor one physical ear/output over
+// the other the way RX's board-wiring-dependent ADC channel does.
+int8_t bridge_settings_get_tx_slot(void);
+bool bridge_settings_set_tx_slot(int8_t slot_value);
+
 // ES8388 MIC preamp (PGA) gain in dB — see audio_monitor_set_mic_gain_db().
 // Defaults to 0.0 dB, the ES8388's own PGA default (unity gain) — a higher
 // value was tried earlier to fight onboard-mic bleed-through, but that
@@ -87,6 +96,24 @@ bool bridge_settings_set_rx_slot_is_right(bool use_right);
 // there's no reason to default away from unity.
 float bridge_settings_get_mic_gain_db(void);
 bool bridge_settings_set_mic_gain_db(float db_value);
+
+// ES8388 DAC output volume — see audio_monitor_set_speaker_vol(). 0-100 on
+// esp_codec_dev's own volume-curve scale (0=-50dB, 100=0dB, linear between
+// — see esp_codec_dev.c's _get_default_vol_curve()), NOT dB directly, unlike
+// mic gain above. Defaults to 80: esp_codec_dev_new()'s own zero-initialized
+// `volume` field was never being overridden by this firmware, so every boot
+// silently applied volume=0 — which esp_codec_dev special-cases to -96dB
+// (its "off" floor, not the curve's 0% point) — leaving the DAC receiving
+// real audio while its own output attenuator sat near-silent regardless of
+// the separate NS4150 amp-enable GPIO being on. Confirmed on real hardware:
+// TX audio visibly reached the codec (mic-sniffer showed it) and the amp
+// GPIO read enabled via GET /status, yet nothing was audible on the
+// headphone/speaker jack — tracing esp_codec_dev_open()'s internal
+// _update_codec_setting() call chain found the real cause. 80 (~ -10dB) is a
+// reasonable audible-but-not-clipping starting point, not a measured ideal —
+// same "operator can live-adjust and it persists" pattern as mic gain.
+int8_t bridge_settings_get_speaker_vol(void);
+bool bridge_settings_set_speaker_vol(int8_t vol_value);
 
 // WiFi max TX power in quarter-dBm units (see wifi_net_set_tx_power_quarter_dbm()
 // for the full range/units explanation). Defaults to 78 (~19.5 dBm, the
