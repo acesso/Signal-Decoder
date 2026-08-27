@@ -345,6 +345,28 @@
       ways and listen/measure to see which one actually silences it, and whether it changes the line-in noise
       floor at all. Not persisted; resets to On after a reboot regardless.</p>
       <div class="audio-input-row">
+        <span class="audio-input-label">Speaker volume</span>
+        <input id="speaker-vol-slider" type="range" min="0" max="100" step="5" value="80" class="audio-gain-slider">
+        <span id="speaker-vol-readout" class="audio-input-label">80</span>
+      </div>
+      <p class="hint audio-input-hint">The ES8388 DAC's own output level, separate from the amp on/off toggle above
+      &mdash; both need to be right for the jack to be audible. This firmware never set this before, so it silently
+      defaulted to ~0 (near-silent) on every boot even with the amp enabled and real audio reaching the codec.
+      Applied immediately and persisted.</p>
+      <div class="audio-input-row">
+        <span class="audio-input-label">TX/playback output</span>
+        <div class="audio-input-toggle">
+          <button data-tx-slot="left" type="button" class="audio-input-option">Left</button>
+          <button data-tx-slot="right" type="button" class="audio-input-option">Right</button>
+          <button data-tx-slot="both" type="button" class="audio-input-option">Both</button>
+        </div>
+      </div>
+      <p class="hint audio-input-hint">Which physical jack output(s) TX/playback audio (mic-send AND FT8/FT4 /tx-play)
+      reaches. This firmware never set this before, so it was always Left-only regardless of what got selected here
+      &mdash; "Both" duplicates the (always-mono) TX source to both channels in hardware, not something that costs
+      any extra CPU. Applied immediately (a brief output gap while it reconfigures) and persisted. Refuses to apply
+      while a /tx-play is actually in progress &mdash; change it between transmissions.</p>
+      <div class="audio-input-row">
         <span class="audio-input-label">Input mode</span>
         <div class="audio-input-toggle">
           <button data-input-mode="audio" type="button" class="audio-input-option">Audio</button>

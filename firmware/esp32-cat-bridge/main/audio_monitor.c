@@ -205,6 +205,27 @@ static i2s_chan_handle_t s_rx_handle = NULL;
 static _Atomic bool s_rx_paused = false;
 static _Atomic bool s_rx_slot_is_right = false; // real value set from bridge_settings in audio_monitor_start() — this initializer is just the pre-boot placeholder
 
+// Kept past audio_monitor_start() for the same reason s_rx_handle is —
+// audio_monitor_set_tx_slot()'s live re-config. Real bug this fixes: TX
+// was always LEFT-only — see audio_tx_slot_t's own comment in audio_monitor.h.
+static i2s_chan_handle_t s_tx_handle = NULL;
+static _Atomic int s_tx_slot = AUDIO_TX_SLOT_BOTH; // real value set from bridge_settings in audio_monitor_start()
+
+// The REAL, live I2S TX DMA ring size — dma_desc_num/dma_frame_num are
+// computed dynamically in audio_monitor_start() (scaling with the codec
+// rate and available DMA-capable heap, see that function's own comments),
+// not fixed constants. Kept past audio_monitor_start() so tx_play_task()'s
+// end-of-playback silence flush (see TX_PLAY_SILENCE_FLUSH_CHUNKS's
+// comment) can size itself against the ring this device ACTUALLY got, not
+// a guess: a flush that writes fewer samples than the ring holds leaves
+// some descriptors with stale real-audio content, which I2S TX's
+// underrun behavior (replays the last-written descriptor forever, since
+// this driver never enables auto_clear_after_cb) then repeats
+// indefinitely — confirmed on real hardware as a small residual tick
+// surviving a too-short fixed-chunk-count flush.
+static uint32_t s_dma_desc_num = 6;
+static uint32_t s_dma_frame_num = 0;
+
 // RX-loop timing instrumentation — added specifically to investigate a
 // real report of "cutting/paper-crackling" noise on the digitized I/Q
 // signal (heard on the ESP32/ES8388 path, confirmed ABSENT when the same
@@ -248,6 +269,15 @@ static _Atomic bool s_adc_hpf_enabled = true;
 // or page reload, which looked exactly like "the setting didn't persist"
 // even though the codec register itself was correctly re-applied.
 static _Atomic float s_mic_gain_db = 0.0f;
+
+// Tracks whatever audio_monitor_set_speaker_vol() last applied — same
+// "GET /status must reflect the real re-applied value, not drift" reasoning
+// as s_mic_gain_db above. Initialized to 0 as a pre-boot placeholder only;
+// audio_monitor_start() corrects this to the real (persisted-or-default)
+// value the moment it re-applies bridge_settings_get_speaker_vol() — see
+// that call site's own comment for why this MUST run after
+// esp_codec_dev_open(), same as mic gain.
+static _Atomic int8_t s_speaker_vol = 0;
 
 // Live kill-switch for the onboard NS4150 speaker amplifier (its own
 // enable/shutdown pin, ES8388_PA_ENABLE_PIN — see bridge_config.h; the
@@ -458,6 +488,27 @@ static bool upsample_build_kernel(uint32_t in_rate_hz, uint32_t out_rate_hz) {
     s_upsample_center = 0;
     s_upsample_phase = 0;
     return true;
+}
+
+// Drops the carried history/position state without touching the built
+// kernel table itself (unlike upsample_build_kernel's reset, which only
+// happens as a side effect of a rate change). Needed before a silence
+// flush: upsample_bandlimited() blends up to UPSAMPLE_SINC_HALF_WIDTH
+// samples of PRIOR real input into each output sample via the sinc
+// kernel, by design, for continuity across normal call boundaries — but
+// at end-of-playback that design goal becomes the bug: the first
+// "silent" flush chunk's output isn't actually silent, it's the real
+// tone's tail smeared forward through the kernel. If that blended chunk
+// lands in the DMA ring's last-written descriptor, I2S TX's underrun
+// behavior (re-transmits the last descriptor forever, see
+// TX_PLAY_SILENCE_FLUSH_CHUNKS's comment) replays that quiet-but-real
+// residue indefinitely — confirmed against real hardware as the small
+// repeating artifact that survived the plain zero-chunk flush alone.
+static void upsample_reset_history(void) {
+    memset(s_upsample_history, 0, sizeof(s_upsample_history));
+    s_upsample_hist_len = 0;
+    s_upsample_center = 0;
+    s_upsample_phase = 0;
 }
 
 static size_t upsample_bandlimited(const int16_t *in, size_t in_count, int16_t *out, size_t out_cap, uint32_t in_rate_hz, uint32_t out_rate_hz) {
@@ -839,6 +890,67 @@ static void tx_play_task(void *arg) {
         // write call itself blocks).
     }
 
+    // Explicit silence flush — real-hardware bug (2026-08-26): ESP-IDF's
+    // I2S TX DMA does NOT auto-zero on underrun, it keeps re-transmitting
+    // the last-filled descriptor until something writes fresh data. The
+    // loop above's LAST real chunk is the tail of an encoded FT8/FT4 tone
+    // (loud, sustained — not naturally trailing to near-zero the way live
+    // mic audio usually is), so without this, that tone's final DMA buffer
+    // just kept looping forever after playback "finished" — audible as the
+    // last note repeating endlessly. A prior comment on
+    // audio_rx_callback() assumed I2S underrun produces silence on its
+    // own; confirmed on real hardware that assumption is false. Writing
+    // enough chunks of actual zeroed samples (same size/path as real
+    // playback, same DAC-write/RMS/LED pipeline) overwrites every
+    // descriptor in the ring with true silence.
+    //
+    // REAL HARDWARE INCIDENT (2026-08-27): a first version of this fix
+    // used a FIXED chunk count (4), reasoning that dma_desc_num's 6-
+    // descriptor baseline made 4 "comfortably above any realistic
+    // descriptor depth." That reasoning conflated descriptor COUNT with
+    // ring DURATION: at this device's actual 48kHz default codec rate,
+    // dma_desc_num scales up to 7 and dma_frame_num to 1440, i.e. a
+    // 10,080-sample ring — while 4 chunks of the upsampled ~2400-sample
+    // output this loop's TX_PLAY_CHUNK_SAMPLES input produces only
+    // covered 9,600 samples, ~480 samples (10ms) short. That shortfall
+    // left the ring's tail descriptor(s) never overwritten, which then
+    // kept replaying a small residual tick forever — confirmed still
+    // present on real hardware even after ruling out the upsampler's
+    // carried sinc-history as a contributing cause (see
+    // upsample_reset_history()'s call below, which fixed a real but
+    // separate issue and was NOT sufficient on its own). Sizing the flush
+    // from the ACTUAL live ring capacity (s_dma_desc_num/s_dma_frame_num,
+    // set in audio_monitor_start() from the same dynamic sizing this
+    // comment used to avoid threading out) instead of a fixed guess is
+    // the correct fix — the sizing math needs the real numbers, a
+    // constant can't be picked to safely cover every rate/heap
+    // configuration this device can boot into.
+    upsample_reset_history();
+    // Ring capacity in mono output-domain samples — TX playback is always
+    // mono at the esp_codec_dev_write() call level (stereo duplication
+    // for AUDIO_TX_SLOT_BOTH happens via I2S hardware slot_mask, not a
+    // doubled sample buffer — see audio_tx_slot_t's own comment), so no
+    // channel-count factor is needed here.
+    uint32_t ring_capacity_samples = s_dma_desc_num * s_dma_frame_num;
+    uint32_t codec_rate_hz = bridge_settings_get_sample_rate_hz();
+    // Output-domain samples one TX_PLAY_CHUNK_SAMPLES-sized silence chunk
+    // actually produces, after upsample_bandlimited()'s 16kHz -> codec
+    // rate conversion (see audio_rx_callback()) — the same ratio the
+    // real playback loop above already went through.
+    uint32_t chunk_out_samples = (uint32_t)(((uint64_t)TX_PLAY_CHUNK_SAMPLES * codec_rate_hz) / MIC_SEND_SAMPLE_RATE_HZ);
+    // +1 full extra chunk of margin: the write cursor isn't guaranteed to
+    // sit at a ring boundary when the flush starts (i2s_channel_write()
+    // just continues wherever the last real-audio write left off), so
+    // "exactly enough to cover ring_capacity_samples" can still leave a
+    // few samples at the wrap point stale.
+    int silence_flush_chunks = chunk_out_samples > 0
+        ? (int)((ring_capacity_samples + chunk_out_samples - 1) / chunk_out_samples) + 1
+        : 4;
+    static const int16_t silence_chunk[TX_PLAY_CHUNK_SAMPLES] = {0};
+    for (int i = 0; i < silence_flush_chunks; i++) {
+        audio_monitor_report_out_samples(silence_chunk, TX_PLAY_CHUNK_SAMPLES);
+    }
+
     atomic_store(&s_tx_playing, false);
     atomic_store(&s_tx_playing_slot, -1);
     atomic_store(&s_tx_play_stop_requested, false);
@@ -985,6 +1097,32 @@ bool audio_monitor_set_mic_gain_db(float db_value) {
 
 float audio_monitor_get_mic_gain_db(void) {
     return atomic_load(&s_mic_gain_db);
+}
+
+// Live-adjusts the ES8388's DAC output volume (0-100 on esp_codec_dev's own
+// volume curve — see bridge_settings.h's DEFAULT_SPEAKER_VOL comment for
+// the real bug this fixes: this firmware previously never called this API
+// at all, silently leaving the DAC's own output attenuator at the driver's
+// zero-initialized default, which esp_codec_dev special-cases to -96dB
+// rather than the curve's 0% point). Separate axis from the NS4150 amp
+// enable/shutdown GPIO (see audio_monitor_set_speaker_amp_enabled()) — that
+// GPIO is a hard on/off for the whole amplifier IC; this is the codec's own
+// analog output level feeding it, and both must be right for the jack to
+// produce audible sound.
+bool audio_monitor_set_speaker_vol(int8_t vol_value) {
+    if (!s_codec_dev) return false; // codec never came up — audio monitor disabled
+    int ret = esp_codec_dev_set_out_vol(s_codec_dev, vol_value);
+    if (ret != ESP_CODEC_DEV_OK) {
+        ESP_LOGW(TAG, "esp_codec_dev_set_out_vol(%d) failed (ret=%d)", vol_value, ret);
+        return false;
+    }
+    atomic_store(&s_speaker_vol, vol_value);
+    ESP_LOGI(TAG, "speaker output volume set to %d", vol_value);
+    return true;
+}
+
+int8_t audio_monitor_get_speaker_vol(void) {
+    return atomic_load(&s_speaker_vol);
 }
 
 // Live-toggles ALC (Automatic Level Control) — see the ALCCONTROL comment
@@ -1150,6 +1288,58 @@ bool audio_monitor_set_rx_slot(bool use_right) {
 
 bool audio_monitor_get_rx_slot_is_right(void) {
     return atomic_load(&s_rx_slot_is_right);
+}
+
+// See audio_tx_slot_t's own comment (audio_monitor.h) for the bug this
+// fixes and why AUDIO_TX_SLOT_BOTH works via hardware mono-duplication
+// rather than a firmware buffer change. Refuses to run while a TX-buffer-
+// pool playback is actually in flight (s_tx_playing) — disabling the TX
+// channel mid-write would corrupt/cut off whatever's currently playing;
+// the browser should apply a slot change between transmissions, not during
+// one, same as how real playback itself never overlaps (see
+// audio_monitor_tx_play()'s own single-slot-at-a-time guard).
+bool audio_monitor_set_tx_slot(audio_tx_slot_t slot) {
+    if (!s_tx_handle) return false; // codec never came up — audio monitor disabled
+    if (atomic_load(&s_tx_playing)) {
+        ESP_LOGW(TAG, "refusing TX slot change — playback in progress");
+        return false;
+    }
+
+    esp_err_t err = i2s_channel_disable(s_tx_handle);
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+        ESP_LOGW(TAG, "i2s_channel_disable(tx) failed: %s", esp_err_to_name(err));
+        return false;
+    }
+
+    i2s_std_slot_config_t slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO);
+    switch (slot) {
+        case AUDIO_TX_SLOT_RIGHT: slot_cfg.slot_mask = I2S_STD_SLOT_RIGHT; break;
+        case AUDIO_TX_SLOT_BOTH:  slot_cfg.slot_mask = I2S_STD_SLOT_BOTH;  break;
+        case AUDIO_TX_SLOT_LEFT:
+        default:                 slot_cfg.slot_mask = I2S_STD_SLOT_LEFT;  break;
+    }
+    err = i2s_channel_reconfig_std_slot(s_tx_handle, &slot_cfg);
+    bool ok = err == ESP_OK;
+    if (!ok) {
+        ESP_LOGW(TAG, "i2s_channel_reconfig_std_slot(tx) failed: %s", esp_err_to_name(err));
+    }
+
+    err = i2s_channel_enable(s_tx_handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "i2s_channel_enable failed after TX slot switch: %s — TX audio may be dead until reboot", esp_err_to_name(err));
+        ok = false;
+    }
+
+    if (ok) {
+        atomic_store(&s_tx_slot, (int)slot);
+        ESP_LOGI(TAG, "TX output slot set to %s",
+                 slot == AUDIO_TX_SLOT_BOTH ? "both" : slot == AUDIO_TX_SLOT_RIGHT ? "right" : "left");
+    }
+    return ok;
+}
+
+audio_tx_slot_t audio_monitor_get_tx_slot(void) {
+    return (audio_tx_slot_t)atomic_load(&s_tx_slot);
 }
 
 const char *audio_monitor_get_adc_input_name(void) {
@@ -1362,6 +1552,8 @@ void audio_monitor_start(void) {
         ESP_LOGW(TAG, "only %u descriptors fit in available DMA memory (%u bytes free, largest block) — wanted %u for full anti-jitter headroom",
                  (unsigned)dma_desc_num, (unsigned)dma_free_now, (unsigned)ideal_desc_num);
     }
+    s_dma_desc_num = dma_desc_num;
+    s_dma_frame_num = dma_frame_num;
 
     i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(ES8388_I2S_PORT,
         ES8388_MASTER_MODE ? I2S_ROLE_MASTER : I2S_ROLE_SLAVE);
@@ -1484,6 +1676,7 @@ void audio_monitor_start(void) {
         return;
     }
     s_rx_handle = rx_handle; // kept for audio_monitor_set_rx_slot()'s live re-config — see its comment
+    s_tx_handle = tx_handle; // kept for audio_monitor_set_tx_slot()'s live re-config — see its comment
 
     audio_codec_i2c_cfg_t i2c_cfg = {
         .port = ES8388_I2C_PORT,
@@ -1629,10 +1822,35 @@ void audio_monitor_start(void) {
                  rx_slot_right ? "right" : "left");
     }
 
+    // Must ALSO run after esp_codec_dev_open() — same clobbering mechanism
+    // as RX above, applied to the TX/output side instead (see
+    // audio_tx_slot_t's own comment for the real bug this fixes: TX was
+    // always left-only). UNLIKE RX, this runs regardless of iq_mode — TX
+    // audio (mic-send AND /tx-play) is always mono, in both input modes
+    // (see the tx_slot_mode comment above this function's own I2S TX
+    // channel setup for why: "the TX/DAC side... is always mono data
+    // regardless of input mode, since I/Q only concerns the ADC capture
+    // side").
+    int8_t saved_tx_slot = bridge_settings_get_tx_slot();
+    if (!audio_monitor_set_tx_slot((audio_tx_slot_t)saved_tx_slot)) {
+        ESP_LOGW(TAG, "failed to re-apply saved TX slot (%d) after esp_codec_dev_open() reset it to left", saved_tx_slot);
+    }
+
     // Same "start from whatever was last saved" reasoning as ADC input
     // above — see bridge_settings_get_mic_gain_db()'s comment for the
     // confirmed-on-real-hardware default (21dB).
     audio_monitor_set_mic_gain_db(bridge_settings_get_mic_gain_db());
+
+    // Must ALSO run after esp_codec_dev_open() — that call is what invokes
+    // esp_codec_dev's own internal _update_codec_setting(), which applies
+    // dev->volume (zero-initialized by esp_codec_dev_new(), never set by
+    // this firmware before now) BEFORE this line ever runs, silencing the
+    // DAC's own output attenuator regardless of the separate NS4150 amp GPIO
+    // — see bridge_settings.h's DEFAULT_SPEAKER_VOL comment for the full
+    // real-hardware confirmation of this bug. Re-applying here, same
+    // pattern as mic gain above, fixes it for both first boot (persisted
+    // default) and every subsequent boot (persisted operator choice).
+    audio_monitor_set_speaker_vol(bridge_settings_get_speaker_vol());
 
     audio_ws_set_rx_callback(audio_rx_callback);
 

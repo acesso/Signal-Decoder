@@ -104,6 +104,24 @@ bool audio_monitor_set_mic_gain_db(float db_value);
 // a persisted setting.
 float audio_monitor_get_mic_gain_db(void);
 
+// Live-adjusts the ES8388's DAC output volume via esp_codec_dev's public
+// API (esp_codec_dev_set_out_vol — a 0-100 scale on the driver's own
+// volume curve, NOT dB, unlike mic gain above). See bridge_settings.h's
+// own comment on DEFAULT_SPEAKER_VOL for the real bug this fixes: this
+// firmware never called this API at all, so every boot silently inherited
+// esp_codec_dev's zero-initialized volume (0), which the driver treats as
+// its -96dB floor — real audio reached the DAC and the separate NS4150 amp-
+// enable GPIO was on, but the codec's own output attenuator left it
+// inaudible. vol_value <= 0 drives the DAC output to its minimum (not a
+// mute — see esp_codec_dev_set_out_mute() if a true mute is ever needed).
+// Returns false if the codec never came up or the underlying call failed.
+bool audio_monitor_set_speaker_vol(int8_t vol_value);
+
+// Returns whatever audio_monitor_set_speaker_vol() last successfully
+// applied — for GET /status to report the live value, e.g. after a reboot
+// re-applies a persisted setting.
+int8_t audio_monitor_get_speaker_vol(void);
+
 // Live-toggles the ES8388's ALC (Automatic Level Control) — confirmed OFF
 // by the chip's own power-on-reset default (the vendored driver never
 // writes these registers), exposed here as a checkable on/off diagnostic
@@ -155,6 +173,40 @@ bool audio_monitor_set_rx_slot(bool use_right);
 // audio_monitor_start()'s I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG default) —
 // for GET /status to report.
 bool audio_monitor_get_rx_slot_is_right(void);
+
+// Which physical output slot(s) TX/playback audio (mic-send AND the
+// TX-buffer-pool /tx-play mechanism — both funnel through the same
+// audio_rx_callback()/audio_monitor_report_out_samples() DAC-write path)
+// reaches — tri-state, unlike RX's plain left/right: "both" is a real,
+// useful default (mono source audibly duplicated to both physical
+// channels/ears) that RX has no equivalent for (RX genuinely only wants
+// ONE physical ADC channel, since the other one may carry something
+// different depending on board wiring).
+typedef enum {
+    AUDIO_TX_SLOT_LEFT = 0,
+    AUDIO_TX_SLOT_RIGHT,
+    AUDIO_TX_SLOT_BOTH,
+} audio_tx_slot_t;
+
+// Live-switches which I2S output slot(s) TX/playback audio reaches. Real
+// bug this fixes: TX was always LEFT-only (esp_codec_dev_open()'s own
+// channel==1 special-case clobbers slot_mask to LEFT for BOTH tx and rx
+// when the codec is opened IN_OUT, the same mechanism audio_monitor_set_rx_slot()
+// already works around for RX — see that function's own comment). "Both"
+// uses I2S_SLOT_MODE_MONO + I2S_STD_SLOT_BOTH together — confirmed via the
+// ESP-IDF HAL source (I2S_SLOT_MODE_MONO's own doc: "transmit same data in
+// all slots for tx mode") that this duplicates one written sample to both
+// physical outputs in HARDWARE, not something this firmware's own sample
+// buffer needs to pre-duplicate. Same brief disable/reconfigure/re-enable
+// cost as audio_monitor_set_rx_slot() — expect a short gap on switch, but
+// TX-play only ever runs this at idle (not mid-playback) so that gap is
+// never audible in practice. Returns false if the codec never came up or
+// any step failed.
+bool audio_monitor_set_tx_slot(audio_tx_slot_t slot);
+
+// Current TX slot selection, reflecting the last successful
+// audio_monitor_set_tx_slot() call — for GET /status to report.
+audio_tx_slot_t audio_monitor_get_tx_slot(void);
 
 // Pre-encoded TX buffer playback, now a fixed pool of TX_SLOT_COUNT
 // independently-addressable slots — see http_control.h's POST /tx-audio,

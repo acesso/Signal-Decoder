@@ -42,6 +42,16 @@ static const char *TAG = "http_control";
 // "mic_gain" means: POST /mic-gain exists — lets the browser live-adjust
 // the ES8388's MIC preamp gain (see audio_monitor_set_mic_gain_db()), for
 // attenuating the onboard MIC1 preamp's bleed-through into other input modes.
+// "speaker_vol" means: GET /status reports speaker_vol and POST /speaker-vol
+// exists — lets the browser live-adjust the ES8388's DAC output volume (see
+// audio_monitor_set_speaker_vol()), fixing a real bug where this firmware
+// never called that API at all, silently leaving the DAC's own output
+// attenuator at the driver's near-silent zero-initialized default.
+// "tx_slot_select" means: GET /status reports tx_slot and POST /tx-slot
+// exists — lets the browser live-switch which I2S output slot(s) TX/
+// playback audio reaches (see audio_monitor_set_tx_slot()), fixing a real
+// bug where TX was always left-channel-only regardless of what the operator
+// heard/expected.
 // "rx_slot_select" means: GET /status reports rx_slot_right and
 // POST /rx-slot exists — lets the browser live-switch which I2S slot
 // (left/right) the ADC capture reads, independent of the ADCCONTROL2 mux
@@ -132,7 +142,7 @@ static const char *const BRIDGE_FEATURES[] = {
     "audio_input_select", "mic_gain", "rx_slot_select", "led_enable",
     "alc_control", "noise_gate_control", "cpu_monitor", "wifi_tx_power_control",
     "adc_hpf_control", "sample_rate_select", "speaker_amp_control", "cat_log",
-    "audio_mic_sniff", "input_mode_select", "tx_buffer_playback",
+    "audio_mic_sniff", "input_mode_select", "tx_buffer_playback", "speaker_vol", "tx_slot_select",
 };
 
 // The uSDX firmware's own CAT_BAUD menu setting (usdxBLACKBRICK.ino) only
@@ -157,6 +167,15 @@ static const char *wifi_state_str(bridge_wifi_state_t s) {
         case BRIDGE_WIFI_AP_FALLBACK:  return "ap_fallback";
         case BRIDGE_WIFI_DISCONNECTED:
         default:                      return "disconnected";
+    }
+}
+
+static const char *tx_slot_name(audio_tx_slot_t slot) {
+    switch (slot) {
+        case AUDIO_TX_SLOT_RIGHT: return "right";
+        case AUDIO_TX_SLOT_BOTH:  return "both";
+        case AUDIO_TX_SLOT_LEFT:
+        default:                 return "left";
     }
 }
 
@@ -201,7 +220,7 @@ static esp_err_t status_handler(httpd_req_t *req) {
     int8_t tx_power_quarter_dbm = 0;
     wifi_net_get_tx_power_quarter_dbm(&tx_power_quarter_dbm); // best-effort; 0 if WiFi hasn't started yet
 
-    char body[850];
+    char body[950];
     int n = snprintf(body, sizeof(body),
         "{\"wifi_state\":\"%s\",\"ssid\":\"%s\",\"bssid\":\"%s\",\"rssi\":%d,\"ip\":\"%s\","
         "\"ws_clients\":%u,\"ws_max_clients\":%d,\"radio_linked\":%s,"
@@ -210,7 +229,7 @@ static esp_err_t status_handler(httpd_req_t *req) {
         "\"alc_enabled\":%s,\"noise_gate_enabled\":%s,\"cpu_freq_mhz\":%d,"
         "\"wifi_tx_power_quarter_dbm\":%d,\"adc_hpf_enabled\":%s,"
         "\"sample_rate_hz\":%u,\"speaker_amp_enabled\":%s,"
-        "\"mic_gain_db\":%.1f,\"cat_log_enabled\":%s,"
+        "\"mic_gain_db\":%.1f,\"speaker_vol\":%d,\"tx_slot\":\"%s\",\"cat_log_enabled\":%s,"
         "\"input_mode\":\"%s\","
         "\"uptime_s\":%lld}",
         wifi_state_str(st.wifi_state), ssid_escaped, bssid, (int)live_rssi,
@@ -231,6 +250,8 @@ static esp_err_t status_handler(httpd_req_t *req) {
         (unsigned)bridge_settings_get_sample_rate_hz(),
         audio_monitor_get_speaker_amp_enabled() ? "true" : "false",
         (double)audio_monitor_get_mic_gain_db(),
+        (int)audio_monitor_get_speaker_vol(),
+        tx_slot_name(audio_monitor_get_tx_slot()),
         bridge_settings_get_cat_log_enabled() ? "true" : "false",
         audio_monitor_input_mode_name(audio_monitor_get_input_mode()),
         (long long)uptime_s);
@@ -585,6 +606,38 @@ static esp_err_t mic_gain_handler(httpd_req_t *req) {
     return httpd_resp_send(req, resp_body, n);
 }
 
+// POST /speaker-vol — body: {"vol":80}. Live-adjusts the ES8388's DAC
+// output volume (0-100, esp_codec_dev's own volume-curve scale — see
+// audio_monitor_set_speaker_vol() for why this exists: this firmware never
+// called this API before, so every boot silently left the DAC's own
+// output attenuator at the driver's zero-initialized default, which
+// esp_codec_dev special-cases to -96dB — real audio reached the codec and
+// the separate NS4150 amp-enable GPIO was on, but the jack stayed
+// essentially silent regardless). Applied immediately AND persisted to
+// NVS. Clamped to [0,100] — esp_codec_dev_set_out_vol()'s own valid range.
+static esp_err_t speaker_vol_handler(httpd_req_t *req) {
+    char body[64];
+    if (read_request_body(req, body, sizeof(body)) != ESP_OK) return ESP_FAIL;
+
+    int vol = 0;
+    if (!extract_json_int(body, "vol", &vol)) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "missing or invalid \"vol\"");
+        return ESP_FAIL;
+    }
+    if (vol < 0) vol = 0;
+    if (vol > 100) vol = 100;
+
+    bool applied = audio_monitor_set_speaker_vol((int8_t)vol);
+    bool saved = applied && bridge_settings_set_speaker_vol((int8_t)vol);
+
+    httpd_resp_set_type(req, "application/json");
+    set_cors(req);
+    char resp_body[80];
+    int n = snprintf(resp_body, sizeof(resp_body), "{\"vol\":%d,\"applied\":%s,\"saved\":%s}",
+        vol, applied ? "true" : "false", saved ? "true" : "false");
+    return httpd_resp_send(req, resp_body, n);
+}
+
 // POST /wifi-tx-power — body: {"quarter_dbm":84}. Live-sets the WiFi
 // radio's max TX power via wifi_net_set_tx_power_quarter_dbm() — units are
 // quarter-dBm (84 == 21.0dBm, the driver's own maximum), valid range [8,84]
@@ -665,6 +718,45 @@ static esp_err_t rx_slot_handler(httpd_req_t *req) {
     char resp_body[80];
     int n = snprintf(resp_body, sizeof(resp_body), "{\"right\":%s,\"applied\":%s,\"saved\":%s}",
         audio_monitor_get_rx_slot_is_right() ? "true" : "false", applied ? "true" : "false", saved ? "true" : "false");
+    return httpd_resp_send(req, resp_body, n);
+}
+
+// POST /tx-slot — body: {"slot":"left"|"right"|"both"}. Live-switches which
+// I2S output slot(s) TX/playback audio (mic-send AND /tx-play) reaches —
+// see audio_monitor_set_tx_slot()'s comment for the real bug this fixes
+// (TX was always left-only). Unlike /rx-slot, this is NOT rejected in I/Q
+// input mode — TX audio has nothing to do with I/Q (that only concerns RX
+// capture), so this axis is always valid regardless of input mode. Applied
+// immediately (disables/reconfigures/re-enables the TX I2S channel — see
+// audio_monitor_set_tx_slot()'s own comment on why this refuses to run
+// mid-playback) AND persisted to NVS.
+static esp_err_t tx_slot_handler(httpd_req_t *req) {
+    char body[64];
+    if (read_request_body(req, body, sizeof(body)) != ESP_OK) return ESP_FAIL;
+
+    char slot_str[8];
+    if (!extract_json_string(body, "slot", slot_str, sizeof(slot_str))) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "missing or invalid \"slot\"");
+        return ESP_FAIL;
+    }
+
+    audio_tx_slot_t slot;
+    if (strcmp(slot_str, "left") == 0) slot = AUDIO_TX_SLOT_LEFT;
+    else if (strcmp(slot_str, "right") == 0) slot = AUDIO_TX_SLOT_RIGHT;
+    else if (strcmp(slot_str, "both") == 0) slot = AUDIO_TX_SLOT_BOTH;
+    else {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "\"slot\" must be \"left\", \"right\", or \"both\"");
+        return ESP_FAIL;
+    }
+
+    bool applied = audio_monitor_set_tx_slot(slot);
+    bool saved = applied && bridge_settings_set_tx_slot((int8_t)slot);
+
+    httpd_resp_set_type(req, "application/json");
+    set_cors(req);
+    char resp_body[96];
+    int n = snprintf(resp_body, sizeof(resp_body), "{\"slot\":\"%s\",\"applied\":%s,\"saved\":%s}",
+        tx_slot_name(audio_monitor_get_tx_slot()), applied ? "true" : "false", saved ? "true" : "false");
     return httpd_resp_send(req, resp_body, n);
 }
 
@@ -1374,6 +1466,7 @@ void http_control_start(void) {
     httpd_uri_t mic_gain_uri    = { .uri = "/mic-gain",    .method = HTTP_POST, .handler = mic_gain_handler };
     httpd_uri_t wifi_tx_power_uri = { .uri = "/wifi-tx-power", .method = HTTP_POST, .handler = wifi_tx_power_handler };
     httpd_uri_t rx_slot_uri     = { .uri = "/rx-slot",     .method = HTTP_POST, .handler = rx_slot_handler };
+    httpd_uri_t tx_slot_uri     = { .uri = "/tx-slot",     .method = HTTP_POST, .handler = tx_slot_handler };
     httpd_uri_t led_enable_uri = { .uri = "/led-enable", .method = HTTP_POST, .handler = led_enable_handler };
     httpd_uri_t alc_uri         = { .uri = "/alc",         .method = HTTP_POST, .handler = alc_handler };
     httpd_uri_t noise_gate_uri  = { .uri = "/noise-gate",  .method = HTTP_POST, .handler = noise_gate_handler };
@@ -1384,6 +1477,7 @@ void http_control_start(void) {
     httpd_uri_t input_mode_uri  = { .uri = "/input-mode",  .method = HTTP_POST, .handler = input_mode_handler };
     httpd_uri_t cat_log_enable_uri = { .uri = "/cat-log-enable", .method = HTTP_POST, .handler = cat_log_enable_handler };
     httpd_uri_t speaker_amp_uri  = { .uri = "/speaker-amp",  .method = HTTP_POST, .handler = speaker_amp_handler };
+    httpd_uri_t speaker_vol_uri  = { .uri = "/speaker-vol",  .method = HTTP_POST, .handler = speaker_vol_handler };
     httpd_uri_t cat_log_uri       = { .uri = "/cat-log",       .method = HTTP_GET,  .handler = cat_log_handler };
     httpd_uri_t cat_log_clear_uri = { .uri = "/cat-log/clear", .method = HTTP_POST, .handler = cat_log_clear_handler };
     httpd_uri_t tx_audio_uri     = { .uri = "/tx-audio",   .method = HTTP_POST, .handler = tx_audio_handler };
@@ -1403,6 +1497,7 @@ void http_control_start(void) {
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &mic_gain_uri));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &wifi_tx_power_uri));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &rx_slot_uri));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &tx_slot_uri));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &led_enable_uri));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &alc_uri));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &noise_gate_uri));
@@ -1413,6 +1508,7 @@ void http_control_start(void) {
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &input_mode_uri));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &cat_log_enable_uri));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &speaker_amp_uri));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &speaker_vol_uri));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &cat_log_uri));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &cat_log_clear_uri));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &tx_audio_uri));
