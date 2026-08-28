@@ -111,6 +111,44 @@ export function acquireBridgeSource(bridge: AudioBridge | IQBridge): AudioSource
   }
 }
 
+const BRIDGE_RETRY_POLL_MS = 500
+
+// Like acquireBridgeSource(), but for when the operator has explicitly
+// FORCED a bridge source (see AudioSourceOverride) rather than it being
+// auto-detected as already live. Clicking "Start Decoding" with a forced
+// bridge choice is a clear statement of intent — the operator wants that
+// source, even if the bridge isn't connected yet (they may be about to
+// open the Bridge panel and hit "Listen to Radio", or the bridge is mid-
+// reconnect) — so this polls instead of failing immediately with an error
+// that doesn't go away on its own. shouldAbort() is checked before each
+// attempt and each wait, so a stopRecording() call mid-poll (which flips
+// whatever flag the caller's shouldAbort reads) ends the wait promptly
+// instead of an orphaned timer eventually resolving into a torn-down
+// processor. Resolves to null only on abort — never throws, and never
+// times out on its own, matching the operator's explicit "keep trying
+// this source" choice; there's no arbitrary duration for correctly giving
+// up before they've had a chance to connect it.
+export function acquireBridgeSourceWithRetry(
+  bridge: AudioBridge | IQBridge,
+  shouldAbort: () => boolean,
+): Promise<AudioSourceHandle | null> {
+  return new Promise((resolve) => {
+    const attempt = () => {
+      if (shouldAbort()) {
+        resolve(null)
+        return
+      }
+      const source = acquireBridgeSource(bridge)
+      if (source) {
+        resolve(source)
+        return
+      }
+      setTimeout(attempt, BRIDGE_RETRY_POLL_MS)
+    }
+    attempt()
+  })
+}
+
 // What a TX feature's playback graph needs to send its output somewhere:
 // a place for its GainNode to connect into.
 export interface AudioSinkHandle {
