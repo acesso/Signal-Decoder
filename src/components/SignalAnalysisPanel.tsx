@@ -519,7 +519,15 @@ interface Props {
   markers?: AudioMarker[]
   /** shiftKey reflects the modifier during the drag — lets a mode offer an
    *  alternate drag behavior (e.g. MFSK: move one tone instead of the group). */
-  onMarkerDrag?: (index: number, newFreq: number, shiftKey?: boolean) => void
+  // committed: false while the marker is actively being dragged (position-
+  // only, live visual feedback) — true for the drag's own final mouseup
+  // value and for every non-drag caller (typed field, step buttons). A
+  // caller that triggers real work (encoding audio, uploading to a bridge)
+  // from this callback MUST gate on committed, not fire on every call — see
+  // the real-hardware regression this parameter exists to prevent: an
+  // un-gated network upload on every live drag tick saturated the bridge's
+  // WiFi link badly enough to crash/reboot it (2026-08-28).
+  onMarkerDrag?: (index: number, newFreq: number, shiftKey?: boolean, committed?: boolean) => void
   /** I/Q mode only — see IQPassband. Present together, or not at all. */
   passband?: IQPassband
   onPassbandChange?: (passband: IQPassband) => void
@@ -647,12 +655,19 @@ export default function SignalAnalysisPanel(props: Props): JSX.Element {
   // the raw tap (base is forced empty there — see effectiveMarkers' own
   // comment), so it's always at index 0 when this is true.
   const isPassbandMarkerIndex = (i: number) => props.passband != null && onRawTap() && i === 0
-  const handleMarkerDrag = (index: number, newFreq: number, shiftKey?: boolean) => {
+  // committed distinguishes a LIVE drag-in-progress update (marker position
+  // only, no downstream network/encode work should happen yet) from a final
+  // value — the drag's own mouseup, or any one-shot caller (typed Hz field,
+  // step buttons, applyCenterShift) that was never a drag at all. Defaults
+  // true so every existing non-drag call site (which never passed this
+  // before it existed) keeps its original "commit immediately" behavior —
+  // only the live mousemove handler below explicitly passes false.
+  const handleMarkerDrag = (index: number, newFreq: number, shiftKey?: boolean, committed = true) => {
     if (isPassbandMarkerIndex(index)) {
       props.onPassbandChange?.({ centerHz: newFreq, bandwidthHz: props.passband!.bandwidthHz })
       return
     }
-    props.onMarkerDrag?.(index, newFreq, shiftKey)
+    props.onMarkerDrag?.(index, newFreq, shiftKey, committed)
   }
   const hasMarkerDrag = createMemo(() => !!props.onMarkerDrag || !!props.onPassbandChange)
 
@@ -836,6 +851,14 @@ export default function SignalAnalysisPanel(props: Props): JSX.Element {
   }
 
   onMount(() => {
+    // Last live (uncommitted) drag update — replayed once, committed=true,
+    // on mouseup. See onMarkerDrag's own comment for why: a caller wired to
+    // do real work (encode+upload to the bridge) from every tick of this
+    // callback previously fired on EVERY mousemove during a drag, which
+    // saturated the bridge's WiFi link badly enough to crash/reboot it on
+    // real hardware. Position-only feedback during the drag is still fully
+    // live (this only gates when the "real work" callback should act).
+    let lastDrag: { index: number; freq: number; shiftKey?: boolean } | null = null
     const onMove = (e: MouseEvent) => {
       if (squelchDragging && props.onSquelchChange) {
         e.preventDefault()
@@ -854,10 +877,15 @@ export default function SignalAnalysisPanel(props: Props): JSX.Element {
       const rect = drag.el.getBoundingClientRect()
       const xRatio = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width))
       const newHz = Math.round(displayMinHz() + xRatio * (displayMaxHz() - displayMinHz()))
-      handleMarkerDrag(drag.index, newHz, e.shiftKey)
+      lastDrag = { index: drag.index, freq: newHz, shiftKey: e.shiftKey }
+      handleMarkerDrag(drag.index, newHz, e.shiftKey, false)
     }
     const onUp = () => {
+      if (markerDrag && lastDrag) {
+        handleMarkerDrag(lastDrag.index, lastDrag.freq, lastDrag.shiftKey, true)
+      }
       markerDrag = null
+      lastDrag = null
       squelchDragging = false
     }
     window.addEventListener('mousemove', onMove, { passive: false })

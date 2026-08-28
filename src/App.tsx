@@ -926,7 +926,7 @@ function App(): JSX.Element {
     activeHandle().current?.reset()
     clearSent?.()
   }
-  let setTxBaseFreq: ((v: number) => void) | null = null
+  let setTxBaseFreq: ((v: number, committed: boolean) => void) | null = null
 
   function handleFTModeChange(m: FTMode) {
     setFTMode(m)
@@ -1187,7 +1187,7 @@ function App(): JSX.Element {
             analyser={globalAudio.analyser()}
             vfoFrequency={vfoFrequency()}
             txAudioHz={txAudioHz()}
-            onTxAudioHzChange={(hz) => setTxBaseFreq?.(hz)}
+            onTxAudioHzChange={(hz, committed) => setTxBaseFreq?.(hz, committed)}
             audioBridge={audioBridge}
             iqBridge={iqBridge}
             audioSourceOverride={audioSourceOverride()}

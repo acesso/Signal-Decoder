@@ -447,17 +447,29 @@ interface FTTransmitPanelProps {
   onTxWindowEnd?: () => void;
   onStatusChange?: (s: TxStatus) => void;
   onReset?: (clearSentFn: () => void) => void;
-  onBaseFreqHandle?: (setFn: (v: number) => void) => void;
+  onBaseFreqHandle?: (setFn: (v: number, committed?: boolean) => void) => void;
 }
 
 export default function FTTransmitPanel(props: FTTransmitPanelProps): JSX.Element {
   const [myCall, setMyCallState]     = createSignal(loadMyCall())
   const [myGrid, setMyGridState]     = createSignal(loadMyGrid())
   const [baseFreq, setBaseFreqState] = createSignal(loadBaseFreq())
-  const setBaseFreq = (v: number) => {
+  // Tracks whether the LATEST baseFreq update is a final, committed value —
+  // false while the TX marker is actively being dragged (see
+  // SignalAnalysisPanel's onMarkerDrag comment). The syncParams() effect
+  // below gates its real work (encode + upload to the bridge) on this
+  // being true, so a live drag only ever moves the marker/updates the
+  // displayed number — never fires a network request until the drag ends.
+  // REAL HARDWARE INCIDENT this fixes (2026-08-28): every live drag tick
+  // used to eventually trigger a full re-encode-and-upload (via a settle-
+  // timer that fires on ANY pause mid-drag, not just at release), which
+  // saturated the ESP32 bridge's WiFi link badly enough to crash/reboot it.
+  const [baseFreqCommitted, setBaseFreqCommitted] = createSignal(true)
+  const setBaseFreq = (v: number, committed = true) => {
     const clamped = Math.max(200, Math.min(3000, Math.round(v)))
     setBaseFreqState(clamped)
-    saveBaseFreq(clamped)
+    setBaseFreqCommitted(committed)
+    if (committed) saveBaseFreq(clamped) // no need to persist every live drag tick — only the final value
   }
   const [editMsg, setEditMsg]        = createSignal('')
   const [editLabel, setEditLabel]    = createSignal('')
@@ -534,11 +546,24 @@ export default function FTTransmitPanel(props: FTTransmitPanelProps): JSX.Elemen
   // visible lag. Mode changes are rare/discrete (a dropdown pick), so only
   // baseFreq's rapid-fire case needs debouncing — but both go through the
   // same timer for one code path.
+  //
+  // baseFreqCommitted() gates this ENTIRELY while false — a live TX marker
+  // drag must never start this timer at all, only the drag's own final
+  // (committed) value at mouseup should. REAL HARDWARE INCIDENT this fixes
+  // (2026-08-28): the previous version armed this timer on every drag tick
+  // too, and since it's a settle-timer (fires 300ms after the LAST change,
+  // not after a fixed delay from drag-start), any brief pause mid-drag —
+  // not just release — was enough to let it fire, triggering a full
+  // re-encode-and-upload burst mid-drag. That flooded the ESP32 bridge's
+  // fragile WiFi link badly enough to crash/reboot it. Gating on
+  // baseFreqCommitted() means NOTHING fires until the drag genuinely ends.
   let syncParamsTimer: ReturnType<typeof setTimeout> | undefined
   createEffect(() => {
     void props.mode
     void baseFreq()
+    const committed = baseFreqCommitted()
     if (syncParamsTimer) clearTimeout(syncParamsTimer)
+    if (!committed) return
     syncParamsTimer = setTimeout(() => tx.syncParams(), 300)
   })
   onCleanup(() => { if (syncParamsTimer) clearTimeout(syncParamsTimer) })

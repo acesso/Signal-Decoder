@@ -318,7 +318,10 @@ interface Props {
   myGrid?: string
   onContactsChange?: (c: Map<string, Contact>) => void
   txAudioHz?: number
-  onTxAudioHzChange?: (hz: number) => void
+  // committed: false while the marker is still being dragged (position-only
+  // preview) — only true once means it's safe to do real work (encode/
+  // upload to the bridge). See SignalAnalysisPanel's onMarkerDrag comment.
+  onTxAudioHzChange?: (hz: number, committed: boolean) => void
   analyser?: AnalyserNode | null
   vfoFrequency?: number
   onStateChange?: (controls: DecoderControls) => void
@@ -1002,7 +1005,7 @@ export default function FTDecoder(props: Props): JSX.Element {
               vfoFrequency={props.vfoFrequency}
               storageKeyPrefix="ft"
               markers={(props.txAudioHz ?? 0) > 0 ? [{ freq: props.txAudioHz!, color: '#f85149', label: 'TX' }] : undefined}
-              onMarkerDrag={props.onTxAudioHzChange ? (_i, hz) => props.onTxAudioHzChange!(hz) : undefined}
+              onMarkerDrag={props.onTxAudioHzChange ? (_i, hz, _shiftKey, committed) => props.onTxAudioHzChange!(hz, committed ?? true) : undefined}
               markerFieldLabel="Tx"
               class="min-w-0"
               style={{ flex: panelWeights()[1] }}
