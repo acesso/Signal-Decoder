@@ -1,5 +1,5 @@
 // Port of src/components/FTTransmitPanel.tsx (Next.js app).
-import { batch, createEffect, createMemo, createSignal, For, onCleanup, onMount, Show, type JSX } from 'solid-js'
+import { batch, createEffect, createMemo, createSignal, For, onCleanup, onMount, Show, untrack, type JSX } from 'solid-js'
 import {
   createFTTransmit, loadMyCall, saveMyCall, loadMyGrid, saveMyGrid,
   loadAutoReply, saveAutoReply, loadBaseFreq, saveBaseFreq,
@@ -635,7 +635,31 @@ export default function FTTransmitPanel(props: FTTransmitPanelProps): JSX.Elemen
   }
 
   createEffect(() => {
-    if (myCall()) tx.setAutoCQMessage(buildFTMessage('cq', myCall().toUpperCase(), '', undefined, myGrid().toUpperCase()))
+    const call = myCall()
+    const grid = myGrid()
+    // untrack() is load-bearing here, not a style preference — REAL
+    // HARDWARE INCIDENT this fixes (2026-08-28): tx.setAutoCQMessage()
+    // calls rebuildAutoCQCache() internally, which reads getBaseFrequency()
+    // (a signal read) to encode+upload the auto-CQ cache at the CURRENT
+    // base frequency. Without untrack(), that nested signal read gets
+    // attributed to THIS effect by Solid's automatic dependency tracking —
+    // any function an effect calls that reads a signal makes the effect
+    // depend on that signal too, even though baseFreq never appears in
+    // this effect's own source. That silently subscribed this effect to
+    // baseFreq, so every live TX-marker-drag tick (baseFreq changing
+    // dozens of times a second) re-ran this effect and re-fired a full
+    // real encode+upload each time — completely bypassing the committed
+    // gate on the OTHER effect (which correctly only reacts to committed
+    // drag values), because this effect was never meant to react to
+    // baseFreq changes AT ALL. Confirmed on real hardware: 9+ separate
+    // uploads fired during one drag even after that gate was in place,
+    // each one knocking the live /audio WebSocket connection offline.
+    // untrack() ensures this effect's dependency list is exactly
+    // {myCall, myGrid} as intended — a base-frequency change alone can no
+    // longer trigger it.
+    untrack(() => {
+      if (call) tx.setAutoCQMessage(buildFTMessage('cq', call.toUpperCase(), '', undefined, grid.toUpperCase()))
+    })
   })
 
   const canOperate = createMemo(() => validCall(myCall()) && validGrid(myGrid()) && props.mode !== 'FT2')
