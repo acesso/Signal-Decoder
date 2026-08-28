@@ -1347,6 +1347,97 @@ const char *audio_monitor_get_adc_input_name(void) {
     return ADC_INPUT_OPTIONS[idx].name;
 }
 
+// RX anti-alias low-pass — AUDIO_INPUT_MODE_AUDIO only, never applied to
+// I/Q (that path hands the browser genuinely raw ADC data it demodulates
+// itself; filtering it here would corrupt the very thing that mode exists
+// to preserve).
+//
+// REAL HARDWARE FINDING (2026-08-28): captured raw /audio samples directly
+// off the WebSocket (bypassing the browser entirely) and ran a real FFT —
+// confirmed structured, real-looking energy aliasing back into the
+// passband from just past each configured rate's own Nyquist edge (a
+// strong low-frequency tone's mirror image landed within ~1dB of its
+// exact predicted fold position at 8/16/48kHz, ruling out coincidence).
+// Cross-checked against the actual ES8388 datasheet (Everest
+// Semiconductor Rev 5.0, July 2018, section 8.3 "Filter Frequency
+// Response – Single Speed", 0.4535*Fs passband / 0.5465*Fs stopband /
+// 50dB MINIMUM stopband attenuation — that 50dB figure is only a
+// guaranteed floor, not what real measured performance necessarily hits)
+// — the real capture showed roll-off starting almost exactly at the
+// spec's 0.4535*Fs passband edge, but nowhere near 50dB down by the
+// stopband edge, at 8kHz specifically. The vendored es8388.c driver
+// writes registers 0x35/0x37/0x39 unconditionally at every rate
+// ("disable the internal DLL to improve 8K sample rate" — see that
+// driver's own comment) — those registers sit past the LAST one this
+// datasheet documents (0x34, Register 52), so there is no authoritative
+// way to verify or safely improve whatever that hack is actually doing
+// to the codec's internal PLL/DLL, which is what ultimately drives the
+// ADC's decimation filter timing. Given that, filtering here — in code
+// this project owns and can verify on real hardware — is the safe fix,
+// not a guess at an undocumented codec register.
+//
+// Design: a plain 2nd-order (biquad) Butterworth low-pass, cutoff at
+// 0.35*Fs — comfortably inside the datasheet's own 0.4535*Fs passband
+// edge (so genuine in-band audio is essentially untouched) while adding
+// real additional attenuation exactly where the codec's own filter was
+// measured falling short of its spec. A biquad (a handful of multiply-
+// adds per sample) was chosen over a proper FIR/windowed-sinc design
+// (like upsample_bandlimited() above) specifically because of THIS
+// file's own documented real-hardware crash history: a trig-heavy
+// per-sample inner loop previously starved IDLE0 long enough to trip the
+// task watchdog and force a reboot mid-TX (see upsample_bandlimited()'s
+// own comment) — coefficients here are computed ONCE per boot/rate
+// change, never per-sample.
+static float s_rx_lpf_b0 = 1.0f, s_rx_lpf_b1 = 0.0f, s_rx_lpf_b2 = 0.0f;
+static float s_rx_lpf_a1 = 0.0f, s_rx_lpf_a2 = 0.0f;
+static float s_rx_lpf_z1 = 0.0f, s_rx_lpf_z2 = 0.0f; // Direct Form II Transposed state, carried across calls
+static uint32_t s_rx_lpf_rate_hz = 0; // rate the coefficients above were computed for — 0 means "not built yet"
+
+static void rx_lpf_build(uint32_t rate_hz) {
+    const double cutoff_hz = 0.35 * (double)rate_hz;
+    const double w0 = 2.0 * M_PI * cutoff_hz / (double)rate_hz;
+    const double cos_w0 = cos(w0), sin_w0 = sin(w0);
+    const double q = 0.70710678; // 1/sqrt(2) — maximally flat (Butterworth) Q for a single biquad stage
+    const double alpha = sin_w0 / (2.0 * q);
+
+    const double b0 = (1.0 - cos_w0) / 2.0;
+    const double b1 = 1.0 - cos_w0;
+    const double b2 = (1.0 - cos_w0) / 2.0;
+    const double a0 = 1.0 + alpha;
+    const double a1 = -2.0 * cos_w0;
+    const double a2 = 1.0 - alpha;
+
+    s_rx_lpf_b0 = (float)(b0 / a0);
+    s_rx_lpf_b1 = (float)(b1 / a0);
+    s_rx_lpf_b2 = (float)(b2 / a0);
+    s_rx_lpf_a1 = (float)(a1 / a0);
+    s_rx_lpf_a2 = (float)(a2 / a0);
+    s_rx_lpf_z1 = 0.0f;
+    s_rx_lpf_z2 = 0.0f;
+    s_rx_lpf_rate_hz = rate_hz;
+}
+
+// In-place, mono, Direct Form II Transposed — the standard low-state-
+// count biquad structure (2 state vars regardless of coefficient count),
+// chosen for its good numerical behavior in float without needing double
+// precision per sample.
+static void rx_lpf_apply(int16_t *samples, size_t count, uint32_t rate_hz) {
+    if (s_rx_lpf_rate_hz != rate_hz) rx_lpf_build(rate_hz);
+    float z1 = s_rx_lpf_z1, z2 = s_rx_lpf_z2;
+    const float b0 = s_rx_lpf_b0, b1 = s_rx_lpf_b1, b2 = s_rx_lpf_b2;
+    const float a1 = s_rx_lpf_a1, a2 = s_rx_lpf_a2;
+    for (size_t i = 0; i < count; i++) {
+        const float x = (float)samples[i];
+        const float y = b0 * x + z1;
+        z1 = b1 * x - a1 * y + z2;
+        z2 = b2 * x - a2 * y;
+        float clamped = y > 32767.0f ? 32767.0f : (y < -32768.0f ? -32768.0f : y);
+        samples[i] = (int16_t)clamped;
+    }
+    s_rx_lpf_z1 = z1;
+    s_rx_lpf_z2 = z2;
+}
+
 // Radio -> browser. Two distinct modes, resolved once at boot (see
 // s_input_mode) and never mixed within one run of this task:
 //   AUDIO_INPUT_MODE_AUDIO — mono (this board keeps one I2S slot, see
@@ -1363,6 +1454,10 @@ const char *audio_monitor_get_adc_input_name(void) {
 static void audio_task(void *arg) {
     bool iq_mode = audio_monitor_get_input_mode() == AUDIO_INPUT_MODE_IQ;
     size_t values_per_read = iq_mode ? s_read_samples * 2 : s_read_samples;
+    // Read once, not per-loop-iteration — POST /sample-rate only takes
+    // effect via reboot (same reasoning s_read_samples' own comment
+    // gives), so this can never go stale within one run of this task.
+    uint32_t audio_rate_hz = bridge_settings_get_sample_rate_hz();
     // PSRAM (MALLOC_CAP_SPIRAM) — same reasoning as s_tx_stereo_scratch
     // above: esp_codec_dev_read() -> _i2s_data_read() (audio_codec_data_i2s.c)
     // calls i2s_channel_read(), which memcpy()s FROM its own internal DMA
@@ -1418,6 +1513,11 @@ static void audio_task(void *arg) {
         if (iq_mode) {
             audio_iq_broadcast(buf, values_per_read);
         } else {
+            // See rx_lpf_apply()'s own comment — real-hardware-measured
+            // ES8388 aliasing fix, audio mode only (never applied to raw
+            // I/Q, which the browser demodulates itself from untouched
+            // ADC data).
+            rx_lpf_apply(buf, s_read_samples, audio_rate_hz);
             audio_ws_send_to_clients(buf, s_read_samples);
         }
         {
