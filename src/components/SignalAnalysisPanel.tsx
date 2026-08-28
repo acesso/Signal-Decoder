@@ -907,8 +907,7 @@ export default function SignalAnalysisPanel(props: Props): JSX.Element {
     const bc = d.length
     const srcSpan = src.maxHz - src.minHz
     const bin0 = Math.floor(((minHz - src.minHz) / srcSpan) * bc)
-    const bin1raw = ((maxHz - src.minHz) / srcSpan) * bc
-    const bin1 = Math.min(Math.ceil(bin1raw), bc)
+    const bin1 = Math.min(Math.ceil(((maxHz - src.minHz) / srcSpan) * bc), bc)
     const vis = d.subarray(Math.max(0, bin0), Math.max(0, bin1))
 
     const ms = effectiveMarkers()
@@ -917,26 +916,7 @@ export default function SignalAnalysisPanel(props: Props): JSX.Element {
     ctx.strokeStyle = '#2ea043'
     ctx.lineWidth = 1.5
     ctx.beginPath()
-    // REAL BUG this fixes (reported 2026-08-28): when the operator's View
-    // range extends beyond what the source actually has data for (e.g.
-    // typing 48000 into "View" when the source's real Nyquist — the FFT's
-    // actual bin coverage — only reaches 24000), bin1 gets clamped to bc
-    // (the real bin count) while bw used to be canvas.width / vis.length —
-    // stretching the REAL, in-range data to fill the WHOLE canvas
-    // regardless of how much of the requested range it actually covers.
-    // The x-axis ruler/grid lines (computeTicks, drawn from the full
-    // requested minHz/maxHz) disagreed with this stretched trace — a real
-    // signal at, say, true 12000Hz landed at the pixel position the ruler
-    // labeled "24000Hz" (exactly double), making a genuine aliasing
-    // artifact sitting near the real Nyquist look like it was happening
-    // near the requested range's edge instead. bw must be sized against
-    // the FULL requested bin span (unclamped), not just the bins that
-    // happen to exist — any bins beyond bc simply aren't drawn (the vis
-    // array — sourced from the clamped bin1 — doesn't cover them),
-    // correctly leaving that portion of the canvas blank instead of
-    // stretching real data to paper over it.
-    const fullBinSpan = Math.max(1, bin1raw - bin0)
-    const bw = canvas.width / fullBinSpan
+    const bw = canvas.width / Math.max(1, vis.length)
     for (let i = 0; i < vis.length; i++) {
       const x = i * bw,
         y = PLOT_H - (vis[i] / 255) * PLOT_H
@@ -973,24 +953,6 @@ export default function SignalAnalysisPanel(props: Props): JSX.Element {
     const txMarkerHz = props.txMarkerHz ?? 0
     if (txMarkerHz > 0) {
       drawTxMarker(ctx, canvas.width, PLOT_H, txMarkerHz, minHz, maxHz)
-    }
-    // Zero-pad to the FULL requested [minHz,maxHz] bin span before handing
-    // off to the waterfall (drawSpectrogram/GLSpectrogram's pushRow) — both
-    // consumers stretch whatever-length array they're given to fill their
-    // own full width/texture, with no separate knowledge of how much of
-    // the requested range the array's real data actually covers. Returning
-    // the unpadded, real-bins-only `vis` (as this used to) meant a View
-    // range wider than the source's real coverage (e.g. typing a Max Hz
-    // past the source's true Nyquist) got silently stretched across the
-    // WHOLE waterfall too — the same mislabeling bug just fixed above for
-    // the line trace, but in the waterfall instead. Padding with 0s here
-    // means the out-of-range portion renders as flat/silent in the
-    // waterfall, consistent with the (now correctly blank) line trace.
-    if (bin0 < 0 || bin1raw > bc) {
-      const padded = new Uint8Array(Math.max(1, Math.round(fullBinSpan)))
-      const destOffset = Math.max(0, -bin0)
-      padded.set(vis, destOffset)
-      return padded
     }
     return vis
   }
