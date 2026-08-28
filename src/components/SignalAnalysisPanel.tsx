@@ -221,7 +221,7 @@ function drawHorizontalGridLines(ctx: CanvasRenderingContext2D, w: number, h: nu
 function FreqRuler(props: { minHz: number; maxHz: number; vfoHz?: number }): JSX.Element {
   const ticks = createMemo(() => computeTicks(props.minHz, props.maxHz, props.vfoHz ?? 0))
   return (
-    <div class="relative h-4 select-none">
+    <div class="relative h-4 min-w-0 flex-1 select-none">
       {ticks().map((t) => (
         <div
           class="absolute top-0 flex flex-col items-center"
