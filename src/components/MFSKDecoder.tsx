@@ -7,7 +7,7 @@ import { fmtAbsHz } from '$decoder-lib/formatFreq'
 import SignalAnalysisPanel from './SignalAnalysisPanel'
 import NumberField from './NumberField'
 import { createMFSKProcessor, type MFSKSymbol, type MFSKWord } from '../lib/mfsk/processor'
-import type { AudioSourceKind } from '../lib/audio/audioSource'
+import { resolveAudioSource, type AudioSourceKind } from '../lib/audio/audioSource'
 import { MFSKChannel, MFSKDecoderOptions, DEFAULT_DECODER_OPTIONS } from '$decoder-lib/mfsk/decoder'
 import { bitsToBaudotCode, decodeBaudotCodePoints } from '$decoder-lib/mfsk/baudot'
 import { decodeCCIR476FromBits } from '$decoder-lib/mfsk/ccir476'
@@ -759,11 +759,11 @@ export default function MFSKDecoder(props: DecoderProps): JSX.Element {
   const [, setActivePresetLabel] = createSignal<string | null>(null)
 
   // ── Processor ─────────────────────────────────────────────────────────────
-  // Same iqBridge-first/audioBridge/microphone precedence as
-  // FTDecoder.tsx's audioSourceKind()/getBridge() — see that file's comment.
+  // See resolveAudioSource()'s own comment in audioSource.ts for the full
+  // precedence (auto vs. the operator's forced override).
   const audioSourceKind = (): AudioSourceKind =>
-    props.iqBridge?.state().connected ? 'bridge' : props.audioBridge?.state().playbackActive ? 'bridge' : 'microphone'
-  const getBridge = () => (props.iqBridge?.state().connected ? props.iqBridge : props.audioBridge)
+    resolveAudioSource(props.audioSourceOverride ?? 'auto', props.iqBridge, props.audioBridge).kind
+  const getBridge = () => resolveAudioSource(props.audioSourceOverride ?? 'auto', props.iqBridge, props.audioBridge).bridge
   const processor = createMFSKProcessor(
     { channels, baudRate, squelch, decoderOptions: decoderOpts },
     audioSourceKind,

@@ -24,7 +24,8 @@ import type { Contact } from '$decoder-lib/ft/parser'
 import { audioRecorder, REC_DURATION_CHOICES_SEC } from '$decoder-lib/audio/ringRecorder'
 import type { CapturedImage } from '$decoder-lib/sstv/audioProcessor'
 import { trackEvent } from '$decoder-lib/analytics'
-import { loadObject, saveObject } from '$decoder-lib/storage'
+import { loadObject, saveObject, loadString, saveString } from '$decoder-lib/storage'
+import { type AudioSourceOverride, resolveAudioSource } from '$decoder-lib/audio/audioSource'
 
 type DecoderMode = 'rtty' | 'sstv' | 'cw' | 'ft' | 'mfsk'
 
@@ -48,6 +49,18 @@ function loadFTMode(): FTMode {
 }
 function saveFTMode(v: FTMode) {
   localStorage.setItem(LS_FT_MODE, v)
+}
+
+// ── Audio source override — force mic/bridge instead of always auto-
+// detecting. 'auto' preserves every decoder's original precedence (see
+// resolveAudioSource() in audioSource.ts); the two bridge-specific values
+// are the operator's own explicit choice and deliberately don't get
+// second-guessed against the bridge's actual live firmware mode — see
+// AudioSourceOverride's own comment. ──────────────────────────────────────
+const LS_AUDIO_SOURCE_OVERRIDE = 'audio_source_override'
+const VALID_AUDIO_SOURCE_OVERRIDES: AudioSourceOverride[] = ['auto', 'microphone', 'bridge-audio', 'bridge-iq']
+function loadAudioSourceOverride(): AudioSourceOverride {
+  return loadString(LS_AUDIO_SOURCE_OVERRIDE, 'auto', VALID_AUDIO_SOURCE_OVERRIDES)
 }
 
 // ── I/Q passband width, per decoder mode ─────────────────────────────────
@@ -212,6 +225,8 @@ function TopBar(props: {
   ftMode: FTMode
   onFTModeChange: (m: FTMode) => void
   audioSource: AudioSourceDisplay | null
+  audioSourceOverride: AudioSourceOverride
+  onAudioSourceOverrideChange: (v: AudioSourceOverride) => void
   // True while the bridge audio source currently feeding decode (whichever
   // of iqBridge/audioBridge audioSource above reflects) has dropped and is
   // retrying automatically — see useIQBridge.ts's/useAudioBridge.ts's
@@ -336,21 +351,32 @@ function TopBar(props: {
           </div>
         </Show>
 
-        <Show when={isRecording() && props.audioSource}>
-          <span class="ml-auto text-[10px] text-[#8b949e] whitespace-nowrap">
-            Audio source:{' '}
+        <div class="ml-auto flex items-center gap-1.5 text-[10px] text-[#8b949e] whitespace-nowrap">
+          <span class="shrink-0">Audio source</span>
+          <select
+            value={props.audioSourceOverride}
+            onChange={(e) => props.onAudioSourceOverrideChange(e.currentTarget.value as AudioSourceOverride)}
+            title="Force which source decoders read from — Auto keeps the existing bridge/microphone auto-detection. Forcing a bridge choice reads from that socket only if it's actually connected right now; it does not switch the bridge's own firmware mode."
+            class="cursor-pointer rounded border border-[#30363d] bg-[#0d1117] px-1.5 py-0.5 font-mono text-[#c9d1d9] focus:border-[#2ea043] focus:outline-none"
+          >
+            <option value="auto">Auto</option>
+            <option value="microphone">Microphone</option>
+            <option value="bridge-audio">Bridge (radio audio)</option>
+            <option value="bridge-iq">Bridge (I/Q)</option>
+          </select>
+          <Show when={isRecording() && props.audioSource}>
             <span class="text-[#c9d1d9] font-semibold">
               {props.audioSource === 'bridge-iq'
-                ? 'ESP32 Bridge (I/Q, demodulated)'
+                ? '— ESP32 Bridge (I/Q, demodulated)'
                 : props.audioSource === 'bridge'
-                  ? 'ESP32 Bridge (radio audio)'
-                  : 'Local microphone'}
+                  ? '— ESP32 Bridge (radio audio)'
+                  : '— Local microphone'}
             </span>
-          </span>
-        </Show>
+          </Show>
+        </div>
 
         <Show when={error()}>
-          <span class={`${isRecording() && props.audioSource ? '' : 'ml-auto'} font-mono text-xs text-[#f85149]`}>{error()}</span>
+          <span class="font-mono text-xs text-[#f85149]">{error()}</span>
         </Show>
       </div>
 
@@ -558,6 +584,7 @@ function RTTYTxSummaryChip(props: { s: RTTYTxStatus | null }): JSX.Element {
 function App(): JSX.Element {
   const [mode, setMode] = createSignal<DecoderMode>(loadMode())
   const [ftMode, setFTMode] = createSignal<FTMode>(loadFTMode())
+  const [audioSourceOverride, setAudioSourceOverride] = createSignal<AudioSourceOverride>(loadAudioSourceOverride())
   const [ftContacts, setFtContacts] = createSignal<Map<string, Contact>>(new Map())
   const [ftMyCall, setFtMyCall] = createSignal('')
   const [ftMyGrid, setFtMyGrid] = createSignal('')
@@ -618,6 +645,24 @@ function App(): JSX.Element {
   // (if empty) bridge audio connection instead of the "wrong mode" problem
   // it actually is.
   const iqBridge = useIQBridge()
+
+  function handleAudioSourceOverrideChange(v: AudioSourceOverride) {
+    setAudioSourceOverride(v)
+    saveString(LS_AUDIO_SOURCE_OVERRIDE, v)
+    // Forcing "Microphone" is the one override value that also touches the
+    // bridge's actual connection (not just which source decoders read
+    // from) — per the operator's own explicit choice, disconnect any open
+    // bridge audio/I/Q socket rather than leaving it connected-but-unused.
+    // The two bridge-specific override values deliberately do NOT trigger
+    // any connect/disconnect/mode-switch here — see AudioSourceOverride's
+    // own comment in audioSource.ts for why: the operator's forced choice
+    // is authoritative, not another layer of automatic correction.
+    if (v === 'microphone') {
+      if (iqBridge.state().connected) iqBridge.disconnect()
+      if (audioBridge.state().connected || audioBridge.state().playbackActive) audioBridge.disconnect()
+    }
+  }
+
   // See IQ_PASSBAND_DEFAULTS' own comment. Loaded once; applied to
   // iqBridge on mount (for whatever mode() already restored from its own
   // localStorage key) and again on every handleModeChange() below.
@@ -716,6 +761,31 @@ function App(): JSX.Element {
   // ── Unified start / stop ─────────────────────────────────────────────────
 
   async function handleStart() {
+    setBridgeAudioFallbackWarning(null)
+
+    // A forced override (see audioSourceOverride's own comment) skips ALL
+    // of the auto-detect query/connect/disconnect machinery below — the
+    // operator's explicit choice is authoritative. 'microphone' also
+    // doesn't need bridgeWsUrl()/refreshInfo() at all since it never
+    // touches the bridge. The two forced bridge values deliberately read
+    // whatever's ALREADY connected via resolveAudioSource() rather than
+    // connecting/switching anything themselves — if nothing is connected
+    // on the forced socket, that's the operator's own call to fix (open
+    // the Bridge panel / flip its input mode), not something this
+    // function should silently paper over.
+    const override = audioSourceOverride()
+    if (override !== 'auto') {
+      const { kind, bridge } = resolveAudioSource(override, iqBridge, audioBridge)
+      globalAudio.configureSource(kind, bridge)
+      setDecodingFromBridgeMode(null)
+      const node = await globalAudio.start()
+      if (node) {
+        await activeHandle().current?.start()
+        trackEvent('decode_start', mode() === 'ft' ? { mode: mode(), ft_mode: ftMode() } : { mode: mode() })
+      }
+      return
+    }
+
     // If the CAT connection is over the ESP32 bridge, decode from the
     // bridge's own live radio audio instead of always prompting for a
     // local mic — auto-opening the /audio connection here (same as
@@ -723,7 +793,6 @@ function App(): JSX.Element {
     // that a separate required step; connecting the bridge at all should
     // be enough for decoding to just work.
     const wsUrl = bridgeWsUrl()
-    setBridgeAudioFallbackWarning(null)
 
     // Which physical path the bridge is currently sampling — "audio"
     // (already-demodulated) or "iq" (raw, demodulated client-side by
@@ -885,12 +954,16 @@ function App(): JSX.Element {
     reset: handleReset,
   }))
 
-  // Same precedence as handleStart()'s useIQ/useAudio and FTDecoder.tsx's
-  // own audioSourceKind() — iqBridge first, since audioBridge is never
-  // connected while the bridge is in "iq" input mode.
-  const audioSourceDisplay = createMemo<AudioSourceDisplay | null>(() =>
-    iqBridge.state().connected ? 'bridge-iq' : audioBridge.state().playbackActive ? 'bridge' : 'microphone'
-  )
+  // Reflects the SAME resolveAudioSource() precedence every decoder now
+  // uses (see audioSource.ts) — auto-detects same as before when
+  // audioSourceOverride() is 'auto', otherwise reports whatever the
+  // operator forced, even if that forced bridge choice has nothing to
+  // actually read right now (see AudioSourceOverride's own comment).
+  const audioSourceDisplay = createMemo<AudioSourceDisplay | null>(() => {
+    const { kind, bridge } = resolveAudioSource(audioSourceOverride(), iqBridge, audioBridge)
+    if (kind === 'microphone') return 'microphone'
+    return bridge === iqBridge ? 'bridge-iq' : 'bridge'
+  })
   // Same precedence as audioSourceDisplay above — whichever bridge is
   // actually the one feeding decode is the one whose reconnect state
   // matters. Checked independently of audioSourceDisplay's own 'connected'/
@@ -929,7 +1002,16 @@ function App(): JSX.Element {
 
       {/* Shared top bar — Start/Stop/Reset + FT sub-mode when active */}
       <div class="shrink-0 px-4 pb-2 sm:px-6 lg:px-8">
-        <TopBar controls={globalControls()} mode={mode()} ftMode={ftMode()} onFTModeChange={handleFTModeChange} audioSource={audioSourceDisplay()} bridgeReconnecting={bridgeReconnecting()} />
+        <TopBar
+          controls={globalControls()}
+          mode={mode()}
+          ftMode={ftMode()}
+          onFTModeChange={handleFTModeChange}
+          audioSource={audioSourceDisplay()}
+          audioSourceOverride={audioSourceOverride()}
+          onAudioSourceOverrideChange={handleAudioSourceOverrideChange}
+          bridgeReconnecting={bridgeReconnecting()}
+        />
       </div>
 
       {/* Scrollable body — CAT + TX panel + decoder content */}
@@ -1052,6 +1134,7 @@ function App(): JSX.Element {
             onActiveConfigChange={setRttyActiveConfig}
             audioBridge={audioBridge}
             iqBridge={iqBridge}
+            audioSourceOverride={audioSourceOverride()}
           />
         </div>
         <div class={mode() === 'sstv' ? '' : 'hidden'}>
@@ -1063,6 +1146,7 @@ function App(): JSX.Element {
             onReply={handleSSTVReply}
             audioBridge={audioBridge}
             iqBridge={iqBridge}
+            audioSourceOverride={audioSourceOverride()}
           />
         </div>
         <div class={mode() === 'cw' ? '' : 'hidden'}>
@@ -1073,6 +1157,7 @@ function App(): JSX.Element {
             vfoFrequency={vfoFrequency()}
             audioBridge={audioBridge}
             iqBridge={iqBridge}
+            audioSourceOverride={audioSourceOverride()}
           />
         </div>
         <div class={mode() === 'mfsk' ? '' : 'hidden'}>
@@ -1083,6 +1168,7 @@ function App(): JSX.Element {
             vfoFrequency={vfoFrequency()}
             audioBridge={audioBridge}
             iqBridge={iqBridge}
+            audioSourceOverride={audioSourceOverride()}
           />
         </div>
         <div class={mode() === 'ft' ? '' : 'hidden'}>
@@ -1099,6 +1185,7 @@ function App(): JSX.Element {
             onTxAudioHzChange={(hz) => setTxBaseFreq?.(hz)}
             audioBridge={audioBridge}
             iqBridge={iqBridge}
+            audioSourceOverride={audioSourceOverride()}
           />
         </div>
       </div>

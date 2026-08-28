@@ -8,7 +8,7 @@
 // job (an I/Q-aware GLSpectrogram view) this component now covers with a
 // real marker/bandwidth system instead of that panel's plain zoom slider.
 import { createEffect, createMemo, createSignal, For, onCleanup, onMount, type JSX } from 'solid-js'
-import GLSpectrogram, { type GLSpectrogramHandle, type SpectroBand } from './GLSpectrogram'
+import GLSpectrogram, { TEX_H, type GLSpectrogramHandle, type SpectroBand } from './GLSpectrogram'
 import { loadNumber, saveNumber, loadString, saveString } from '$decoder-lib/storage'
 import { buildColormapLUT, COLORMAPS, COLORMAP_LABEL, type ColormapName } from '$decoder-lib/colormaps'
 import NumberField from './NumberField'
@@ -26,6 +26,10 @@ export interface SpectrumSource {
   getBytes(): Uint8Array | null
   minHz: number
   maxHz: number
+  /** dB value a byte of 0 represents — needed to label the vertical axis correctly, since the mic/decoder path (AnalyserNode's spec default) and the I/Q path (IQSpectrumComputer's own fixed window) don't share the same range. */
+  minDb: number
+  /** dB value a byte of 255 represents. */
+  maxDb: number
 }
 
 // Adapts a Web Audio AnalyserNode to SpectrumSource — every existing
@@ -40,6 +44,12 @@ class AnalyserSpectrumSource implements SpectrumSource {
   }
   get maxHz() {
     return this.analyser.context.sampleRate / 2
+  }
+  get minDb() {
+    return this.analyser.minDecibels
+  }
+  get maxDb() {
+    return this.analyser.maxDecibels
   }
   getBytes(): Uint8Array | null {
     const bc = this.analyser.frequencyBinCount
@@ -58,6 +68,14 @@ class AnalyserSpectrumSource implements SpectrumSource {
 // false (mirrors the old analyser==null "draw nothing" behavior) — passed
 // as a plain value rather than read from a signal since the panel calls
 // this every animation frame already, not reactively.
+// -90/-10 dB — must match useIQBridge.ts's own IQ_MIN_DB/IQ_MAX_DB (the
+// window IQSpectrumComputer normalizes magnitude into before writing
+// magBytes). Duplicated rather than imported to keep this adapter's plain
+// duck-typed constructor (matching the rest of this class) instead of a
+// real import from useIQBridge.ts, a much heavier module.
+const IQ_MIN_DB = -90
+const IQ_MAX_DB = -10
+
 export class IQSpectrumSourceAdapter implements SpectrumSource {
   constructor(
     private computer: { magBytes: Uint8Array },
@@ -69,6 +87,12 @@ export class IQSpectrumSourceAdapter implements SpectrumSource {
   }
   get maxHz() {
     return this.sampleRateHz() / 2
+  }
+  get minDb() {
+    return IQ_MIN_DB
+  }
+  get maxDb() {
+    return IQ_MAX_DB
   }
   getBytes(): Uint8Array | null {
     return this.active() ? this.computer.magBytes : null
@@ -175,6 +199,92 @@ function FreqRuler(props: { minHz: number; maxHz: number; vfoHz?: number }): JSX
           <div class={`w-px ${t.isMaj ? 'h-2 bg-[#8b949e]' : 'h-1 bg-[#3d444d]'}`} />
           {t.label && <span class="font-mono text-[9px] text-[#8b949e] leading-tight">{t.label}</span>}
         </div>
+      ))}
+    </div>
+  )
+}
+
+interface DbTick {
+  y: number // 0..1 fraction down from the top (0 = maxDb, 1 = minDb — matches drawSpectrum's y = PLOT_H - frac*PLOT_H convention)
+  label: string
+}
+
+// dB ticks at nice round intervals — unlike frequency's niceTicks (which
+// picks a step so roughly <=12 major ticks fit an arbitrary span), the dB
+// span here is always one of two small fixed windows (AnalyserNode's
+// -100..-30 default, or the I/Q path's -90..-10 — see minDb/maxDb's own
+// comments), so a plain fixed 10dB step reads cleanly without needing the
+// same "nice span" search.
+function computeDbTicks(minDb: number, maxDb: number): DbTick[] {
+  const span = maxDb - minDb
+  if (span <= 0) return []
+  const step = 10
+  const out: DbTick[] = []
+  const first = Math.ceil(minDb / step) * step
+  for (let db = first; db <= maxDb + 0.01; db += step) {
+    out.push({ y: 1 - (db - minDb) / span, label: `${db}` })
+  }
+  return out
+}
+
+// HTML dB ruler — a thin overlay along the spectrum canvas's left edge
+// (NOT used for the waterfall: color already encodes amplitude there, so a
+// second amplitude axis would be redundant — see the waterfall's own
+// WaterfallTimeRuler instead, which marks the axis that's actually missing
+// there, elapsed time). Overlaid via absolute positioning rather than a
+// real flex sibling so it doesn't shift the canvas's own pixel width,
+// which the mouse-drag handlers measure via getBoundingClientRect() on the
+// canvas itself — an overlay can't desync that measurement, a reflow could.
+function DbRuler(props: { minDb: number; maxDb: number }): JSX.Element {
+  const ticks = createMemo(() => computeDbTicks(props.minDb, props.maxDb))
+  return (
+    <div class="pointer-events-none absolute inset-y-0 left-0 w-7 select-none">
+      {ticks().map((t) => (
+        <div class="absolute left-0 flex items-center gap-0.5" style={{ top: `${t.y * 100}%`, transform: 'translateY(-50%)' }}>
+          <span class="font-mono text-[8px] text-[#484f58] bg-[#0a0a0a]/70 px-0.5 rounded-sm">{t.label}</span>
+          <div class="h-px w-1 bg-[#3d444d]" />
+        </div>
+      ))}
+    </div>
+  )
+}
+
+// Subtle "how far back in time" markers along the waterfall's edge — the
+// waterfall itself has no axis label at all today, which is fine for
+// frequency (FreqRuler already covers that below it) but leaves time
+// (the axis it's actually scrolling through) completely unlabeled. Kept
+// deliberately understated (small, low-contrast, no background chip like
+// DbRuler's) since this rides ON TOP of the live heatmap, not beside it —
+// see the caller's own comment for why.
+//
+// totalRowsVisible is NOT the same for both rendering paths: the CPU 2D
+// fallback shifts its canvas by exactly 1 real pixel per new row
+// (putImageData), so rows visible = the panel's own pixel height. The GL
+// path (GLSpectrogram.tsx) instead keeps a FIXED 256-row ring texture
+// (TEX_H) that always gets stretched to fill the canvas's current pixel
+// height regardless of that height — so rows visible there is the
+// constant 256, not the panel's height. Passing the wrong one would give
+// a "-Ns" label that doesn't match what's actually on screen at that row.
+function WaterfallTimeRuler(props: { secondsPerRow: number; totalRowsVisible: number }): JSX.Element {
+  const marks = createMemo(() => {
+    const totalSec = props.totalRowsVisible * props.secondsPerRow
+    // ~4 marks top-to-bottom regardless of panel height — dense enough to
+    // read "how far back" at a glance, sparse enough to stay unobtrusive.
+    const count = 4
+    return Array.from({ length: count + 1 }, (_, i) => {
+      const frac = i / count
+      return { y: frac, label: `-${(frac * totalSec).toFixed(0)}s` }
+    }).slice(1) // skip the "-0s" mark at the very top — redundant with "now"
+  })
+  return (
+    <div class="pointer-events-none absolute inset-y-0 right-0 w-8 select-none">
+      {marks().map((m) => (
+        <span
+          class="absolute right-1 font-mono text-[8px] text-white/25 leading-none"
+          style={{ top: `${m.y * 100}%`, transform: 'translateY(-50%)' }}
+        >
+          {m.label}
+        </span>
       ))}
     </div>
   )
@@ -1056,6 +1166,7 @@ export default function SignalAnalysisPanel(props: Props): JSX.Element {
             onMouseDown={hasMarkerDrag() || props.onSquelchChange ? handleSpectrumMouseDown : undefined}
             onMouseMove={props.onSquelchChange ? handleSpectrumHover : undefined}
           />
+          {source() && <DbRuler minDb={source()!.minDb} maxDb={source()!.maxDb} />}
           <MarkerGrips host={() => specWrapEl} />
           {props.onSquelchChange && (
             <div
@@ -1146,25 +1257,27 @@ export default function SignalAnalysisPanel(props: Props): JSX.Element {
           ))}
         </div>
 
-        <div class="mt-0.5 flex items-center justify-between">
-          {props.onSquelchChange ? (
-            <div class="flex items-center gap-2 text-xs text-[#8b949e]">
-              <span class="shrink-0">Squelch</span>
-              <input
-                type="range"
-                min={0}
-                max={100}
-                step={1}
-                value={props.squelch ?? 0}
-                onInput={(e) => props.onSquelchChange!(parseInt(e.currentTarget.value))}
-                class="w-24 accent-[#e3b341]"
-              />
-              <span class="w-8 shrink-0 text-right font-mono text-[#e3b341]">{props.squelch ?? 0}%</span>
-            </div>
-          ) : (
-            <p class="text-[10px] text-[#484f58]">{props.isRecording ? 'Receiving audio' : 'Start decoding to see spectrum'}</p>
-          )}
-        </div>
+        {(props.onSquelchChange || !props.isRecording) && (
+          <div class="mt-0.5 flex items-center justify-between">
+            {props.onSquelchChange ? (
+              <div class="flex items-center gap-2 text-xs text-[#8b949e]">
+                <span class="shrink-0">Squelch</span>
+                <input
+                  type="range"
+                  min={0}
+                  max={100}
+                  step={1}
+                  value={props.squelch ?? 0}
+                  onInput={(e) => props.onSquelchChange!(parseInt(e.currentTarget.value))}
+                  class="w-24 accent-[#e3b341]"
+                />
+                <span class="w-8 shrink-0 text-right font-mono text-[#e3b341]">{props.squelch ?? 0}%</span>
+              </div>
+            ) : (
+              <p class="text-[10px] text-[#484f58]">Start decoding to see spectrum</p>
+            )}
+          </div>
+        )}
       </div>
 
       <div class="mt-3 flex min-h-0 flex-1 flex-col gap-2">
@@ -1211,6 +1324,17 @@ export default function SignalAnalysisPanel(props: Props): JSX.Element {
           {/* Grips over the waterfall — terrain excluded: its markers sit in a
               rotating 3D projection, so a flat grip row would misalign. */}
           {(sgView() === 'waterfall' || glFailed()) && <MarkerGrips host={() => sgContainerEl} />}
+          {/* Time axis — terrain excluded for the same reason as the grips
+              above (no flat vertical axis in a rotating 3D projection).
+              Row-basis differs by path: see WaterfallTimeRuler's own
+              comment for why glFailed() uses sgH() (real 1px-per-row) while
+              the GL path uses the fixed TEX_H ring depth instead. */}
+          {sgView() === 'waterfall' &&
+            (glFailed() ? (
+              <WaterfallTimeRuler secondsPerRow={sg2dSpeed() / 1000} totalRowsVisible={sgH()} />
+            ) : (
+              <WaterfallTimeRuler secondsPerRow={glRowInterval() / 1000} totalRowsVisible={TEX_H} />
+            ))}
         </div>
         {(sgView() === 'waterfall' || glFailed()) && (
           <FreqRuler minHz={displayMinHz()} maxHz={displayMaxHz()} vfoHz={props.vfoFrequency} />
