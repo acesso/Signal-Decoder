@@ -1200,7 +1200,6 @@ export default function SignalAnalysisPanel(props: Props): JSX.Element {
         )}
 
         <div class="flex items-stretch gap-1">
-          {source() && <AxisRuler side="left" ticks={computeDbTicks(source()!.minDb, source()!.maxDb)} />}
           <div ref={specWrapEl} class="relative min-w-0 flex-1">
             <canvas
               ref={specEl}
@@ -1234,10 +1233,15 @@ export default function SignalAnalysisPanel(props: Props): JSX.Element {
               </div>
             )}
           </div>
+          {/* Right side, matching the waterfall's time ruler below — keeps
+              both plot boxes flush-aligned on the left edge instead of the
+              spectrum box being offset right by a left-side ruler while the
+              waterfall box starts at true 0. */}
+          {source() && <AxisRuler side="right" ticks={computeDbTicks(source()!.minDb, source()!.maxDb)} />}
         </div>
         <div class="flex items-center gap-1">
-          {source() && <div class="w-9 shrink-0" />}
           <FreqRuler minHz={displayMinHz()} maxHz={displayMaxHz()} vfoHz={props.vfoFrequency} />
+          {source() && <div class="w-9 shrink-0" />}
         </div>
 
         <div class="mt-1 flex items-center gap-1.5 text-[10px] text-[#8b949e]">
