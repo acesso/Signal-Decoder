@@ -25,6 +25,7 @@ import {
   subscribeDecoderStats,
   subscribeDecoderStatus,
 } from '$decoder-lib/ft/decoder'
+import { DEFAULT_EARLY_DECODE_MS } from '$decoder-lib/ft/processor'
 
 const STORAGE_KEY = 'ft-decoder-params-v1'
 const POOL_SIZE_KEY = 'ft-decoder-pool-size-v1'
@@ -111,7 +112,11 @@ function DecodeProgress(props: { startedAt: number; budgetSec: number; decoded: 
   )
 }
 
-export default function FTWasmPanel(props: { ftMode: string }): JSX.Element {
+export default function FTWasmPanel(props: {
+  ftMode: string
+  earlyDecodeMs: number
+  onEarlyDecodeMsChange: (ms: number) => void
+}): JSX.Element {
   const [stats, setStats] = createSignal<FTDecoderStats | null>(null)
   const [status, setStatus] = createSignal<FTDecoderStatus>({ engines: [], generation: 0 })
   const [activity, setActivity] = createSignal<FTDecoderActivity>({ inFlight: 0, startedAt: null, decodedSoFar: 0 })
@@ -174,6 +179,7 @@ export default function FTWasmPanel(props: { ftMode: string }): JSX.Element {
     } catch {
       /* ignore */
     }
+    props.onEarlyDecodeMsChange(DEFAULT_EARLY_DECODE_MS)
   }
 
   const decodeS = createMemo(() => (stats() ? (stats()!.decodeMs / 1000).toFixed(1) : '—'))
@@ -289,6 +295,24 @@ export default function FTWasmPanel(props: { ftMode: string }): JSX.Element {
                 )
               }}
             </For>
+            <label
+              class="flex items-center gap-2 min-w-0"
+              title="How long before the window's real UTC boundary to start decoding — a real transmission has already finished by then (12.64s of 15s for FT8, 5.04s of 7.5s for FT4), so this loses nothing but trailing silence and results land sooner. Lower it if a message's tail seems clipped; raise it if results feel too early relative to the window shown. Applies to FT8 and FT4 both — it's a capture-scheduling setting, not a WASM engine tuning."
+            >
+              <span class="text-[#8b949e] w-24 shrink-0 text-[10px]">Early decode</span>
+              <span class="relative flex-1 flex items-center">
+                <input
+                  type="range"
+                  min={0}
+                  max={3000}
+                  step={100}
+                  value={props.earlyDecodeMs}
+                  onInput={(e) => props.onEarlyDecodeMsChange(Number(e.currentTarget.value))}
+                  class="w-full h-1 accent-[#1f6feb] cursor-pointer"
+                />
+              </span>
+              <span class="font-mono text-[#c9d1d9] w-10 text-right shrink-0">{(props.earlyDecodeMs / 1000).toFixed(1)}s</span>
+            </label>
           </div>
           <div class="mt-2 pt-2 border-t border-[#21262d] flex items-center justify-between gap-2">
             <label

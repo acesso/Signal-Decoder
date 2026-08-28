@@ -3,7 +3,7 @@ import { createEffect, createMemo, createSignal, For, onCleanup, onMount, Show, 
 import type { DecoderControls } from '../lib/decoderControls'
 import { fmtAbsHz } from '$decoder-lib/formatFreq'
 import SignalAnalysisPanel from './SignalAnalysisPanel'
-import { createFTProcessor } from '../lib/ft/processor'
+import { createFTProcessor, DEFAULT_EARLY_DECODE_MS } from '../lib/ft/processor'
 import { type FTMode, type FTMessage, FT_WINDOW_SECONDS } from '$decoder-lib/ft/decoder'
 import {
   type Contact,
@@ -21,7 +21,7 @@ import { DecodeGate } from '$decoder-lib/ft/gate'
 import FTContactsPanel from './FTContactsPanel'
 import FTWasmPanel from './FTWasmPanel'
 import VirtualList from './VirtualList'
-import { loadNumberArray, saveNumberArray, loadBoolean, saveBoolean } from '$decoder-lib/storage'
+import { loadNumberArray, saveNumberArray, loadBoolean, saveBoolean, loadNumber, saveNumber } from '$decoder-lib/storage'
 import type { AudioBridge } from '$decoder-lib/cat/useAudioBridge'
 import type { IQBridge } from '$decoder-lib/cat/useIQBridge'
 import type { AudioSourceKind } from '$decoder-lib/audio/audioSource'
@@ -31,6 +31,7 @@ const LS_PANEL_WEIGHTS = 'ft_panel_weights'
 const LS_MSG_SORT_KEY = 'ft_messages_sort_key'
 const LS_MSG_SORT_REV = 'ft_messages_sort_rev'
 const MSG_SORT_COLS = ['freq', 'snr', 'dt', 'msg'] as const
+const LS_EARLY_DECODE_MS = 'ft_early_decode_ms'
 
 // ── Clock ring (rAF-driven, no signal writes) ────────────────────────────
 
@@ -340,7 +341,8 @@ export default function FTDecoder(props: Props): JSX.Element {
   const audioSourceKind = (): AudioSourceKind =>
     props.iqBridge?.state().connected ? 'bridge' : props.audioBridge?.state().playbackActive ? 'bridge' : 'microphone'
   const getBridge = () => (props.iqBridge?.state().connected ? props.iqBridge : props.audioBridge)
-  const processor = createFTProcessor(() => props.ftMode, audioSourceKind, getBridge)
+  const [earlyDecodeMs, setEarlyDecodeMs] = createSignal(loadNumber(LS_EARLY_DECODE_MS, DEFAULT_EARLY_DECODE_MS))
+  const processor = createFTProcessor(() => props.ftMode, audioSourceKind, getBridge, earlyDecodeMs)
 
   createEffect((prevMode: FTMode | undefined) => {
     const mode = props.ftMode
@@ -973,7 +975,14 @@ export default function FTDecoder(props: Props): JSX.Element {
 
           {/* WASM engine monitor + runtime tuning */}
           <div class="mt-2 shrink-0">
-            <FTWasmPanel ftMode={props.ftMode} />
+            <FTWasmPanel
+              ftMode={props.ftMode}
+              earlyDecodeMs={earlyDecodeMs()}
+              onEarlyDecodeMsChange={(ms) => {
+                setEarlyDecodeMs(ms)
+                saveNumber(LS_EARLY_DECODE_MS, ms)
+              }}
+            />
           </div>
         </div>
 
