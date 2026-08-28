@@ -1,5 +1,5 @@
 // Port of src/components/FTTransmitPanel.tsx (Next.js app).
-import { createEffect, createMemo, createSignal, For, onCleanup, onMount, Show, type JSX } from 'solid-js'
+import { batch, createEffect, createMemo, createSignal, For, onCleanup, onMount, Show, type JSX } from 'solid-js'
 import {
   createFTTransmit, loadMyCall, saveMyCall, loadMyGrid, saveMyGrid,
   loadAutoReply, saveAutoReply, loadBaseFreq, saveBaseFreq,
@@ -467,8 +467,24 @@ export default function FTTransmitPanel(props: FTTransmitPanelProps): JSX.Elemen
   const [baseFreqCommitted, setBaseFreqCommitted] = createSignal(true)
   const setBaseFreq = (v: number, committed = true) => {
     const clamped = Math.max(200, Math.min(3000, Math.round(v)))
-    setBaseFreqState(clamped)
-    setBaseFreqCommitted(committed)
+    // batch() is load-bearing here, not a style preference: baseFreq and
+    // baseFreqCommitted are two SEPARATE signals the syncParams effect
+    // below reads together. Without batching, each setter below runs its
+    // OWN synchronous effect re-run — the first (setBaseFreqState) would
+    // re-run the effect with baseFreqCommitted() still holding its value
+    // from BEFORE this call, before the second setter has a chance to
+    // update it. Real hardware incident this fixes (2026-08-28): exactly
+    // this unbatched-write race let the effect observe a stale
+    // committed=true on live drag ticks, re-arming the 300ms encode/
+    // upload timer mid-drag instead of only at the drag's real end —
+    // reproduced against the physical ESP32 bridge (repeated /tx-audio
+    // uploads roughly every 1.5s while the marker was being held and
+    // dragged, well before release), which saturated its WiFi link badly
+    // enough to crash/reboot it.
+    batch(() => {
+      setBaseFreqState(clamped)
+      setBaseFreqCommitted(committed)
+    })
     if (committed) saveBaseFreq(clamped) // no need to persist every live drag tick — only the final value
   }
   const [editMsg, setEditMsg]        = createSignal('')
