@@ -8,7 +8,7 @@ import {
   type MFSKDecoderOptions,
 } from '$decoder-lib/mfsk/decoder'
 import { createCaptureNode, type CaptureNode } from '$decoder-lib/audio/captureNode'
-import { acquireMicrophoneSource, acquireBridgeSource, type AudioSourceKind, type AudioSourceHandle } from '$decoder-lib/audio/audioSource'
+import { acquireMicrophoneSource, acquireBridgeSourceWithRetry, type AudioSourceKind, type AudioSourceHandle } from '$decoder-lib/audio/audioSource'
 import type { AudioBridge } from '$decoder-lib/cat/useAudioBridge'
 import type { IQBridge } from '$decoder-lib/cat/useIQBridge'
 
@@ -58,6 +58,10 @@ export function createMFSKProcessor(
   let decoder: MFSKDecoder | null = null
   let processorNode: CaptureNode | null = null
   let fftBuf: Uint8Array<ArrayBuffer> | null = null
+  // Bumped by stopRecording() — see ft/processor.ts's identical field for
+  // why (aborts a startRecording() call mid-retry for a forced bridge
+  // source once it's been superseded).
+  let startGeneration = 0
 
   let symbols: MFSKSymbol[] = []
   let words: MFSKWord[] = []
@@ -139,6 +143,7 @@ export function createMFSKProcessor(
   // ── Start / Stop ──────────────────────────────────────────────────────────
 
   async function startRecording() {
+    const myGeneration = ++startGeneration
     try {
       if (!state().isSupported) throw new Error('Web Audio API not supported')
 
@@ -146,8 +151,12 @@ export function createMFSKProcessor(
       let handle: AudioSourceHandle
       if (kind === 'bridge') {
         const bridge = getAudioBridge()
-        const bridgeSource = bridge ? acquireBridgeSource(bridge) : null
-        if (!bridgeSource) throw new Error('Connect to the bridge (Listen to Radio) before selecting it as the audio source')
+        if (!bridge) throw new Error('No bridge is configured for this decoder')
+        // Retries instead of failing immediately — see
+        // acquireBridgeSourceWithRetry()'s own comment.
+        setState((prev) => ({ ...prev, isRecording: true, error: null }))
+        const bridgeSource = await acquireBridgeSourceWithRetry(bridge, () => startGeneration !== myGeneration)
+        if (!bridgeSource) return // superseded/stopped while waiting
         handle = bridgeSource
       } else {
         handle = await acquireMicrophoneSource()
@@ -197,6 +206,7 @@ export function createMFSKProcessor(
   }
 
   function stopRecording() {
+    startGeneration++ // aborts any in-flight bridge-retry wait — see its own comment
     source?.release()
     source = null
     if (processorNode) {

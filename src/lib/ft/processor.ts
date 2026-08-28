@@ -5,7 +5,7 @@
 import { createSignal } from 'solid-js'
 import { type FTDecodeResult, type FTMessage, type FTMode, FT_WINDOW_SECONDS, FT_SUPPORTED, decodeFTAudio } from '$decoder-lib/ft/decoder'
 import { createCaptureNode, type CaptureNode } from '$decoder-lib/audio/captureNode'
-import { acquireMicrophoneSource, acquireBridgeSource, type AudioSourceKind, type AudioSourceHandle } from '$decoder-lib/audio/audioSource'
+import { acquireMicrophoneSource, acquireBridgeSourceWithRetry, type AudioSourceKind, type AudioSourceHandle } from '$decoder-lib/audio/audioSource'
 import type { AudioBridge } from '$decoder-lib/cat/useAudioBridge'
 import type { IQBridge } from '$decoder-lib/cat/useIQBridge'
 
@@ -65,6 +65,11 @@ export function createFTProcessor(
   let sampleBuf: Float32Array | null = null
   let sampleCount = 0
   let windowStart: Date | null = null
+  // Bumped by stopRecording() so a startRecording() call that's mid-retry
+  // waiting for a forced bridge source (see acquireBridgeSourceWithRetry())
+  // notices it's been superseded and gives up instead of eventually
+  // resolving into a session that's already been torn down.
+  let startGeneration = 0
   // Sample-clock anchor for window-boundary bookkeeping — see the rollover
   // block in runLoop() for why this replaced a per-window Date.now() read.
   // anchorUtcMs/samplesSinceAnchor correlate ONE (UTC time, cumulative
@@ -285,6 +290,7 @@ export function createFTProcessor(
   }
 
   async function startRecording() {
+    const myGeneration = ++startGeneration
     try {
       if (!state().isSupported) throw new Error('Web Audio API not supported')
 
@@ -292,8 +298,16 @@ export function createFTProcessor(
       let handle: AudioSourceHandle
       if (kind === 'bridge') {
         const bridge = getAudioBridge()
-        const bridgeSource = bridge ? acquireBridgeSource(bridge) : null
-        if (!bridgeSource) throw new Error('Connect to the bridge (Listen to Radio) before selecting it as the audio source')
+        if (!bridge) throw new Error('No bridge is configured for this decoder')
+        // Retries instead of failing immediately — clicking Start with a
+        // bridge source selected is a clear statement of intent, even if
+        // the bridge isn't connected THIS instant (see
+        // acquireBridgeSourceWithRetry()'s own comment). Aborts if this
+        // call has been superseded by a newer startRecording()/
+        // stopRecording() while waiting.
+        setState((prev) => ({ ...prev, isRecording: true, error: null, status: 'waiting' }))
+        const bridgeSource = await acquireBridgeSourceWithRetry(bridge, () => startGeneration !== myGeneration)
+        if (!bridgeSource) return // superseded/stopped while waiting — stopRecording() already reset state
         handle = bridgeSource
       } else {
         handle = await acquireMicrophoneSource()
@@ -337,6 +351,7 @@ export function createFTProcessor(
   }
 
   function stopRecording() {
+    startGeneration++ // see its own comment — aborts any in-flight bridge-retry wait
     isRunning = false
     clearTimers()
     sampleBuf = null

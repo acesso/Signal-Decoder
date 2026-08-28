@@ -351,26 +351,31 @@ function TopBar(props: {
           </div>
         </Show>
 
-        <div class="ml-auto flex items-center gap-1.5 text-[10px] text-[#8b949e] whitespace-nowrap">
-          <span class="shrink-0">Audio source</span>
-          <select
-            value={props.audioSourceOverride}
-            onChange={(e) => props.onAudioSourceOverrideChange(e.currentTarget.value as AudioSourceOverride)}
-            title="Force which source decoders read from — Auto keeps the existing bridge/microphone auto-detection. Forcing a bridge choice reads from that socket only if it's actually connected right now; it does not switch the bridge's own firmware mode."
-            class="cursor-pointer rounded border border-[#30363d] bg-[#0d1117] px-1.5 py-0.5 font-mono text-[#c9d1d9] focus:border-[#2ea043] focus:outline-none"
-          >
-            <option value="auto">Auto</option>
-            <option value="microphone">Microphone</option>
-            <option value="bridge-audio">Bridge (radio audio)</option>
-            <option value="bridge-iq">Bridge (I/Q)</option>
-          </select>
-          <Show when={isRecording() && props.audioSource}>
+        <div class="ml-auto flex flex-col items-end gap-0.5 text-[10px] text-[#8b949e] whitespace-nowrap">
+          <div class="flex items-center gap-1.5">
+            <span class="shrink-0">Audio source</span>
+            <select
+              value={props.audioSourceOverride}
+              onChange={(e) => props.onAudioSourceOverrideChange(e.currentTarget.value as AudioSourceOverride)}
+              title="Force which source decoders read from — Auto keeps the existing bridge/microphone auto-detection. Forcing a bridge choice reads from that socket only if it's actually connected right now; it does not switch the bridge's own firmware mode."
+              class="cursor-pointer rounded border border-[#30363d] bg-[#0d1117] px-1.5 py-0.5 font-mono text-[#c9d1d9] focus:border-[#2ea043] focus:outline-none"
+            >
+              <option value="auto">Auto</option>
+              <option value="microphone">Microphone</option>
+              <option value="bridge-audio">Bridge (radio audio)</option>
+              <option value="bridge-iq">Bridge (I/Q)</option>
+            </select>
+          </div>
+          {/* Only meaningful in Auto — a forced choice already says exactly
+              what's being used; showing this in that case would just
+              repeat the selector's own value back at the operator. */}
+          <Show when={props.audioSourceOverride === 'auto' && isRecording() && props.audioSource}>
             <span class="text-[#c9d1d9] font-semibold">
               {props.audioSource === 'bridge-iq'
-                ? '— ESP32 Bridge (I/Q, demodulated)'
+                ? 'ESP32 Bridge (I/Q, demodulated)'
                 : props.audioSource === 'bridge'
-                  ? '— ESP32 Bridge (radio audio)'
-                  : '— Local microphone'}
+                  ? 'ESP32 Bridge (radio audio)'
+                  : 'Local microphone'}
             </span>
           </Show>
         </div>
