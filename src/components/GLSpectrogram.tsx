@@ -50,7 +50,7 @@ interface Props {
 }
 
 const TEX_W = 512
-const TEX_H = 256
+export const TEX_H = 256
 const BG: [number, number, number] = [0.051, 0.067, 0.09]
 const SQL_COLOR: [number, number, number] = [0.89, 0.7, 0.25]
 const MAX_BANDS = 8

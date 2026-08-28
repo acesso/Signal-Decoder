@@ -1217,35 +1217,72 @@ export function useRadioCAT(): RadioCATControls {
       log('info', 'polling every', config.pollIntervalMs + 'ms');
       schedulePoll();
       if (config.rigProfile === 'usdx-blackbrick') {
-        // Ask the radio which firmware it runs (FV;) — retried a few times since
-        // the reply can be eaten by the LCD/UART pin-share noise. The UI shows
-        // the PU7FTW extension controls only once this answers, so a stock rig
-        // on the blackbrick preset degrades gracefully to generic TS-480.
-        (async () => {
-          for (let i = 0; i < 3; i++) {
-            let resp = '';
-            try { resp = await query('FV;'); } catch { /* retry */ }
-            const m = resp.match(/FV(\d\.\d\d[a-z]?);/);
-            if (m) { log('info', 'firmware version:', m[1]); setState(prev => ({ ...prev, firmwareVersion: m[1] })); return; }
-            await new Promise(res => setTimeout(res, 300));
-          }
-          log('warn', 'radio did not answer FV; — PU7FTW extensions hidden');
-        })();
-        // One-shot CAT auto-report discovery (AI; — same retry pattern as FV).
-        // Deliberately queried only here, at connection time: older firmware
-        // always answers AI0; (→ keep long-polling), and later toggles at the
-        // rig are announced with an unsolicited AIn; frame, so re-polling the
+        // Confirm the initial connect actually got real answers back from the
+        // radio — not just "the WebSocket opened" — by retrying FV;/AI;/FA;
+        // until each succeeds, instead of giving up after a handful of quick
+        // attempts. REAL-WORLD BUG this fixes: a bridge-relayed WebSocket hop
+        // occasionally eats a reply during a brief WiFi/network blip — the
+        // bridge's own CAT log confirms the radio DID answer, but the
+        // browser never saw it. The previous fixed-3-tries/300ms-gap loop
+        // (≈1.5s total) gave up well within a blip that can run several
+        // seconds, leaving the UI stuck showing no firmware version/
+        // frequency for the rest of the session with no further attempt —
+        // this loop instead keeps trying (capped backoff, so a genuinely
+        // absent/non-blackbrick radio doesn't hammer the link forever)
+        // until it succeeds or the connection is superseded (a fresh
+        // connect()/disconnect() bumps connectGeneration, checked every
+        // iteration so a stale retry loop from a torn-down session can
+        // never resurrect/overwrite newer state).
+        const retryUntilConnected = (label: string, run: () => Promise<boolean>) => {
+          (async () => {
+            let delayMs = 300;
+            for (;;) {
+              if (generation !== connectGeneration) return; // superseded — stop silently, a newer connect() owns this now
+              let ok = false;
+              try { ok = await run(); } catch { /* retry */ }
+              if (ok) return;
+              await new Promise(res => setTimeout(res, delayMs));
+              delayMs = Math.min(delayMs * 2, 5000); // backs off to a 5s ceiling — a blip resolves fast, a genuinely silent radio shouldn't be polled aggressively forever
+              log('debug', `${label} — no answer yet, retrying (next gap ${delayMs}ms)`);
+            }
+          })();
+        };
+
+        // Ask the radio which firmware it runs (FV;). The UI shows the
+        // PU7FTW extension controls only once this answers, so a stock rig
+        // on the blackbrick preset degrades gracefully to generic TS-480
+        // for as long as it hasn't answered yet.
+        retryUntilConnected('FV;', async () => {
+          const resp = await query('FV;');
+          const m = resp.match(/FV(\d\.\d\d[a-z]?);/);
+          if (!m) return false;
+          log('info', 'firmware version:', m[1]);
+          setState(prev => ({ ...prev, firmwareVersion: m[1] }));
+          return true;
+        });
+        // One-shot CAT auto-report discovery (AI;). Deliberately queried
+        // only here, at connection time: older firmware always answers
+        // AI0; (→ keep long-polling), and later toggles at the rig are
+        // announced with an unsolicited AIn; frame, so re-polling the
         // capability would be wasted traffic.
-        (async () => {
-          for (let i = 0; i < 3; i++) {
-            let resp = '';
-            try { resp = await query('AI;'); } catch { /* retry */ }
-            const v = parseIntField(resp, 'AI');
-            if (v !== null) { applyAutoReportState(v >= 1); return; }
-            await new Promise(res => setTimeout(res, 300));
-          }
-          log('warn', 'radio did not answer AI; — assuming no auto-report (long poll)');
-        })();
+        retryUntilConnected('AI;', async () => {
+          const resp = await query('AI;');
+          const v = parseIntField(resp, 'AI');
+          if (v === null) return false;
+          applyAutoReportState(v >= 1);
+          return true;
+        });
+        // Confirm the initial frequency read too — previously this had NO
+        // connect-time query at all and relied purely on the first regular
+        // poll tick, which (like FV;/AI; before this fix) never retried
+        // beyond its own single attempt if that one poll's reply got lost.
+        retryUntilConnected('FA;', async () => {
+          const resp = await query('FA;');
+          const hz = parseFrequency(resp);
+          if (hz === null) return false;
+          setState(prev => ({ ...prev, frequency: hz }));
+          return true;
+        });
       }
     } catch (err) {
       log('info', 'connection failed:', err);

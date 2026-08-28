@@ -630,10 +630,27 @@ export function createFTTransmit(
   // Start encoding the moment a message is added. By the time the window
   // arrives (~seconds away), samples are already ready in the entry.
 
+  // Per-entry generation counters — a re-encode of the SAME queued entry
+  // (e.g. syncParams() re-encoding every stale entry after a base-freq
+  // change) supersedes any still-in-flight encode for that entry.
+  // Real-hardware finding this fixes (2026-08-28): several separate,
+  // legitimate TX-marker drag-release commits in quick succession each
+  // correctly triggered exactly one re-encode of every stale entry (the
+  // committed gate worked), but with no cancellation, EVERY one of those
+  // per-commit encodes still ran to completion and uploaded — the single-
+  // threaded encode worker just queued them up and drained them
+  // sequentially, saturating the bridge's WiFi link with several minutes'
+  // worth of uploads for what the operator experienced as a few quick
+  // marker nudges.
+  const encodeGenerationByEntryId = new Map<string, number>();
+
   function startEncode(entry: TxQueueEntry) {
     const ENC_RATE = 12000;
+    const myGeneration = (encodeGenerationByEntryId.get(entry.id) ?? 0) + 1;
+    encodeGenerationByEntryId.set(entry.id, myGeneration);
     encodeAsync(entry.message, getMode(), ENC_RATE, entry.audioHz ?? getBaseFrequency())
       .then(samples => {
+        if (encodeGenerationByEntryId.get(entry.id) !== myGeneration) return; // superseded by a newer re-encode of this same entry
         const slot = lookaheadSlotForQueuePosition(entry.id);
         if (slot !== null) uploadIfBridgeSink(slot, entry.message, entry.label, samples, ENC_RATE);
         setState(prev => {
@@ -645,6 +662,7 @@ export function createFTTransmit(
         });
       })
       .catch(err => {
+        if (encodeGenerationByEntryId.get(entry.id) !== myGeneration) return; // superseded — a newer re-encode owns this entry's status now
         const encodeError = err instanceof Error ? err.message : String(err);
         setState(prev => {
           const q = prev.queue.map(e =>
@@ -666,15 +684,36 @@ export function createFTTransmit(
   let autoCQModeCached = '';   // mode that was encoded for
   let autoCQFreqCached = 0;    // baseFreq that was encoded for
   let autoCQMessage    = '';
+  // Bumped by every rebuildAutoCQCache() call — lets an in-flight encode's
+  // own .then() notice a NEWER call has already superseded it and skip
+  // BOTH the state write and the /tx-audio upload, not just the write (the
+  // freq/mode/msg equality check above already did that, but real hardware
+  // testing found repeated legitimate commits — several separate drag-
+  // release cycles in quick succession, each syncParams() call correctly
+  // firing exactly once per drag per the committed gate — still queued one
+  // real encode+upload per commit, with no way for a newer commit to
+  // cancel an older one still draining through the single-threaded encode
+  // worker. This generation counter is a stronger, more direct guard than
+  // comparing captured freq/mode/msg values, which can spuriously PASS if
+  // an operator's later drag happens to land back on a frequency an
+  // earlier, now-irrelevant encode also targeted.
+  let autoCQGeneration = 0;
 
   function rebuildAutoCQCache(msg: string) {
     if (!msg) { autoCQSamples = null; autoCQMsgCached = ''; return; }
+    const myGeneration = ++autoCQGeneration;
     autoCQSamples = null; // invalidate while encoding
     autoCQMsgCached  = msg;
     autoCQModeCached = getMode();
     autoCQFreqCached = getBaseFrequency();
     encodeAsync(msg, getMode(), 12000, getBaseFrequency())
       .then(samples => {
+        // Superseded by a newer rebuildAutoCQCache() call while this one
+        // was still encoding — skip both the state write and the upload
+        // outright, regardless of whether freq/mode/msg happen to still
+        // match (see autoCQGeneration's own comment for why that
+        // comparison alone isn't a strong enough guard).
+        if (myGeneration !== autoCQGeneration) return;
         // Only store if message/mode/freq haven't changed since we started
         if (
           autoCQMsgCached  === msg &&

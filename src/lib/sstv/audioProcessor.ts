@@ -8,7 +8,7 @@ import { transmittedLines } from '$decoder-lib/sstv/encoder'
 import { createCaptureNode, type CaptureNode } from '$decoder-lib/audio/captureNode'
 import { estimateSignalReport, type SignalReport } from '$decoder-lib/sstv/signalReport'
 import { GoertzelFilter } from '$decoder-lib/sstv/dsp'
-import { acquireMicrophoneSource, acquireBridgeSource, type AudioSourceKind, type AudioSourceHandle } from '$decoder-lib/audio/audioSource'
+import { acquireMicrophoneSource, acquireBridgeSourceWithRetry, type AudioSourceKind, type AudioSourceHandle } from '$decoder-lib/audio/audioSource'
 import type { AudioBridge } from '$decoder-lib/cat/useAudioBridge'
 import type { IQBridge } from '$decoder-lib/cat/useIQBridge'
 
@@ -168,6 +168,10 @@ export function createAudioProcessor(
   let source: AudioSourceHandle | null = null
   let decoder: SSTVDecoder | null = null
   let visDetector: VISDetector | null = null
+  // Bumped by stopRecording() — see ft/processor.ts's identical field for
+  // why (aborts a startRecording() call mid-retry for a forced bridge
+  // source once it's been superseded).
+  let startGeneration = 0
   // Fallback for tuning in mid-transmission (VIS header already passed) —
   // runs alongside visDetector while listening, mode-agnostic, and identifies
   // the mode from the timing between sync pulses instead of the VIS code.
@@ -369,6 +373,7 @@ export function createAudioProcessor(
   }
 
   async function startRecording() {
+    const myGeneration = ++startGeneration
     try {
       if (!state().isSupported) throw new Error('Web Audio API not supported in this browser')
 
@@ -376,8 +381,12 @@ export function createAudioProcessor(
       let handle: AudioSourceHandle
       if (kind === 'bridge') {
         const bridge = getAudioBridge()
-        const bridgeSource = bridge ? acquireBridgeSource(bridge) : null
-        if (!bridgeSource) throw new Error('Connect to the bridge (Listen to Radio) before selecting it as the audio source')
+        if (!bridge) throw new Error('No bridge is configured for this decoder')
+        // Retries instead of failing immediately — see
+        // acquireBridgeSourceWithRetry()'s own comment.
+        setState((prev) => ({ ...prev, isRecording: true, error: null }))
+        const bridgeSource = await acquireBridgeSourceWithRetry(bridge, () => startGeneration !== myGeneration)
+        if (!bridgeSource) return // superseded/stopped while waiting
         handle = bridgeSource
       } else {
         handle = await acquireMicrophoneSource()
@@ -419,6 +428,7 @@ export function createAudioProcessor(
   }
 
   function stopRecording() {
+    startGeneration++ // aborts any in-flight bridge-retry wait — see its own comment
     if (source) {
       source.release()
       source = null

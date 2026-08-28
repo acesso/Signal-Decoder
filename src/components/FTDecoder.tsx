@@ -3,7 +3,7 @@ import { createEffect, createMemo, createSignal, For, onCleanup, onMount, Show, 
 import type { DecoderControls } from '../lib/decoderControls'
 import { fmtAbsHz } from '$decoder-lib/formatFreq'
 import SignalAnalysisPanel from './SignalAnalysisPanel'
-import { createFTProcessor } from '../lib/ft/processor'
+import { createFTProcessor, DEFAULT_EARLY_DECODE_MS } from '../lib/ft/processor'
 import { type FTMode, type FTMessage, FT_WINDOW_SECONDS } from '$decoder-lib/ft/decoder'
 import {
   type Contact,
@@ -21,16 +21,17 @@ import { DecodeGate } from '$decoder-lib/ft/gate'
 import FTContactsPanel from './FTContactsPanel'
 import FTWasmPanel from './FTWasmPanel'
 import VirtualList from './VirtualList'
-import { loadNumberArray, saveNumberArray, loadBoolean, saveBoolean } from '$decoder-lib/storage'
+import { loadNumberArray, saveNumberArray, loadBoolean, saveBoolean, loadNumber, saveNumber } from '$decoder-lib/storage'
 import type { AudioBridge } from '$decoder-lib/cat/useAudioBridge'
 import type { IQBridge } from '$decoder-lib/cat/useIQBridge'
-import type { AudioSourceKind } from '$decoder-lib/audio/audioSource'
+import { resolveAudioSource, type AudioSourceKind, type AudioSourceOverride } from '$decoder-lib/audio/audioSource'
 
 const DEFAULT_PANEL_WEIGHTS = [0.8, 0.6, 1.2]
 const LS_PANEL_WEIGHTS = 'ft_panel_weights'
 const LS_MSG_SORT_KEY = 'ft_messages_sort_key'
 const LS_MSG_SORT_REV = 'ft_messages_sort_rev'
 const MSG_SORT_COLS = ['freq', 'snr', 'dt', 'msg'] as const
+const LS_EARLY_DECODE_MS = 'ft_early_decode_ms'
 
 // ── Clock ring (rAF-driven, no signal writes) ────────────────────────────
 
@@ -317,30 +318,29 @@ interface Props {
   myGrid?: string
   onContactsChange?: (c: Map<string, Contact>) => void
   txAudioHz?: number
-  onTxAudioHzChange?: (hz: number) => void
+  // committed: false while the marker is still being dragged (position-only
+  // preview) — only true once means it's safe to do real work (encode/
+  // upload to the bridge). See SignalAnalysisPanel's onMarkerDrag comment.
+  onTxAudioHzChange?: (hz: number, committed: boolean) => void
   analyser?: AnalyserNode | null
   vfoFrequency?: number
   onStateChange?: (controls: DecoderControls) => void
   handle?: { current: DecoderControls | null }
   audioBridge?: AudioBridge
   iqBridge?: IQBridge
+  audioSourceOverride?: AudioSourceOverride
 }
 
 export default function FTDecoder(props: Props): JSX.Element {
-  // Where decode input comes from — the ESP32 bridge's live radio audio
-  // whenever it's actually connected (matches globalAudio's own
-  // auto-detection in App.tsx's handleStart(), so both agree without a
-  // separate manual selector), falling back to the local mic otherwise.
-  // Checks iqBridge FIRST: while the bridge is in "iq" input mode,
-  // audioBridge is never connected (see App.tsx's handleStart()) and
-  // wouldn't report playbackActive even though the bridge is very much
-  // live — iqBridge's own connected+getPlaybackSource() (demodulated
-  // client-side, see useIQBridge.ts's header comment) is the actual
-  // source of truth in that mode.
+  // Where decode input comes from — see resolveAudioSource()'s own comment
+  // in audioSource.ts for the full precedence (auto: iqBridge-connected
+  // first, then audioBridge-playbackActive, else microphone; overridden:
+  // the operator's forced choice from App.tsx's top-bar selector).
   const audioSourceKind = (): AudioSourceKind =>
-    props.iqBridge?.state().connected ? 'bridge' : props.audioBridge?.state().playbackActive ? 'bridge' : 'microphone'
-  const getBridge = () => (props.iqBridge?.state().connected ? props.iqBridge : props.audioBridge)
-  const processor = createFTProcessor(() => props.ftMode, audioSourceKind, getBridge)
+    resolveAudioSource(props.audioSourceOverride ?? 'auto', props.iqBridge, props.audioBridge).kind
+  const getBridge = () => resolveAudioSource(props.audioSourceOverride ?? 'auto', props.iqBridge, props.audioBridge).bridge
+  const [earlyDecodeMs, setEarlyDecodeMs] = createSignal(loadNumber(LS_EARLY_DECODE_MS, DEFAULT_EARLY_DECODE_MS))
+  const processor = createFTProcessor(() => props.ftMode, audioSourceKind, getBridge, earlyDecodeMs)
 
   createEffect((prevMode: FTMode | undefined) => {
     const mode = props.ftMode
@@ -973,7 +973,14 @@ export default function FTDecoder(props: Props): JSX.Element {
 
           {/* WASM engine monitor + runtime tuning */}
           <div class="mt-2 shrink-0">
-            <FTWasmPanel ftMode={props.ftMode} />
+            <FTWasmPanel
+              ftMode={props.ftMode}
+              earlyDecodeMs={earlyDecodeMs()}
+              onEarlyDecodeMsChange={(ms) => {
+                setEarlyDecodeMs(ms)
+                saveNumber(LS_EARLY_DECODE_MS, ms)
+              }}
+            />
           </div>
         </div>
 
@@ -998,7 +1005,7 @@ export default function FTDecoder(props: Props): JSX.Element {
               vfoFrequency={props.vfoFrequency}
               storageKeyPrefix="ft"
               markers={(props.txAudioHz ?? 0) > 0 ? [{ freq: props.txAudioHz!, color: '#f85149', label: 'TX' }] : undefined}
-              onMarkerDrag={props.onTxAudioHzChange ? (_i, hz) => props.onTxAudioHzChange!(hz) : undefined}
+              onMarkerDrag={props.onTxAudioHzChange ? (_i, hz, _shiftKey, committed) => props.onTxAudioHzChange!(hz, committed ?? true) : undefined}
               markerFieldLabel="Tx"
               class="min-w-0"
               style={{ flex: panelWeights()[1] }}

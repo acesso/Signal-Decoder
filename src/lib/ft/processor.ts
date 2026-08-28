@@ -5,7 +5,7 @@
 import { createSignal } from 'solid-js'
 import { type FTDecodeResult, type FTMessage, type FTMode, FT_WINDOW_SECONDS, FT_SUPPORTED, decodeFTAudio } from '$decoder-lib/ft/decoder'
 import { createCaptureNode, type CaptureNode } from '$decoder-lib/audio/captureNode'
-import { acquireMicrophoneSource, acquireBridgeSource, type AudioSourceKind, type AudioSourceHandle } from '$decoder-lib/audio/audioSource'
+import { acquireMicrophoneSource, acquireBridgeSourceWithRetry, type AudioSourceKind, type AudioSourceHandle } from '$decoder-lib/audio/audioSource'
 import type { AudioBridge } from '$decoder-lib/cat/useAudioBridge'
 import type { IQBridge } from '$decoder-lib/cat/useIQBridge'
 
@@ -25,10 +25,13 @@ const PARTIAL_FLUSH_MS = 250
 // FT4_SYMBOL_PERIOD/FT4_NN in lib/ft8_lib/ft8/constants.h). Decoding this
 // early — instead of waiting for the full window — uses that dead air
 // productively: a message that's actually there has already fully arrived,
-// so nothing is lost, and results land ~2s sooner. Kept under the real
-// silence gap (not right at 2.3-2.5s) so a slightly late-starting or
-// slightly-longer-than-nominal transmission doesn't get truncated.
-const EARLY_DECODE_MS = 2000
+// so nothing is lost, and results land ~2s sooner. Default kept under the
+// real silence gap (not right at 2.3-2.5s) so a slightly late-starting or
+// slightly-longer-than-nominal transmission doesn't get truncated — user-
+// tunable (see FTWasmPanel.tsx's "Early decode" slider) since how much
+// margin is safe depends on real-world propagation/timing conditions this
+// code can't predict.
+export const DEFAULT_EARLY_DECODE_MS = 2000
 
 function msUntilNextWindow(windowSec: number): number {
   const totalMs = windowSec * 1000
@@ -44,6 +47,7 @@ export function createFTProcessor(
   // (see audioSource.ts's acquireMicrophoneSource()/acquireBridgeSource()).
   getAudioSourceKind: () => AudioSourceKind = () => 'microphone',
   getAudioBridge: () => AudioBridge | IQBridge | undefined = () => undefined,
+  getEarlyDecodeMs: () => number = () => DEFAULT_EARLY_DECODE_MS,
 ) {
   const [state, setState] = createSignal<FTProcessorState>({
     isRecording: false,
@@ -61,6 +65,22 @@ export function createFTProcessor(
   let sampleBuf: Float32Array | null = null
   let sampleCount = 0
   let windowStart: Date | null = null
+  // Bumped by stopRecording() so a startRecording() call that's mid-retry
+  // waiting for a forced bridge source (see acquireBridgeSourceWithRetry())
+  // notices it's been superseded and gives up instead of eventually
+  // resolving into a session that's already been torn down.
+  let startGeneration = 0
+  // Sample-clock anchor for window-boundary bookkeeping — see the rollover
+  // block in runLoop() for why this replaced a per-window Date.now() read.
+  // anchorUtcMs/samplesSinceAnchor correlate ONE (UTC time, cumulative
+  // captured sample count) pair, established once when capture starts;
+  // every later window boundary is located by comparing samplesSinceAnchor
+  // (a running total advanced by exactly how many real samples the
+  // AudioWorklet delivered — audio-thread-accurate, never approximated)
+  // against that fixed anchor, instead of re-deriving "how far into this
+  // window are we" from a fresh Date.now() read each rollover.
+  let anchorUtcMs = 0
+  let samplesSinceAnchor = 0
   let isRunning = false
   const timers = new Set<ReturnType<typeof setTimeout>>()
 
@@ -175,6 +195,14 @@ export function createFTProcessor(
         sampleBuf = new Float32Array(capacity)
         sampleCount = 0
         windowStart = new Date()
+        // Re-anchor the sample clock to this exact instant — see
+        // samplesSinceAnchor's own comment. This runs once at capture
+        // start and again only if the sample rate changes mid-session
+        // (forcing a buffer resize), both one-time correlation points,
+        // not a per-window recurrence — so it can't reintroduce the
+        // accumulating drift this scheme exists to avoid.
+        anchorUtcMs = windowStart.getTime()
+        samplesSinceAnchor = 0
       }
       if (firstWindow) {
         firstWindow = false
@@ -188,12 +216,16 @@ export function createFTProcessor(
 
       const windowMs = curWindowSec * 1000
       const toBoundaryMs = msUntilNextWindow(curWindowSec) || windowMs
-      // Wake up EARLY_DECODE_MS before the real boundary and decode whatever
+      const earlyDecodeMs = getEarlyDecodeMs()
+      // Wake up earlyDecodeMs before the real boundary and decode whatever
       // has accumulated so far — a real transmission has already finished by
-      // then (see EARLY_DECODE_MS comment), so this loses nothing but the
-      // trailing silence. Too-short windows (or a loop that's arming more
-      // than EARLY_DECODE_MS late) fall back to the old boundary-exact wake.
-      const earlyMs = toBoundaryMs - EARLY_DECODE_MS
+      // then (see DEFAULT_EARLY_DECODE_MS's comment), so this loses nothing
+      // but the trailing silence. Too-short windows (or a loop that's
+      // arming more than earlyDecodeMs late) fall back to the old
+      // boundary-exact wake. This sleep's precision doesn't matter for
+      // correctness — it only decides roughly WHEN to look, never where the
+      // window boundary actually is; that's the sample-clock math below.
+      const earlyMs = toBoundaryMs - earlyDecodeMs
       const sleepMs = earlyMs > 100 ? earlyMs : toBoundaryMs
       await sleep(sleepMs)
       if (!isRunning) break
@@ -207,17 +239,40 @@ export function createFTProcessor(
         // wake) through the remaining trailing silence up to the real
         // boundary, where the rollover logic below still runs normally.
         dispatchDecode(sampleBuf.slice(0, sampleCount), sampleRate, dWindowStart)
-        await sleep(EARLY_DECODE_MS)
+        await sleep(earlyDecodeMs)
         if (!isRunning) break
         setState((prev) => ({ ...prev, status: 'recording' }))
       }
 
-      const nowMs = Date.now()
-      const sinceBoundary = nowMs % windowMs
+      // Locate the boundary from the SAMPLE clock, not a fresh Date.now()
+      // read here. REAL HARDWARE/BROWSER BUG this fixes (reported
+      // 2026-08-27): the previous version computed `Date.now() % windowMs`
+      // at exactly this point, after the `await sleep(...)` calls above —
+      // but setTimeout has no minimum-delay guarantee, and under CPU load
+      // (confirmed by the user across multiple browser tabs each running
+      // their own decode pipeline, and even in a pipeline that never
+      // touches this app's own ESP32 bridge code, e.g. WebSDR-loopback
+      // mic capture) that resolve can land arbitrarily late. Every bit of
+      // that lateness got misread as "more samples belong to the next
+      // window than actually do," permanently shifting windowStart earlier
+      // than the samples' true first-sample instant — and because
+      // setTimeout lateness is one-directional (always late, never early),
+      // that misattribution compounded window over window instead of
+      // averaging out, matching the reported "deltas start accurate, then
+      // get steadily worse after 5-10 windows" symptom. samplesSinceAnchor
+      // instead counts exactly how many real samples the audio-thread
+      // AudioWorklet has ever delivered since a single anchor taken once
+      // at capture start (see its own comment) — that count cannot drift
+      // relative to the actual audio, regardless of how late this main-
+      // thread loop iteration happens to run.
+      const windowSamples = Math.round((windowMs / 1000) * sampleRate)
+      const sinceBoundarySamples = windowSamples > 0 ? samplesSinceAnchor % windowSamples : 0
+      const sinceBoundary = (sinceBoundarySamples / sampleRate) * 1000
       const total = sampleCount
-      const tailSamples = sinceBoundary > 50 && sinceBoundary < windowMs / 2 ? Math.min(Math.round((sinceBoundary / 1000) * sampleRate), total) : 0
+      const tailSamples = sinceBoundary > 50 && sinceBoundary < windowMs / 2 ? Math.min(sinceBoundarySamples, total) : 0
+      const nowMs = anchorUtcMs + (samplesSinceAnchor / sampleRate) * 1000
       if (sinceBoundary > 300 && sinceBoundary < windowMs - 300) {
-        console.debug(`[ft] window rollover ${sinceBoundary} ms after the UTC boundary — carrying ${tailSamples} samples into the next window`)
+        console.debug(`[ft] window rollover ${sinceBoundary.toFixed(0)} ms after the UTC boundary — carrying ${tailSamples} samples into the next window`)
       }
 
       // Already decoded this window early — the samples captured between
@@ -235,6 +290,7 @@ export function createFTProcessor(
   }
 
   async function startRecording() {
+    const myGeneration = ++startGeneration
     try {
       if (!state().isSupported) throw new Error('Web Audio API not supported')
 
@@ -242,8 +298,16 @@ export function createFTProcessor(
       let handle: AudioSourceHandle
       if (kind === 'bridge') {
         const bridge = getAudioBridge()
-        const bridgeSource = bridge ? acquireBridgeSource(bridge) : null
-        if (!bridgeSource) throw new Error('Connect to the bridge (Listen to Radio) before selecting it as the audio source')
+        if (!bridge) throw new Error('No bridge is configured for this decoder')
+        // Retries instead of failing immediately — clicking Start with a
+        // bridge source selected is a clear statement of intent, even if
+        // the bridge isn't connected THIS instant (see
+        // acquireBridgeSourceWithRetry()'s own comment). Aborts if this
+        // call has been superseded by a newer startRecording()/
+        // stopRecording() while waiting.
+        setState((prev) => ({ ...prev, isRecording: true, error: null, status: 'waiting' }))
+        const bridgeSource = await acquireBridgeSourceWithRetry(bridge, () => startGeneration !== myGeneration)
+        if (!bridgeSource) return // superseded/stopped while waiting — stopRecording() already reset state
         handle = bridgeSource
       } else {
         handle = await acquireMicrophoneSource()
@@ -269,6 +333,7 @@ export function createFTProcessor(
         const copy = Math.min(input.length, space)
         buf.set(input.subarray(0, copy), sampleCount)
         sampleCount += copy
+        samplesSinceAnchor += copy
       })
       processorNode = proc
       analyserNode.connect(proc.node)
@@ -286,6 +351,7 @@ export function createFTProcessor(
   }
 
   function stopRecording() {
+    startGeneration++ // see its own comment — aborts any in-flight bridge-retry wait
     isRunning = false
     clearTimers()
     sampleBuf = null

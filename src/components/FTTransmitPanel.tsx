@@ -1,5 +1,5 @@
 // Port of src/components/FTTransmitPanel.tsx (Next.js app).
-import { createEffect, createMemo, createSignal, For, onCleanup, onMount, Show, type JSX } from 'solid-js'
+import { batch, createEffect, createMemo, createSignal, For, onCleanup, onMount, Show, untrack, type JSX } from 'solid-js'
 import {
   createFTTransmit, loadMyCall, saveMyCall, loadMyGrid, saveMyGrid,
   loadAutoReply, saveAutoReply, loadBaseFreq, saveBaseFreq,
@@ -56,6 +56,19 @@ const CALL_RE = /^[A-Z0-9]{1,3}[0-9][A-Z]{1,4}(\/[A-Z0-9]+)?$/i
 
 function validCall(s: string) { return CALL_RE.test(s.trim().toUpperCase()) }
 function validGrid(s: string) { return s === '' || GRID_RE.test(s.trim().toUpperCase()) }
+
+// Floor-only parse for the Audio Hz field — no live upper clamp and no
+// step: NumberField's default min/max clamp (applied per keystroke) fought
+// the operator mid-typing, same complaint already fixed for
+// SignalAnalysisPanel's Width field via its own rawFreqParse. 0 is still
+// enforced as a hard floor since a negative base frequency has no meaning
+// for the encoder (see @e04/ft8ts's generateFT8Waveform, which only checks
+// finiteness — nothing downstream else would catch it).
+function nonNegativeFreqParse(raw: string): number | null {
+  const n = parseFloat(raw)
+  if (!Number.isFinite(n)) return null
+  return Math.max(0, n)
+}
 
 // Convert lat/lon to 4-char Maidenhead grid square
 function latLonToGrid(lat: number, lon: number): string {
@@ -434,17 +447,45 @@ interface FTTransmitPanelProps {
   onTxWindowEnd?: () => void;
   onStatusChange?: (s: TxStatus) => void;
   onReset?: (clearSentFn: () => void) => void;
-  onBaseFreqHandle?: (setFn: (v: number) => void) => void;
+  onBaseFreqHandle?: (setFn: (v: number, committed?: boolean) => void) => void;
 }
 
 export default function FTTransmitPanel(props: FTTransmitPanelProps): JSX.Element {
   const [myCall, setMyCallState]     = createSignal(loadMyCall())
   const [myGrid, setMyGridState]     = createSignal(loadMyGrid())
   const [baseFreq, setBaseFreqState] = createSignal(loadBaseFreq())
-  const setBaseFreq = (v: number) => {
+  // Tracks whether the LATEST baseFreq update is a final, committed value —
+  // false while the TX marker is actively being dragged (see
+  // SignalAnalysisPanel's onMarkerDrag comment). The syncParams() effect
+  // below gates its real work (encode + upload to the bridge) on this
+  // being true, so a live drag only ever moves the marker/updates the
+  // displayed number — never fires a network request until the drag ends.
+  // REAL HARDWARE INCIDENT this fixes (2026-08-28): every live drag tick
+  // used to eventually trigger a full re-encode-and-upload (via a settle-
+  // timer that fires on ANY pause mid-drag, not just at release), which
+  // saturated the ESP32 bridge's WiFi link badly enough to crash/reboot it.
+  const [baseFreqCommitted, setBaseFreqCommitted] = createSignal(true)
+  const setBaseFreq = (v: number, committed = true) => {
     const clamped = Math.max(200, Math.min(3000, Math.round(v)))
-    setBaseFreqState(clamped)
-    saveBaseFreq(clamped)
+    // batch() is load-bearing here, not a style preference: baseFreq and
+    // baseFreqCommitted are two SEPARATE signals the syncParams effect
+    // below reads together. Without batching, each setter below runs its
+    // OWN synchronous effect re-run — the first (setBaseFreqState) would
+    // re-run the effect with baseFreqCommitted() still holding its value
+    // from BEFORE this call, before the second setter has a chance to
+    // update it. Real hardware incident this fixes (2026-08-28): exactly
+    // this unbatched-write race let the effect observe a stale
+    // committed=true on live drag ticks, re-arming the 300ms encode/
+    // upload timer mid-drag instead of only at the drag's real end —
+    // reproduced against the physical ESP32 bridge (repeated /tx-audio
+    // uploads roughly every 1.5s while the marker was being held and
+    // dragged, well before release), which saturated its WiFi link badly
+    // enough to crash/reboot it.
+    batch(() => {
+      setBaseFreqState(clamped)
+      setBaseFreqCommitted(committed)
+    })
+    if (committed) saveBaseFreq(clamped) // no need to persist every live drag tick — only the final value
   }
   const [editMsg, setEditMsg]        = createSignal('')
   const [editLabel, setEditLabel]    = createSignal('')
@@ -521,11 +562,24 @@ export default function FTTransmitPanel(props: FTTransmitPanelProps): JSX.Elemen
   // visible lag. Mode changes are rare/discrete (a dropdown pick), so only
   // baseFreq's rapid-fire case needs debouncing — but both go through the
   // same timer for one code path.
+  //
+  // baseFreqCommitted() gates this ENTIRELY while false — a live TX marker
+  // drag must never start this timer at all, only the drag's own final
+  // (committed) value at mouseup should. REAL HARDWARE INCIDENT this fixes
+  // (2026-08-28): the previous version armed this timer on every drag tick
+  // too, and since it's a settle-timer (fires 300ms after the LAST change,
+  // not after a fixed delay from drag-start), any brief pause mid-drag —
+  // not just release — was enough to let it fire, triggering a full
+  // re-encode-and-upload burst mid-drag. That flooded the ESP32 bridge's
+  // fragile WiFi link badly enough to crash/reboot it. Gating on
+  // baseFreqCommitted() means NOTHING fires until the drag genuinely ends.
   let syncParamsTimer: ReturnType<typeof setTimeout> | undefined
   createEffect(() => {
     void props.mode
     void baseFreq()
+    const committed = baseFreqCommitted()
     if (syncParamsTimer) clearTimeout(syncParamsTimer)
+    if (!committed) return
     syncParamsTimer = setTimeout(() => tx.syncParams(), 300)
   })
   onCleanup(() => { if (syncParamsTimer) clearTimeout(syncParamsTimer) })
@@ -581,7 +635,31 @@ export default function FTTransmitPanel(props: FTTransmitPanelProps): JSX.Elemen
   }
 
   createEffect(() => {
-    if (myCall()) tx.setAutoCQMessage(buildFTMessage('cq', myCall().toUpperCase(), '', undefined, myGrid().toUpperCase()))
+    const call = myCall()
+    const grid = myGrid()
+    // untrack() is load-bearing here, not a style preference — REAL
+    // HARDWARE INCIDENT this fixes (2026-08-28): tx.setAutoCQMessage()
+    // calls rebuildAutoCQCache() internally, which reads getBaseFrequency()
+    // (a signal read) to encode+upload the auto-CQ cache at the CURRENT
+    // base frequency. Without untrack(), that nested signal read gets
+    // attributed to THIS effect by Solid's automatic dependency tracking —
+    // any function an effect calls that reads a signal makes the effect
+    // depend on that signal too, even though baseFreq never appears in
+    // this effect's own source. That silently subscribed this effect to
+    // baseFreq, so every live TX-marker-drag tick (baseFreq changing
+    // dozens of times a second) re-ran this effect and re-fired a full
+    // real encode+upload each time — completely bypassing the committed
+    // gate on the OTHER effect (which correctly only reacts to committed
+    // drag values), because this effect was never meant to react to
+    // baseFreq changes AT ALL. Confirmed on real hardware: 9+ separate
+    // uploads fired during one drag even after that gate was in place,
+    // each one knocking the live /audio WebSocket connection offline.
+    // untrack() ensures this effect's dependency list is exactly
+    // {myCall, myGrid} as intended — a base-frequency change alone can no
+    // longer trigger it.
+    untrack(() => {
+      if (call) tx.setAutoCQMessage(buildFTMessage('cq', call.toUpperCase(), '', undefined, grid.toUpperCase()))
+    })
   })
 
   const canOperate = createMemo(() => validCall(myCall()) && validGrid(myGrid()) && props.mode !== 'FT2')
@@ -879,7 +957,7 @@ export default function FTTransmitPanel(props: FTTransmitPanelProps): JSX.Elemen
         <div class="flex flex-col gap-1">
           <label class="text-[#8b949e] text-[10px] font-semibold tracking-wide">Audio Hz</label>
           <NumberField value={baseFreq()}
-            min={200} max={3000} step={50}
+            parse={nonNegativeFreqParse}
             onCommit={setBaseFreq}
             class="bg-[#0d1117] border border-[#30363d] rounded px-2 py-1.5 text-sm font-mono text-[#c9d1d9] w-24 focus:outline-none focus:border-[#388bfd]" />
         </div>
