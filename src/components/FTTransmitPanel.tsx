@@ -57,6 +57,19 @@ const CALL_RE = /^[A-Z0-9]{1,3}[0-9][A-Z]{1,4}(\/[A-Z0-9]+)?$/i
 function validCall(s: string) { return CALL_RE.test(s.trim().toUpperCase()) }
 function validGrid(s: string) { return s === '' || GRID_RE.test(s.trim().toUpperCase()) }
 
+// Floor-only parse for the Audio Hz field — no live upper clamp and no
+// step: NumberField's default min/max clamp (applied per keystroke) fought
+// the operator mid-typing, same complaint already fixed for
+// SignalAnalysisPanel's Width field via its own rawFreqParse. 0 is still
+// enforced as a hard floor since a negative base frequency has no meaning
+// for the encoder (see @e04/ft8ts's generateFT8Waveform, which only checks
+// finiteness — nothing downstream else would catch it).
+function nonNegativeFreqParse(raw: string): number | null {
+  const n = parseFloat(raw)
+  if (!Number.isFinite(n)) return null
+  return Math.max(0, n)
+}
+
 // Convert lat/lon to 4-char Maidenhead grid square
 function latLonToGrid(lat: number, lon: number): string {
   const adjLon = lon + 180
@@ -879,7 +892,7 @@ export default function FTTransmitPanel(props: FTTransmitPanelProps): JSX.Elemen
         <div class="flex flex-col gap-1">
           <label class="text-[#8b949e] text-[10px] font-semibold tracking-wide">Audio Hz</label>
           <NumberField value={baseFreq()}
-            min={200} max={3000} step={50}
+            parse={nonNegativeFreqParse}
             onCommit={setBaseFreq}
             class="bg-[#0d1117] border border-[#30363d] rounded px-2 py-1.5 text-sm font-mono text-[#c9d1d9] w-24 focus:outline-none focus:border-[#388bfd]" />
         </div>

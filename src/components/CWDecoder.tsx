@@ -5,7 +5,7 @@ import { fmtAbsHz } from '$decoder-lib/formatFreq'
 import SignalAnalysisPanel from './SignalAnalysisPanel'
 import NumberField from './NumberField'
 import { createCWProcessor, type TextToken } from '../lib/cw/processor'
-import type { AudioSourceKind } from '../lib/audio/audioSource'
+import { resolveAudioSource, type AudioSourceKind } from '../lib/audio/audioSource'
 import { loadNumberArray, saveNumberArray } from '$decoder-lib/storage'
 
 const DEFAULT_PANEL_WEIGHTS = [1, 1, 0.75]
@@ -243,11 +243,11 @@ export default function CWDecoder(props: DecoderProps): JSX.Element {
   let prevSym1 = ''
   let prevSym2 = ''
 
-  // Same iqBridge-first/audioBridge/microphone precedence as
-  // FTDecoder.tsx's audioSourceKind()/getBridge() — see that file's comment.
+  // See resolveAudioSource()'s own comment in audioSource.ts for the full
+  // precedence (auto vs. the operator's forced override).
   const audioSourceKind = (): AudioSourceKind =>
-    props.iqBridge?.state().connected ? 'bridge' : props.audioBridge?.state().playbackActive ? 'bridge' : 'microphone'
-  const getBridge = () => (props.iqBridge?.state().connected ? props.iqBridge : props.audioBridge)
+    resolveAudioSource(props.audioSourceOverride ?? 'auto', props.iqBridge, props.audioBridge).kind
+  const getBridge = () => resolveAudioSource(props.audioSourceOverride ?? 'auto', props.iqBridge, props.audioBridge).bridge
   const processor = createCWProcessor(
     {
       toneFreq,

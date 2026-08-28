@@ -5,7 +5,7 @@ import { createEffect, createMemo, createSignal, For, onCleanup, onMount, Show, 
 import type { RTTYConfig } from '$decoder-lib/rtty/decoder'
 import { loadNumberArray, saveNumberArray } from '$decoder-lib/storage'
 import { createMultiRTTYProcessor } from '../lib/rtty/multiProcessor'
-import type { AudioSourceKind } from '../lib/audio/audioSource'
+import { resolveAudioSource, type AudioSourceKind } from '../lib/audio/audioSource'
 import { createSessionsStore } from '../lib/rtty/sessionsStore'
 import type { DecoderControls, DecoderProps } from '../lib/decoderControls'
 import SignalAnalysisPanel from './SignalAnalysisPanel'
@@ -36,11 +36,11 @@ export default function RTTYDecoder(props: RTTYDecoderProps): JSX.Element {
   const sessions = createSessionsStore(DEFAULT_CONFIG)
   const initialSession = sessions.initialSession
   const [squelch, setSquelch] = createSignal(0)
-  // Same iqBridge-first/audioBridge/microphone precedence as
-  // FTDecoder.tsx's audioSourceKind()/getBridge() — see that file's comment.
+  // See resolveAudioSource()'s own comment in audioSource.ts for the full
+  // precedence (auto vs. the operator's forced override).
   const audioSourceKind = (): AudioSourceKind =>
-    props.iqBridge?.state().connected ? 'bridge' : props.audioBridge?.state().playbackActive ? 'bridge' : 'microphone'
-  const getBridge = () => (props.iqBridge?.state().connected ? props.iqBridge : props.audioBridge)
+    resolveAudioSource(props.audioSourceOverride ?? 'auto', props.iqBridge, props.audioBridge).kind
+  const getBridge = () => resolveAudioSource(props.audioSourceOverride ?? 'auto', props.iqBridge, props.audioBridge).bridge
   const processor = createMultiRTTYProcessor(
     (sessionId, chars) => {
       sessions.dispatch({ type: 'APPEND_TEXT', id: sessionId, chars })

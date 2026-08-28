@@ -3,7 +3,7 @@ import { createEffect, createMemo, createSignal, For, onCleanup, onMount, Show, 
 import type { DecoderProps, DecoderControls } from '../lib/decoderControls'
 import SignalAnalysisPanel from './SignalAnalysisPanel'
 import { createAudioProcessor, type CapturedImage, type SSTVMode } from '../lib/sstv/audioProcessor'
-import type { AudioSourceKind } from '../lib/audio/audioSource'
+import { resolveAudioSource, type AudioSourceKind } from '../lib/audio/audioSource'
 import { SSTV_MODES } from '$decoder-lib/sstv/constants'
 import { DecoderState } from '$decoder-lib/sstv/decoder'
 import { loadNumberArray, saveNumberArray } from '$decoder-lib/storage'
@@ -168,11 +168,11 @@ export default function SSTVDecoder(props: DecoderProps & { onReply?: (img: Capt
     })
   })
 
-  // Same iqBridge-first/audioBridge/microphone precedence as
-  // FTDecoder.tsx's audioSourceKind()/getBridge() — see that file's comment.
+  // See resolveAudioSource()'s own comment in audioSource.ts for the full
+  // precedence (auto vs. the operator's forced override).
   const audioSourceKind = (): AudioSourceKind =>
-    props.iqBridge?.state().connected ? 'bridge' : props.audioBridge?.state().playbackActive ? 'bridge' : 'microphone'
-  const getBridge = () => (props.iqBridge?.state().connected ? props.iqBridge : props.audioBridge)
+    resolveAudioSource(props.audioSourceOverride ?? 'auto', props.iqBridge, props.audioBridge).kind
+  const getBridge = () => resolveAudioSource(props.audioSourceOverride ?? 'auto', props.iqBridge, props.audioBridge).bridge
   const processor = createAudioProcessor({ manualMode, autoDetect, autoSlant }, audioSourceKind, getBridge)
 
   createEffect(() => {
