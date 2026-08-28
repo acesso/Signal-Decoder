@@ -8,7 +8,7 @@
 // job (an I/Q-aware GLSpectrogram view) this component now covers with a
 // real marker/bandwidth system instead of that panel's plain zoom slider.
 import { createEffect, createMemo, createSignal, For, onCleanup, onMount, type JSX } from 'solid-js'
-import GLSpectrogram, { type GLSpectrogramHandle, type SpectroBand } from './GLSpectrogram'
+import GLSpectrogram, { TEX_H, type GLSpectrogramHandle, type SpectroBand } from './GLSpectrogram'
 import { loadNumber, saveNumber, loadString, saveString } from '$decoder-lib/storage'
 import { buildColormapLUT, COLORMAPS, COLORMAP_LABEL, type ColormapName } from '$decoder-lib/colormaps'
 import NumberField from './NumberField'
@@ -26,6 +26,10 @@ export interface SpectrumSource {
   getBytes(): Uint8Array | null
   minHz: number
   maxHz: number
+  /** dB value a byte of 0 represents — needed to label the vertical axis correctly, since the mic/decoder path (AnalyserNode's spec default) and the I/Q path (IQSpectrumComputer's own fixed window) don't share the same range. */
+  minDb: number
+  /** dB value a byte of 255 represents. */
+  maxDb: number
 }
 
 // Adapts a Web Audio AnalyserNode to SpectrumSource — every existing
@@ -40,6 +44,12 @@ class AnalyserSpectrumSource implements SpectrumSource {
   }
   get maxHz() {
     return this.analyser.context.sampleRate / 2
+  }
+  get minDb() {
+    return this.analyser.minDecibels
+  }
+  get maxDb() {
+    return this.analyser.maxDecibels
   }
   getBytes(): Uint8Array | null {
     const bc = this.analyser.frequencyBinCount
@@ -58,6 +68,14 @@ class AnalyserSpectrumSource implements SpectrumSource {
 // false (mirrors the old analyser==null "draw nothing" behavior) — passed
 // as a plain value rather than read from a signal since the panel calls
 // this every animation frame already, not reactively.
+// -90/-10 dB — must match useIQBridge.ts's own IQ_MIN_DB/IQ_MAX_DB (the
+// window IQSpectrumComputer normalizes magnitude into before writing
+// magBytes). Duplicated rather than imported to keep this adapter's plain
+// duck-typed constructor (matching the rest of this class) instead of a
+// real import from useIQBridge.ts, a much heavier module.
+const IQ_MIN_DB = -90
+const IQ_MAX_DB = -10
+
 export class IQSpectrumSourceAdapter implements SpectrumSource {
   constructor(
     private computer: { magBytes: Uint8Array },
@@ -69,6 +87,12 @@ export class IQSpectrumSourceAdapter implements SpectrumSource {
   }
   get maxHz() {
     return this.sampleRateHz() / 2
+  }
+  get minDb() {
+    return IQ_MIN_DB
+  }
+  get maxDb() {
+    return IQ_MAX_DB
   }
   getBytes(): Uint8Array | null {
     return this.active() ? this.computer.magBytes : null
@@ -88,6 +112,14 @@ const LS_SG_3D_SPEED = 'sg_3d_speed'
 const LS_SG_2D_SPEED = 'sg_2d_speed'
 const LS_SG_3D_SMOOTH = 'sg_3d_smooth'
 const LS_SG_BAND_ALPHA = 'sg_band_alpha'
+// Axis grid line contrast — one control for ALL horizontal lines (dB on
+// the spectrum graph, elapsed-time on the waterfall) and one for ALL
+// vertical/frequency lines (both plots), rather than a separate knob per
+// plot — the operator asked for exactly two, not four, so one dB/time
+// slider and one frequency slider read the same regardless of which plot
+// is drawing them.
+const LS_GRID_H_ALPHA = 'axis_grid_h_alpha'
+const LS_GRID_V_ALPHA = 'axis_grid_v_alpha'
 
 // The ruler used to be painted into a reserved bottom band of this canvas —
 // it's now a separate HTML strip below the canvas (see FreqRuler), so the
@@ -142,19 +174,42 @@ function computeTicks(minF: number, maxF: number, vfoHz = 0): FreqTick[] {
   return out
 }
 
-// Faint vertical grid lines at major ticks, drawn INTO the plot canvas itself
-// (used by the waterfall, which benefits from gridlines through the image).
-// The ruler's own tick marks/labels are rendered as HTML outside the canvas
-// by FreqRuler — this function no longer draws them.
-function drawGridLines(ctx: CanvasRenderingContext2D, w: number, pH: number, minF: number, maxF: number) {
+// Vertical grid lines at major frequency ticks, drawn INTO the plot canvas
+// itself — lets the operator read off a peak's frequency at a glance
+// anywhere in the plot, not just against the ruler at the edge. alpha is
+// the shared "vertical/frequency" contrast control (see LS_GRID_V_ALPHA) —
+// the SAME value on the spectrum graph and the waterfall, per the
+// operator's own request for one control per axis kind, not per plot.
+function drawGridLines(ctx: CanvasRenderingContext2D, w: number, pH: number, minF: number, maxF: number, alpha: number) {
+  if (alpha <= 0) return
   for (const t of computeTicks(minF, maxF)) {
     if (!t.isMaj) continue
     const x = t.x * w
-    ctx.strokeStyle = 'rgba(48,54,61,0.6)'
+    ctx.strokeStyle = `rgba(139,148,158,${alpha})`
     ctx.lineWidth = 0.5
     ctx.beginPath()
     ctx.moveTo(x, 0)
     ctx.lineTo(x, pH)
+    ctx.stroke()
+  }
+}
+
+// Horizontal grid lines at arbitrary fractional y-positions (0=top, 1=
+// bottom) — shared by the spectrum graph's dB ticks (computeDbTicks) and
+// the waterfall's elapsed-time ticks (computeTimeTicks): both are "a
+// handful of major horizontal positions across the plot height," just
+// with different tick math, so one drawing function serves both rather
+// than duplicating the same three canvas calls twice. alpha is the shared
+// "horizontal" contrast control (see LS_GRID_H_ALPHA).
+function drawHorizontalGridLines(ctx: CanvasRenderingContext2D, w: number, h: number, fracs: number[], alpha: number) {
+  if (alpha <= 0) return
+  for (const frac of fracs) {
+    const y = frac * h
+    ctx.strokeStyle = `rgba(139,148,158,${alpha})`
+    ctx.lineWidth = 0.5
+    ctx.beginPath()
+    ctx.moveTo(0, y)
+    ctx.lineTo(w, y)
     ctx.stroke()
   }
 }
@@ -166,7 +221,7 @@ function drawGridLines(ctx: CanvasRenderingContext2D, w: number, pH: number, min
 function FreqRuler(props: { minHz: number; maxHz: number; vfoHz?: number }): JSX.Element {
   const ticks = createMemo(() => computeTicks(props.minHz, props.maxHz, props.vfoHz ?? 0))
   return (
-    <div class="relative h-4 select-none">
+    <div class="relative h-4 min-w-0 flex-1 select-none">
       {ticks().map((t) => (
         <div
           class="absolute top-0 flex flex-col items-center"
@@ -174,6 +229,73 @@ function FreqRuler(props: { minHz: number; maxHz: number; vfoHz?: number }): JSX
         >
           <div class={`w-px ${t.isMaj ? 'h-2 bg-[#8b949e]' : 'h-1 bg-[#3d444d]'}`} />
           {t.label && <span class="font-mono text-[9px] text-[#8b949e] leading-tight">{t.label}</span>}
+        </div>
+      ))}
+    </div>
+  )
+}
+
+interface DbTick {
+  y: number // 0..1 fraction down from the top (0 = maxDb, 1 = minDb — matches drawSpectrum's y = PLOT_H - frac*PLOT_H convention)
+  label: string
+}
+
+// dB ticks at nice round intervals — unlike frequency's niceTicks (which
+// picks a step so roughly <=12 major ticks fit an arbitrary span), the dB
+// span here is always one of two small fixed windows (AnalyserNode's
+// -100..-30 default, or the I/Q path's -90..-10 — see minDb/maxDb's own
+// comments), so a plain fixed 10dB step reads cleanly without needing the
+// same "nice span" search.
+function computeDbTicks(minDb: number, maxDb: number): DbTick[] {
+  const span = maxDb - minDb
+  if (span <= 0) return []
+  const step = 10
+  const out: DbTick[] = []
+  const first = Math.ceil(minDb / step) * step
+  for (let db = first; db <= maxDb + 0.01; db += step) {
+    out.push({ y: 1 - (db - minDb) / span, label: `${db}` })
+  }
+  return out
+}
+
+// ~4 marks top-to-bottom regardless of panel height — dense enough to read
+// "how far back" at a glance, sparse enough to stay unobtrusive. Shared by
+// the ruler labels AND the horizontal grid-line drawing, so both always
+// agree on exactly where a "time" line falls.
+//
+// totalRowsVisible is NOT the same for both rendering paths: the CPU 2D
+// fallback shifts its canvas by exactly 1 real pixel per new row
+// (putImageData), so rows visible = the panel's own pixel height. The GL
+// path (GLSpectrogram.tsx) instead keeps a FIXED 256-row ring texture
+// (TEX_H) that always gets stretched to fill the canvas's current pixel
+// height regardless of that height — so rows visible there is the
+// constant 256, not the panel's height. Passing the wrong one would give
+// a "-Ns" label/line that doesn't match what's actually on screen at that row.
+function computeTimeTicks(secondsPerRow: number, totalRowsVisible: number): DbTick[] {
+  const totalSec = totalRowsVisible * secondsPerRow
+  const count = 4
+  return Array.from({ length: count + 1 }, (_, i) => {
+    const frac = i / count
+    return { y: frac, label: `-${(frac * totalSec).toFixed(0)}s` }
+  }).slice(1) // skip the "-0s" mark at the very top — redundant with "now"
+}
+
+// HTML axis ruler for the plot's non-frequency axis — dB along the
+// spectrum graph's left edge, or elapsed time along the waterfall's right
+// edge. A real flex/block sibling OUTSIDE the plot canvas (not an overlay
+// on top of it) so it never competes with the live signal/heatmap for
+// legibility — the actual peak-reading grid lines that used to live only
+// in this ruler now render INTO the canvas itself (see drawHorizontalGridLines/
+// drawGridLines), so the ruler's only remaining job is the tick labels.
+function AxisRuler(props: { ticks: DbTick[]; side: 'left' | 'right' }): JSX.Element {
+  return (
+    <div class={`relative w-9 shrink-0 select-none ${props.side === 'left' ? 'order-first' : ''}`}>
+      {props.ticks.map((t) => (
+        <div
+          class={`absolute flex items-center gap-1 ${props.side === 'left' ? 'right-0 flex-row-reverse' : 'left-0'}`}
+          style={{ top: `${t.y * 100}%`, transform: 'translateY(-50%)' }}
+        >
+          <span class="font-mono text-[8px] text-[#8b949e]">{t.label}</span>
         </div>
       ))}
     </div>
@@ -397,7 +519,15 @@ interface Props {
   markers?: AudioMarker[]
   /** shiftKey reflects the modifier during the drag — lets a mode offer an
    *  alternate drag behavior (e.g. MFSK: move one tone instead of the group). */
-  onMarkerDrag?: (index: number, newFreq: number, shiftKey?: boolean) => void
+  // committed: false while the marker is actively being dragged (position-
+  // only, live visual feedback) — true for the drag's own final mouseup
+  // value and for every non-drag caller (typed field, step buttons). A
+  // caller that triggers real work (encoding audio, uploading to a bridge)
+  // from this callback MUST gate on committed, not fire on every call — see
+  // the real-hardware regression this parameter exists to prevent: an
+  // un-gated network upload on every live drag tick saturated the bridge's
+  // WiFi link badly enough to crash/reboot it (2026-08-28).
+  onMarkerDrag?: (index: number, newFreq: number, shiftKey?: boolean, committed?: boolean) => void
   /** I/Q mode only — see IQPassband. Present together, or not at all. */
   passband?: IQPassband
   onPassbandChange?: (passband: IQPassband) => void
@@ -525,12 +655,19 @@ export default function SignalAnalysisPanel(props: Props): JSX.Element {
   // the raw tap (base is forced empty there — see effectiveMarkers' own
   // comment), so it's always at index 0 when this is true.
   const isPassbandMarkerIndex = (i: number) => props.passband != null && onRawTap() && i === 0
-  const handleMarkerDrag = (index: number, newFreq: number, shiftKey?: boolean) => {
+  // committed distinguishes a LIVE drag-in-progress update (marker position
+  // only, no downstream network/encode work should happen yet) from a final
+  // value — the drag's own mouseup, or any one-shot caller (typed Hz field,
+  // step buttons, applyCenterShift) that was never a drag at all. Defaults
+  // true so every existing non-drag call site (which never passed this
+  // before it existed) keeps its original "commit immediately" behavior —
+  // only the live mousemove handler below explicitly passes false.
+  const handleMarkerDrag = (index: number, newFreq: number, shiftKey?: boolean, committed = true) => {
     if (isPassbandMarkerIndex(index)) {
       props.onPassbandChange?.({ centerHz: newFreq, bandwidthHz: props.passband!.bandwidthHz })
       return
     }
-    props.onMarkerDrag?.(index, newFreq, shiftKey)
+    props.onMarkerDrag?.(index, newFreq, shiftKey, committed)
   }
   const hasMarkerDrag = createMemo(() => !!props.onMarkerDrag || !!props.onPassbandChange)
 
@@ -598,12 +735,16 @@ export default function SignalAnalysisPanel(props: Props): JSX.Element {
   const [sg2dSpeed, setSg2dSpeed] = createSignal(loadNumber(LS_SG_2D_SPEED, 16))
   const [sg3dSmooth, setSg3dSmooth] = createSignal(loadNumber(LS_SG_3D_SMOOTH, 0.35))
   const [bandAlpha, setBandAlpha] = createSignal(loadNumber(LS_SG_BAND_ALPHA, 0.3))
+  const [gridHAlpha, setGridHAlpha] = createSignal(loadNumber(LS_GRID_H_ALPHA, 0.35))
+  const [gridVAlpha, setGridVAlpha] = createSignal(loadNumber(LS_GRID_V_ALPHA, 0.35))
 
   createEffect(() => saveNumber(LS_SG_GAMMA, sgGamma()))
   createEffect(() => saveNumber(LS_SG_3D_SPEED, sg3dSpeed()))
   createEffect(() => saveNumber(LS_SG_2D_SPEED, sg2dSpeed()))
   createEffect(() => saveNumber(LS_SG_3D_SMOOTH, sg3dSmooth()))
   createEffect(() => saveNumber(LS_SG_BAND_ALPHA, bandAlpha()))
+  createEffect(() => saveNumber(LS_GRID_H_ALPHA, gridHAlpha()))
+  createEffect(() => saveNumber(LS_GRID_V_ALPHA, gridVAlpha()))
   createEffect(() => {
     if (typeof window !== 'undefined') localStorage.setItem(LS_SG_VIEW, sgView())
   })
@@ -618,6 +759,12 @@ export default function SignalAnalysisPanel(props: Props): JSX.Element {
   let specWrapEl: HTMLDivElement | undefined
   let sgCanvEl: HTMLCanvasElement | undefined
   let sgOverlayEl: HTMLCanvasElement | undefined
+  // Plain 2D canvas layered on top of GLSpectrogram specifically for axis
+  // grid lines — GLSpectrogram has no 2D overlay of its own (its squelch
+  // grid is drawn via a WebGL shader, not 2D canvas calls) and adding one
+  // there would mean touching its shader code for a feature that's simple
+  // 2D line-drawing; a sibling canvas is the minimal change.
+  let glGridEl: HTMLCanvasElement | undefined
   const glSg: { current: GLSpectrogramHandle | null } = { current: null }
   let rafId: number | null = null
   let sgContainerEl: HTMLDivElement | undefined
@@ -704,6 +851,14 @@ export default function SignalAnalysisPanel(props: Props): JSX.Element {
   }
 
   onMount(() => {
+    // Last live (uncommitted) drag update — replayed once, committed=true,
+    // on mouseup. See onMarkerDrag's own comment for why: a caller wired to
+    // do real work (encode+upload to the bridge) from every tick of this
+    // callback previously fired on EVERY mousemove during a drag, which
+    // saturated the bridge's WiFi link badly enough to crash/reboot it on
+    // real hardware. Position-only feedback during the drag is still fully
+    // live (this only gates when the "real work" callback should act).
+    let lastDrag: { index: number; freq: number; shiftKey?: boolean } | null = null
     const onMove = (e: MouseEvent) => {
       if (squelchDragging && props.onSquelchChange) {
         e.preventDefault()
@@ -722,10 +877,15 @@ export default function SignalAnalysisPanel(props: Props): JSX.Element {
       const rect = drag.el.getBoundingClientRect()
       const xRatio = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width))
       const newHz = Math.round(displayMinHz() + xRatio * (displayMaxHz() - displayMinHz()))
-      handleMarkerDrag(drag.index, newHz, e.shiftKey)
+      lastDrag = { index: drag.index, freq: newHz, shiftKey: e.shiftKey }
+      handleMarkerDrag(drag.index, newHz, e.shiftKey, false)
     }
     const onUp = () => {
+      if (markerDrag && lastDrag) {
+        handleMarkerDrag(lastDrag.index, lastDrag.freq, lastDrag.shiftKey, true)
+      }
       markerDrag = null
+      lastDrag = null
       squelchDragging = false
     }
     window.addEventListener('mousemove', onMove, { passive: false })
@@ -763,6 +923,8 @@ export default function SignalAnalysisPanel(props: Props): JSX.Element {
     ctx.fillRect(0, 0, canvas.width, CANVAS_H)
     const src = source()
     if (!src) return null
+    drawGridLines(ctx, canvas.width, PLOT_H, minHz, maxHz, gridVAlpha())
+    drawHorizontalGridLines(ctx, canvas.width, PLOT_H, computeDbTicks(src.minDb, src.maxDb).map((t) => t.y), gridHAlpha())
     const d = src.getBytes()
     if (!d) return null
 
@@ -854,11 +1016,29 @@ export default function SignalAnalysisPanel(props: Props): JSX.Element {
     ctx.clearRect(0, 0, w, h)
     const minHz = displayMinHz(),
       maxHz = displayMaxHz()
-    drawGridLines(ctx, w, h, minHz, maxHz)
+    drawGridLines(ctx, w, h, minHz, maxHz, gridVAlpha())
+    // CPU fallback shifts the canvas by exactly 1 real pixel per new row
+    // (putImageData) — see computeTimeTicks' own comment on why this
+    // differs from the GL path's fixed TEX_H basis.
+    drawHorizontalGridLines(ctx, w, h, computeTimeTicks(sg2dSpeed() / 1000, h).map((t) => t.y), gridHAlpha())
     const txMarkerHz = props.txMarkerHz ?? 0
     if (txMarkerHz > 0) {
       drawTxMarker(ctx, w, h, txMarkerHz, minHz, maxHz)
     }
+  }
+
+  // Grid overlay for the GL waterfall — a plain 2D canvas layered on top
+  // (see glGridEl's own comment). Terrain excluded: no flat axis in a
+  // rotating 3D projection, same reasoning as the grips/time-ruler above.
+  function drawGlGrid(canvas: HTMLCanvasElement) {
+    const ctx = canvas.getContext('2d')
+    if (!ctx) return
+    const w = canvas.width,
+      h = canvas.height
+    ctx.clearRect(0, 0, w, h)
+    if (sgView() !== 'waterfall') return
+    drawGridLines(ctx, w, h, displayMinHz(), displayMaxHz(), gridVAlpha())
+    drawHorizontalGridLines(ctx, w, h, computeTimeTicks(glRowInterval() / 1000, TEX_H).map((t) => t.y), gridHAlpha())
   }
 
   onMount(() => {
@@ -868,7 +1048,8 @@ export default function SignalAnalysisPanel(props: Props): JSX.Element {
     const tick = (now: number) => {
       const sp = specEl,
         sg = sgCanvEl,
-        ov = sgOverlayEl
+        ov = sgOverlayEl,
+        gg = glGridEl
       if (sp && now - spLastTs >= 33) {
         spLastTs = now
         const fd = drawSpectrum(sp)
@@ -886,6 +1067,7 @@ export default function SignalAnalysisPanel(props: Props): JSX.Element {
         }
       }
       if (ov && glFailed()) drawSgOverlay(ov)
+      if (gg && !glFailed()) drawGlGrid(gg)
       glSg.current?.render()
       rafId = requestAnimationFrame(tick)
     }
@@ -1045,40 +1227,50 @@ export default function SignalAnalysisPanel(props: Props): JSX.Element {
           </div>
         )}
 
-        <div ref={specWrapEl} class="relative">
-          <canvas
-            ref={specEl}
-            width={640}
-            height={CANVAS_H}
-            class={`block w-full touch-manipulation rounded border border-[#30363d] bg-[#0a0a0a] ${
-              hasMarkerDrag() ? 'cursor-ew-resize' : props.onSquelchChange ? 'cursor-ns-resize' : 'cursor-crosshair'
-            }`}
-            onMouseDown={hasMarkerDrag() || props.onSquelchChange ? handleSpectrumMouseDown : undefined}
-            onMouseMove={props.onSquelchChange ? handleSpectrumHover : undefined}
-          />
-          <MarkerGrips host={() => specWrapEl} />
-          {props.onSquelchChange && (
-            <div
-              class="absolute z-10 cursor-ns-resize select-none"
-              style={{
-                right: '-8px',
-                top: `${(1 - (props.squelch ?? 0) / 100) * 100}%`,
-                transform: 'translateY(-50%)',
-              }}
-              title="Drag to set squelch"
-              onMouseDown={(e) => {
-                e.preventDefault()
-                e.stopPropagation()
-                squelchDragging = true
-              }}
-            >
-              <svg width="15" height="18" viewBox="0 0 15 18">
-                <path d="M14 1 L14 17 L1 9 Z" fill="#e3b341" stroke="rgba(13,17,23,0.7)" stroke-width="1.5" />
-              </svg>
-            </div>
-          )}
+        <div class="flex items-stretch gap-1">
+          <div ref={specWrapEl} class="relative min-w-0 flex-1">
+            <canvas
+              ref={specEl}
+              width={640}
+              height={CANVAS_H}
+              class={`block w-full touch-manipulation rounded border border-[#30363d] bg-[#0a0a0a] ${
+                hasMarkerDrag() ? 'cursor-ew-resize' : props.onSquelchChange ? 'cursor-ns-resize' : 'cursor-crosshair'
+              }`}
+              onMouseDown={hasMarkerDrag() || props.onSquelchChange ? handleSpectrumMouseDown : undefined}
+              onMouseMove={props.onSquelchChange ? handleSpectrumHover : undefined}
+            />
+            <MarkerGrips host={() => specWrapEl} />
+            {props.onSquelchChange && (
+              <div
+                class="absolute z-10 cursor-ns-resize select-none"
+                style={{
+                  right: '-8px',
+                  top: `${(1 - (props.squelch ?? 0) / 100) * 100}%`,
+                  transform: 'translateY(-50%)',
+                }}
+                title="Drag to set squelch"
+                onMouseDown={(e) => {
+                  e.preventDefault()
+                  e.stopPropagation()
+                  squelchDragging = true
+                }}
+              >
+                <svg width="15" height="18" viewBox="0 0 15 18">
+                  <path d="M14 1 L14 17 L1 9 Z" fill="#e3b341" stroke="rgba(13,17,23,0.7)" stroke-width="1.5" />
+                </svg>
+              </div>
+            )}
+          </div>
+          {/* Right side, matching the waterfall's time ruler below — keeps
+              both plot boxes flush-aligned on the left edge instead of the
+              spectrum box being offset right by a left-side ruler while the
+              waterfall box starts at true 0. */}
+          {source() && <AxisRuler side="right" ticks={computeDbTicks(source()!.minDb, source()!.maxDb)} />}
         </div>
-        <FreqRuler minHz={displayMinHz()} maxHz={displayMaxHz()} vfoHz={props.vfoFrequency} />
+        <div class="flex items-center gap-1">
+          <FreqRuler minHz={displayMinHz()} maxHz={displayMaxHz()} vfoHz={props.vfoFrequency} />
+          {source() && <div class="w-9 shrink-0" />}
+        </div>
 
         <div class="mt-1 flex items-center gap-1.5 text-[10px] text-[#8b949e]">
           <span class="shrink-0">View</span>
@@ -1146,74 +1338,103 @@ export default function SignalAnalysisPanel(props: Props): JSX.Element {
           ))}
         </div>
 
-        <div class="mt-0.5 flex items-center justify-between">
-          {props.onSquelchChange ? (
-            <div class="flex items-center gap-2 text-xs text-[#8b949e]">
-              <span class="shrink-0">Squelch</span>
-              <input
-                type="range"
-                min={0}
-                max={100}
-                step={1}
-                value={props.squelch ?? 0}
-                onInput={(e) => props.onSquelchChange!(parseInt(e.currentTarget.value))}
-                class="w-24 accent-[#e3b341]"
-              />
-              <span class="w-8 shrink-0 text-right font-mono text-[#e3b341]">{props.squelch ?? 0}%</span>
-            </div>
-          ) : (
-            <p class="text-[10px] text-[#484f58]">{props.isRecording ? 'Receiving audio' : 'Start decoding to see spectrum'}</p>
-          )}
-        </div>
+        {(props.onSquelchChange || !props.isRecording) && (
+          <div class="mt-0.5 flex items-center justify-between">
+            {props.onSquelchChange ? (
+              <div class="flex items-center gap-2 text-xs text-[#8b949e]">
+                <span class="shrink-0">Squelch</span>
+                <input
+                  type="range"
+                  min={0}
+                  max={100}
+                  step={1}
+                  value={props.squelch ?? 0}
+                  onInput={(e) => props.onSquelchChange!(parseInt(e.currentTarget.value))}
+                  class="w-24 accent-[#e3b341]"
+                />
+                <span class="w-8 shrink-0 text-right font-mono text-[#e3b341]">{props.squelch ?? 0}%</span>
+              </div>
+            ) : (
+              <p class="text-[10px] text-[#484f58]">Start decoding to see spectrum</p>
+            )}
+          </div>
+        )}
       </div>
 
       <div class="mt-3 flex min-h-0 flex-1 flex-col gap-2">
         <h3 class="shrink-0 text-xs font-medium text-[#8b949e]">Spectrogram</h3>
-        <div ref={sgContainerEl} class="relative min-h-[100px] flex-1">
-          {glFailed() ? (
-            /* CPU 2D-canvas pipeline — only when WebGL is unavailable */
-            <div class="relative">
-              <canvas
-                ref={sgCanvEl}
-                width={640}
-                height={sgH()}
-                style={{ height: `${sgH()}px` }}
-                class="block w-full rounded border border-[#30363d] bg-[#0d1117]"
-              />
-              <canvas
-                ref={sgOverlayEl}
-                width={640}
-                height={sgH()}
-                style={{ height: `${sgH()}px` }}
-                class="pointer-events-none absolute inset-0 w-full"
-              />
-            </div>
-          ) : (
-            <GLSpectrogram
-              handle={glSg}
-              view={sgView()}
-              gamma={sgGamma()}
-              height={sgH()}
-              maxHz={displayMaxHz()}
-              minHz={displayMinHz()}
-              bands={glBandsComputed()}
-              bandAlpha={bandAlpha()}
-              markers={glMarkers()}
-              sqlLevel={props.onSquelchChange != null ? (props.squelch ?? 0) / 100 : undefined}
-              sqlAlpha={0.6}
-              sqlGridSize={props.showGrid ? props.gridSize : undefined}
-              vfoFrequency={props.vfoFrequency}
-              txMarkerHz={props.txMarkerHz}
-              colormap={colormap()}
-              onFailed={() => setGlFailed(true)}
-            />
-          )}
-          {/* Grips over the waterfall — terrain excluded: its markers sit in a
-              rotating 3D projection, so a flat grip row would misalign. */}
-          {(sgView() === 'waterfall' || glFailed()) && <MarkerGrips host={() => sgContainerEl} />}
+        <div class="flex min-h-0 flex-1 items-stretch gap-1">
+          <div ref={sgContainerEl} class="relative min-h-[100px] min-w-0 flex-1">
+            {glFailed() ? (
+              /* CPU 2D-canvas pipeline — only when WebGL is unavailable */
+              <div class="relative">
+                <canvas
+                  ref={sgCanvEl}
+                  width={640}
+                  height={sgH()}
+                  style={{ height: `${sgH()}px` }}
+                  class="block w-full rounded border border-[#30363d] bg-[#0d1117]"
+                />
+                <canvas
+                  ref={sgOverlayEl}
+                  width={640}
+                  height={sgH()}
+                  style={{ height: `${sgH()}px` }}
+                  class="pointer-events-none absolute inset-0 w-full"
+                />
+              </div>
+            ) : (
+              <>
+                <GLSpectrogram
+                  handle={glSg}
+                  view={sgView()}
+                  gamma={sgGamma()}
+                  height={sgH()}
+                  maxHz={displayMaxHz()}
+                  minHz={displayMinHz()}
+                  bands={glBandsComputed()}
+                  bandAlpha={bandAlpha()}
+                  markers={glMarkers()}
+                  sqlLevel={props.onSquelchChange != null ? (props.squelch ?? 0) / 100 : undefined}
+                  sqlAlpha={0.6}
+                  sqlGridSize={props.showGrid ? props.gridSize : undefined}
+                  vfoFrequency={props.vfoFrequency}
+                  txMarkerHz={props.txMarkerHz}
+                  colormap={colormap()}
+                  onFailed={() => setGlFailed(true)}
+                />
+                <canvas
+                  ref={glGridEl}
+                  width={640}
+                  height={sgH()}
+                  style={{ height: `${sgH()}px` }}
+                  class="pointer-events-none absolute inset-0 w-full"
+                />
+              </>
+            )}
+            {/* Grips over the waterfall — terrain excluded: its markers sit in a
+                rotating 3D projection, so a flat grip row would misalign. */}
+            {(sgView() === 'waterfall' || glFailed()) && <MarkerGrips host={() => sgContainerEl} />}
+          </div>
+          {/* Time axis ruler — a real sibling OUTSIDE the plot (not an
+              overlay on top of the heatmap, per the operator's own
+              feedback that the in-plot overlay competed with the live
+              data for legibility). Row-basis differs by path: see
+              computeTimeTicks' own comment for why glFailed() uses sgH()
+              (real 1px-per-row) while the GL path uses the fixed TEX_H
+              ring depth instead. */}
+          {sgView() === 'waterfall' &&
+            (glFailed() ? (
+              <AxisRuler side="right" ticks={computeTimeTicks(sg2dSpeed() / 1000, sgH())} />
+            ) : (
+              <AxisRuler side="right" ticks={computeTimeTicks(glRowInterval() / 1000, TEX_H)} />
+            ))}
         </div>
         {(sgView() === 'waterfall' || glFailed()) && (
-          <FreqRuler minHz={displayMinHz()} maxHz={displayMaxHz()} vfoHz={props.vfoFrequency} />
+          <div class="flex items-center gap-1">
+            <FreqRuler minHz={displayMinHz()} maxHz={displayMaxHz()} vfoHz={props.vfoFrequency} />
+            <div class="w-9 shrink-0" />
+          </div>
         )}
         <div class="flex flex-wrap items-center gap-3 text-xs text-[#8b949e]">
           <label class="flex items-center gap-1.5">
@@ -1262,6 +1483,30 @@ export default function SignalAnalysisPanel(props: Props): JSX.Element {
               step={0.1}
               value={sgGamma()}
               onInput={(e) => setSgGamma(parseFloat(e.currentTarget.value))}
+              class="w-14 accent-[#2ea043]"
+            />
+          </label>
+          <label class="flex items-center gap-1.5" title="Horizontal grid line contrast (dB lines on the spectrum graph, time lines on the waterfall) — shared across both plots.">
+            Grid ↔
+            <input
+              type="range"
+              min={0}
+              max={1}
+              step={0.05}
+              value={gridHAlpha()}
+              onInput={(e) => setGridHAlpha(parseFloat(e.currentTarget.value))}
+              class="w-14 accent-[#2ea043]"
+            />
+          </label>
+          <label class="flex items-center gap-1.5" title="Vertical/frequency grid line contrast — shared across both plots.">
+            Grid ↕
+            <input
+              type="range"
+              min={0}
+              max={1}
+              step={0.05}
+              value={gridVAlpha()}
+              onInput={(e) => setGridVAlpha(parseFloat(e.currentTarget.value))}
               class="w-14 accent-[#2ea043]"
             />
           </label>

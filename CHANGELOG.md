@@ -12,6 +12,26 @@ them into a version section when cutting a release.
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-08-28
+
+### Fixed
+
+- Fixed FT8/FT4 decode time-offset (Δ) drift that grew steadily worse over a long session, especially with multiple browser tabs decoding at once: window-boundary detection relied on a `Date.now()` read that could lag arbitrarily under CPU load, misattributing that lag as extra samples and permanently shifting later windows. Now anchored to the audio sample clock, which can't drift relative to the actual audio.
+- Fixed a rare but severe bug where dragging the FT8 TX frequency marker could flood the ESP32 bridge with repeated audio re-encodes and uploads, knocking its live audio/I-Q connection offline and sometimes crashing the bridge: an unrelated reactive effect was silently (and unintentionally) re-triggering a real encode+upload on every live drag movement, not just when the marker was released.
+- Fixed the ESP32 bridge's speaker jack staying silent regardless of volume settings (the codec's DAC output level was never explicitly set); added a live speaker volume slider and channel selector (Left/Right/Both) to the bridge's web control page.
+- Fixed FT8/FT4 TX playback's last note repeating endlessly after the message finished sending.
+- Fixed real signal content aliasing back into the audible band on the ESP32 bridge's receive audio, worst at low sample rates — visible as structured, signal-like content well past where the radio's own audio bandwidth should end. Added a firmware anti-alias filter, since the issue traces to the ES8388 codec's own limited stopband rejection rather than a firmware misconfiguration.
+- Fixed the CAT connection occasionally getting stuck showing no firmware version or frequency after a brief network hiccup during connect: the initial queries gave up after 3 quick tries; they now retry until they succeed.
+- Fixed the Signal Analysis panel's frequency ruler collapsing all its tick labels to the left edge.
+- Fixed the Transmit panel's TX Audio Hz field clamping and losing keystrokes while typing.
+
+### Changed
+
+- Signal Analysis panel: added dB axis labels beside the spectrum graph and a subtle elapsed-time ruler beside the waterfall, plus real grid lines (frequency and dB/time) with two contrast sliders.
+- Added an Auto/Microphone/Bridge (radio audio)/Bridge (I/Q) selector to the top toolbar, letting the operator force which source every decoder reads from instead of always auto-detecting.
+- Removed the "Receiving audio" status line that only took up space with no information.
+- Added a persisted "Early decode" setting (was a fixed 2-second margin) for how long before a window's real boundary FT8/FT4 decoding starts.
+
 ## [0.12.0] - 2026-08-26
 
 ### Fixed

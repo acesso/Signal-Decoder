@@ -7,7 +7,7 @@
 import { createSignal } from 'solid-js'
 import { audioRecorder } from '$decoder-lib/audio/ringRecorder'
 import { createCaptureNode, type CaptureNode } from '$decoder-lib/audio/captureNode'
-import { acquireMicrophoneSource, acquireBridgeSource, type AudioSourceKind, type AudioSourceHandle } from '$decoder-lib/audio/audioSource'
+import { acquireMicrophoneSource, acquireBridgeSourceWithRetry, type AudioSourceKind, type AudioSourceHandle } from '$decoder-lib/audio/audioSource'
 import type { AudioBridge } from '$decoder-lib/cat/useAudioBridge'
 import type { IQBridge } from '$decoder-lib/cat/useIQBridge'
 
@@ -48,8 +48,13 @@ function createGlobalAudio() {
 
   let source: AudioSourceHandle | null = null
   let recTap: CaptureNode | null = null
+  // Bumped by stop() — see ft/processor.ts's identical field for why
+  // (aborts a start() call mid-retry for a forced bridge source once it's
+  // been superseded).
+  let startGeneration = 0
 
   function stop() {
+    startGeneration++ // aborts any in-flight bridge-retry wait — see its own comment
     if (recTap) {
       recTap.disconnect()
       recTap = null
@@ -70,13 +75,17 @@ function createGlobalAudio() {
   }
 
   async function start(): Promise<AnalyserNode | null> {
+    if (source) stop()
+    const myGeneration = ++startGeneration
     try {
-      if (source) stop()
-
       let handle: AudioSourceHandle
       if (sourceKind === 'bridge') {
-        const bridgeSource = bridge ? acquireBridgeSource(bridge) : null
-        if (!bridgeSource) throw new Error('Connect to the bridge (Listen to Radio) before selecting it as the audio source')
+        if (!bridge) throw new Error('No bridge is configured')
+        // Retries instead of failing immediately — see
+        // acquireBridgeSourceWithRetry()'s own comment in audioSource.ts.
+        setState((prev) => ({ ...prev, isRecording: true, error: null }))
+        const bridgeSource = await acquireBridgeSourceWithRetry(bridge, () => startGeneration !== myGeneration)
+        if (!bridgeSource) return null // superseded/stopped while waiting
         handle = bridgeSource
       } else {
         handle = await acquireMicrophoneSource()

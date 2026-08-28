@@ -26,4 +26,6 @@ export interface DecoderProps {
    *  not yet wired to accept them. */
   audioBridge?: import('./cat/useAudioBridge').AudioBridge
   iqBridge?: import('./cat/useIQBridge').IQBridge
+  /** Force which source decoders read from — see resolveAudioSource()'s own comment in audio/audioSource.ts. Undefined/'auto' preserves the precedence above. */
+  audioSourceOverride?: import('./audio/audioSource').AudioSourceOverride
 }
