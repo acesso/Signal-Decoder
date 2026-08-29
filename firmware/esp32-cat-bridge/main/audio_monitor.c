@@ -986,6 +986,142 @@ static void tx_play_task(void *arg) {
     vTaskDelete(NULL);
 }
 
+// ── Continuous test tone ─────────────────────────────────────────────────
+// See audio_monitor.h's audio_monitor_tone_start() comment block for why
+// this generates in-firmware instead of looping an uploaded buffer.
+
+// Tone parameters are atomics read fresh by the generator task once per
+// chunk, so POST /tone can retune a RUNNING tone without stopping it —
+// the phase accumulator below is deliberately NOT reset when they change,
+// which is what makes a retune glide instead of click.
+static _Atomic uint32_t s_tone_hz        = 700;   // the preamp-tuning default
+static _Atomic int      s_tone_amp_milli = 250;   // 0-1000; see audio_monitor_tone_start()
+static _Atomic bool     s_tone_running   = false;
+static _Atomic bool     s_tone_stop_requested = false;
+// Same start/stop race guard as s_tx_play_task_alive_slot — two concurrent
+// POST /tone requests on the shared httpd worker must not both spawn a
+// generator task.
+static _Atomic bool     s_tone_task_alive = false;
+
+static void tone_task(void *arg) {
+    (void)arg;
+    // Phase as a normalized [0,1) accumulator rather than radians: keeps
+    // precision bounded no matter how long the tone runs (a radian
+    // accumulator grows without limit and loses mantissa bits over a long
+    // tuning session, drifting the pitch), since we wrap it every sample.
+    double phase = 0.0;
+    static int16_t chunk[TX_PLAY_CHUNK_SAMPLES];
+
+    atomic_store(&s_tone_running, true);
+    ESP_LOGI(TAG, "test tone started (%u Hz)", (unsigned)atomic_load(&s_tone_hz));
+
+    while (!atomic_load(&s_tone_stop_requested)) {
+        // Re-read every chunk so a retune takes effect within one
+        // READ_WINDOW_MS without interrupting the tone.
+        uint32_t hz  = atomic_load(&s_tone_hz);
+        double   amp = (double)atomic_load(&s_tone_amp_milli) / 1000.0;
+        double   step = (double)hz / (double)MIC_SEND_SAMPLE_RATE_HZ;
+
+        for (size_t i = 0; i < TX_PLAY_CHUNK_SAMPLES; i++) {
+            // 32767.0 not 32768.0 — the positive peak of a full-scale sine
+            // must stay inside int16 range; scaling by 32768 would wrap the
+            // single sample that lands exactly on the peak into a large
+            // negative value, an audible tick once per cycle.
+            chunk[i] = (int16_t)lrint(amp * 32767.0 * sin(2.0 * M_PI * phase));
+            phase += step;
+            if (phase >= 1.0) phase -= 1.0;
+        }
+
+        // Blocks for this chunk's real duration inside esp_codec_dev_write()
+        // — the same DMA pacing tx_play_task() relies on, and the reason
+        // this loop needs no vTaskDelay of its own (see that task's long
+        // comment about a real dropout bug caused by adding one).
+        audio_monitor_report_out_samples(chunk, TX_PLAY_CHUNK_SAMPLES);
+    }
+
+    // Identical silence flush to tx_play_task()'s — I2S TX DMA re-transmits
+    // its last-filled descriptor forever on underrun, and a tone's final
+    // chunk is by definition a loud sustained waveform, so without this the
+    // tone would keep ringing after "stop". Sized from the live ring
+    // capacity for the same reason documented there (a fixed chunk count
+    // under-covered the ring at 48kHz and left a residual tick looping).
+    upsample_reset_history();
+    uint32_t ring_capacity_samples = s_dma_desc_num * s_dma_frame_num;
+    uint32_t codec_rate_hz = bridge_settings_get_sample_rate_hz();
+    uint32_t chunk_out_samples = (uint32_t)(((uint64_t)TX_PLAY_CHUNK_SAMPLES * codec_rate_hz) / MIC_SEND_SAMPLE_RATE_HZ);
+    int silence_flush_chunks = chunk_out_samples > 0
+        ? (int)((ring_capacity_samples + chunk_out_samples - 1) / chunk_out_samples) + 1
+        : 4;
+    memset(chunk, 0, sizeof(chunk));
+    for (int i = 0; i < silence_flush_chunks; i++) {
+        audio_monitor_report_out_samples(chunk, TX_PLAY_CHUNK_SAMPLES);
+    }
+
+    atomic_store(&s_tone_running, false);
+    atomic_store(&s_tone_stop_requested, false);
+    ESP_LOGI(TAG, "test tone stopped");
+    atomic_store(&s_tone_task_alive, false);
+    vTaskDelete(NULL);
+}
+
+bool audio_monitor_tone_start(uint32_t hz, float amplitude) {
+    if (hz < TONE_HZ_MIN) hz = TONE_HZ_MIN;
+    if (hz > TONE_HZ_MAX) hz = TONE_HZ_MAX;
+    if (!(amplitude >= 0.0f)) amplitude = 0.0f; // also catches NaN
+    if (amplitude > 1.0f) amplitude = 1.0f;
+
+    atomic_store(&s_tone_hz, hz);
+    atomic_store(&s_tone_amp_milli, (int)lrintf(amplitude * 1000.0f));
+
+    // Already running: the stores above ARE the retune — the generator task
+    // picks them up on its next chunk, phase intact.
+    if (atomic_load(&s_tone_running) || atomic_load(&s_tone_task_alive)) return true;
+
+    // One audio output path shared with slot playback (see
+    // audio_monitor_tx_play()'s identical guard).
+    if (atomic_load(&s_tx_playing) || atomic_load(&s_tx_play_task_alive_slot) != -1) return false;
+
+    atomic_store(&s_tone_task_alive, true);
+    atomic_store(&s_tone_stop_requested, false);
+    BaseType_t created = xTaskCreatePinnedToCore(tone_task, "tone", 4096, NULL,
+                                                 TX_PLAY_TASK_PRIO, NULL, TX_PLAY_TASK_CORE);
+    if (created != pdPASS) {
+        ESP_LOGE(TAG, "failed to create tone task");
+        atomic_store(&s_tone_task_alive, false);
+        return false;
+    }
+    // Brief wait for the task to actually flip s_tone_running before
+    // returning: POST /tone reports status straight back to the caller, and
+    // without this the start response raced the new task and reported
+    // "running": false for a tone that was in fact about to start — which
+    // read to the UI as "Start didn't work" and left the button out of sync
+    // until the next poll.
+    for (int i = 0; i < 20 && !atomic_load(&s_tone_running); i++) {
+        vTaskDelay(pdMS_TO_TICKS(5));
+    }
+    return true;
+}
+
+bool audio_monitor_tone_stop(void) {
+    if (!atomic_load(&s_tone_running) && !atomic_load(&s_tone_task_alive)) return true;
+    atomic_store(&s_tone_stop_requested, true);
+    // Bounded wait, same shape as audio_monitor_tx_stop(): the generator
+    // checks the flag once per chunk, and the silence flush that follows
+    // costs a few more chunks, so allow generously more than that before
+    // giving up and reporting the state as-is.
+    for (int i = 0; i < 100 && atomic_load(&s_tone_task_alive); i++) {
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+    return !atomic_load(&s_tone_running);
+}
+
+void audio_monitor_tone_get_status(audio_monitor_tone_status_t *out) {
+    if (!out) return;
+    out->running   = atomic_load(&s_tone_running);
+    out->hz        = atomic_load(&s_tone_hz);
+    out->amplitude = (float)atomic_load(&s_tone_amp_milli) / 1000.0f;
+}
+
 bool audio_monitor_tx_play(int slot) {
     if (!audio_monitor_tx_buffer_ready(slot)) return false;
     // ANY slot already playing or starting (not just this one) blocks a new
@@ -993,6 +1129,9 @@ bool audio_monitor_tx_play(int slot) {
     // playing" is shared global state, same reasoning as s_tx_playing_slot's
     // own comment above.
     if (atomic_load(&s_tx_playing) || atomic_load(&s_tx_play_task_alive_slot) != -1) return false;
+    // The test tone feeds the same single output path — see
+    // audio_monitor_tone_start()'s mirror-image guard.
+    if (atomic_load(&s_tone_running) || atomic_load(&s_tone_task_alive)) return false;
 
     atomic_store(&s_tx_play_task_alive_slot, slot);
     s_tx_play_task_arg_slot = slot;

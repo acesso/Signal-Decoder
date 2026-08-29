@@ -398,6 +398,60 @@ void audio_monitor_tx_get_status(audio_monitor_tx_status_t *out);
 // stop takes effect, since s_tx_playing_slot resets to -1 once stopped.
 bool audio_monitor_tx_stop(int *stopped_slot_out);
 
+// ── Continuous test tone (POST /tone) ────────────────────────────────────
+// A steady sine written to the same mic-send path the TX slots use, for
+// tuning the radio's preamps against a known, unchanging reference: the
+// slot-playback pool above can only ever play a FINITE pre-uploaded buffer
+// (that's the whole point of it — a fully-known FT8/FT4 message), which is
+// useless for "leave a tone running while I turn a trimmer and watch the
+// meter". Generated in-firmware rather than looped from an uploaded buffer
+// so the frequency can change instantly with no re-upload, and so phase
+// stays continuous across every chunk boundary forever (a buffer loop
+// would splatter the spectrum with a discontinuity at each wrap unless its
+// length happened to be an exact whole number of cycles).
+//
+// Shares the single-audio-output-path interlock with slot playback: the
+// tone refuses to start while any slot is playing, and tx_play() likewise
+// refuses while the tone is running. Both feed
+// audio_monitor_report_out_samples(), so the tone appears in the
+// /audio-mic-sniff waterfall automatically with no extra plumbing.
+//
+// Deliberately NOT persisted to NVS: a test tone that survived a reboot
+// would come back driving the radio's mic input with nobody watching.
+// Every boot starts with the tone off.
+
+// Lowest/highest tone the setter accepts. Upper bound is well under the
+// 16kHz wire rate's 8kHz Nyquist (see MIC_SEND_SAMPLE_RATE_HZ) — this is a
+// tool for audio-passband alignment, not a full-bandwidth sweep generator.
+#define TONE_HZ_MIN 100
+#define TONE_HZ_MAX 4000
+
+// Starts the continuous tone, or retunes it if already running (in which
+// case phase is preserved — retuning mid-run never clicks). Returns false
+// only if a TX slot is currently playing, since this board has exactly one
+// audio output path. hz is clamped to [TONE_HZ_MIN, TONE_HZ_MAX] and
+// amplitude to [0.0, 1.0].
+bool audio_monitor_tone_start(uint32_t hz, float amplitude);
+
+// Stops the tone at the next chunk boundary and blocks (briefly) until the
+// generator task has genuinely exited, flushing real silence through the
+// DMA ring on its way out — same reasoning as tx_play_task()'s own silence
+// flush (I2S TX DMA re-transmits its last descriptor forever on underrun,
+// so a tone that just stopped writing would ring on indefinitely).
+// Returns true once stopped, including the trivial "wasn't running" case.
+bool audio_monitor_tone_stop(void);
+
+// Current tone state, for GET /tone and the control page's own readout.
+// running == false leaves hz/amplitude at their last-set values so the UI
+// can restore the sliders where the operator left them.
+typedef struct {
+    bool     running;
+    uint32_t hz;
+    float    amplitude;
+} audio_monitor_tone_status_t;
+
+void audio_monitor_tone_get_status(audio_monitor_tone_status_t *out);
+
 // RX-loop timing diagnostics — added to investigate a real report of
 // periodic "cutting/paper-crackling" noise on the digitized I/Q signal,
 // confirmed present on THIS board's capture path but absent when the same

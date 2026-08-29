@@ -267,6 +267,27 @@
             <span>Clips (10s)</span><span id="quality-out-clips">0</span>
             <span>Scope gain</span><span id="quality-out-gain">&mdash;</span>
           </div>
+          <div class="tone-panel">
+            <div class="tone-head">
+              <span class="audio-input-label">Test tone</span>
+              <span id="tone-readout" class="quality-readout">off</span>
+              <button id="tone-toggle" type="button" class="tone-toggle">Start</button>
+            </div>
+            <label class="quality-contrast-label">
+              Freq
+              <input id="tone-freq" type="range" min="100" max="4000" step="10" value="700">
+              <span id="tone-freq-val">700 Hz</span>
+            </label>
+            <label class="quality-contrast-label">
+              Level
+              <input id="tone-amp" type="range" min="0" max="100" step="1" value="25">
+              <span id="tone-amp-val">25%</span>
+            </label>
+            <p class="hint tone-hint">Continuous sine on the mic-send path, for tuning the radio's
+            preamps against a fixed reference &mdash; it shows up in the waterfall above. Retunes
+            without clicking while running. Always starts off after a reboot, and won't start while
+            a TX slot is playing.</p>
+          </div>
         </div>
       </div>
       <p class="hint">"Speaker" streams raw audio over a second WebSocket
