@@ -483,3 +483,26 @@ dl#pa-list {
   color: color-mix(in srgb, var(--fg) 40%, transparent);
   margin-top: 0.05rem;
 }
+
+/* Test tone controls, inside the Mic -> Radio (sniffed) channel — the tone
+   drives that exact path, so it belongs with the display that shows it. */
+.tone-panel {
+  margin-top: 0.6rem;
+  padding-top: 0.6rem;
+  border-top: 1px solid color-mix(in srgb, var(--fg) 15%, transparent);
+}
+.tone-head {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-bottom: 0.35rem;
+}
+.tone-toggle {
+  margin-left: auto;
+  padding: 0.25rem 0.7rem;
+  font-size: 0.75rem;
+}
+/* Running state reads as "live output", matching the danger colour used
+   elsewhere for anything actively driving the radio. */
+.tone-toggle.tone-on { background: var(--danger); }
+.tone-hint { margin-top: 0.4rem; }

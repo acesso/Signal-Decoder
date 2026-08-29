@@ -1382,6 +1382,68 @@ static esp_err_t tx_audio_handler(httpd_req_t *req) {
 }
 
 // POST /tx-play?slot=N — no body. Starts the dedicated playback task (see
+// POST /tone — body: {"on":true,"hz":700,"amp":0.25}. Starts, retunes, or
+// stops the continuous test tone (see audio_monitor.h's
+// audio_monitor_tone_start() block for what it's for and why it isn't
+// persisted). "hz" and "amp" are both optional: omitting either keeps the
+// current value, so a frequency slider can POST {"hz":N} alone while the
+// tone runs and get a click-free retune. Sending {"on":false} stops it and
+// ignores any other field.
+//
+// 400 when a TX slot is playing — ESP-IDF's httpd_err_code_t has no 409, and
+// this matches how POST /tx-clear already reports the same single-audio-path
+// conflict, so the message text carries the actionable part.
+static esp_err_t tone_handler(httpd_req_t *req) {
+    char body[96];
+    if (read_request_body(req, body, sizeof(body)) != ESP_OK) return ESP_FAIL;
+
+    audio_monitor_tone_status_t cur;
+    audio_monitor_tone_get_status(&cur);
+
+    bool on = true;
+    extract_json_bool(body, "on", &on); // absent == "on", so {"hz":N} alone retunes
+
+    bool ok = true;
+    if (on) {
+        int   hz  = (int)cur.hz;
+        float amp = cur.amplitude;
+        extract_json_int(body, "hz", &hz);
+        extract_json_float(body, "amp", &amp);
+        ok = audio_monitor_tone_start((uint32_t)(hz < 0 ? 0 : hz), amp);
+        if (!ok) {
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "a TX slot is playing — call POST /tx-stop first");
+            return ESP_FAIL;
+        }
+    } else {
+        ok = audio_monitor_tone_stop();
+    }
+
+    audio_monitor_tone_get_status(&cur);
+    httpd_resp_set_type(req, "application/json");
+    set_cors(req);
+    char resp_body[96];
+    int n = snprintf(resp_body, sizeof(resp_body),
+                     "{\"running\":%s,\"hz\":%u,\"amp\":%.3f}",
+                     cur.running ? "true" : "false", (unsigned)cur.hz, cur.amplitude);
+    return httpd_resp_send(req, resp_body, n);
+}
+
+// GET /tone — current tone state, so a freshly loaded control page (or the
+// web app) can restore its sliders to what the device is actually doing
+// rather than assuming its own defaults.
+static esp_err_t tone_status_handler(httpd_req_t *req) {
+    audio_monitor_tone_status_t cur;
+    audio_monitor_tone_get_status(&cur);
+    httpd_resp_set_type(req, "application/json");
+    set_cors(req);
+    char resp_body[96];
+    int n = snprintf(resp_body, sizeof(resp_body),
+                     "{\"running\":%s,\"hz\":%u,\"amp\":%.3f,\"hz_min\":%d,\"hz_max\":%d}",
+                     cur.running ? "true" : "false", (unsigned)cur.hz, cur.amplitude,
+                     TONE_HZ_MIN, TONE_HZ_MAX);
+    return httpd_resp_send(req, resp_body, n);
+}
+
 // audio_monitor_tx_play()'s own comment for why this MUST be a genuinely
 // separate FreeRTOS task, not more work stuffed into this httpd worker
 // context) reading from slot. Rejects with 400 if slot has no buffer
@@ -1592,6 +1654,8 @@ void http_control_start(void) {
     httpd_uri_t tx_status_uri    = { .uri = "/tx-status",  .method = HTTP_GET,  .handler = tx_status_handler };
     httpd_uri_t tx_stop_uri      = { .uri = "/tx-stop",    .method = HTTP_POST, .handler = tx_stop_handler };
     httpd_uri_t tx_clear_uri     = { .uri = "/tx-clear",   .method = HTTP_POST, .handler = tx_clear_handler };
+    httpd_uri_t tone_uri         = { .uri = "/tone",       .method = HTTP_POST, .handler = tone_handler };
+    httpd_uri_t tone_status_uri  = { .uri = "/tone",       .method = HTTP_GET,  .handler = tone_status_handler };
     httpd_uri_t options_uri      = { .uri = "/*",           .method = HTTP_OPTIONS, .handler = options_handler };
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &status_uri));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &info_uri));
@@ -1623,6 +1687,8 @@ void http_control_start(void) {
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &tx_status_uri));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &tx_stop_uri));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &tx_clear_uri));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &tone_uri));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &tone_status_uri));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &options_uri));
 
     ESP_LOGI(TAG, "control endpoints ready: GET /status, GET /info, GET /wifi-scan, POST /reset, "

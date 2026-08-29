@@ -827,6 +827,90 @@ const TX_CACHE_REFRESH_MS = 5000;
 refreshTxCache();
 setInterval(refreshTxCache, TX_CACHE_REFRESH_MS);
 
+// ── Continuous test tone (POST/GET /tone) ────────────────────────────────
+// Drives the same mic-send path the sniffer above taps, so the tone shows
+// up in that waterfall with no extra wiring — see audio_monitor.h's
+// audio_monitor_tone_start() block for the firmware side.
+const toneToggle = document.getElementById('tone-toggle');
+const toneReadout = document.getElementById('tone-readout');
+const toneFreq = document.getElementById('tone-freq');
+const toneFreqVal = document.getElementById('tone-freq-val');
+const toneAmp = document.getElementById('tone-amp');
+const toneAmpVal = document.getElementById('tone-amp-val');
+let toneRunning = false;
+let toneDebounce = null;
+
+function renderToneState(state) {
+  toneRunning = !!state.running;
+  toneReadout.textContent = toneRunning ? `${state.hz} Hz` : 'off';
+  toneToggle.textContent = toneRunning ? 'Stop' : 'Start';
+  toneToggle.classList.toggle('tone-on', toneRunning);
+  // Same focus guard as updateMicGainSlider(): never move a thumb the
+  // operator is currently dragging.
+  if (document.activeElement !== toneFreq && typeof state.hz === 'number') {
+    toneFreq.value = String(state.hz);
+    toneFreqVal.textContent = `${state.hz} Hz`;
+  }
+  if (document.activeElement !== toneAmp && typeof state.amp === 'number') {
+    const pct = Math.round(state.amp * 100);
+    toneAmp.value = String(pct);
+    toneAmpVal.textContent = `${pct}%`;
+  }
+}
+
+async function postTone(payload) {
+  try {
+    const res = await fetch('/tone', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    if (!res.ok) {
+      // The one expected failure is the single-audio-path conflict — the
+      // firmware's own message text says which, so surface it verbatim.
+      showMsg(await res.text() || `Tone request failed (HTTP ${res.status})`, 'error');
+      return;
+    }
+    renderToneState(await res.json());
+  } catch (err) {
+    showMsg(`Tone request failed: ${err.message}`, 'error');
+  }
+}
+
+// Retunes live while running (the firmware keeps phase, so this never
+// clicks); while stopped it only moves the slider, so changing frequency
+// before pressing Start doesn't start the tone unexpectedly.
+function onToneSliderInput() {
+  const hz = Number(toneFreq.value);
+  const pct = Number(toneAmp.value);
+  toneFreqVal.textContent = `${hz} Hz`;
+  toneAmpVal.textContent = `${pct}%`;
+  if (!toneRunning) return;
+  clearTimeout(toneDebounce);
+  toneDebounce = setTimeout(() => void postTone({ hz, amp: pct / 100 }), 150);
+}
+
+toneFreq.addEventListener('input', onToneSliderInput);
+toneAmp.addEventListener('input', onToneSliderInput);
+
+toneToggle.addEventListener('click', () => {
+  if (toneRunning) {
+    void postTone({ on: false });
+  } else {
+    void postTone({ on: true, hz: Number(toneFreq.value), amp: Number(toneAmp.value) / 100 });
+  }
+});
+
+// One-shot sync so a reloaded page shows what the device is actually doing
+// rather than the HTML defaults. Silent on failure, same as the other
+// best-effort panel refreshes on this page.
+(async () => {
+  try {
+    const res = await fetch('/tone');
+    if (res.ok) renderToneState(await res.json());
+  } catch (err) { /* silent */ }
+})();
+
 async function scanNetworks() {
   scanBtn.disabled = true;
   scanBtn.classList.add('spinning');
