@@ -253,8 +253,15 @@ Global variables use 1499 bytes (73%) of dynamic memory, leaving 549 bytes for l
 
 // G8RDI removed for memory due to CAT  
 //#define TX_DELAY       1   // Enables a delay in the actual transmission to allow relay-switching to be completed before the power is applied (see also NTX, PTX definitions below for GPIO that can switch relay/PA)
-//#define NTX            11  // Enables LOW  on TX, used as PTT out to enable external PAs (a value of 11 means PB3 is used)
-#define PTX            11  // Enables HIGH on TX, used as PTT out to enable external PAs (a value of 11 means PB3 is used)
+// EXPERIMENT 2026-08-31: inverted from PTX to NTX. Measured at the interface
+// board, Ring 2 idles HIGH on RX and the 2N2222 low-side switch therefore
+// keys the PA on RECEIVE and releases it on TRANSMIT — the opposite of what
+// the board needs. PB3 is NOT directly wired to the CAT plug's Ring 2 (there
+// is an intermediate stage in the radio), so this may be inverted a second
+// time downstream and come back unchanged; that is precisely what this
+// experiment is measuring. Revert to PTX if Ring 2's behaviour does not flip.
+#define NTX            11  // Enables LOW  on TX, used as PTT out to enable external PAs (a value of 11 means PB3 is used)
+//#define PTX            11  // Enables HIGH on TX, used as PTT out to enable external PAs (a value of 11 means PB3 is used)
 //#define CLOCK          1   // Enables clock
 // G8RDI removed to save memory #define:
 //#define F_XTAL  20000000   // Enable this for uSDXDuO, 20MHz SI5351 crystal
