@@ -140,13 +140,22 @@
 // uSDX's command line or the interface board's own level-shifting are
 // behaving correctly. That independence is the entire point of a watchdog.
 //
-// PA_EMERGENCY_PIN is a permissive line in series with the uSDX's PA-send
-// path on the interface board — HIGH (idle) lets the radio's own signal
-// control the PA normally; pulled LOW only once PA_MAX_ON_SECONDS of
-// continuous PA_SENSE_PIN=HIGH has elapsed, forcing the PA off regardless
-// of what the radio is doing. Latches LOW until manually cleared (see
+// Both lines are switched by an NPN (2N2222) low-side transistor on the
+// interface board behind forward-biased isolation diodes, so both have
+// non-obvious polarity — pa_watchdog.c's polarity block is the single
+// source of truth. PA_SENSE_PIN is ACTIVE LOW: the collector floats and the
+// level shifter's pull-up holds it HIGH while the PA is idle, and grounds
+// it LOW once the PA is energized.
+//
+// PA_EMERGENCY_PIN is a clamp line driving that transistor's base — LOW
+// (idle) leaves the isolation diode unbiased so the radio's own signal
+// controls the PA normally; driven HIGH only once PA_MAX_ON_SECONDS of
+// continuous PA_SENSE_PIN=energized has elapsed, biasing the base on,
+// grounding the PA keying loop and forcing the PA off regardless of what
+// the radio is doing. Latches HIGH until manually cleared (see
 // POST /pa-emergency-clear) — deliberately does not auto-recover once
-// PA_SENSE_PIN drops, so a real hardware fault can't flap silently.
+// PA_SENSE_PIN returns to idle, so a real hardware fault can't flap
+// silently. LOW-when-idle also suits GPIO5 being an ESP32 strapping pin.
 //
 // Both pins are now on the main header, not the SD-card pads — GPIO19 (was
 // LED_AUDIO_OUT_PIN, freed above) for PA_SENSE_PIN, GPIO5 (previously the
@@ -160,6 +169,17 @@
 // read/drive as expected before trusting the watchdog on real hardware.
 #define PA_SENSE_PIN            GPIO_NUM_19
 #define PA_EMERGENCY_PIN        GPIO_NUM_5
+// Master enable for actually ASSERTING the emergency clamp. Set to 0 while
+// the interface board's clamp diode sits on the transistor's base junction:
+// in that topology asserting the clamp turns the switching transistor ON,
+// grounding the PA key line, which KEYS the amplifier instead of shutting it
+// down (confirmed on hardware 2026-08-31 — see pa_watchdog.h's KNOWN
+// LIMITATION 2). Sensing, state publishing, logging and the manual
+// clear endpoint all remain fully functional; only the automatic assert is
+// suppressed. Set back to 1 once the hardware has a genuine shutdown path
+// (base-steal NPN across base-emitter, or a series interrupt in the key line).
+#define PA_WATCHDOG_TRIP_ENABLED 0
+
 #define PA_MAX_ON_SECONDS       300     // placeholder — tune to the longest
                                         // realistic legitimate transmission
                                         // for this station, with real margin

@@ -31,8 +31,8 @@ circuitry (already built by the user, just needs a GPIO) is worth it.
 
 | Name         | Direction | GPIO (current) | Idle state | Meaning |
 |--------------|-----------|------------------|------------|---------|
-| PA Sense     | input     | GPIO19           | n/a        | HIGH = PA hardware confirmed energized (already level-shifted to safe logic by the user's board — plain digital read, no ADC) |
-| PA Emergency | output    | GPIO5            | HIGH       | Permissive line, in series with the uSDX's own PA-send path — HIGH lets the radio's own signal control the PA normally; LOW forcibly cuts it regardless of what the radio is doing |
+| PA Sense     | input     | GPIO19           | n/a        | **ACTIVE LOW** — LOW = PA hardware confirmed energized (2N2222 collector grounds the line); HIGH = idle (collector floats, level-shifter pull-up holds it up). Already level-shifted to safe logic by the user's board — plain digital read, no ADC |
+| PA Emergency | output    | GPIO5            | LOW        | **ACTIVE HIGH** clamp line driving the 2N2222 base — LOW leaves the isolation diode unbiased so the radio's own signal controls the PA normally; HIGH biases the base on, grounding the PA keying loop and forcibly cutting it regardless of what the radio is doing. LOW-when-idle also suits GPIO5 being an ESP32 strapping pin |
 
 ### Pin choice — revision history
 
@@ -82,10 +82,10 @@ firmware, and the exact check that caught GPIO2's false-HIGH pull-up in v1.
 ## Behavior
 
 **Trigger**: fixed maximum continuous PA-on duration. The moment PA Sense
-reads HIGH, start a timer. If PA Sense is *still* HIGH after
+reads LOW (energized), start a timer. If PA Sense is *still* energized after
 `PA_MAX_ON_SECONDS` (proposed default: 300s / 5 minutes — comfortably past
 any real SSB/CW transmission, far short of "left keyed for hours"), pull PA
-Emergency LOW. The timer resets the instant PA Sense reads LOW again — a
+Emergency HIGH (clamped). The timer resets the instant PA Sense returns to idle — a
 normal TX-then-RX cycle never comes close to tripping it.
 
 Deliberately *not* cross-checked against the CAT line's TX0;/RX0; state
@@ -95,8 +95,27 @@ as CAT parsing, and it wouldn't catch a hang that happens to occur while
 the radio still legitimately believes it's transmitting. PA Sense is
 ground truth about the hardware; the timeout should depend on nothing else.
 
-**Recovery**: latched, not auto-clearing. Once PA Emergency goes LOW, it
-**stays** LOW — even after PA Sense drops back to LOW on its own — until an
+**Polarity (2026-08-31 revision):** both lines were originally specified
+active-HIGH-sense / active-LOW-clamp. The real interface board switches them
+with an NPN (2N2222) low-side transistor behind forward-biased isolation
+diodes, which inverts BOTH relative to that original assumption — sense is
+now active LOW, clamp is now active HIGH. `pa_watchdog.c` holds the only
+level<->meaning conversion (`PA_SENSE_LEVEL_ENERGIZED` /
+`PA_EMERGENCY_LEVEL_CLAMPED` and the `pa_level_is_energized()` helper);
+nothing else in the firmware should compare these pins to a raw 0/1.
+
+**Known limitation — the watchdog cannot detect loss of its own sense line.**
+The internal pull is UP (matching the board's level-shifter pull-up), so an
+unplugged or severed sense wire reads HIGH = "PA idle" — indistinguishable
+from a genuinely idle PA on this pin alone, and the watchdog would simply
+never trip. The alternative (pull-down) would make a severed wire read as
+energized and trip after the full 300s, but that trades silent blindness for
+a guaranteed-but-late trip that misreports its cause, and it fights the
+board's own pull-up. Closing this properly needs a second signal — the
+bridge currently tracks no PTT/TX state of its own to cross-check against.
+
+**Recovery**: latched, not auto-clearing. Once PA Emergency goes HIGH, it
+**stays** HIGH — even after PA Sense returns to idle on its own — until an
 explicit operator action clears it (a control-page/web-app button, or a
 bridge reboot). Auto-recovery risks a flapping fault (PA re-enables,
 immediately re-trips, disables again) with nobody ever notified that a real
