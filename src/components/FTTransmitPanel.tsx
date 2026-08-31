@@ -607,6 +607,16 @@ export default function FTTransmitPanel(props: FTTransmitPanelProps): JSX.Elemen
     if (myGrid()) props.onMyGridChange?.(myGrid())
   })
 
+  // Ask the device what it's actually holding in its TX slots, so a
+  // freshly loaded page shows real staged content instead of four empty
+  // rows — state.bridgeSlots is otherwise only ever written by THIS
+  // session's own uploads. Keyed on the bridge URL rather than done once
+  // on mount, since that URL usually isn't known yet at mount time (the
+  // CAT panel resolves it after connecting).
+  createEffect(() => {
+    if (props.bridgeWsUrl) void tx.syncBridgeSlotsFromDevice()
+  })
+
   // ── Geolocation on mount (if no saved grid) ──────────────────────────────
   onMount(() => {
     if (loadMyGrid() || typeof navigator === 'undefined' || !navigator.geolocation) return
@@ -1462,13 +1472,13 @@ export default function FTTransmitPanel(props: FTTransmitPanelProps): JSX.Elemen
         {/* ── Right: queue + sent log ── */}
         <div class="space-y-3">
           {/* Bridge TX slot pool — only meaningful once the bridge is
-              actually the TX output; see useFTTransmit.ts's
-              BridgeSlotInfo/uploadIfBridgeSink() comments for why this is
-              browser-tracked (the firmware itself has no concept of
-              message text, only raw PCM + a hash). Shows what's actually
-              staged in each of the ESP32's 4 PSRAM slots so an operator
-              can see (and clear) what would play if that slot were
-              triggered, without having to trust it's still accurate. */}
+              actually the TX output. Shows what's actually staged in each
+              of the ESP32's 4 PSRAM slots so an operator can see (and
+              clear) what would play if that slot were triggered. Populated
+              both from this session's own uploads and, on mount, from the
+              device itself (syncBridgeSlotsFromDevice()) — the firmware
+              stores each slot's message/label/Hz alongside the audio, so a
+              freshly loaded page can describe slots it never staged. */}
           <Show when={audioSinkKind() === 'bridge'}>
             <div class="rounded border border-[#21262d] bg-[#0d1117] p-2">
               <div class="text-[#8b949e] text-[10px] font-semibold uppercase tracking-wide mb-1.5">
@@ -1486,7 +1496,9 @@ export default function FTTransmitPanel(props: FTTransmitPanelProps): JSX.Elemen
                           {slot.uploaded ? slot.message : '— empty —'}
                         </div>
                         <Show when={slot.uploaded}>
-                          <div class="text-[#484f58] text-[9px] truncate">{slot.label}</div>
+                          <div class="text-[#484f58] text-[9px] truncate">
+                            {[slot.audioHz > 0 ? `${slot.audioHz} Hz` : null, slot.label].filter(Boolean).join(' · ')}
+                          </div>
                         </Show>
                       </div>
                       <Show when={slot.uploaded}>

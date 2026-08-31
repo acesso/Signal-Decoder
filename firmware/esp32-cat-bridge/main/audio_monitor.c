@@ -710,6 +710,13 @@ typedef struct {
     size_t cap_bytes;   // heap_caps_realloc()'d capacity — may exceed len_bytes after a later, smaller upload
     size_t len_bytes;   // actual uploaded length; 0 means "no buffer uploaded yet"
     uint32_t hash;      // esp_rom_crc32_le() over the uploaded bytes — see audio_monitor_tx_slot_hash()
+    // Descriptive metadata from the uploader, stored verbatim and echoed by
+    // GET /tx-status — never interpreted here (the audio Hz is already baked
+    // into buf's own samples). See audio_monitor_tx_slot_status_t's comment
+    // in audio_monitor.h for why the hash alone isn't enough.
+    uint32_t audio_hz;  // 0 when the uploader supplied none
+    char message[TX_SLOT_MESSAGE_MAX];
+    char label[TX_SLOT_LABEL_MAX];
 } tx_slot_t;
 static tx_slot_t s_tx_slots[TX_SLOT_COUNT];
 
@@ -742,7 +749,19 @@ static bool tx_slot_valid(int slot) {
     return slot >= 0 && slot < TX_SLOT_COUNT;
 }
 
-bool audio_monitor_tx_buffer_upload(int slot, const int16_t *data, size_t byte_count) {
+// Copies at most cap-1 bytes and always NUL-terminates — strncpy() alone
+// doesn't terminate on truncation, which is exactly the case these fixed
+// buffers are sized to expect (see TX_SLOT_MESSAGE_MAX's comment: over-long
+// descriptive text is truncated, never rejected). NULL src clears the field.
+static void tx_slot_copy_meta(char *dst, size_t cap, const char *src) {
+    if (!src) { dst[0] = '\0'; return; }
+    size_t n = strnlen(src, cap - 1);
+    memcpy(dst, src, n);
+    dst[n] = '\0';
+}
+
+bool audio_monitor_tx_buffer_upload(int slot, const int16_t *data, size_t byte_count,
+                                    const char *message, const char *label, uint32_t audio_hz) {
     if (!tx_slot_valid(slot)) return false;
     // Only refuse if THIS slot is the one currently playing — the playback
     // task only ever reads s_tx_slots[s_tx_playing_slot], so any other slot
@@ -769,9 +788,12 @@ bool audio_monitor_tx_buffer_upload(int slot, const int16_t *data, size_t byte_c
     // standing auto-CQ waveform re-derived every cycle) whose content hash
     // hasn't actually changed since the last upload.
     s->hash = esp_rom_crc32_le(0, (const uint8_t *)data, byte_count);
-    ESP_LOGI(TAG, "TX playback buffer uploaded (slot %d): %u bytes (%u ms @ %dHz), hash %08x",
+    s->audio_hz = audio_hz;
+    tx_slot_copy_meta(s->message, sizeof(s->message), message);
+    tx_slot_copy_meta(s->label, sizeof(s->label), label);
+    ESP_LOGI(TAG, "TX playback buffer uploaded (slot %d): %u bytes (%u ms @ %dHz), hash %08x, audio %uHz \"%s\"",
               slot, (unsigned)byte_count, (unsigned)audio_monitor_tx_buffer_duration_ms(slot),
-              MIC_SEND_SAMPLE_RATE_HZ, (unsigned)s->hash);
+              MIC_SEND_SAMPLE_RATE_HZ, (unsigned)s->hash, (unsigned)s->audio_hz, s->message);
     return true;
 }
 
@@ -799,6 +821,11 @@ bool audio_monitor_tx_buffer_clear(int slot) {
     tx_slot_t *s = &s_tx_slots[slot];
     s->len_bytes = 0;
     s->hash = 0;
+    // Metadata describes the buffer that's now gone — leaving it would make
+    // GET /tx-status report a message/Hz for a slot that reads back as empty.
+    s->audio_hz = 0;
+    s->message[0] = '\0';
+    s->label[0] = '\0';
     ESP_LOGI(TAG, "TX playback buffer cleared (slot %d)", slot);
     return true;
 }
@@ -1000,6 +1027,9 @@ void audio_monitor_tx_get_status(audio_monitor_tx_status_t *out) {
         out->slots[i].byte_count = s_tx_slots[i].len_bytes;
         out->slots[i].duration_ms = audio_monitor_tx_buffer_duration_ms(i);
         out->slots[i].hash = s_tx_slots[i].hash;
+        out->slots[i].audio_hz = s_tx_slots[i].audio_hz;
+        tx_slot_copy_meta(out->slots[i].message, sizeof(out->slots[i].message), s_tx_slots[i].message);
+        tx_slot_copy_meta(out->slots[i].label, sizeof(out->slots[i].label), s_tx_slots[i].label);
     }
 }
 
