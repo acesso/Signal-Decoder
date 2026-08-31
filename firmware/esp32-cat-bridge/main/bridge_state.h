@@ -52,7 +52,7 @@ typedef struct {
     // pa_watchdog.h. pa_sense mirrors the live PA_SENSE_PIN reading (the
     // amp's own energized-state feedback, not the radio's command signal);
     // pa_emergency_tripped is true once PA_MAX_ON_SECONDS of continuous
-    // pa_sense has forced PA_EMERGENCY_PIN low — latched until
+    // pa_sense has driven PA_EMERGENCY_PIN high (clamped) — latched until
     // pa_watchdog_clear_emergency() is called (POST /pa-emergency-clear),
     // never auto-clears on its own even if pa_sense drops back to false.
     bool pa_sense;

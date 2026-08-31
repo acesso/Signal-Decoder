@@ -75,7 +75,7 @@
 //                       a latched PA safety cutoff (see pa_watchdog.h) —
 //                       no body needed, no auto-recovery exists on the
 //                       firmware side, so this is the only way to restore
-//                       PA_EMERGENCY_PIN to its permissive HIGH default
+//                       PA_EMERGENCY_PIN to its permissive LOW default
 //                       after a trip.
 // POST /audio-input -> body {"input":"lin1"|"lin2"|"mic1"|"mic2"|"diff"};
 //                       live-switches the ES8388's ADC input mux to one of
