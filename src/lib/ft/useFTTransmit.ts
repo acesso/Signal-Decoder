@@ -81,6 +81,14 @@ export interface BridgeSlotInfo {
    *  either way. False only for a slot that's never been assigned a
    *  message at all (the initial state, or right after POST /tx-clear). */
   uploaded: boolean;
+  /** TX audio frequency this slot's waveform was ENCODED at, 0 when
+   *  unknown. Descriptive only — the frequency is already baked into the
+   *  samples themselves, so this is a label, not something playback reads.
+   *  Uploaded to the device alongside the audio and read back by
+   *  refreshSlotHashCache(), which is what lets a freshly loaded page
+   *  (or a different browser entirely) describe slots it never staged
+   *  itself — see that function's own comment. */
+  audioHz: number;
 }
 
 // ── localStorage persistence ──────────────────────────────────────────────────
@@ -341,7 +349,7 @@ const TX_SLOT_AUTOCQ = 0;
 const TX_SLOT_QUEUE_LOOKAHEAD = [1, 2] as const;
 
 function emptyBridgeSlots(): BridgeSlotInfo[] {
-  return Array.from({ length: TX_SLOT_COUNT }, (_, slot) => ({ slot, message: '', label: '', uploaded: false }));
+  return Array.from({ length: TX_SLOT_COUNT }, (_, slot) => ({ slot, message: '', label: '', uploaded: false, audioHz: 0 }));
 }
 
 // Matches the firmware's esp_rom_crc32_le() exactly (standard zlib/PNG/
@@ -410,25 +418,65 @@ function slotHashCacheFor(wsUrl: string): Map<number, string> {
   return m;
 }
 
-// Resolves once the upload actually completes (or was skipped because the
-// slot already holds identical content) — the caller doesn't need to know
-// or care whether it succeeded (see this function's own comment history: a
-// failed upload just means the eventual /tx-play call 400s, which the play
-// loop already treats as "nothing to send").
-async function uploadToBridgeSlot(wsUrl: string, slot: number, samples: Float32Array, fromRateHz: number, gain: number): Promise<void> {
-  const url = bridgeHttpUrl(wsUrl, '/tx-audio', `slot=${slot}`);
-  if (!url) return;
+// Resolves to the slot that actually holds this content once the upload
+// completes — which is NOT always the slot that was asked for. The caller
+// doesn't need to know whether the upload itself succeeded (see this
+// function's own comment history: a failed upload just means the eventual
+// /tx-play call 400s, which the play loop already treats as "nothing to
+// send"), but it DOES need the resolved slot so it can play the right one.
+//
+// Content-addressed reuse: the bridge's slots are a content cache, and the
+// hash is over the exact wire bytes, so two slots holding the same hash
+// hold byte-identical audio. When ANY slot already has this content, there
+// is nothing to gain from uploading a second copy — a ~400KB POST over the
+// same local WiFi that carries the live RX audio stream, for a waveform the
+// device can already play. So we skip the upload and return the slot that
+// has it. Callers must play the RETURNED slot, not the requested one.
+//
+// The one thing this deliberately does not do is evict or rewrite the
+// requested slot: leaving stale content there is harmless (nothing plays a
+// slot without resolving through here first) and clearing it would cost an
+// extra round-trip to save PSRAM that isn't under pressure.
+async function uploadToBridgeSlot(
+  wsUrl: string,
+  slot: number,
+  samples: Float32Array,
+  fromRateHz: number,
+  gain: number,
+  // Descriptive metadata stored on the device beside the audio and echoed
+  // by GET /tx-status — see BridgeSlotInfo's own comment for why this
+  // travels with the upload rather than living only in browser state: the
+  // hash is one-way, so nothing that didn't perform the upload itself
+  // (a reloaded page, another browser, the bridge's own control page)
+  // could otherwise say what a slot holds. audioHz is a LABEL for what was
+  // encoded — the frequency is already baked into `samples` themselves.
+  meta?: { message: string; label: string; audioHz: number },
+): Promise<number> {
+  const query = [`slot=${slot}`];
+  if (meta) {
+    if (meta.message) query.push(`message=${encodeURIComponent(meta.message)}`);
+    if (meta.label) query.push(`label=${encodeURIComponent(meta.label)}`);
+    if (meta.audioHz > 0) query.push(`hz=${Math.round(meta.audioHz)}`);
+  }
+  const url = bridgeHttpUrl(wsUrl, '/tx-audio', query.join('&'));
+  if (!url) return slot;
   const int16 = toBridgeWireFormat(samples, fromRateHz, gain);
   const hash = hex8(crc32(new Uint8Array(int16.buffer, int16.byteOffset, int16.byteLength)));
   const cache = slotHashCacheFor(wsUrl);
-  if (cache.get(slot) === hash) return; // this slot already has exactly this content — skip the upload entirely
+  if (cache.get(slot) === hash) return slot; // this slot already has exactly this content
+  // Some OTHER slot already holds byte-identical audio — play that one
+  // instead of spending an upload duplicating it (see the header comment).
+  for (const [otherSlot, otherHash] of cache) {
+    if (otherHash === hash) return otherSlot;
+  }
   try {
     const res = await fetch(url, { method: 'POST', body: int16.buffer });
-    if (res.ok) cache.set(slot, hash);
-    else cache.delete(slot); // unknown state — don't skip a future retry based on a stale/wrong assumption
+    if (res.ok) { cache.set(slot, hash); return slot; }
+    cache.delete(slot); // unknown state — don't skip a future retry based on a stale/wrong assumption
   } catch {
     cache.delete(slot);
   }
+  return slot;
 }
 
 // One-shot GET /tx-status read used to seed slotHashCache with whatever
@@ -439,20 +487,45 @@ async function uploadToBridgeSlot(wsUrl: string, slot: number, samples: Float32A
 // read just means the cache stays cold and the next upload attempt pays
 // for one real round-trip instead of skipping — same fallback shape as
 // every other best-effort call in this file.
-async function refreshSlotHashCache(wsUrl: string): Promise<void> {
+//
+// Also returns each ready slot's stored descriptive metadata so the caller
+// can repopulate state.bridgeSlots. This is what lets a freshly loaded
+// page describe slots it never staged itself: everything in bridgeSlots is
+// otherwise in-memory bookkeeping written at upload time, so a reload
+// (or a different browser, or a cleared cache) would leave real, staged
+// slots showing as blank. The device is the only thing that survives all
+// of those, which is exactly why the metadata lives there rather than in
+// localStorage.
+async function refreshSlotHashCache(wsUrl: string): Promise<BridgeSlotInfo[] | null> {
   const url = bridgeHttpUrl(wsUrl, '/tx-status');
-  if (!url) return;
+  if (!url) return null;
   try {
     const res = await fetch(url);
-    if (!res.ok) return;
-    const data = await res.json() as { slots?: { slot: number; ready: boolean; hash: string }[] };
+    if (!res.ok) return null;
+    const data = await res.json() as {
+      slots?: { slot: number; ready: boolean; hash: string; message?: string; label?: string; audio_hz?: number }[];
+    };
     const cache = slotHashCacheFor(wsUrl);
+    const restored: BridgeSlotInfo[] = [];
     for (const s of data.slots ?? []) {
       if (s.ready) cache.set(s.slot, s.hash);
       else cache.delete(s.slot);
+      restored.push({
+        slot: s.slot,
+        message: s.message ?? '',
+        label: s.label ?? '',
+        // A ready slot genuinely holds audio, whatever this page knows
+        // about it — reporting uploaded:false there would misdescribe the
+        // device's real state just because this browser session didn't
+        // happen to be the one that staged it.
+        uploaded: s.ready,
+        audioHz: s.audio_hz ?? 0,
+      });
     }
+    return restored;
   } catch {
     // Best-effort — see this function's own comment.
+    return null;
   }
 }
 
@@ -589,26 +662,53 @@ export function createFTTransmit(
   // the hash-skip check means re-uploading identical content (e.g. an
   // unchanged auto-CQ waveform every cycle) costs nothing beyond the
   // GET-status-free comparison already done client-side.
-  function uploadIfBridgeSink(slot: number, message: string, label: string, samples: Float32Array, sourceRateHz: number) {
-    setBridgeSlotInfo(slot, message, label, true);
-    if (getAudioSinkKind() !== 'bridge') return;
+  // audioHz is the frequency these samples were ENCODED at — passed
+  // through to the device as slot metadata (see uploadToBridgeSlot()), not
+  // used for anything locally.
+  function uploadIfBridgeSink(slot: number, message: string, label: string, samples: Float32Array, sourceRateHz: number, audioHz: number) {
+    if (getAudioSinkKind() !== 'bridge') {
+      // Nothing will be uploaded, so the requested slot is the only
+      // meaningful place to record this locally.
+      setBridgeSlotInfo(slot, message, label, true, audioHz);
+      return;
+    }
     const wsUrl = getBridgeWsUrl();
-    if (!wsUrl) return;
-    void uploadToBridgeSlot(wsUrl, slot, samples, sourceRateHz, gain);
+    if (!wsUrl) { setBridgeSlotInfo(slot, message, label, true, audioHz); return; }
+    // Record against the slot the upload RESOLVED to — when identical
+    // content already lives in another slot, uploadToBridgeSlot() reuses it
+    // and never writes the requested one, so marking the requested slot
+    // ready would describe a slot the device didn't actually fill.
+    void uploadToBridgeSlot(wsUrl, slot, samples, sourceRateHz, gain, { message, label, audioHz })
+      .then(resolved => setBridgeSlotInfo(resolved, message, label, true, audioHz));
   }
 
-  // Updates state.bridgeSlots for one slot — see BridgeSlotInfo's own
-  // comment for why this is tracked here rather than read back from the
-  // firmware (it has no concept of message text, only raw PCM + a hash).
-  // Called unconditionally from uploadIfBridgeSink() regardless of the
-  // CURRENT sink kind, deliberately: an operator watching the slot panel
-  // while on 'speaker' should still see what WOULD be staged if they
-  // switched to 'bridge' — the label reflects "what this slot is assigned
-  // to," not "what's currently sitting in the device's PSRAM."
-  function setBridgeSlotInfo(slot: number, message: string, label: string, uploaded: boolean) {
+  // Updates state.bridgeSlots for one slot. Called unconditionally from
+  // uploadIfBridgeSink() regardless of the CURRENT sink kind,
+  // deliberately: an operator watching the slot panel while on 'speaker'
+  // should still see what WOULD be staged if they switched to 'bridge' —
+  // the label reflects "what this slot is assigned to," not "what's
+  // currently sitting in the device's PSRAM."
+  function setBridgeSlotInfo(slot: number, message: string, label: string, uploaded: boolean, audioHz = 0) {
     setState(prev => ({
       ...prev,
-      bridgeSlots: prev.bridgeSlots.map(s => s.slot === slot ? { slot, message, label, uploaded } : s),
+      bridgeSlots: prev.bridgeSlots.map(s => s.slot === slot ? { slot, message, label, uploaded, audioHz } : s),
+    }));
+  }
+
+  // Replaces state.bridgeSlots with what the DEVICE reports it's holding,
+  // and seeds the hash-skip cache in the same round-trip (see
+  // refreshSlotHashCache()). Called on start(), and exposed so the TX panel
+  // can also call it directly — a page that just loaded has empty
+  // bridgeSlots and no way to describe already-staged slots until it asks
+  // the device, which is the whole reason the metadata is stored there.
+  async function syncBridgeSlotsFromDevice(): Promise<void> {
+    const wsUrl = getBridgeWsUrl();
+    if (!wsUrl) return;
+    const restored = await refreshSlotHashCache(wsUrl);
+    if (!restored || restored.length === 0) return;
+    setState(prev => ({
+      ...prev,
+      bridgeSlots: prev.bridgeSlots.map(s => restored.find(r => r.slot === s.slot) ?? s),
     }));
   }
 
@@ -648,11 +748,12 @@ export function createFTTransmit(
     const ENC_RATE = 12000;
     const myGeneration = (encodeGenerationByEntryId.get(entry.id) ?? 0) + 1;
     encodeGenerationByEntryId.set(entry.id, myGeneration);
-    encodeAsync(entry.message, getMode(), ENC_RATE, entry.audioHz ?? getBaseFrequency())
+    const encodeHz = entry.audioHz ?? getBaseFrequency();
+    encodeAsync(entry.message, getMode(), ENC_RATE, encodeHz)
       .then(samples => {
         if (encodeGenerationByEntryId.get(entry.id) !== myGeneration) return; // superseded by a newer re-encode of this same entry
         const slot = lookaheadSlotForQueuePosition(entry.id);
-        if (slot !== null) uploadIfBridgeSink(slot, entry.message, entry.label, samples, ENC_RATE);
+        if (slot !== null) uploadIfBridgeSink(slot, entry.message, entry.label, samples, ENC_RATE, encodeHz);
         setState(prev => {
           const q = prev.queue.map(e =>
             e.id === entry.id ? { ...e, samples, encodeStatus: 'ready' as const } : e
@@ -721,7 +822,7 @@ export function createFTTransmit(
           autoCQFreqCached === getBaseFrequency()
         ) {
           autoCQSamples = samples;
-          uploadIfBridgeSink(TX_SLOT_AUTOCQ, msg, 'CQ (auto)', samples, 12000);
+          uploadIfBridgeSink(TX_SLOT_AUTOCQ, msg, 'CQ (auto)', samples, 12000, autoCQFreqCached);
         }
       })
       .catch(() => { autoCQSamples = null; });
@@ -925,10 +1026,13 @@ export function createFTTransmit(
       // uncommon one.
       if (getAudioSinkKind() === 'bridge') {
         const wsUrl = getBridgeWsUrl();
-        const slot = useAutoCQ ? TX_SLOT_AUTOCQ : TX_SLOT_QUEUE_LOOKAHEAD[0];
+        const wantSlot = useAutoCQ ? TX_SLOT_AUTOCQ : TX_SLOT_QUEUE_LOOKAHEAD[0];
+        // uploadToBridgeSlot() may redirect us to a different slot that
+        // already holds byte-identical audio — always play what it returns.
+        let slot = wantSlot;
         if (wsUrl) {
-          setBridgeSlotInfo(slot, txMessage, txLabel, true);
-          await uploadToBridgeSlot(wsUrl, slot, samples, 12000, gain);
+          slot = await uploadToBridgeSlot(wsUrl, wantSlot, samples, 12000, gain, { message: txMessage, label: txLabel, audioHz: txAudioHz });
+          setBridgeSlotInfo(slot, txMessage, txLabel, true, txAudioHz);
         }
         const ok = wsUrl && await playBridgeSlotAndWait(wsUrl, slot, () => isRunning);
         if (!ok) {
@@ -1063,8 +1167,7 @@ export function createFTTransmit(
     // re-uploads it needlessly on the very next cycle). Harmless to call
     // even when the sink is 'speaker' or no bridge is configured —
     // bridgeHttpUrl() itself no-ops on an invalid/missing wsUrl.
-    const wsUrlForCache = getBridgeWsUrl();
-    if (wsUrlForCache) void refreshSlotHashCache(wsUrlForCache);
+    void syncBridgeSlotsFromDevice();
     if (!audioCtx || audioCtx.state === 'closed') {
       audioCtx = new AudioContext();
       gainNode = audioCtx.createGain();
@@ -1268,6 +1371,7 @@ export function createFTTransmit(
     setPostKeyMs,
     clearSent,
     clearBridgeSlot,
+    syncBridgeSlotsFromDevice,
     syncParams,
     destroy,
     get isRunning() { return isRunning; },

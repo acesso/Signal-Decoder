@@ -243,6 +243,18 @@ audio_tx_slot_t audio_monitor_get_tx_slot(void);
 // without hardcoding the wire rate a second time in a different file.
 #define TX_BUFFER_SAMPLE_RATE_HZ 16000
 
+// Upper bounds for the per-slot descriptive metadata below. Fixed-size
+// char arrays inside tx_slot_t, not pointers: a few dozen bytes x 4 slots
+// is nothing next to the ~480KB audio buffer each slot already carries,
+// and inlining them keeps the whole struct allocation-free (no lifetime
+// or free() ordering to get wrong on a path that already has to stay
+// safe against a concurrent tx_play_task()).
+// MESSAGE: the browser's TX message field caps at 40 chars
+// (FTTransmitPanel.tsx's maxLength), so 48 leaves real headroom.
+// LABEL: a short operator note ("CQ (auto)", "reply to XX1ABC").
+#define TX_SLOT_MESSAGE_MAX 48
+#define TX_SLOT_LABEL_MAX   32
+
 // Per-slot state for GET /tx-status — bytes/duration/hash of whatever that
 // slot last had uploaded (ready == false means "never uploaded", all other
 // fields 0). hash is the CRC32 (esp_rom_crc32_le(), ROM-resident — no flash
@@ -250,11 +262,28 @@ audio_tx_slot_t audio_monitor_get_tx_slot(void);
 // unchanged message (e.g. a standing auto-CQ waveform re-derived every
 // cycle) can compare against what's already on-device and skip the re-POST
 // /tx-audio entirely when nothing actually changed.
+//
+// message/label/audio_hz are DESCRIPTIVE metadata the uploader supplies
+// alongside the PCM (see audio_monitor_tx_buffer_upload()). The firmware
+// never interprets them — it can't: the audio Hz is already baked into the
+// uploaded waveform's own samples (the browser's encoder folds the carrier
+// into its phase accumulator before synthesis), so this value is a LABEL
+// for what was encoded, never something playback derives anything from.
+// They exist because the hash alone is a one-way fingerprint: it can tell
+// a browser "this slot already holds exactly these bytes", but it can
+// never tell it WHAT those bytes are. Without these fields, any client
+// that didn't itself perform the upload — a fresh page load, a cleared
+// cache, a different browser, the bridge's own control page — can only
+// show an opaque hash for a slot that plainly holds a real, describable
+// message. audio_hz is 0 when the uploader didn't supply one.
 typedef struct {
     bool ready;
     size_t byte_count;
     uint32_t duration_ms;
     uint32_t hash;
+    uint32_t audio_hz;
+    char message[TX_SLOT_MESSAGE_MAX];
+    char label[TX_SLOT_LABEL_MAX];
 } audio_monitor_tx_slot_status_t;
 
 // Fixed at MIC_SEND_SAMPLE_RATE_HZ (16000 Hz mono Int16) — the exact same
@@ -302,7 +331,18 @@ typedef struct {
 // reject with 400 in that case rather than let an upload clobber a buffer
 // the playback task is mid-read on. Uploading to a DIFFERENT slot while some
 // OTHER slot plays is always allowed — that's the entire point of the pool.
-bool audio_monitor_tx_buffer_upload(int slot, const int16_t *data, size_t byte_count);
+//
+// message/label/audio_hz are optional descriptive metadata stored verbatim
+// alongside the audio and echoed back by GET /tx-status — see
+// audio_monitor_tx_slot_status_t's own comment for why they exist (the hash
+// is one-way; nothing else lets a client that didn't do the upload say what
+// a slot actually holds). Pass NULL/NULL/0 to store none. Strings longer
+// than TX_SLOT_MESSAGE_MAX/TX_SLOT_LABEL_MAX-1 are truncated, never
+// rejected: this is descriptive text for a UI, so losing the tail of an
+// over-long label is strictly better than failing an upload whose AUDIO is
+// perfectly valid.
+bool audio_monitor_tx_buffer_upload(int slot, const int16_t *data, size_t byte_count,
+                                    const char *message, const char *label, uint32_t audio_hz);
 
 // True if slot has a buffer from audio_monitor_tx_buffer_upload() present
 // and ready for audio_monitor_tx_play() to start on — for POST /tx-play's

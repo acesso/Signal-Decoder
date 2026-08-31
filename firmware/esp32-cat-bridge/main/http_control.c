@@ -1,5 +1,6 @@
 #include "http_control.h"
 
+#include <ctype.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -182,17 +183,29 @@ static const char *tx_slot_name(audio_tx_slot_t slot) {
 // Minimal JSON-string escaping — Wi-Fi SSIDs/passwords are normally plain
 // ASCII, but nothing stops a network from being named with a `"` or `\` in
 // it, and these fields land straight in a JSON response, so they're escaped
-// rather than assumed safe. Truncates silently if `out` is too small (a
-// garbled tail is preferable to a buffer overflow; these are display-only
-// round-trips, not something the caller reconstructs bit-for-bit).
+// rather than assumed safe. Control characters (which JSON forbids raw in a
+// string) are emitted as \u00XX — they shouldn't appear in an SSID or a TX
+// slot's operator-typed message text, but a single stray one would
+// otherwise produce a response no JSON parser would accept, breaking the
+// whole endpoint rather than just that one field. UTF-8 multibyte sequences
+// pass through untouched, which JSON accepts raw. Truncates silently if
+// `out` is too small (a garbled tail is preferable to a buffer overflow;
+// these are display-only round-trips, not something the caller
+// reconstructs bit-for-bit).
 static void json_escape(char *out, size_t out_sz, const char *in) {
     size_t o = 0;
     for (const char *p = in; *p && o + 2 < out_sz; p++) {
-        if (*p == '"' || *p == '\\') {
+        unsigned char c = (unsigned char)*p;
+        if (c == '"' || c == '\\') {
             if (o + 3 >= out_sz) break;
             out[o++] = '\\';
+            out[o++] = (char)c;
+        } else if (c < 0x20) {
+            if (o + 7 >= out_sz) break;
+            o += (size_t)snprintf(out + o, out_sz - o, "\\u%04x", c);
+        } else {
+            out[o++] = (char)c;
         }
-        out[o++] = *p;
     }
     out[o] = '\0';
 }
@@ -1160,8 +1173,16 @@ static esp_err_t cpu_freq_handler(httpd_req_t *req) {
 // on anything wrong (missing param, non-numeric, out of [0, TX_SLOT_COUNT))
 // so every caller can just do `if (!tx_parse_slot_param(req, &slot)) return
 // ESP_FAIL;` without duplicating the error response.
+// Query strings on the /tx-* routes carry only ?slot=N except on
+// POST /tx-audio, which also takes optional descriptive metadata
+// (?message=&label=&hz=) — a real FT8 message is up to 40 chars and
+// percent-encodes its spaces/slashes, so the raw query can run a few
+// hundred bytes. Sized for that with headroom rather than the 32 bytes
+// ?slot=N alone needed.
+#define TX_QUERY_MAX 384
+
 static bool tx_parse_slot_param(httpd_req_t *req, int *slot_out) {
-    char query[32];
+    char query[TX_QUERY_MAX];
     if (httpd_req_get_url_query_str(req, query, sizeof(query)) != ESP_OK) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "missing ?slot=N query parameter");
         return false;
@@ -1181,6 +1202,60 @@ static bool tx_parse_slot_param(httpd_req_t *req, int *slot_out) {
     return true;
 }
 
+// In-place percent-decode, plus '+' as space (esp-idf's
+// httpd_query_key_value() splits on &/= but leaves escapes untouched, and
+// nothing else in this firmware needed decoding until TX slot metadata
+// started carrying real message text with spaces and '/' in compound
+// callsigns). Malformed escapes are copied through literally rather than
+// rejected — this is descriptive UI text, so a mangled tail is strictly
+// better than failing an upload whose audio is fine.
+static void url_decode_inplace(char *s) {
+    char *w = s;
+    for (const char *r = s; *r; r++) {
+        if (*r == '+') {
+            *w++ = ' ';
+        } else if (*r == '%' && isxdigit((unsigned char)r[1]) && isxdigit((unsigned char)r[2])) {
+            char hex[3] = { r[1], r[2], '\0' };
+            *w++ = (char)strtol(hex, NULL, 16);
+            r += 2;
+        } else {
+            *w++ = *r;
+        }
+    }
+    *w = '\0';
+}
+
+// Optional ?message=&label=&hz= on POST /tx-audio — all absent-tolerant:
+// an uploader that supplies none simply gets empty metadata, which is
+// exactly the pre-metadata behavior. See audio_monitor.h's
+// audio_monitor_tx_slot_status_t comment for why these exist at all.
+static void tx_parse_meta_params(httpd_req_t *req, char *message, size_t message_cap,
+                                 char *label, size_t label_cap, uint32_t *audio_hz) {
+    message[0] = '\0';
+    label[0] = '\0';
+    *audio_hz = 0;
+
+    char query[TX_QUERY_MAX];
+    if (httpd_req_get_url_query_str(req, query, sizeof(query)) != ESP_OK) return;
+
+    if (httpd_query_key_value(query, "message", message, message_cap) == ESP_OK) {
+        url_decode_inplace(message);
+    } else {
+        message[0] = '\0'; // httpd_query_key_value() may write a partial value before returning != OK
+    }
+    if (httpd_query_key_value(query, "label", label, label_cap) == ESP_OK) {
+        url_decode_inplace(label);
+    } else {
+        label[0] = '\0';
+    }
+    char hz_str[12];
+    if (httpd_query_key_value(query, "hz", hz_str, sizeof(hz_str)) == ESP_OK) {
+        char *end;
+        long v = strtol(hz_str, &end, 10);
+        if (end != hz_str && v > 0 && v <= 100000) *audio_hz = (uint32_t)v;
+    }
+}
+
 // POST /tx-audio?slot=N — body: raw Int16 PCM bytes (NOT JSON — a binary
 // body), mono, fixed at MIC_SEND_SAMPLE_RATE_HZ (16000 Hz), the exact same
 // wire format /audio's live mic-send path already uses (see that constant's
@@ -1194,6 +1269,16 @@ static bool tx_parse_slot_param(httpd_req_t *req, int *slot_out) {
 // TX_SLOT_COUNT independent buffers this upload lands in — see
 // audio_monitor.h for why the pool exists (one global buffer meant an
 // auto-CQ loop and a queued reply silently clobbered each other).
+//
+// Also accepts optional descriptive metadata as query params —
+// ?message=<text>&label=<text>&hz=<int> (percent-encoded; see
+// url_decode_inplace() above) — stored verbatim and echoed by
+// GET /tx-status. All three are optional and absent-tolerant; omitting
+// them reproduces the pre-metadata behavior exactly. They're descriptive
+// only: the audio Hz is already baked into the uploaded samples, so `hz`
+// labels what was encoded rather than telling playback anything. See
+// audio_monitor.h's audio_monitor_tx_slot_status_t comment for why the
+// content hash alone can't serve this purpose.
 //
 // Reads the body with a plain loop over httpd_req_recv() rather than this
 // file's usual read_request_body() helper — that helper's whole design
@@ -1270,7 +1355,13 @@ static esp_err_t tx_audio_handler(httpd_req_t *req) {
         received_total += (size_t)received;
     }
 
-    bool saved = audio_monitor_tx_buffer_upload(slot, (const int16_t *)recv_buf, received_total);
+    char meta_message[TX_SLOT_MESSAGE_MAX];
+    char meta_label[TX_SLOT_LABEL_MAX];
+    uint32_t meta_hz;
+    tx_parse_meta_params(req, meta_message, sizeof(meta_message), meta_label, sizeof(meta_label), &meta_hz);
+
+    bool saved = audio_monitor_tx_buffer_upload(slot, (const int16_t *)recv_buf, received_total,
+                                                meta_message, meta_label, meta_hz);
     free(recv_buf);
     if (!saved) {
         // Only real failure path left here is a PSRAM allocation failure
@@ -1354,26 +1445,42 @@ static esp_err_t tx_status_handler(httpd_req_t *req) {
     audio_monitor_tx_status_t status;
     audio_monitor_tx_get_status(&status);
 
-    // Sized generously above the worst case (all 4 slots at the loose
-    // 5-minute/slot sanity cap: "bytes" up to 7 digits, "duration_ms" up to
-    // 6 digits) rather than tightly — this is a poll-friendly status
-    // endpoint, not a hot path where a few dozen spare stack bytes matter.
-    char resp_body[512];
-    int n = snprintf(resp_body, sizeof(resp_body),
-                      "{\"slots\":[{\"slot\":0,\"ready\":%s,\"bytes\":%u,\"duration_ms\":%u,\"hash\":\"%08x\"},"
-                      "{\"slot\":1,\"ready\":%s,\"bytes\":%u,\"duration_ms\":%u,\"hash\":\"%08x\"},"
-                      "{\"slot\":2,\"ready\":%s,\"bytes\":%u,\"duration_ms\":%u,\"hash\":\"%08x\"},"
-                      "{\"slot\":3,\"ready\":%s,\"bytes\":%u,\"duration_ms\":%u,\"hash\":\"%08x\"}],"
-                      "\"playing_slot\":%d,\"playing\":%s,\"position_ms\":%u,\"duration_ms\":%u}",
-                      status.slots[0].ready ? "true" : "false", (unsigned)status.slots[0].byte_count, (unsigned)status.slots[0].duration_ms, (unsigned)status.slots[0].hash,
-                      status.slots[1].ready ? "true" : "false", (unsigned)status.slots[1].byte_count, (unsigned)status.slots[1].duration_ms, (unsigned)status.slots[1].hash,
-                      status.slots[2].ready ? "true" : "false", (unsigned)status.slots[2].byte_count, (unsigned)status.slots[2].duration_ms, (unsigned)status.slots[2].hash,
-                      status.slots[3].ready ? "true" : "false", (unsigned)status.slots[3].byte_count, (unsigned)status.slots[3].duration_ms, (unsigned)status.slots[3].hash,
-                      status.playing_slot, status.playing ? "true" : "false",
-                      (unsigned)status.position_ms, (unsigned)status.duration_ms);
+    // Built incrementally rather than as one unrolled snprintf() (which is
+    // what this was before per-slot metadata existed): message/label are
+    // variable-length operator text, so a fixed format string with a
+    // per-slot argument list stopped being readable or safely sizeable.
+    // Worst case is now ~4 * (fixed fields + escaped message + escaped
+    // label), so the buffer is sized from those real bounds instead of a
+    // round guess.
+    char resp_body[1024];
+    size_t off = 0;
+    off += (size_t)snprintf(resp_body + off, sizeof(resp_body) - off, "{\"slots\":[");
+    for (int i = 0; i < TX_SLOT_COUNT && off < sizeof(resp_body); i++) {
+        // *2 + 1: worst case every byte escapes to two characters.
+        char esc_message[TX_SLOT_MESSAGE_MAX * 2 + 1];
+        char esc_label[TX_SLOT_LABEL_MAX * 2 + 1];
+        json_escape(esc_message, sizeof(esc_message), status.slots[i].message);
+        json_escape(esc_label, sizeof(esc_label), status.slots[i].label);
+        off += (size_t)snprintf(resp_body + off, sizeof(resp_body) - off,
+                                "%s{\"slot\":%d,\"ready\":%s,\"bytes\":%u,\"duration_ms\":%u,"
+                                "\"hash\":\"%08x\",\"audio_hz\":%u,\"message\":\"%s\",\"label\":\"%s\"}",
+                                i == 0 ? "" : ",", i,
+                                status.slots[i].ready ? "true" : "false",
+                                (unsigned)status.slots[i].byte_count,
+                                (unsigned)status.slots[i].duration_ms,
+                                (unsigned)status.slots[i].hash,
+                                (unsigned)status.slots[i].audio_hz,
+                                esc_message, esc_label);
+    }
+    if (off < sizeof(resp_body)) {
+        off += (size_t)snprintf(resp_body + off, sizeof(resp_body) - off,
+                                "],\"playing_slot\":%d,\"playing\":%s,\"position_ms\":%u,\"duration_ms\":%u}",
+                                status.playing_slot, status.playing ? "true" : "false",
+                                (unsigned)status.position_ms, (unsigned)status.duration_ms);
+    }
     httpd_resp_set_type(req, "application/json");
     set_cors(req);
-    return httpd_resp_send(req, resp_body, n);
+    return httpd_resp_send(req, resp_body, (ssize_t)(off < sizeof(resp_body) ? off : sizeof(resp_body) - 1));
 }
 
 // POST /tx-stop — no body, no query params (stops whatever is playing,

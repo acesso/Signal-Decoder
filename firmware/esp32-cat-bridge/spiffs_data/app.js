@@ -694,6 +694,139 @@ const SYSTEM_STATS_REFRESH_MS = 3000;
 refreshSystemStats();
 setInterval(refreshSystemStats, SYSTEM_STATS_REFRESH_MS);
 
+// ── TX cache ────────────────────────────────────────────────────────────
+// Renders GET /tx-status's four slots. Everything shown comes from the
+// device itself, which is the entire point: the content hash alone is a
+// one-way fingerprint, so before slots carried message/label/audio_hz
+// metadata, nothing that hadn't performed the upload itself — this page
+// included — could say what a slot actually held.
+
+const txCacheSlots = document.getElementById('tx-cache-slots');
+const txCacheReadout = document.getElementById('tx-cache-readout');
+
+// Named for the web app's own fixed slot roles (see useFTTransmit.ts's
+// TX_SLOT_AUTOCQ/TX_SLOT_QUEUE_LOOKAHEAD) — a convention between the app
+// and itself, not something the firmware enforces, so this is a display
+// hint rather than a guarantee about what any slot really contains.
+const TX_SLOT_ROLE = ['auto-CQ', 'queue +0', 'queue +1', 'spare'];
+
+function fmtTxDuration(ms) {
+  if (typeof ms !== 'number' || ms <= 0) return '—';
+  return `${(ms / 1000).toFixed(1)}s`;
+}
+
+function renderTxCache(status) {
+  const slots = Array.isArray(status.slots) ? status.slots : [];
+  const readyCount = slots.filter((s) => s.ready).length;
+  txCacheReadout.textContent = status.playing
+    ? `playing slot ${status.playing_slot}`
+    : `${readyCount}/${slots.length || 4} staged`;
+
+  txCacheSlots.replaceChildren();
+  for (const slot of slots) {
+    const row = document.createElement('div');
+    row.className = 'tx-slot';
+    if (!slot.ready) row.classList.add('tx-slot-empty');
+    if (status.playing && status.playing_slot === slot.slot) row.classList.add('tx-slot-playing');
+
+    const head = document.createElement('div');
+    head.className = 'tx-slot-head';
+    const name = document.createElement('span');
+    name.className = 'tx-slot-name';
+    name.textContent = `Slot ${slot.slot}`;
+    const role = document.createElement('span');
+    role.className = 'tx-slot-role';
+    role.textContent = TX_SLOT_ROLE[slot.slot] || '';
+    head.append(name, role);
+
+    if (slot.ready) {
+      const clear = document.createElement('button');
+      clear.className = 'tx-slot-clear';
+      clear.type = 'button';
+      clear.textContent = 'Clear';
+      // Never offer to yank the buffer out from under a live transmission —
+      // the play task reads this slot straight from PSRAM.
+      const playingThis = status.playing && status.playing_slot === slot.slot;
+      if (playingThis) {
+        clear.disabled = true;
+        clear.title = 'Cannot clear a slot while it is playing';
+      } else {
+        clear.title = `Clear slot ${slot.slot}`;
+        clear.addEventListener('click', () => clearTxSlot(slot.slot, clear));
+      }
+      head.append(clear);
+    }
+
+    const body = document.createElement('div');
+    body.className = 'tx-slot-body';
+    if (slot.ready) {
+      // textContent throughout, never innerHTML — message/label are
+      // operator-typed text echoed straight back from the device.
+      const msg = document.createElement('div');
+      msg.className = 'tx-slot-message';
+      msg.textContent = slot.message || '(no message text)';
+      if (!slot.message) msg.classList.add('tx-slot-dim');
+
+      const meta = document.createElement('div');
+      meta.className = 'tx-slot-meta';
+      const bits = [];
+      if (slot.audio_hz) bits.push(`${slot.audio_hz} Hz`);
+      bits.push(fmtTxDuration(slot.duration_ms));
+      bits.push(fmtBytes(slot.bytes));
+      if (slot.label) bits.push(slot.label);
+      meta.textContent = bits.join(' · ');
+
+      const hash = document.createElement('div');
+      hash.className = 'tx-slot-hash';
+      hash.textContent = slot.hash;
+
+      body.append(msg, meta, hash);
+    } else {
+      const empty = document.createElement('div');
+      empty.className = 'tx-slot-message tx-slot-dim';
+      empty.textContent = 'empty';
+      body.append(empty);
+    }
+
+    row.append(head, body);
+    txCacheSlots.append(row);
+  }
+}
+
+// Frees the slot's PSRAM buffer and wipes its metadata on the device. Not
+// confirmed first: a staged slot is re-uploadable at any time (the web app
+// re-stages on its next encode), so this is cheap to undo — unlike the
+// destructive settings elsewhere on this page.
+async function clearTxSlot(slot, btn) {
+  btn.disabled = true;
+  try {
+    const res = await fetch(`/tx-clear?slot=${slot}`, { method: 'POST' });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  } catch (err) {
+    // Re-enabled by the refresh below if the slot is in fact still there.
+    btn.textContent = 'Failed';
+  }
+  refreshTxCache();
+}
+
+async function refreshTxCache() {
+  try {
+    const res = await fetch('/tx-status');
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    renderTxCache(await res.json());
+  } catch (err) {
+    // Silent — same reasoning as refreshSystemStats()/refreshStatus(true):
+    // this panel auto-refreshes, so one dropped poll isn't worth an error.
+  }
+}
+
+// Slower than the system-stats poll: slot contents only change when the web
+// app stages a message, which is a human-paced event, and this endpoint is
+// on the same shared httpd worker as everything else.
+const TX_CACHE_REFRESH_MS = 5000;
+refreshTxCache();
+setInterval(refreshTxCache, TX_CACHE_REFRESH_MS);
+
 async function scanNetworks() {
   scanBtn.disabled = true;
   scanBtn.classList.add('spinning');

@@ -432,3 +432,54 @@ dl#pa-list {
   white-space: nowrap;
 }
 .quality-scale-row .quality-contrast-label { flex: 1; margin: 0; }
+
+/* TX cache — the four /tx-audio buffer slots (see GET /tx-status). */
+.tx-slot-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  margin-top: 0.5rem;
+}
+.tx-slot {
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0.4rem 0.55rem;
+}
+.tx-slot-empty { opacity: 0.55; }
+.tx-slot-playing { border-color: var(--meter); }
+.tx-slot-head {
+  display: flex;
+  align-items: baseline;
+  gap: 0.5rem;
+  margin-bottom: 0.15rem;
+}
+.tx-slot-name { font-weight: 600; font-size: 0.8rem; }
+/* Pushed to the row's trailing edge; inherits the base button colours and
+   the shared :disabled treatment (used while a slot is playing). */
+.tx-slot-clear {
+  margin-left: auto;
+  padding: 0.2rem 0.5rem;
+  font-size: 0.7rem;
+  background: var(--danger);
+}
+.tx-slot-role {
+  font-size: 0.68rem;
+  color: color-mix(in srgb, var(--fg) 55%, transparent);
+}
+.tx-slot-message {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.8rem;
+  word-break: break-word;
+}
+.tx-slot-dim { color: color-mix(in srgb, var(--fg) 50%, transparent); }
+.tx-slot-meta {
+  font-size: 0.7rem;
+  color: color-mix(in srgb, var(--fg) 65%, transparent);
+  margin-top: 0.1rem;
+}
+.tx-slot-hash {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.65rem;
+  color: color-mix(in srgb, var(--fg) 40%, transparent);
+  margin-top: 0.05rem;
+}

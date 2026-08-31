@@ -415,6 +415,23 @@
       (~-6dB below peak); watch it move as you adjust each trimpot.</p>
     </section>
 
+    <section id="tx-cache-card" class="card">
+      <div class="cat-header">
+        <h2>TX cache</h2>
+        <span id="tx-cache-readout" class="quality-readout">&mdash;</span>
+      </div>
+      <p class="hint">The four TX audio buffer slots
+      (<code>POST /tx-audio</code>), each holding one pre-encoded message the
+      device plays back from its own PSRAM on <code>POST /tx-play</code> &mdash;
+      uploading the whole message up front is what keeps Wi-Fi jitter out of
+      the transmitted signal. The message text and audio Hz shown here are
+      metadata the uploader supplied alongside the audio; the device stores
+      them verbatim and never interprets them (the Hz is already baked into
+      the samples themselves). Slot 0 is the standing auto-CQ waveform, 1&ndash;2
+      the head of the web app's TX queue, 3 spare.</p>
+      <div id="tx-cache-slots" class="tx-slot-list"></div>
+    </section>
+
     <section id="iq-spectrum-card" class="card">
       <div class="cat-header">
         <h2>I/Q spectrum</h2>
