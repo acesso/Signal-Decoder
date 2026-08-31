@@ -12,6 +12,29 @@ them into a version section when cutting a release.
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-08-31
+
+### Added
+
+- ESP32 bridge: continuous test tone on the mic-send path, with adjustable frequency (100-4000 Hz) and level, for tuning the radio's preamps against a fixed reference. Appears in the bridge's own mic-sniff waterfall, retunes without clicking while running, and always starts off after a reboot.
+- ESP32 bridge: TX slot metadata (message text, label, encoded audio Hz) is now stored on the device alongside the audio, so a freshly loaded page can describe slots it never staged itself.
+- ESP32 bridge: TX cache view on the control page, showing each slot's message, frequency, duration, size and hash, with a per-slot Clear button (disabled while that slot is playing).
+
+### Changed
+
+- Bridge TX uploads now skip re-uploading audio that any slot already holds, instead of only checking the requested slot: identical content (e.g. a queued CQ matching the standing auto-CQ) previously cost a second ~400KB POST and a duplicate PSRAM buffer.
+- uSDX firmware: `SEND_PA` inverted from `PTX` to `NTX` (active-LOW on TX) to match the interface board's 2N2222 low-side switch. Verified on hardware: the PA keying line now grounds on transmit and stays intact on receive; previously it keyed the PA on receive.
+- ESP32 bridge: PA watchdog sense and emergency polarities inverted to match the interface board's NPN low-side switching -- sense is active LOW (energized), emergency is active HIGH (clamp). Sense now uses an internal pull-up, matching the board's own level shifter.
+
+### Fixed
+
+- ESP32 bridge: the PA emergency line's permissive state is now high-Z rather than a driven LOW. Driving it LOW sank the radio's own PTT base current through the clamp diode, silently preventing the PA from keying at all.
+
+### Known limitations
+
+- The PA emergency clamp cannot shut the PA off with the current interface-board wiring: its diode lands on the switching transistor's base junction, so asserting it keys the amplifier rather than stopping it. Automatic tripping is therefore disabled (`PA_WATCHDOG_TRIP_ENABLED 0`); sensing, logging and manual clear remain functional. Re-enable once the hardware has a base-steal or series-interrupt shutdown path.
+- The PA watchdog cannot detect loss of its own sense line: with the pull-up matching the board, an unplugged sense wire reads as "PA idle" and the watchdog stays quiet.
+
 ## [0.13.0] - 2026-08-28
 
 ### Fixed
