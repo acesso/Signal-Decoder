@@ -5,6 +5,7 @@
 // UI reads from.
 
 import { createSignal, onCleanup } from 'solid-js'
+import { createConfirmErrorTracker } from './confirmError'
 
 // Web Serial API ambient types (not yet in lib.dom.d.ts for all TS versions)
 declare global {
@@ -150,6 +151,8 @@ export interface RadioCATControls {
   state: () => RadioState;
   connect: (config: CATConnectionConfig) => Promise<void>;
   disconnect: () => void;
+  /** Clear the error banner. Display only — never touches pttConfirmAlarm. */
+  dismissError: () => void;
   setFrequency: (hz: number) => Promise<void>;
   setMode: (mode: CATMode) => Promise<void>;
   setPTT: (tx: boolean) => Promise<void>;
@@ -736,6 +739,29 @@ export function useRadioCAT(): RadioCATControls {
     return false;
   }
 
+  // Clears a stale "not confirmed by the radio" banner once the link is
+  // demonstrably working again.
+  //
+  // Every confirmedSet() caller sets an error on failure, but nothing used to
+  // clear it on a later success: the only three places that ever reset error
+  // are the initial state, disconnect() and a successful connect(). That left
+  // a single transient hiccup — one dropped frame on a busy Wi-Fi link —
+  // showing a red CAT error indefinitely, long after the link recovered, with
+  // disconnect/reconnect as the only way to get rid of it. An operator
+  // reasonably reads a persistent red banner as "CAT is broken right now",
+  // which is exactly wrong when the next command confirmed fine.
+  //
+  // Deliberately narrow: it only clears errors this same mechanism raised
+  // (tracked by flag, not by matching message text). Connection-state errors
+  // — "CAT bridge connection lost", "Radio connection lost" — describe a
+  // condition that is still true and own their own lifecycle via
+  // reconnect/connect, so a successful confirm must never wipe those.
+  const confirmErrors = createConfirmErrorTracker(
+    (error) => setState(prev => ({ ...prev, error })),
+  );
+  const noteConfirmFailure = confirmErrors.note;
+  const clearConfirmError = confirmErrors.clear;
+
   // ── WebSocket transport (ESP32 CAT bridge) ──────────────────────────────
   // Bridges a binary WebSocket into the same writer/reader shapes the serial
   // path uses, so startReadLoop/drainQueue below need no transport-specific
@@ -1017,6 +1043,11 @@ export function useRadioCAT(): RadioCATControls {
     log('debug', isPoll ? 'poll(batch)' : 'state refresh', '— freq:', freq, 'mode:', mode, 'agc:', agc, 'agcLvl:', agcLevel, 'filt:', filter,
       'vol:', volume, 'att1:', att1, 'att2:', att2, 'nr:', nr, 'sm:', sMeter, 'drive:', drive, 'bl:', backlight, `[q:${queue.length}]`);
 
+    // Any parsed frame back from the radio proves the CAT link is alive —
+    // same reasoning as the generic poll branch: clear a stale confirm
+    // banner, including when the operator retunes on the radio itself.
+    if (frames.length > 0) clearConfirmError();
+
     setState(prev => ({
       ...prev,
       frequency: freq   !== null && (now - ls.frequency > SET_GRACE_MS) ? freq   : prev.frequency,
@@ -1085,6 +1116,13 @@ export function useRadioCAT(): RadioCATControls {
           const mode = parseMode(mr);
           log('debug', 'poll — freq:', freq, 'mode:', mode, `[q:${queue.length}]`);
           if (freq !== null || mode !== null) {
+            // A poll that got a real answer back is proof the CAT link is
+            // working right now — stronger evidence than any single setter's
+            // confirm, since it round-trips the radio on every tick. Clear a
+            // stale confirm banner here too, so an operator who just tunes
+            // the VFO on the RADIO ITSELF (never touching the panel, so no
+            // setter runs) still sees the error go away on its own.
+            clearConfirmError();
             setState(prev => ({
               ...prev,
               frequency: freq !== null && (now - ls.frequency > SET_GRACE_MS) ? freq : prev.frequency,
@@ -1136,6 +1174,7 @@ export function useRadioCAT(): RadioCATControls {
     ws     = null;
     rxBuf  = '';
     autoReportActive = false;
+    confirmErrors.forget();
     setState(prev => ({
       ...prev, connected: false, reconnecting: false, frequency: null, mode: null, ptt: false, error: null,
       volume: null, att1: null, att2: null, nr: null, agc: null, agcLevel: null, filter: null, sMeter: null, drive: null,
@@ -1213,6 +1252,7 @@ export function useRadioCAT(): RadioCATControls {
       }
       reconnectAttempt = 0;
       hasConnectedOnce = true;
+      confirmErrors.forget();
       setState(prev => ({ ...prev, connected: true, reconnecting: false, error: null }));
       log('info', 'polling every', config.pollIntervalMs + 'ms');
       schedulePoll();
@@ -1323,9 +1363,9 @@ export function useRadioCAT(): RadioCATControls {
     // separate readback query, retried as a whole SET+verify cycle.
     const confirmed = await confirmedSet(cmd, { hasEcho: false, verifyCmd: 'FA;' },
       (reply) => parseFrequency(reply) === hz);
-    if (!confirmed) {
+    if (confirmed) { clearConfirmError(); } else {
       log('warn', 'setFrequency: bridge could not confirm the radio applied', hz, 'Hz after', CONFIRM_RETRIES, 'attempts');
-      setState(prev => ({ ...prev, error: `Frequency change to ${hz} Hz was not confirmed by the radio — link may be unreliable.` }));
+      noteConfirmFailure(`Frequency change to ${hz} Hz was not confirmed by the radio — link may be unreliable.`);
       // Don't silently keep showing the unconfirmed value — re-poll to show
       // whatever the radio is ACTUALLY on, next poll tick will correct it.
     }
@@ -1340,9 +1380,9 @@ export function useRadioCAT(): RadioCATControls {
     // MD; SET has no echo either — same confirm-via-readback pattern as frequency.
     const confirmed = await confirmedSet(cmd, { hasEcho: false, verifyCmd: 'MD;' },
       (reply) => parseMode(reply) === mode);
-    if (!confirmed) {
+    if (confirmed) { clearConfirmError(); } else {
       log('warn', 'setMode: bridge could not confirm the radio applied', mode, 'after', CONFIRM_RETRIES, 'attempts');
-      setState(prev => ({ ...prev, error: `Mode change to ${mode} was not confirmed by the radio — link may be unreliable.` }));
+      noteConfirmFailure(`Mode change to ${mode} was not confirmed by the radio — link may be unreliable.`);
     }
   };
 
@@ -1368,9 +1408,9 @@ export function useRadioCAT(): RadioCATControls {
       setState(prev => ({ ...prev, ptt: true })); // optimistic, see above
       const confirmed = await confirmedSet('TX;', { hasEcho: false, verifyCmd: 'TX;' },
         (reply) => reply.startsWith('TX'));
-      if (!confirmed) {
+      if (confirmed) { clearConfirmError(); } else {
         log('warn', 'setPTT(true): bridge could not confirm the radio keyed TX after', CONFIRM_RETRIES, 'attempts');
-        setState(prev => ({ ...prev, error: 'Could not confirm the radio keyed TX — CAT link may be unreliable.' }));
+        noteConfirmFailure('Could not confirm the radio keyed TX — CAT link may be unreliable.');
       }
       return;
     }
@@ -1379,6 +1419,7 @@ export function useRadioCAT(): RadioCATControls {
     const confirmed = await confirmedSet('RX;', { hasEcho: false, verifyCmd: 'RX;' },
       (reply) => reply.startsWith('RX'));
     if (confirmed) {
+      clearConfirmError();
       setState(prev => ({ ...prev, ptt: false, pttConfirmAlarm: false }));
       return;
     }
@@ -1422,9 +1463,9 @@ export function useRadioCAT(): RadioCATControls {
       if (transportKind !== 'websocket') { await write(cmd); return; }
       const confirmed = await confirmedSet(cmd, { hasEcho: true },
         (reply) => parseIntField(reply, prefix) === n);
-      if (!confirmed) {
+      if (confirmed) { clearConfirmError(); } else {
         log('warn', `set${String(stateKey)}: bridge could not confirm the radio applied`, n, 'after', CONFIRM_RETRIES, 'attempts');
-        setState(prev => ({ ...prev, error: `Setting change (${prefix}${n}) was not confirmed by the radio — link may be unreliable.` }));
+        noteConfirmFailure(`Setting change (${prefix}${n}) was not confirmed by the radio — link may be unreliable.`);
       }
     };
   }
@@ -1744,8 +1785,18 @@ export function useRadioCAT(): RadioCATControls {
 
   onCleanup(() => { disconnect(); });
 
+  // Manual dismiss for the error banner, so a stale message is never stuck
+  // waiting on the next poll/command to clear it on its own. Only clears the
+  // display — it never touches pttConfirmAlarm, which describes a radio that
+  // may still be keyed and must be resolved by the radio actually confirming
+  // RX, not by an operator hiding the warning.
+  function dismissError() {
+    confirmErrors.forget();
+    setState(prev => ({ ...prev, error: null }));
+  }
+
   return {
-    state, connect, disconnect, setFrequency, setMode, setPTT,
+    state, connect, disconnect, dismissError, setFrequency, setMode, setPTT,
     setVolume, setAtt1, setAtt2, setNR, setAGC, setAgcLevel, setFilter, setDrive,
     setBacklight, getPABias, setPABias, getTxTimeout, setTxTimeout, resetRadio,
     getFactoryDefaults, factoryResetRadio, getRefFreq, setRefFreq,

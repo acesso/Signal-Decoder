@@ -2051,6 +2051,12 @@ export default function RadioCATPanel(props: {
         <Show when={state().error}>
           <div class="w-px h-6 bg-[#30363d] shrink-0" />
           <span class="text-[#f85149] text-xs font-mono truncate max-w-xs">{state().error}</span>
+          {/* Manual dismiss — a confirm failure otherwise sits here until the
+              next successful poll/command clears it, and a connection-loss
+              message until the link is actually back. */}
+          <button onClick={() => cat.dismissError()}
+            class="shrink-0 text-[#484f58] hover:text-[#c9d1d9] text-xs px-1"
+            title="Dismiss">✕</button>
         </Show>
 
         <Show when={!state().isSupported && !state().connected && config().transport !== 'websocket'}>
