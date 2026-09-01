@@ -196,6 +196,16 @@ export type MsgRowData = {
 export const MSG_ROW_H = 24
 export const SEP_ROW_H = 22
 const CONTACTS_PUBLISH_MS = 800
+
+// SNR stamped on our own transmissions when they are injected rather than
+// decoded (see injectSentMessage). Our TX has no meaningful received SNR —
+// nothing measured it — so this is a placeholder, not a measurement. It only
+// ever lands on messages where WE are the caller, and extractQSORecords()
+// derives RST_RCVD exclusively from the PEER's transmissions (theySentMsgs),
+// so this value can never leak into an ADIF report field. 0 dB is used
+// instead of a sentinel like -99 so the messages panel doesn't render our own
+// sent lines as if they were unreadably weak decodes.
+const TX_SELF_SNR = 0
 const MSG_GRID_COLS = 'grid grid-cols-[78px_92px_54px_46px_minmax(0,1fr)]'
 
 type MsgSortCol = 'freq' | 'snr' | 'dt' | 'msg'
@@ -312,6 +322,15 @@ function MsgTextStable(props: { msg: string; myCall: string; getContact: (cs: st
 
 // ── Main component ──────────────────────────────────────────────────────────
 
+// FTDecoder's handle is DecoderControls plus the FT-only ability to record a
+// transmission that never went out over a decodable local audio path — see
+// injectSentMessage()'s comment. Kept off DecoderControls itself because that
+// contract is shared by every mode (CW/RTTY/SSTV/MFSK), and none of the others
+// has a QSO log for a sent message to land in.
+export interface FTDecoderHandle extends DecoderControls {
+  injectSentMessage: (msg: string, windowStart: Date, vfoHz: number, audioHz: number) => void
+}
+
 interface Props {
   ftMode: FTMode
   myCall?: string
@@ -325,7 +344,7 @@ interface Props {
   analyser?: AnalyserNode | null
   vfoFrequency?: number
   onStateChange?: (controls: DecoderControls) => void
-  handle?: { current: DecoderControls | null }
+  handle?: { current: FTDecoderHandle | null }
   audioBridge?: AudioBridge
   iqBridge?: IQBridge
   audioSourceOverride?: AudioSourceOverride
@@ -567,6 +586,59 @@ export default function FTDecoder(props: Props): JSX.Element {
     prevResultLen = results.length
   })
 
+  // Records a message this station actually transmitted, as if it had been
+  // decoded off the air.
+  //
+  // Normally our own TX re-enters the contact store the same way everything
+  // else does: it goes out of the speaker, back in through the radio's own
+  // audio, and gets decoded like any other signal (see useFTTransmit.ts's
+  // txTap). The ESP32 bridge sink breaks that loop by design — since
+  // 2026-08-25 the encoded message is uploaded to the bridge's PSRAM and
+  // played by the firmware itself, so it never touches this browser's audio
+  // graph and there is nothing local to decode. Without this injection an
+  // operator running bridge TX produces contact records containing only the
+  // OTHER station's half of every exchange, which means extractQSORecords()
+  // sees an empty iSentMsgs, segmentIsConfirmed() can never return true, and
+  // the QSO log silently degrades every contact to a partial — the ADIF
+  // export ends up missing the QSOs the operator actually made.
+  //
+  // Deliberately NOT gated through DecodeGate: the gate exists to quarantine
+  // callsigns that might be LDPC/OSD misreads, and our own transmission is
+  // ground truth — we know exactly what was sent because we encoded it. It is
+  // passed with osd omitted (a clean decode) and a synthetic SNR for the same
+  // reason. This also makes logging independent of whether the rig actually
+  // hears itself, which a real transceiver muting RX during TX never would.
+  function injectSentMessage(msg: string, windowStart: Date, vfoHz: number, audioHz: number) {
+    const myUp = (props.myCall ?? '').trim().toUpperCase()
+    if (!myUp) return
+    const parsed = parseFTMsgCached(msg)
+    // Only messages we can attribute to a peer are useful here — a bare CQ
+    // has no callee to hang a QSO segment off, and mergeContacts would just
+    // create/refresh a contact keyed by our own callsign that
+    // extractQSORecords() explicitly skips anyway.
+    if (!parsed.clean || parsed.caller?.toUpperCase() !== myUp || !parsed.callee) return
+
+    // Absolute Hz, matching what the decode path stores: mergeContacts is fed
+    // vfo + audio offset when a VFO is known (see the merge effect above), and
+    // extractQSORecords()/its audioHz fallback rely on that same convention.
+    const freq = vfoHz > 0 ? vfoHz + audioHz : audioHz
+    const { contacts: merged } = mergeContacts(
+      contactsAuth,
+      windowStart,
+      [{ msg, freq, snr: TX_SELF_SNR }],
+      0,
+    )
+    contactsAuth = merged
+
+    // Snapshot the peer's QSO segments straight away, exactly as the decode
+    // path does — the 60-message-per-contact ring can rotate this exchange
+    // out before any later decode would have captured it.
+    const peer = merged.get(parsed.callee)
+    if (peer) qsoLogUpsert(extractQSORecords(peer, myUp, props.ftMode, vfoHz))
+
+    if (publishTimer === null) publishTimer = setTimeout(publishContacts, CONTACTS_PUBLISH_MS)
+  }
+
   function handleReset() {
     processor.clearResults()
     contactsAuth = new Map()
@@ -776,6 +848,7 @@ export default function FTDecoder(props: Props): JSX.Element {
         start: processor.startRecording,
         stop: processor.stopRecording,
         reset: handleReset,
+        injectSentMessage,
       }
     }
   })
