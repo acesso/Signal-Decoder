@@ -12,6 +12,13 @@ them into a version section when cutting a release.
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-09-01
+
+### Fixed
+
+- Fixed a residual FT8/FT4 decode time-offset (Δ) drift left over after 0.13.0's sample-clock anchoring fix: a one-time deficit (not a compounding ramp) baked into every window boundary for the rest of the session, from stamping the anchor at the instant the capture buffer was allocated rather than the instant real audio first landed in it. Between an AudioWorkletNode connecting and its first genuinely non-empty input, a few render quanta of real wall-clock time are silently skipped over — worse on the ESP32 bridge (WebSocket connect + first status fetch + first playFrame all fall in that gap) than on direct mic capture. The anchor is now stamped from the capture callback's first actual write into the buffer instead of guessed in advance.
+- Fixed the same drift re-appearing mid-session (not just at startup) whenever the AudioContext was briefly suspended and resumed — e.g. the OS reclaiming audio focus for a notification or call, or tab backgrounding — since no samples are counted for the entire suspended span while wall-clock time keeps passing. The sample clock now re-anchors after any such gap, the same way it does at startup.
+
 ## [0.14.0] - 2026-08-31
 
 ### Added
