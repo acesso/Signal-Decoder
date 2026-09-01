@@ -81,6 +81,34 @@ export function createFTProcessor(
   // window are we" from a fresh Date.now() read each rollover.
   let anchorUtcMs = 0
   let samplesSinceAnchor = 0
+  // Resolved by the capture callback below on the first sample it actually
+  // writes into the CURRENT sampleBuf — see that callback's own comment.
+  // Re-created every time sampleBuf is (re)allocated, so runLoop() can await
+  // "a real sample has now landed in THIS buffer" instead of guessing at it
+  // from its own clock.
+  let pendingAnchor: { resolve: (ms: number) => void; promise: Promise<number> } | null = null
+  // Set by the AudioContext's onstatechange handler (see startRecording())
+  // when the context comes back to 'running' after having left it —
+  // suspended by the OS reclaiming audio focus (a notification, a call, tab
+  // backgrounding/power-saving throttling), or, on the bridge path, any
+  // other reason connect() might leave playCtx briefly non-running. While
+  // suspended, the AudioWorkletNode's process() callback simply isn't
+  // invoked at all — no quanta, empty or otherwise — so samplesSinceAnchor
+  // silently stops advancing for the entire suspended span while real wall-
+  // clock time keeps passing, exactly reproducing the startup gap the
+  // pendingAnchor mechanism above already fixes, except mid-session instead
+  // of only at t=0. runLoop()'s existing allocation/re-anchor block already
+  // does the right thing for a resized buffer; this flag makes it also run
+  // for "same buffer, but audio silently stopped and restarted."
+  let needsReanchor = false
+  // Detaches the statechange listener startRecording() attaches below —
+  // null when nothing is currently attached. Called from stopRecording()
+  // so a long-lived shared context (the bridge's playCtx, reused across
+  // many start/stop cycles in one page session) doesn't accumulate one
+  // dead listener per past session; the generation guard already makes a
+  // stale listener harmless, but "harmless" isn't the same as "not still
+  // attached and taking up memory forever."
+  let detachCtxStateListener: (() => void) | null = null
   let isRunning = false
   const timers = new Set<ReturnType<typeof setTimeout>>()
 
@@ -191,18 +219,64 @@ export function createFTProcessor(
 
       const sampleRate = audioContext?.sampleRate ?? 48000
       const capacity = Math.ceil((curWindowSec + 2) * sampleRate)
-      if (!sampleBuf || sampleBuf.length !== capacity) {
-        sampleBuf = new Float32Array(capacity)
+      if (!sampleBuf || sampleBuf.length !== capacity || needsReanchor) {
+        needsReanchor = false
+        // A resize allocates a fresh buffer; a plain re-anchor (context
+        // resumed after suspending) keeps using the same one — either way,
+        // sampleCount/samplesSinceAnchor restart at 0 for it, so whatever
+        // was captured before the gap (now stale/discontinuous with what's
+        // coming) is dropped rather than silently spliced together with
+        // post-gap audio as if no time had passed.
+        sampleBuf = sampleBuf && sampleBuf.length === capacity ? sampleBuf : new Float32Array(capacity)
         sampleCount = 0
-        windowStart = new Date()
-        // Re-anchor the sample clock to this exact instant — see
-        // samplesSinceAnchor's own comment. This runs once at capture
-        // start and again only if the sample rate changes mid-session
-        // (forcing a buffer resize), both one-time correlation points,
-        // not a per-window recurrence — so it can't reintroduce the
-        // accumulating drift this scheme exists to avoid.
-        anchorUtcMs = windowStart.getTime()
         samplesSinceAnchor = 0
+        // BUG this fixes (reported 2026-09-01: dt drifts steadily worse,
+        // present on the ESP32 bridge, a directly-plugged soundcard, AND a
+        // WebSDR-loopback source — worse on the bridge): anchorUtcMs used
+        // to be stamped from a plain `new Date()` read taken right here,
+        // treating "the instant this main-thread loop happens to allocate
+        // sampleBuf" as if it were "the instant real audio starts landing
+        // in it." Those are NOT the same instant. Between an
+        // AudioWorkletNode being constructed/connected and its process()
+        // callback receiving a genuinely non-empty inputs[0][0] (spec-legal
+        // and normal — the upstream graph briefly delivers empty/absent
+        // input for the first few render quanta right after connect()),
+        // captureWorklet.js's own `if (input && input.length > 0)` guard
+        // silently skips forwarding those quanta — correctly, since
+        // there's nothing real to send, but each one is real wall-clock
+        // time samplesSinceAnchor never learns about. Stamping the anchor
+        // from Date.now() before that startup gap closed silently baked
+        // that gap's whole length into every window boundary computed for
+        // the rest of the session — a ONE-TIME deficit, not a per-window
+        // compounding drift (matching the reported stable-band-not-a-ramp
+        // shape), larger on the bridge (WebSocket connect + first /status
+        // fetch + first playFrame() all sit in that gap) than on direct mic
+        // capture (shorter gap, smaller deficit, still nonzero).
+        //
+        // Fix: don't guess when the first real sample will land — wait for
+        // it. pendingAnchor is a promise the capture callback resolves on
+        // the first write it actually makes into THIS buffer (audio-thread
+        // timestamp, audio-thread accurate); anchorUtcMs is stamped from
+        // that value once it resolves, not before. A short bounded timeout
+        // is the only safety net (a source that never delivers a single
+        // sample has bigger problems than an unanchored window), so this
+        // can't hang the loop forever.
+        let resolveAnchor: (ms: number) => void
+        const anchorPromise = new Promise<number>((resolve) => { resolveAnchor = resolve })
+        pendingAnchor = { resolve: resolveAnchor!, promise: anchorPromise }
+        const ANCHOR_WAIT_TIMEOUT_MS = 2000
+        // sleep() (not a raw setTimeout) so this timer is tracked in the
+        // same `timers` set stopRecording()'s clearTimers() sweeps — a
+        // stop mid-wait shouldn't leave an orphaned timer running, even
+        // though its only effect (resolving an internal promise) would be
+        // harmless either way.
+        const firstSampleAtMs = await Promise.race([
+          anchorPromise,
+          sleep(ANCHOR_WAIT_TIMEOUT_MS).then(() => Date.now()),
+        ])
+        if (!isRunning) break
+        windowStart = new Date(firstSampleAtMs)
+        anchorUtcMs = firstSampleAtMs
       }
       if (firstWindow) {
         firstWindow = false
@@ -316,6 +390,33 @@ export function createFTProcessor(
       const ctx = handle.ctx
       audioContext = ctx
 
+      // Detects the mid-session suspend/resume gap needsReanchor exists
+      // for (see its own comment) — addEventListener, not assigning
+      // ctx.onstatechange directly, since on the bridge path this context
+      // is useAudioBridge.ts's own playCtx, shared with (and outliving)
+      // this decoder session; a plain assignment would silently clobber
+      // any handler that module attaches, now or later, and vice versa.
+      // Guarded by generation (myGeneration) the same way every other
+      // async continuation in this function is — belt-and-suspenders
+      // alongside stopRecording()'s explicit removeEventListener() below:
+      // the guard covers the narrow window where a statechange event is
+      // already queued/in-flight at the exact moment stopRecording() runs,
+      // so it fires once more before the removal takes effect.
+      let sawNonRunning = ctx.state !== 'running'
+      const onCtxStateChange = () => {
+        if (startGeneration !== myGeneration) return
+        if (ctx.state !== 'running') {
+          sawNonRunning = true
+          return
+        }
+        if (sawNonRunning) {
+          sawNonRunning = false
+          needsReanchor = true
+        }
+      }
+      ctx.addEventListener('statechange', onCtxStateChange)
+      detachCtxStateListener = () => ctx.removeEventListener('statechange', onCtxStateChange)
+
       const analyserNode = ctx.createAnalyser()
       analyserNode.fftSize = 4096
       analyser = analyserNode
@@ -329,6 +430,15 @@ export function createFTProcessor(
       const proc = await createCaptureNode(ctx, 4096, (input) => {
         const buf = sampleBuf
         if (!buf) return
+        // The very first write into a freshly (re)allocated buffer
+        // (sampleCount === 0 at entry — see runLoop()'s allocation block)
+        // is exactly the sample this buffer's anchor needs to correlate
+        // to: same write, same timestamp, no gap between "when we decided
+        // to start counting" and "the first thing we actually counted."
+        if (sampleCount === 0 && pendingAnchor) {
+          pendingAnchor.resolve(Date.now())
+          pendingAnchor = null
+        }
         const space = buf.length - sampleCount
         const copy = Math.min(input.length, space)
         buf.set(input.subarray(0, copy), sampleCount)
@@ -354,6 +464,8 @@ export function createFTProcessor(
     startGeneration++ // see its own comment — aborts any in-flight bridge-retry wait
     isRunning = false
     clearTimers()
+    detachCtxStateListener?.()
+    detachCtxStateListener = null
     sampleBuf = null
     if (processorNode) {
       processorNode.disconnect()
