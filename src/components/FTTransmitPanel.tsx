@@ -445,6 +445,9 @@ interface FTTransmitPanelProps {
    *  contention — see loadSuspendIQDuringTx()). */
   onTxWindowStart?: () => void;
   onTxWindowEnd?: () => void;
+  /** Fired with each completed transmission so it can be recorded in the
+   *  contact store / QSO log — see useFTTransmit.ts's getOnSentMessage. */
+  onSentMessage?: (msg: string, windowStart: Date, vfoHz: number, audioHz: number) => void;
   onStatusChange?: (s: TxStatus) => void;
   onReset?: (clearSentFn: () => void) => void;
   onBaseFreqHandle?: (setFn: (v: number, committed?: boolean) => void) => void;
@@ -550,6 +553,7 @@ export default function FTTransmitPanel(props: FTTransmitPanelProps): JSX.Elemen
     () => props.bridgeWsUrl,
     () => props.onTxWindowStart,
     () => props.onTxWindowEnd,
+    () => props.onSentMessage,
   )
 
   // Keep the auto-CQ cache in sync with mode/baseFreq changes. Debounced:
@@ -1502,6 +1506,19 @@ export default function FTTransmitPanel(props: FTTransmitPanelProps): JSX.Elemen
                         </Show>
                       </div>
                       <Show when={slot.uploaded}>
+                        {/* Requeue a slot staged in an earlier session — the
+                            message/Hz come back from the device itself, so this
+                            works even for a slot this browser never staged. */}
+                        <button onClick={() => tx.enqueueBridgeSlot(slot.slot)}
+                          class="shrink-0 text-[#484f58] hover:text-[#58a6ff] p-0.5"
+                          title="Requeue — send this staged message on the next window">
+                          <svg class="w-3 h-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+                            <path d="M3 12a9 9 0 0 1 15.3-6.4L21 8" />
+                            <path d="M21 3v5h-5" />
+                            <path d="M21 12a9 9 0 0 1-15.3 6.4L3 16" />
+                            <path d="M3 21v-5h5" />
+                          </svg>
+                        </button>
                         <button onClick={() => void tx.clearBridgeSlot(slot.slot)}
                           class="text-[#484f58] hover:text-[#f85149] text-xs px-1 shrink-0" title="Remove from bridge">✕</button>
                       </Show>

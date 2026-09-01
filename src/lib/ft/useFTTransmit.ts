@@ -596,6 +596,24 @@ export function createFTTransmit(
   // it's off or nothing's connected.
   getOnTxWindowStart: () => (() => void) | undefined = () => undefined,
   getOnTxWindowEnd: () => (() => void) | undefined = () => undefined,
+  // Fired once per completed transmission with what actually went out.
+  //
+  // A transmission normally re-enters the contact store by being decoded off
+  // the air like any other signal (txTap below feeds the local capture path).
+  // The bridge sink has no such loop — the firmware plays the audio from its
+  // own PSRAM, so nothing local ever hears it — which left the QSO log with
+  // only the other station's half of every bridge-sink exchange. The caller
+  // (App.tsx) forwards this to FTDecoder's injectSentMessage(); see that
+  // function's comment for the full rationale.
+  //
+  // Fired for BOTH sinks, not just 'bridge': injection is idempotent for
+  // logging purposes (mergeContacts/qsoLogUpsert merge by callsign + time
+  // overlap, and extractQSORecords derives RST_SENT from the message text
+  // rather than by counting duplicates), and a speaker-sink operator whose
+  // rig mutes RX during TX — most of them — has exactly the same gap. Making
+  // it unconditional means the log no longer depends on the rig hearing
+  // itself, which was never guaranteed on either path.
+  getOnSentMessage: () => ((msg: string, windowStart: Date, vfoHz: number, audioHz: number) => void) | undefined = () => undefined,
 ) {
   const [state, setState] = createSignal<FTTransmitState>({
     status: 'idle',
@@ -1081,10 +1099,17 @@ export function createFTTransmit(
 
       getOnTxWindowEnd()?.();
 
+      const sentVfoHz = getVfoFrequency();
       const sent: SentEntry = {
         id: txId, message: txMessage, label: txLabel, windowStart,
-        vfoHz: getVfoFrequency(), audioHz: txAudioHz,
+        vfoHz: sentVfoHz, audioHz: txAudioHz,
       };
+      // Record what we just sent into the contact store / QSO log. Guarded so
+      // a throwing consumer can never break the TX loop itself — a failed log
+      // update must not stop the operator from transmitting the next window.
+      try {
+        getOnSentMessage()?.(txMessage, windowStart, sentVfoHz, txAudioHz);
+      } catch { /* logging must never interrupt TX */ }
       setState(prev => ({
         ...prev, status: 'waiting',
         // Auto-CQ entries never enter the queue, so only filter for real entries
@@ -1334,6 +1359,54 @@ export function createFTTransmit(
   // /tx-* call in this file) — the local state clears either way, since an
   // operator clicking "remove" wants the panel to reflect that regardless
   // of whether the bridge round-trip itself succeeds.
+  // Requeue a message that is already staged in one of the bridge's TX
+  // slots, so it goes out on the next available window.
+  //
+  // The point is cross-session reuse: slot metadata (message/label/Hz) lives
+  // on the DEVICE alongside the audio, so syncBridgeSlotsFromDevice() can
+  // repopulate it on mount — which means an operator who reloads the page,
+  // opens a different browser, or comes back the next day can still see and
+  // resend what a previous session staged, with no local record of it at all.
+  // Without this, a staged slot could only be inspected or cleared; actually
+  // sending it again meant retyping the message by hand.
+  //
+  // Deliberately re-encodes locally rather than just triggering /tx-play on
+  // that slot directly. Three reasons:
+  //   - The TX loop is built around a queue entry carrying its own samples
+  //     (window timing, PTT bracketing, the sent log, self-logging). Playing a
+  //     slot out-of-band would bypass all of it.
+  //   - The queue's lookahead assigns slots by queue POSITION
+  //     (lookaheadSlotForQueuePosition), so the requeued entry may legitimately
+  //     end up staged in a different slot than the one it came from.
+  //   - FT8 encoding is deterministic: same message + mode + Hz gives
+  //     byte-identical audio. uploadToBridgeSlot() hashes before uploading, so
+  //     if the content really is unchanged the upload is skipped and the round
+  //     trip costs nothing.
+  //
+  // audioHz is pinned from the slot rather than left to follow the panel's
+  // global Audio Hz — the slot records what it was encoded at, and an operator
+  // resending a staged message means that message, not a copy retuned to
+  // wherever the marker happens to sit now. A slot with no recorded Hz (0,
+  // e.g. staged by an older firmware) falls back to the panel default.
+  //
+  // Returns false when the slot holds nothing to send; the caller is expected
+  // to only offer this for a slot whose `uploaded` is true.
+  function enqueueBridgeSlot(slot: number): boolean {
+    const info = state().bridgeSlots.find(s => s.slot === slot);
+    if (!info?.uploaded || !info.message) return false;
+    enqueue({
+      // Random suffix, not a timestamp: two requeues of the same slot inside
+      // the same millisecond would otherwise collide, and every queue
+      // operation (dequeue/moveUp/the loop's own lookups) addresses entries
+      // by id.
+      id: `slot${slot}-${Math.random().toString(36).slice(2, 9)}`,
+      message: info.message,
+      label: info.label || info.message,
+      audioHz: info.audioHz > 0 ? info.audioHz : undefined,
+    });
+    return true;
+  }
+
   async function clearBridgeSlot(slot: number): Promise<void> {
     setBridgeSlotInfo(slot, '', '', false);
     const wsUrl = getBridgeWsUrl();
@@ -1371,6 +1444,7 @@ export function createFTTransmit(
     setPostKeyMs,
     clearSent,
     clearBridgeSlot,
+    enqueueBridgeSlot,
     syncBridgeSlotsFromDevice,
     syncParams,
     destroy,

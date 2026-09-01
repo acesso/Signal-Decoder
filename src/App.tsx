@@ -7,7 +7,7 @@ import RTTYTransmitPanel, { type RTTYTxStatus } from './components/RTTYTransmitP
 import SSTVDecoder from './components/SSTVDecoder'
 import SSTVComposer, { type SSTVTxStatus } from './components/SSTVComposer'
 import CWDecoder from './components/CWDecoder'
-import FTDecoder, { FTModeSelector } from './components/FTDecoder'
+import FTDecoder, { FTModeSelector, type FTDecoderHandle } from './components/FTDecoder'
 import MFSKDecoder from './components/MFSKDecoder'
 import FTTransmitPanel, { type TxStatus } from './components/FTTransmitPanel'
 import type { RTTYConfig } from '$decoder-lib/rtty/decoder'
@@ -734,7 +734,7 @@ function App(): JSX.Element {
   const rtty: { current: DecoderControls | null } = { current: null }
   const sstv: { current: DecoderControls | null } = { current: null }
   const cw: { current: DecoderControls | null } = { current: null }
-  const ft: { current: DecoderControls | null } = { current: null }
+  const ft: { current: FTDecoderHandle | null } = { current: null }
   const mfsk: { current: DecoderControls | null } = { current: null }
 
   function handleForMode(m: DecoderMode) {
@@ -1068,6 +1068,9 @@ function App(): JSX.Element {
                   onSetPTT={cat.state().connected ? cat.setPTT : undefined}
                   onTxWindowStart={handleTxWindowStart}
                   onTxWindowEnd={handleTxWindowEnd}
+                  onSentMessage={(msg, windowStart, vfoHz, audioHz) =>
+                    ft.current?.injectSentMessage(msg, windowStart, vfoHz, audioHz)
+                  }
                   onStatusChange={setTxStatus}
                   onReset={(fn) => {
                     clearSent = fn
