@@ -71,6 +71,13 @@ export interface FTTransmitState {
   /** FT8-only: restrict TX to one parity of window pair (even: :00/:30,
    *  odd: :15/:45) — see doc/FAKE_SPLIT_AND_WINDOW_PARITY_DESIGN.md. */
   txWindowParity: 'even' | 'odd';
+  /** Non-null when a Fake Split VFO retune was NOT confirmed-restored
+   *  before the app last shut down (a reload/crash mid-TX, or a restore
+   *  that itself failed to confirm) — see loadPendingFakeSplitRestoreHz's
+   *  own comment. The value is the VFO frequency the radio should be
+   *  restored to. The panel surfaces this as a small dismissable warning
+   *  with a one-click "restore now" action (revertStaleFakeSplitVfo). */
+  fakeSplitStaleRestoreHz: number | null;
   error: string | null;
   outputDeviceId: string;
   txGain: number;
@@ -129,6 +136,31 @@ const LS_CONSECUTIVE_TX  = 'ft_consecutive_tx';
 const LS_FAKE_SPLIT      = 'ft_fake_split';
 const LS_FAKE_SPLIT_SWEET_SPOT_HZ = 'ft_fake_split_sweet_spot_hz';
 const LS_TX_WINDOW_PARITY = 'ft_tx_window_parity';
+const LS_FAKE_SPLIT_PENDING_RESTORE_HZ = 'ft_fake_split_pending_restore_hz';
+
+// Fake Split's crash-recovery marker: the VFO frequency to restore, written
+// to localStorage BEFORE the pre-TX retune and cleared only after the
+// post-TX restore actually succeeds. A page reload (or crash) between those
+// two points would otherwise lose the in-memory record of what to restore
+// to, silently leaving the radio parked on the shifted frequency forever —
+// runLoop() only ever kept this in a local `let`, not anywhere durable. On
+// the next startup, a leftover value here means exactly that happened —
+// createFTTransmit()'s initial state reads this directly into
+// fakeSplitStaleRestoreHz, and FTTransmitPanel.tsx surfaces it as a
+// dismissable warning with a one-click revertStaleFakeSplitVfo() action.
+// Exported (like this file's other load*/save* pairs) so tests can drive
+// the recovery path without duplicating the localStorage key.
+export function loadPendingFakeSplitRestoreHz(): number | null {
+  if (typeof window === 'undefined') return null;
+  const n = parseInt(localStorage.getItem(LS_FAKE_SPLIT_PENDING_RESTORE_HZ) ?? '', 10);
+  return Number.isFinite(n) ? n : null;
+}
+export function savePendingFakeSplitRestoreHz(hz: number) {
+  if (typeof window !== 'undefined') localStorage.setItem(LS_FAKE_SPLIT_PENDING_RESTORE_HZ, String(hz));
+}
+export function clearPendingFakeSplitRestoreHz() {
+  if (typeof window !== 'undefined') localStorage.removeItem(LS_FAKE_SPLIT_PENDING_RESTORE_HZ);
+}
 
 // Fake Split's fixed "sweet spot" audio tone — see
 // doc/FAKE_SPLIT_AND_WINDOW_PARITY_DESIGN.md. This is a FIXED reference
@@ -745,6 +777,7 @@ export function createFTTransmit(
     fakeSplit: loadFakeSplit(),
     fakeSplitSweetSpotHz: loadFakeSplitSweetSpotHz(),
     txWindowParity: loadTxWindowParity(),
+    fakeSplitStaleRestoreHz: loadPendingFakeSplitRestoreHz(),
     error: null,
     outputDeviceId: loadOutputDevice(),
     txGain: loadTxGain(),
@@ -1189,6 +1222,12 @@ export function createFTTransmit(
           const delta = desiredHz - fakeSplitEncodedHz;
           if (delta !== 0) {
             const originalVfoHz = getVfoFrequency();
+            // Persisted BEFORE the retune command is even sent (not after
+            // it resolves) — a reload/crash during the CAT round-trip
+            // itself must still leave a durable record of what to restore
+            // to. See loadPendingFakeSplitRestoreHz's own comment; cleared
+            // only once the restore below is confirmed.
+            savePendingFakeSplitRestoreHz(originalVfoHz);
             try {
               await Promise.race([
                 onSetFrequency(originalVfoHz + delta),
@@ -1203,6 +1242,18 @@ export function createFTTransmit(
               // via the normal "not confirmed" CAT error surfacing (see
               // useRadioCAT's noteConfirmFailure), not a separate Fake
               // Split error path.
+              //
+              // Deliberately does NOT clear the pending-restore marker
+              // just saved above: a timeout/rejection here means the SET+
+              // verify cycle didn't CONFIRM success, not that the radio
+              // definitely never applied it — over the 'websocket'
+              // transport especially, the command can land while the
+              // confirmation read is what actually failed/timed out. The
+              // safe default is to leave the marker and let the operator
+              // see (and dismiss, if it turns out to be a false alarm) the
+              // stale-restore warning, rather than silently clear it and
+              // risk abandoning a radio that IS sitting on the shifted
+              // frequency with no record of it anywhere.
             }
           }
         }
@@ -1319,7 +1370,11 @@ export function createFTTransmit(
             onSetFrequency(fakeSplitOriginalVfoHz),
             new Promise<void>((_, reject) => setTimeout(() => reject(new Error('Fake Split restore timeout')), 1500)),
           ]);
-        } catch { /* CAT not connected or timed out — next poll/manual check will surface the mismatch */ }
+          // Confirmed restored — safe to drop the crash-recovery marker.
+          // Left in place on failure (see the catch below): an unconfirmed
+          // restore is exactly the case that marker exists to catch.
+          clearPendingFakeSplitRestoreHz();
+        } catch { /* CAT not connected or timed out — the pending-restore marker (and the panel's stale-restore warning) surfaces this */ }
       }
 
       getOnTxWindowEnd()?.();
@@ -1488,6 +1543,21 @@ export function createFTTransmit(
     // actually resumes — the normal getOnTxWindowEnd() call after PTT-off
     // in the loop above never runs when the loop is aborted this way.
     getOnTxWindowEnd()?.();
+    // Same reasoning for Fake Split: fakeSplitOriginalVfoHz is scoped
+    // inside runLoop()'s loop body, so an operator-initiated Stop mid-TX
+    // (as opposed to the loop reaching its own restore step normally)
+    // never gets a chance to restore the VFO there either. The persisted
+    // marker (see loadPendingFakeSplitRestoreHz's own comment) is exactly
+    // what's needed here regardless of how the retune happened — attempt
+    // an immediate best-effort restore rather than leaving the operator to
+    // notice the stale-restore warning on their next reload.
+    const pendingHz = loadPendingFakeSplitRestoreHz();
+    const onSetFrequency = getOnSetFrequency();
+    if (pendingHz !== null && onSetFrequency) {
+      onSetFrequency(pendingHz)
+        .then(() => clearPendingFakeSplitRestoreHz())
+        .catch(() => null); // left pending — the panel's stale-restore warning covers this
+    }
   }
 
   function enqueue(entry: Omit<TxQueueEntry, 'samples' | 'encodeStatus'>) {
@@ -1612,6 +1682,34 @@ export function createFTTransmit(
     setState(prev => ({ ...prev, sent: [] }));
   }
 
+  // One-click fix for FTTransmitState.fakeSplitStaleRestoreHz's warning —
+  // see loadPendingFakeSplitRestoreHz's own comment for what this marker
+  // means. Explicit operator action, not automatic: retuning the radio's
+  // VFO on the operator's behalf without them asking for it right now
+  // (e.g. right after a reload, before they've even looked at the panel)
+  // would be the same kind of surprise this whole feature exists to avoid.
+  async function revertStaleFakeSplitVfo() {
+    const hz = state().fakeSplitStaleRestoreHz;
+    const onSetFrequency = getOnSetFrequency();
+    if (hz === null || !onSetFrequency) return;
+    try {
+      await onSetFrequency(hz);
+      clearPendingFakeSplitRestoreHz();
+      setState(prev => ({ ...prev, fakeSplitStaleRestoreHz: null }));
+    } catch {
+      // Leave the marker and the warning up — the operator can retry, or
+      // fix it manually on the radio and dismiss.
+    }
+  }
+
+  // Dismiss without reverting — e.g. the operator already fixed it manually
+  // on the radio, or the marker is a false alarm (see the retune-failure
+  // comment above on why a failed retune still leaves the marker set).
+  function dismissStaleFakeSplitVfo() {
+    clearPendingFakeSplitRestoreHz();
+    setState(prev => ({ ...prev, fakeSplitStaleRestoreHz: null }));
+  }
+
   // Removes a slot's cached message — see BridgeSlotInfo's own comment for
   // why this needs a real firmware call (POST /tx-clear), not just wiping
   // the local label: without it, the device would still happily play
@@ -1710,6 +1808,8 @@ export function createFTTransmit(
     setPreKeyMs,
     setPostKeyMs,
     clearSent,
+    revertStaleFakeSplitVfo,
+    dismissStaleFakeSplitVfo,
     clearBridgeSlot,
     enqueueBridgeSlot,
     syncBridgeSlotsFromDevice,

@@ -14,7 +14,7 @@ them into a version section when cutting a release.
 
 ### Added
 
-- FT8/FT4 TX: **Fake Split** toggle — on TX, always encodes audio at a fixed "sweet spot" tone (1750 Hz by default, configurable) and retunes the VFO via CAT to make up the difference, so the operator's actual chosen TX frequency (Audio Hz, or a per-message pinned tone) still goes out over the air — matches WSJT-X's real "Fake It" split mode. Requires a live, frequency-reporting CAT connection; warns (rather than blocking) when Auto-PTT is off or CAT is on the unconfirmed serial transport. See `src/lib/ft/doc/FAKE_SPLIT_AND_WINDOW_PARITY_DESIGN.md`.
+- FT8/FT4 TX: **Fake Split** toggle — on TX, always encodes audio at a fixed "sweet spot" tone (1750 Hz by default, configurable) and retunes the VFO via CAT to make up the difference, so the operator's actual chosen TX frequency (Audio Hz, or a per-message pinned tone) still goes out over the air — matches WSJT-X's real "Fake It" split mode. Requires a live, frequency-reporting CAT connection; warns (rather than blocking) when Auto-PTT is off or CAT is on the unconfirmed serial transport. If a page reload/crash (or a Stop click) interrupts a Fake Split cycle before the VFO is restored, a compact warning appears with the leftover frequency and a one-click revert. See `src/lib/ft/doc/FAKE_SPLIT_AND_WINDOW_PARITY_DESIGN.md`.
 - FT8 TX: **Even/Odd** window-parity toggle — restricts transmission to one parity of the two 15s windows per 30s period (Even: :00/:30, Odd: :15/:45), for coordinating with a QSO partner using the other slot. FT8 only; both new toggles are session-persisted the same way as the existing Auto-CQ/Auto-PTT/Consecutive-TX chips.
 
 ## [0.15.0] - 2026-09-01
