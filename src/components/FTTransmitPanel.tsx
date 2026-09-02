@@ -1125,7 +1125,7 @@ export default function FTTransmitPanel(props: FTTransmitPanelProps): JSX.Elemen
             <NumberField value={tx.state().fakeSplitSweetSpotHz}
               onCommit={tx.setFakeSplitSweetSpotHz}
               disabled={!tx.state().fakeSplit}
-              min={300} max={2800} step={10}
+              min={300} max={2800}
               class="bg-[#0d1117] border border-[#30363d] rounded px-1.5 py-1 text-xs font-mono text-[#c9d1d9] w-16 focus:outline-none focus:border-[#388bfd] disabled:cursor-not-allowed" />
             <span class="text-[10px] text-[#8b949e] whitespace-nowrap">Hz</span>
           </div>
