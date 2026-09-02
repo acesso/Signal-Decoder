@@ -31,6 +31,7 @@ function makeTx(sinkKind: 'speaker' | 'bridge' = 'bridge') {
     () => 1500,        // panel's global Audio Hz
     () => 14_074_000,
     () => undefined,
+    () => undefined,   // no CAT frequency setter — Fake Split stays off in these tests
     () => sinkKind,
     () => undefined,   // no bridge URL — keeps uploads out of these tests
   );

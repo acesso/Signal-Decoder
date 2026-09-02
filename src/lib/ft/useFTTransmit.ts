@@ -17,12 +17,21 @@ export interface TxQueueEntry {
   label: string;
   /** Pinned TX audio frequency for THIS entry (honors a station's QSY
    *  request per conversation) — overrides the panel's global Audio Hz,
-   *  which stays untouched. */
+   *  which stays untouched. Under Fake Split this becomes the DESIRED tone
+   *  used to compute a VFO delta rather than what's actually encoded — see
+   *  fakeSplitEncodedHz below and the Fake Split design doc. */
   audioHz?: number;
   // Populated as soon as the entry is enqueued — loop never waits for encoding
   samples: Float32Array | null;
   encodeStatus: 'pending' | 'ready' | 'error';
   encodeError?: string;
+  /** The tone `samples` was ACTUALLY encoded at when Fake Split was on at
+   *  encode time (always the panel's Audio Hz then, per Fake Split's
+   *  design — see runLoop's fake-split branch), so a later Audio Hz change
+   *  can't desync "what's baked into the samples" from "what delta we
+   *  compute for the VFO retune." Undefined when Fake Split was off at
+   *  encode time (encodeHz was audioHz ?? getBaseFrequency() as normal). */
+  fakeSplitEncodedHz?: number;
 }
 
 export interface SentEntry {
@@ -45,6 +54,16 @@ export interface FTTransmitState {
   autoCQIntervalMin: number;
   autoPTT: boolean;
   allowConsecutiveTx: boolean;
+  /** Fake Split (see doc/FAKE_SPLIT_AND_WINDOW_PARITY_DESIGN.md): on TX,
+   *  retunes the VFO via CAT so the panel's own Audio Hz is always what's
+   *  actually transmitted, moving any per-entry QSY offset into the VFO
+   *  shift instead of the audio tone. Requires a live, frequency-reporting
+   *  CAT connection — the panel gates the chip on that, this flag alone
+   *  doesn't imply CAT is actually usable right now. */
+  fakeSplit: boolean;
+  /** FT8-only: restrict TX to one parity of window pair (even: :00/:30,
+   *  odd: :15/:45) — see doc/FAKE_SPLIT_AND_WINDOW_PARITY_DESIGN.md. */
+  txWindowParity: 'even' | 'odd';
   error: string | null;
   outputDeviceId: string;
   txGain: number;
@@ -100,6 +119,39 @@ const LS_AUDIO_SINK      = 'ft_audio_sink_kind';
 const LS_GAIN            = 'ft_tx_gain';
 const LS_AUTOPTT         = 'ft_auto_ptt';
 const LS_CONSECUTIVE_TX  = 'ft_consecutive_tx';
+const LS_FAKE_SPLIT      = 'ft_fake_split';
+const LS_TX_WINDOW_PARITY = 'ft_tx_window_parity';
+
+// Guard delay after Fake Split's VFO retune is CAT-confirmed but before
+// audio/PTT proceeds. A confirmed SET only proves the radio ACKNOWLEDGED
+// the new frequency, not that its synthesizer/PLL has finished physically
+// settling on it — keying immediately risks the first symbol(s) going out
+// chirped or off-frequency. No source (WSJT-X's own docs included) gives a
+// universal number for this; it's genuinely radio/synthesizer-specific.
+// Ships as a conservative default pending real-hardware measurement across
+// at least the TS-480-direct-serial and ESP32-bridge paths — see
+// doc/FAKE_SPLIT_AND_WINDOW_PARITY_DESIGN.md's "Remaining open question."
+const FAKE_SPLIT_SETTLE_MS = 75;
+
+// Window-parity guard (FT8 only — see doc/FAKE_SPLIT_AND_WINDOW_PARITY_DESIGN.md):
+// two consecutive 15s windows make one WSJT-X-style 30s period; parity 0 =
+// the pair starting at :00/:30 ("even"), 1 = :15/:45 ("odd"). Exported as a
+// standalone pure function (rather than left inline in runLoop) so this
+// epoch-alignment math — verified once against known UTC boundaries, not
+// just assumed — has a direct unit test rather than only being exercised
+// indirectly through the full async TX loop. FT4/FT2 windows don't divide
+// into a clean 2-way parity (4 and 8 slots per 30s respectively), so this
+// only ever restricts FT8.
+export function isWrongWindowParity(
+  currentWindowStart: number,
+  windowMs: number,
+  mode: FTMode,
+  txWindowParity: 'even' | 'odd',
+): boolean {
+  if (mode !== 'FT8') return false;
+  const windowParity = Math.floor(currentWindowStart / windowMs) % 2;
+  return windowParity !== (txWindowParity === 'even' ? 0 : 1);
+}
 const LS_BASE_FREQ       = 'ft_base_freq';
 const LS_AUTOCQ_INTERVAL = 'ft_autocq_interval_min';
 const LS_PREKEY_MS       = 'ft_prekey_ms';
@@ -187,6 +239,31 @@ export function loadAllowConsecutiveTx(): boolean {
 }
 export function saveAllowConsecutiveTx(v: boolean) {
   if (typeof window !== 'undefined') localStorage.setItem(LS_CONSECUTIVE_TX, String(v));
+}
+
+// Fake Split — see FTTransmitState.fakeSplit's own comment and
+// doc/FAKE_SPLIT_AND_WINDOW_PARITY_DESIGN.md. Off by default: it retunes
+// the VFO on every TX, which is only safe with a CAT link the operator has
+// deliberately connected.
+export function loadFakeSplit(): boolean {
+  if (typeof window === 'undefined') return false;
+  return localStorage.getItem(LS_FAKE_SPLIT) === 'true';
+}
+export function saveFakeSplit(v: boolean) {
+  if (typeof window !== 'undefined') localStorage.setItem(LS_FAKE_SPLIT, String(v));
+}
+
+// TX window parity — see FTTransmitState.txWindowParity's own comment.
+// Always restricts to one parity or the other (no separate "off"/"any"
+// state — allowConsecutiveTx already covers "don't restrict windows").
+// Defaults to 'even': WSJT-X's own "Tx even/1st" is the more commonly-seen
+// default in the wild.
+export function loadTxWindowParity(): 'even' | 'odd' {
+  if (typeof window === 'undefined') return 'even';
+  return localStorage.getItem(LS_TX_WINDOW_PARITY) === 'odd' ? 'odd' : 'even';
+}
+export function saveTxWindowParity(v: 'even' | 'odd') {
+  if (typeof window !== 'undefined') localStorage.setItem(LS_TX_WINDOW_PARITY, v);
 }
 
 // Minimum gap between unattended auto-CQ transmissions. Left unchecked, the
@@ -580,6 +657,14 @@ export function createFTTransmit(
   getBaseFrequency: () => number,
   getVfoFrequency: () => number,
   getOnSetPTT: () => ((tx: boolean) => Promise<void>) | undefined,
+  // Fake Split's VFO retune (see doc/FAKE_SPLIT_AND_WINDOW_PARITY_DESIGN.md)
+  // — separate from getOnSetPTT rather than folded into it, since it needs
+  // to run and be AWAITED strictly before PTT keys (a retune that hasn't
+  // landed yet must not let audio start), and separate from
+  // getOnTxWindowStart/End below since those exist for an unrelated
+  // concern (suspending the I/Q bridge) that doesn't need to block TX.
+  // Undefined when no CAT frequency-set is wired up (mirrors getOnSetPTT).
+  getOnSetFrequency: () => ((hz: number) => Promise<void>) | undefined = () => undefined,
   // Where TX audio plays — the local speaker (default, matches all prior
   // behavior when omitted) or the ESP32 bridge, uploaded once and played
   // from its own RAM (see uploadIfBridgeSink()/playBridgeSlotAndWait()'s
@@ -623,6 +708,8 @@ export function createFTTransmit(
     autoCQIntervalMin: loadAutoCQIntervalMin(),
     autoPTT: loadAutoPTT(),
     allowConsecutiveTx: loadAllowConsecutiveTx(),
+    fakeSplit: loadFakeSplit(),
+    txWindowParity: loadTxWindowParity(),
     error: null,
     outputDeviceId: loadOutputDevice(),
     txGain: loadTxGain(),
@@ -640,6 +727,8 @@ export function createFTTransmit(
   let lastAutoCQAtMs     = 0; // epoch ms of the last auto-CQ transmission, 0 = none sent yet this session
   let autoPTTOn          = loadAutoPTT();
   let allowConsecutiveTx = loadAllowConsecutiveTx();
+  let fakeSplitOn        = loadFakeSplit();
+  let txWindowParity: 'even' | 'odd' = loadTxWindowParity();
   let preKeyMs           = loadPreKeyMs();
   let postKeyMs          = loadPostKeyMs();
   let lastTxWindow       = -1; // epoch ms of last window we transmitted in
@@ -766,7 +855,14 @@ export function createFTTransmit(
     const ENC_RATE = 12000;
     const myGeneration = (encodeGenerationByEntryId.get(entry.id) ?? 0) + 1;
     encodeGenerationByEntryId.set(entry.id, myGeneration);
-    const encodeHz = entry.audioHz ?? getBaseFrequency();
+    // Fake Split always encodes at the panel's Audio Hz (the operator's
+    // chosen "sweet spot" — see the Fake Split design doc), ignoring any
+    // per-entry QSY audioHz for the ENCODE itself; that intent is preserved
+    // instead as a VFO delta computed at TX time (runLoop, below) from
+    // entry.audioHz vs. fakeSplitEncodedHz. This is the one case where
+    // encodeHz and entry.audioHz deliberately diverge.
+    const fakeSplitEncodedHz = fakeSplitOn ? getBaseFrequency() : undefined;
+    const encodeHz = fakeSplitEncodedHz ?? entry.audioHz ?? getBaseFrequency();
     encodeAsync(entry.message, getMode(), ENC_RATE, encodeHz)
       .then(samples => {
         if (encodeGenerationByEntryId.get(entry.id) !== myGeneration) return; // superseded by a newer re-encode of this same entry
@@ -774,7 +870,7 @@ export function createFTTransmit(
         if (slot !== null) uploadIfBridgeSink(slot, entry.message, entry.label, samples, ENC_RATE, encodeHz);
         setState(prev => {
           const q = prev.queue.map(e =>
-            e.id === entry.id ? { ...e, samples, encodeStatus: 'ready' as const } : e
+            e.id === entry.id ? { ...e, samples, encodeStatus: 'ready' as const, fakeSplitEncodedHz } : e
           );
           queue = q;
           return { ...prev, queue: q };
@@ -905,8 +1001,9 @@ export function createFTTransmit(
       const nowMs              = Date.now();
       const currentWindowStart = nowMs - (nowMs % windowMs);
       const prevWindowStart    = currentWindowStart - windowMs;
-      const skipForListen      = !allowConsecutiveTx &&
-        (lastTxWindow === prevWindowStart || lastTxWindow === currentWindowStart);
+      const wrongParity        = isWrongWindowParity(currentWindowStart, windowMs, getMode(), txWindowParity);
+      const skipForListen      = wrongParity || (!allowConsecutiveTx &&
+        (lastTxWindow === prevWindowStart || lastTxWindow === currentWindowStart));
 
       if (skipForListen) {
         // Nothing will transmit at the upcoming boundary — the UI's countdown
@@ -946,6 +1043,11 @@ export function createFTTransmit(
       let txLabel   = '';
       let txId      = '';
       let txAudioHz = getBaseFrequency();
+      // Set only when this entry was encoded under Fake Split (see
+      // startEncode's own comment) — auto-CQ never carries a QSY intent, so
+      // it's always encoded at getBaseFrequency() with nothing to shift via
+      // VFO, hence no separate fakeSplitEncodedHz value needed for it.
+      let fakeSplitEncodedHz: number | undefined;
 
       if (useAutoCQ) {
         samples   = autoCQSamples;
@@ -987,6 +1089,7 @@ export function createFTTransmit(
         txLabel   = finalEntry.label;
         txId      = finalEntry.id;
         txAudioHz = finalEntry.audioHz ?? getBaseFrequency();
+        fakeSplitEncodedHz = finalEntry.fakeSplitEncodedHz;
       }
 
       if (!samples) continue;
@@ -998,6 +1101,39 @@ export function createFTTransmit(
       // For auto-CQ, generate a unique sent-log id from exact playback time
       if (useAutoCQ) { txId = `autocq-${windowStartMs}`; lastAutoCQAtMs = windowStartMs; }
       setState(prev => ({ ...prev, status: 'playing', error: null }));
+
+      // Fake Split (see doc/FAKE_SPLIT_AND_WINDOW_PARITY_DESIGN.md): retune
+      // the VFO BEFORE PTT keys so the panel's Audio Hz — always what's
+      // actually encoded when Fake Split is on, see startEncode — comes out
+      // at the frequency the operator actually intends (their normal Audio
+      // Hz for a plain CQ, or the QSY-adjusted entry.audioHz for a reply).
+      // Awaited: an unconfirmed/unsettled retune must not let audio start,
+      // or the first symbol(s) go out at the wrong frequency with no local
+      // sign anything went wrong. Restored after PTT-off, below.
+      let fakeSplitOriginalVfoHz: number | null = null;
+      const onSetFrequency = getOnSetFrequency();
+      if (fakeSplitOn && onSetFrequency) {
+        const desiredHz = txAudioHz; // entry.audioHz ?? getBaseFrequency() — what SHOULD go out
+        const sweetSpotHz = fakeSplitEncodedHz ?? getBaseFrequency(); // what's ACTUALLY encoded
+        const delta = desiredHz - sweetSpotHz;
+        if (delta !== 0) {
+          const originalVfoHz = getVfoFrequency();
+          try {
+            await Promise.race([
+              onSetFrequency(originalVfoHz + delta),
+              new Promise<void>((_, reject) => setTimeout(() => reject(new Error('Fake Split retune timeout')), 1500)),
+            ]);
+            fakeSplitOriginalVfoHz = originalVfoHz;
+            if (FAKE_SPLIT_SETTLE_MS > 0) await sleep(FAKE_SPLIT_SETTLE_MS);
+          } catch {
+            // CAT not connected, timed out, or unconfirmed — proceed without
+            // the shift rather than silently transmit off-frequency AND
+            // blow the window; the operator sees this via the normal "not
+            // confirmed" CAT error surfacing (see useRadioCAT's
+            // noteConfirmFailure), not a separate Fake Split error path.
+          }
+        }
+      }
 
       getOnTxWindowStart()?.();
 
@@ -1097,9 +1233,25 @@ export function createFTTransmit(
         } catch { /* CAT not connected or timed out */ }
       }
 
+      // Fake Split: restore the RX dial frequency now that TX has ended.
+      // Fired right after PTT-off resolves/rejects rather than chained onto
+      // its own confirmation — setPTT(false) can retry forever in the
+      // background on a stuck radio (see useRadioCAT's pttConfirmAlarm),
+      // and the VFO restore must not wait on that. Awaited for symmetry
+      // with the pre-TX retune, but nothing downstream blocks on it the way
+      // audio start blocks on the pre-TX one.
+      if (fakeSplitOriginalVfoHz !== null && onSetFrequency) {
+        try {
+          await Promise.race([
+            onSetFrequency(fakeSplitOriginalVfoHz),
+            new Promise<void>((_, reject) => setTimeout(() => reject(new Error('Fake Split restore timeout')), 1500)),
+          ]);
+        } catch { /* CAT not connected or timed out — next poll/manual check will surface the mismatch */ }
+      }
+
       getOnTxWindowEnd()?.();
 
-      const sentVfoHz = getVfoFrequency();
+      const sentVfoHz = fakeSplitOriginalVfoHz ?? getVfoFrequency();
       const sent: SentEntry = {
         id: txId, message: txMessage, label: txLabel, windowStart,
         vfoHz: sentVfoHz, audioHz: txAudioHz,
@@ -1344,6 +1496,18 @@ export function createFTTransmit(
     setState(prev => ({ ...prev, allowConsecutiveTx: v }));
   }
 
+  function setFakeSplit(v: boolean) {
+    fakeSplitOn = v;
+    saveFakeSplit(v);
+    setState(prev => ({ ...prev, fakeSplit: v }));
+  }
+
+  function setTxWindowParity(v: 'even' | 'odd') {
+    txWindowParity = v;
+    saveTxWindowParity(v);
+    setState(prev => ({ ...prev, txWindowParity: v }));
+  }
+
   function clearSent() {
     setState(prev => ({ ...prev, sent: [] }));
   }
@@ -1440,6 +1604,8 @@ export function createFTTransmit(
     setTxGain,
     setAutoPTT,
     setAllowConsecutiveTx,
+    setFakeSplit,
+    setTxWindowParity,
     setPreKeyMs,
     setPostKeyMs,
     clearSent,

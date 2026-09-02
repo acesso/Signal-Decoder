@@ -439,6 +439,15 @@ interface FTTransmitPanelProps {
   onMyCallChange?: (call: string) => void;
   onMyGridChange?: (grid: string) => void;
   onSetPTT?: (tx: boolean) => Promise<void>;
+  /** CAT VFO frequency setter, for Fake Split's pre/post-TX retune — see
+   *  useFTTransmit.ts's getOnSetFrequency and
+   *  doc/FAKE_SPLIT_AND_WINDOW_PARITY_DESIGN.md. Undefined when CAT isn't
+   *  connected, same gating as onSetPTT. */
+  onSetFrequency?: (hz: number) => Promise<void>;
+  /** Which CAT transport is active — 'serial' can't confirm a frequency
+   *  change landed before Fake Split proceeds (see useRadioCAT.ts's
+   *  setFrequency), so the chip warns rather than silently trusting it. */
+  catTransportKind?: 'serial' | 'websocket';
   /** Brackets each keyed TX window — see useFTTransmit.ts's
    *  getOnTxWindowStart/End comment. App.tsx wires these to suspend/resume
    *  the bridge's /iq-data spectrum connection (real-hardware WiFi/I2S DMA
@@ -549,6 +558,7 @@ export default function FTTransmitPanel(props: FTTransmitPanelProps): JSX.Elemen
     baseFreq,
     vfoFrequency,
     () => props.onSetPTT,
+    () => props.onSetFrequency,
     audioSinkKind,
     () => props.bridgeWsUrl,
     () => props.onTxWindowStart,
@@ -1097,7 +1107,7 @@ export default function FTTransmitPanel(props: FTTransmitPanelProps): JSX.Elemen
           </div>
         </div>
 
-        {/* Toggle chips — 2 columns x 2 rows, pushed to the row's far right.
+        {/* Toggle chips — 2 columns x N rows, pushed to the row's far right.
             Was one long horizontal strip of 4 chips; grouping into a compact
             grid keeps the whole top row single-line instead of wrapping. */}
         <div class="grid grid-cols-2 gap-1.5 ml-auto">
@@ -1157,6 +1167,62 @@ export default function FTTransmitPanel(props: FTTransmitPanelProps): JSX.Elemen
             </div>
             <span class="text-[10px] text-[#8b949e] whitespace-nowrap">Auto-Reply</span>
           </div>
+          {/* Fake Split — see useFTTransmit.ts's fakeSplit state and
+              doc/FAKE_SPLIT_AND_WINDOW_PARITY_DESIGN.md. Requires a live,
+              frequency-reporting CAT connection (onSetFrequency AND a known
+              VFO) — without either, there's nothing to retune. Warns rather
+              than blocks when Auto-PTT is off (VFO would shift ahead of a
+              manual/VOX key-up) or CAT is on serial transport (no
+              confirmation the retune actually landed) — both real risks the
+              operator should see, not silent failure modes. */}
+          {(() => {
+            const fakeSplitUsable = () => !!props.onSetFrequency && vfoFrequency() > 0
+            const fakeSplitTitle = () => {
+              if (!fakeSplitUsable()) return 'Fake Split requires a live CAT connection with a known VFO frequency'
+              const warnings: string[] = []
+              if (!tx.state().autoPTT) warnings.push('Auto-PTT is off — the VFO will retune before you key manually')
+              if (props.catTransportKind === 'serial') warnings.push('serial CAT cannot confirm the retune landed — verify on the radio')
+              const base = tx.state().fakeSplit
+                ? 'Fake Split on — TX always at your Audio Hz tone, VFO shifts to compensate'
+                : 'Fake Split off — click to always transmit at your Audio Hz tone via a VFO shift instead of the audio tone'
+              return warnings.length ? `${base} (${warnings.join('; ')})` : base
+            }
+            return (
+              <div onClick={() => fakeSplitUsable() && tx.setFakeSplit(!tx.state().fakeSplit)}
+                title={fakeSplitTitle()}
+                class={`flex items-center gap-1.5 cursor-pointer select-none px-2 py-1 rounded border transition-colors ${!fakeSplitUsable() ? 'opacity-40' : ''}`}
+                style={{
+                  'border-color': tx.state().fakeSplit ? 'rgba(163,113,247,0.5)' : 'rgba(48,54,61,1)',
+                  background:  tx.state().fakeSplit ? 'rgba(163,113,247,0.08)' : 'transparent',
+                }}>
+                <div class={`w-6 h-3 rounded-full transition-colors relative shrink-0 ${tx.state().fakeSplit ? 'bg-[#a371f7]' : 'bg-[#30363d]'}`}>
+                  <div class={`absolute top-0.5 w-2 h-2 rounded-full bg-white transition-transform ${tx.state().fakeSplit ? 'translate-x-3' : 'translate-x-0.5'}`} />
+                </div>
+                <span class="text-[10px] text-[#8b949e] whitespace-nowrap">Fake Split</span>
+              </div>
+            )
+          })()}
+          {/* TX window parity — FT8 only (7.5s FT4 windows don't split into a
+              clean 2-way parity — see the design doc). Always restricts to
+              one parity or the other; allowConsecutiveTx above already
+              covers "don't restrict windows," so there's no separate off
+              state here. Seconds go in the tooltip, not the compact label. */}
+          <Show when={props.mode === 'FT8'}>
+            <div onClick={() => tx.setTxWindowParity(tx.state().txWindowParity === 'even' ? 'odd' : 'even')}
+              title={tx.state().txWindowParity === 'even'
+                ? 'Transmit only in windows starting at :00 and :30 — click to switch to Odd'
+                : 'Transmit only in windows starting at :15 and :45 — click to switch to Even'}
+              class="flex items-center gap-1.5 cursor-pointer select-none px-2 py-1 rounded border transition-colors"
+              style={{
+                'border-color': tx.state().txWindowParity === 'odd' ? 'rgba(63,185,80,0.5)' : 'rgba(48,54,61,1)',
+                background:  tx.state().txWindowParity === 'odd' ? 'rgba(63,185,80,0.08)' : 'transparent',
+              }}>
+              <div class={`w-6 h-3 rounded-full transition-colors relative shrink-0 ${tx.state().txWindowParity === 'odd' ? 'bg-[#3fb950]' : 'bg-[#30363d]'}`}>
+                <div class={`absolute top-0.5 w-2 h-2 rounded-full bg-white transition-transform ${tx.state().txWindowParity === 'odd' ? 'translate-x-3' : 'translate-x-0.5'}`} />
+              </div>
+              <span class="text-[10px] text-[#8b949e] whitespace-nowrap">{tx.state().txWindowParity === 'even' ? 'Even' : 'Odd'}</span>
+            </div>
+          </Show>
         </div>
       </div>
       {/* ── Active TX banner ── */}
