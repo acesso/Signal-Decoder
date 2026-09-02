@@ -516,12 +516,29 @@ describe('nextTxMsgType — QSO auto-sequencing incl. retries', () => {
     expect(nextTxMsgType('cq', 'report')).toBe('r_report');
   });
 
-  it('re-sends the lost transmission when the peer repeats an earlier message', () => {
+  it('re-sends the lost transmission when the peer repeats an earlier message (mid-QSO steps only)', () => {
     expect(nextTxMsgType('answer', 'cq')).toBe('answer');         // they re-CQ'd, keep calling
     expect(nextTxMsgType('report', 'answer')).toBe('report');     // they missed my report
     expect(nextTxMsgType('r_report', 'report')).toBe('r_report'); // they missed my R+report
-    expect(nextTxMsgType('rr73', 'r_report')).toBe('rr73');       // they missed my RR73
-    expect(nextTxMsgType('tx73', 'rr73')).toBe('tx73');           // they missed my 73
+  });
+
+  // REGRESSION (reported 2026-09-02, seen in production): rr73/tx73 are
+  // absorbing/terminal states, not steps awaiting acknowledgment — there is
+  // no ack that follows a goodbye, so a repeated peer message (even in a
+  // genuinely later decode window, not a stale re-decode) must NOT trigger
+  // another 73/RR73. The app was caught sending the identical 73 (and
+  // separately RR73) twice, back to back, to two different real stations —
+  // this pins the fix: once we've said our goodbye, nothing the peer sends
+  // afterward should produce another transmission.
+  it('NEVER re-sends RR73/73 once sent, regardless of what the peer repeats', () => {
+    // Old (buggy) behavior: these all used to return 'rr73'/'tx73' again.
+    expect(nextTxMsgType('rr73', 'r_report')).toBe('cq'); // they "missed" my RR73 — still done
+    expect(nextTxMsgType('rr73', 'report')).toBe('cq');
+    expect(nextTxMsgType('rr73', 'rrr')).toBe('cq');
+    expect(nextTxMsgType('rr73', 'rr73')).toBe('cq');     // their RR73 crossing ours — still done
+    expect(nextTxMsgType('rrr', 'report')).toBe('cq');
+    expect(nextTxMsgType('tx73', 'rr73')).toBe('cq');     // they "missed" my 73 — still done
+    expect(nextTxMsgType('tx73', 'rrr')).toBe('cq');
   });
 
   it('never advances past what the peer has confirmed', () => {
