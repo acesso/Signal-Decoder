@@ -12,6 +12,10 @@ them into a version section when cutting a release.
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed the app re-sending an identical 73/RR73 to a station after the QSO was already complete: the auto-sequencing logic treated a repeated peer message (their RR73/RRR/report showing up again in a later decode window) as "my last transmission was lost, resend it" — correct for mid-QSO steps, but 73/RR73 are one-shot sign-offs with no acknowledgment to wait for, so this kept firing indefinitely with no way to stop. 73/RR73 are now absorbing states: once sent, nothing the peer sends afterward triggers another transmission to them.
+
 ## [0.15.0] - 2026-09-01
 
 ### Fixed
