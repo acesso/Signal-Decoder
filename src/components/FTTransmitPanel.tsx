@@ -439,6 +439,15 @@ interface FTTransmitPanelProps {
   onMyCallChange?: (call: string) => void;
   onMyGridChange?: (grid: string) => void;
   onSetPTT?: (tx: boolean) => Promise<void>;
+  /** CAT VFO frequency setter, for Fake Split's pre/post-TX retune — see
+   *  useFTTransmit.ts's getOnSetFrequency and
+   *  doc/FAKE_SPLIT_AND_WINDOW_PARITY_DESIGN.md. Undefined when CAT isn't
+   *  connected, same gating as onSetPTT. */
+  onSetFrequency?: (hz: number) => Promise<void>;
+  /** Which CAT transport is active — 'serial' can't confirm a frequency
+   *  change landed before Fake Split proceeds (see useRadioCAT.ts's
+   *  setFrequency), so the chip warns rather than silently trusting it. */
+  catTransportKind?: 'serial' | 'websocket';
   /** Brackets each keyed TX window — see useFTTransmit.ts's
    *  getOnTxWindowStart/End comment. App.tsx wires these to suspend/resume
    *  the bridge's /iq-data spectrum connection (real-hardware WiFi/I2S DMA
@@ -549,6 +558,7 @@ export default function FTTransmitPanel(props: FTTransmitPanelProps): JSX.Elemen
     baseFreq,
     vfoFrequency,
     () => props.onSetPTT,
+    () => props.onSetFrequency,
     audioSinkKind,
     () => props.bridgeWsUrl,
     () => props.onTxWindowStart,
@@ -581,6 +591,12 @@ export default function FTTransmitPanel(props: FTTransmitPanelProps): JSX.Elemen
   createEffect(() => {
     void props.mode
     void baseFreq()
+    // Fake Split's sweet spot diverges from Audio Hz by design (see
+    // useFTTransmit.ts's syncParams/fakeSplitChanged) — a toggle or
+    // sweet-spot change alone (Audio Hz unchanged) still needs every
+    // already-encoded entry re-encoded at the new effective tone.
+    void tx.state().fakeSplit
+    void tx.state().fakeSplitSweetSpotHz
     const committed = baseFreqCommitted()
     if (syncParamsTimer) clearTimeout(syncParamsTimer)
     if (!committed) return
@@ -1095,9 +1111,27 @@ export default function FTTransmitPanel(props: FTTransmitPanelProps): JSX.Elemen
               class="bg-[#0d1117] border border-[#30363d] rounded px-1.5 py-1 text-xs font-mono text-[#c9d1d9] w-12 focus:outline-none focus:border-[#388bfd] disabled:cursor-not-allowed" />
             <span class="text-[10px] text-[#8b949e] whitespace-nowrap">min</span>
           </div>
+          {/* Fake Split sweet-spot tone — the fixed frequency TX audio is
+              always encoded at while Fake Split is on (see useFTTransmit.ts's
+              fakeSplitSweetSpotHz and doc/FAKE_SPLIT_AND_WINDOW_PARITY_DESIGN.md).
+              Only meaningful with Fake Split actually on — greyed out
+              otherwise, same pattern as Pre-key/Post-key gating on Auto-PTT
+              above. Bounds (300-2800 Hz) match setFakeSplitSweetSpotHz's own
+              clamp, which mirrors the passband floor/ceiling most SSB TX
+              audio chains enforce. */}
+          <div class={`flex items-center gap-1 ${!tx.state().fakeSplit ? 'opacity-40' : ''}`}
+            title="Fixed audio tone Fake Split always encodes at — the VFO shifts to compensate so your chosen TX frequency still goes out over the air">
+            <span class="text-[10px] text-[#8b949e] whitespace-nowrap">Sweet Spot</span>
+            <NumberField value={tx.state().fakeSplitSweetSpotHz}
+              onCommit={tx.setFakeSplitSweetSpotHz}
+              disabled={!tx.state().fakeSplit}
+              min={300} max={2800}
+              class="bg-[#0d1117] border border-[#30363d] rounded px-1.5 py-1 text-xs font-mono text-[#c9d1d9] w-16 focus:outline-none focus:border-[#388bfd] disabled:cursor-not-allowed" />
+            <span class="text-[10px] text-[#8b949e] whitespace-nowrap">Hz</span>
+          </div>
         </div>
 
-        {/* Toggle chips — 2 columns x 2 rows, pushed to the row's far right.
+        {/* Toggle chips — 2 columns x N rows, pushed to the row's far right.
             Was one long horizontal strip of 4 chips; grouping into a compact
             grid keeps the whole top row single-line instead of wrapping. */}
         <div class="grid grid-cols-2 gap-1.5 ml-auto">
@@ -1157,8 +1191,89 @@ export default function FTTransmitPanel(props: FTTransmitPanelProps): JSX.Elemen
             </div>
             <span class="text-[10px] text-[#8b949e] whitespace-nowrap">Auto-Reply</span>
           </div>
+          {/* Fake Split — see useFTTransmit.ts's fakeSplit state and
+              doc/FAKE_SPLIT_AND_WINDOW_PARITY_DESIGN.md. Requires a live,
+              frequency-reporting CAT connection (onSetFrequency AND a known
+              VFO) — without either, there's nothing to retune. Warns rather
+              than blocks when Auto-PTT is off (VFO would shift ahead of a
+              manual/VOX key-up) or CAT is on serial transport (no
+              confirmation the retune actually landed) — both real risks the
+              operator should see, not silent failure modes. */}
+          {(() => {
+            const fakeSplitUsable = () => !!props.onSetFrequency && vfoFrequency() > 0
+            const fakeSplitTitle = () => {
+              if (!fakeSplitUsable()) return 'Fake Split requires a live CAT connection with a known VFO frequency'
+              const warnings: string[] = []
+              if (!tx.state().autoPTT) warnings.push('Auto-PTT is off — the VFO will retune before you key manually')
+              if (props.catTransportKind === 'serial') warnings.push('serial CAT cannot confirm the retune landed — verify on the radio')
+              const base = tx.state().fakeSplit
+                ? `Fake Split on — TX audio always at ${tx.state().fakeSplitSweetSpotHz} Hz, VFO shifts so your chosen frequency still goes out over the air`
+                : `Fake Split off — click to always transmit audio at a fixed ${tx.state().fakeSplitSweetSpotHz} Hz tone, shifting the VFO to preserve your chosen TX frequency`
+              return warnings.length ? `${base} (${warnings.join('; ')})` : base
+            }
+            return (
+              <div onClick={() => fakeSplitUsable() && tx.setFakeSplit(!tx.state().fakeSplit)}
+                title={fakeSplitTitle()}
+                class={`flex items-center gap-1.5 cursor-pointer select-none px-2 py-1 rounded border transition-colors ${!fakeSplitUsable() ? 'opacity-40' : ''}`}
+                style={{
+                  'border-color': tx.state().fakeSplit ? 'rgba(163,113,247,0.5)' : 'rgba(48,54,61,1)',
+                  background:  tx.state().fakeSplit ? 'rgba(163,113,247,0.08)' : 'transparent',
+                }}>
+                <div class={`w-6 h-3 rounded-full transition-colors relative shrink-0 ${tx.state().fakeSplit ? 'bg-[#a371f7]' : 'bg-[#30363d]'}`}>
+                  <div class={`absolute top-0.5 w-2 h-2 rounded-full bg-white transition-transform ${tx.state().fakeSplit ? 'translate-x-3' : 'translate-x-0.5'}`} />
+                </div>
+                <span class="text-[10px] text-[#8b949e] whitespace-nowrap">Fake Split</span>
+              </div>
+            )
+          })()}
+          {/* TX window parity — FT8 only (7.5s FT4 windows don't split into a
+              clean 2-way parity — see the design doc). Always restricts to
+              one parity or the other; allowConsecutiveTx above already
+              covers "don't restrict windows," so there's no separate off
+              state here. Seconds go in the tooltip, not the compact label. */}
+          <Show when={props.mode === 'FT8'}>
+            <div onClick={() => tx.setTxWindowParity(tx.state().txWindowParity === 'even' ? 'odd' : 'even')}
+              title={tx.state().txWindowParity === 'even'
+                ? 'Transmit only in windows starting at :00 and :30 — click to switch to Odd'
+                : 'Transmit only in windows starting at :15 and :45 — click to switch to Even'}
+              class="flex items-center gap-1.5 cursor-pointer select-none px-2 py-1 rounded border transition-colors"
+              style={{
+                'border-color': tx.state().txWindowParity === 'odd' ? 'rgba(63,185,80,0.5)' : 'rgba(48,54,61,1)',
+                background:  tx.state().txWindowParity === 'odd' ? 'rgba(63,185,80,0.08)' : 'transparent',
+              }}>
+              <div class={`w-6 h-3 rounded-full transition-colors relative shrink-0 ${tx.state().txWindowParity === 'odd' ? 'bg-[#3fb950]' : 'bg-[#30363d]'}`}>
+                <div class={`absolute top-0.5 w-2 h-2 rounded-full bg-white transition-transform ${tx.state().txWindowParity === 'odd' ? 'translate-x-3' : 'translate-x-0.5'}`} />
+              </div>
+              <span class="text-[10px] text-[#8b949e] whitespace-nowrap">{tx.state().txWindowParity === 'even' ? 'Even' : 'Odd'}</span>
+            </div>
+          </Show>
         </div>
       </div>
+
+      {/* Fake Split stale-restore warning — see useFTTransmit.ts's
+          fakeSplitStaleRestoreHz/loadPendingFakeSplitRestoreHz comments.
+          Means the app shut down (reload/crash) mid-TX before a Fake Split
+          VFO shift was confirmed restored, so the radio may still be
+          sitting on a shifted frequency with no other record of it
+          anywhere. Kept to one compact line (not a full-width block banner
+          like the error box below) — noticeable via the amber color and
+          persisting until acted on, but not competing for space with the
+          rest of the panel. */}
+      <Show when={tx.state().fakeSplitStaleRestoreHz !== null}>
+        <div class="flex items-center gap-1.5 text-[10px] text-[#e3b341]">
+          <span>⚠ Fake Split VFO may not have been restored (interrupted mid-TX) — radio may still be shifted to {tx.state().fakeSplitStaleRestoreHz} Hz.</span>
+          <Show when={props.onSetFrequency}>
+            <button onClick={() => void tx.revertStaleFakeSplitVfo()}
+              class="text-[#e3b341] underline hover:text-[#f0c964] shrink-0">
+              Revert now
+            </button>
+          </Show>
+          <button onClick={() => tx.dismissStaleFakeSplitVfo()}
+            class="shrink-0 text-[#484f58] hover:text-[#c9d1d9] px-1"
+            title="Dismiss">✕</button>
+        </div>
+      </Show>
+
       {/* ── Active TX banner ── */}
       <Show when={isPlaying()}>
         <div class="flex items-center gap-3 bg-[#2ea043]/10 border border-[#2ea043]/40 rounded px-3 py-2">
