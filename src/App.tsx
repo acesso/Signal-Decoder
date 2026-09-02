@@ -1066,6 +1066,8 @@ function App(): JSX.Element {
                   onMyCallChange={setFtMyCall}
                   onMyGridChange={setFtMyGrid}
                   onSetPTT={cat.state().connected ? cat.setPTT : undefined}
+                  onSetFrequency={cat.state().connected ? cat.setFrequency : undefined}
+                  catTransportKind={cat.getTransportKind()}
                   onTxWindowStart={handleTxWindowStart}
                   onTxWindowEnd={handleTxWindowEnd}
                   onSentMessage={(msg, windowStart, vfoHz, audioHz) =>

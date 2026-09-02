@@ -149,6 +149,13 @@ export interface FactoryDefaults {
 
 export interface RadioCATControls {
   state: () => RadioState;
+  /** Which transport backs the current/last connection — 'serial' commands
+   *  (incl. setFrequency) are fire-and-forget with no confirmation the radio
+   *  actually applied them; 'websocket' (ESP32 bridge) confirms with retry.
+   *  Callers that need a guaranteed-applied frequency change (e.g. Fake
+   *  Split) should check this before relying on setFrequency's resolution
+   *  alone. */
+  getTransportKind: () => CATTransportKind;
   connect: (config: CATConnectionConfig) => Promise<void>;
   disconnect: () => void;
   /** Clear the error banner. Display only — never touches pttConfirmAlarm. */
@@ -1796,7 +1803,8 @@ export function useRadioCAT(): RadioCATControls {
   }
 
   return {
-    state, connect, disconnect, dismissError, setFrequency, setMode, setPTT,
+    state, getTransportKind: () => transportKind,
+    connect, disconnect, dismissError, setFrequency, setMode, setPTT,
     setVolume, setAtt1, setAtt2, setNR, setAGC, setAgcLevel, setFilter, setDrive,
     setBacklight, getPABias, setPABias, getTxTimeout, setTxTimeout, resetRadio,
     getFactoryDefaults, factoryResetRadio, getRefFreq, setRefFreq,
