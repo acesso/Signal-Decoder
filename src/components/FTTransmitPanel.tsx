@@ -591,6 +591,12 @@ export default function FTTransmitPanel(props: FTTransmitPanelProps): JSX.Elemen
   createEffect(() => {
     void props.mode
     void baseFreq()
+    // Fake Split's sweet spot diverges from Audio Hz by design (see
+    // useFTTransmit.ts's syncParams/fakeSplitChanged) — a toggle or
+    // sweet-spot change alone (Audio Hz unchanged) still needs every
+    // already-encoded entry re-encoded at the new effective tone.
+    void tx.state().fakeSplit
+    void tx.state().fakeSplitSweetSpotHz
     const committed = baseFreqCommitted()
     if (syncParamsTimer) clearTimeout(syncParamsTimer)
     if (!committed) return
@@ -1183,8 +1189,8 @@ export default function FTTransmitPanel(props: FTTransmitPanelProps): JSX.Elemen
               if (!tx.state().autoPTT) warnings.push('Auto-PTT is off — the VFO will retune before you key manually')
               if (props.catTransportKind === 'serial') warnings.push('serial CAT cannot confirm the retune landed — verify on the radio')
               const base = tx.state().fakeSplit
-                ? 'Fake Split on — TX always at your Audio Hz tone, VFO shifts to compensate'
-                : 'Fake Split off — click to always transmit at your Audio Hz tone via a VFO shift instead of the audio tone'
+                ? `Fake Split on — TX audio always at ${tx.state().fakeSplitSweetSpotHz} Hz, VFO shifts so your chosen frequency still goes out over the air`
+                : `Fake Split off — click to always transmit audio at a fixed ${tx.state().fakeSplitSweetSpotHz} Hz tone, shifting the VFO to preserve your chosen TX frequency`
               return warnings.length ? `${base} (${warnings.join('; ')})` : base
             }
             return (

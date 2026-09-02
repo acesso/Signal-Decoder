@@ -55,12 +55,19 @@ export interface FTTransmitState {
   autoPTT: boolean;
   allowConsecutiveTx: boolean;
   /** Fake Split (see doc/FAKE_SPLIT_AND_WINDOW_PARITY_DESIGN.md): on TX,
-   *  retunes the VFO via CAT so the panel's own Audio Hz is always what's
-   *  actually transmitted, moving any per-entry QSY offset into the VFO
-   *  shift instead of the audio tone. Requires a live, frequency-reporting
-   *  CAT connection — the panel gates the chip on that, this flag alone
-   *  doesn't imply CAT is actually usable right now. */
+   *  encodes audio at a FIXED sweet-spot tone (fakeSplitSweetSpotHz) instead
+   *  of the operator's chosen Audio Hz / entry.audioHz, and retunes the VFO
+   *  via CAT to make up the difference — so the operator's intended TX
+   *  frequency is preserved on air while the audio itself stays at a tone
+   *  known to minimize harmonics/IMD on typical SSB TX audio chains.
+   *  Requires a live, frequency-reporting CAT connection — the panel gates
+   *  the chip on that, this flag alone doesn't imply CAT is actually usable
+   *  right now. */
   fakeSplit: boolean;
+  /** Fixed audio tone Fake Split always encodes at — see fakeSplit's own
+   *  comment. Configurable (not hardcoded) since a radio's actual filter
+   *  response can differ; defaults to DEFAULT_FAKE_SPLIT_SWEET_SPOT_HZ. */
+  fakeSplitSweetSpotHz: number;
   /** FT8-only: restrict TX to one parity of window pair (even: :00/:30,
    *  odd: :15/:45) — see doc/FAKE_SPLIT_AND_WINDOW_PARITY_DESIGN.md. */
   txWindowParity: 'even' | 'odd';
@@ -120,7 +127,34 @@ const LS_GAIN            = 'ft_tx_gain';
 const LS_AUTOPTT         = 'ft_auto_ptt';
 const LS_CONSECUTIVE_TX  = 'ft_consecutive_tx';
 const LS_FAKE_SPLIT      = 'ft_fake_split';
+const LS_FAKE_SPLIT_SWEET_SPOT_HZ = 'ft_fake_split_sweet_spot_hz';
 const LS_TX_WINDOW_PARITY = 'ft_tx_window_parity';
+
+// Fake Split's fixed "sweet spot" audio tone — see
+// doc/FAKE_SPLIT_AND_WINDOW_PARITY_DESIGN.md. This is a FIXED reference
+// point independent of the operator's chosen TX frequency (Audio Hz /
+// entry.audioHz, i.e. wherever they clicked on the waterfall) — conflating
+// the two was the original design's bug (both resolved to the same
+// getBaseFrequency() value, so the VFO delta was always zero for ordinary
+// traffic). 1750 Hz is the center of WSJT-X's own 1500-2000 Hz range,
+// chosen for the same documented reason WSJT-X uses that range: low tones'
+// harmonics can land back inside the transmit passband and cause splatter,
+// so a tone safely away from both the passband edges and DC minimizes
+// harmonic/IMD risk on typical SSB transceiver TX audio chains. Configurable
+// (not hardcoded) since a given radio's actual filter response can differ.
+export const DEFAULT_FAKE_SPLIT_SWEET_SPOT_HZ = 1750;
+const FAKE_SPLIT_SWEET_SPOT_MIN_HZ = 300;  // matches the passband floor most SSB TX audio chains enforce
+const FAKE_SPLIT_SWEET_SPOT_MAX_HZ = 2800; // matches the passband ceiling — see the design doc's research
+export function loadFakeSplitSweetSpotHz(): number {
+  if (typeof window === 'undefined') return DEFAULT_FAKE_SPLIT_SWEET_SPOT_HZ;
+  const n = parseInt(localStorage.getItem(LS_FAKE_SPLIT_SWEET_SPOT_HZ) ?? '', 10);
+  return Number.isFinite(n) && n >= FAKE_SPLIT_SWEET_SPOT_MIN_HZ && n <= FAKE_SPLIT_SWEET_SPOT_MAX_HZ
+    ? n : DEFAULT_FAKE_SPLIT_SWEET_SPOT_HZ;
+}
+export function saveFakeSplitSweetSpotHz(v: number) {
+  const clamped = Math.max(FAKE_SPLIT_SWEET_SPOT_MIN_HZ, Math.min(FAKE_SPLIT_SWEET_SPOT_MAX_HZ, Math.round(v)));
+  if (typeof window !== 'undefined') localStorage.setItem(LS_FAKE_SPLIT_SWEET_SPOT_HZ, String(clamped));
+}
 
 // Guard delay after Fake Split's VFO retune is CAT-confirmed but before
 // audio/PTT proceeds. A confirmed SET only proves the radio ACKNOWLEDGED
@@ -709,6 +743,7 @@ export function createFTTransmit(
     autoPTT: loadAutoPTT(),
     allowConsecutiveTx: loadAllowConsecutiveTx(),
     fakeSplit: loadFakeSplit(),
+    fakeSplitSweetSpotHz: loadFakeSplitSweetSpotHz(),
     txWindowParity: loadTxWindowParity(),
     error: null,
     outputDeviceId: loadOutputDevice(),
@@ -728,6 +763,7 @@ export function createFTTransmit(
   let autoPTTOn          = loadAutoPTT();
   let allowConsecutiveTx = loadAllowConsecutiveTx();
   let fakeSplitOn        = loadFakeSplit();
+  let fakeSplitSweetSpotHz = loadFakeSplitSweetSpotHz();
   let txWindowParity: 'even' | 'odd' = loadTxWindowParity();
   let preKeyMs           = loadPreKeyMs();
   let postKeyMs          = loadPostKeyMs();
@@ -855,13 +891,14 @@ export function createFTTransmit(
     const ENC_RATE = 12000;
     const myGeneration = (encodeGenerationByEntryId.get(entry.id) ?? 0) + 1;
     encodeGenerationByEntryId.set(entry.id, myGeneration);
-    // Fake Split always encodes at the panel's Audio Hz (the operator's
-    // chosen "sweet spot" — see the Fake Split design doc), ignoring any
-    // per-entry QSY audioHz for the ENCODE itself; that intent is preserved
-    // instead as a VFO delta computed at TX time (runLoop, below) from
+    // Fake Split always encodes at the FIXED sweet-spot tone (independent of
+    // the operator's chosen Audio Hz / entry.audioHz — see fakeSplitSweetSpotHz's
+    // own comment for why those must NOT be the same value), ignoring the
+    // entry's own target tone for the ENCODE itself; that target is instead
+    // recovered as a VFO delta computed at TX time (runLoop, below) from
     // entry.audioHz vs. fakeSplitEncodedHz. This is the one case where
     // encodeHz and entry.audioHz deliberately diverge.
-    const fakeSplitEncodedHz = fakeSplitOn ? getBaseFrequency() : undefined;
+    const fakeSplitEncodedHz = fakeSplitOn ? fakeSplitSweetSpotHz : undefined;
     const encodeHz = fakeSplitEncodedHz ?? entry.audioHz ?? getBaseFrequency();
     encodeAsync(entry.message, getMode(), ENC_RATE, encodeHz)
       .then(samples => {
@@ -898,6 +935,15 @@ export function createFTTransmit(
   let autoCQMsgCached  = '';   // message text that was last encoded
   let autoCQModeCached = '';   // mode that was encoded for
   let autoCQFreqCached = 0;    // baseFreq that was encoded for
+  // Set only when autoCQSamples was encoded under Fake Split — mirrors
+  // TxQueueEntry.fakeSplitEncodedHz. Needed so runLoop's delta computation
+  // for auto-CQ compares against what was ACTUALLY baked into
+  // autoCQSamples (the sweet spot), not getBaseFrequency() — auto-CQ has
+  // no per-entry audioHz override, but it still needs its own VFO shift
+  // whenever Fake Split is on, same as any other entry: getBaseFrequency()
+  // is auto-CQ's target frequency, and the sweet spot is what it's encoded
+  // at, and those are different values whenever Fake Split is enabled.
+  let autoCQFakeSplitEncodedHz: number | undefined;
   let autoCQMessage    = '';
   // Bumped by every rebuildAutoCQCache() call — lets an in-flight encode's
   // own .then() notice a NEWER call has already superseded it and skip
@@ -921,7 +967,15 @@ export function createFTTransmit(
     autoCQMsgCached  = msg;
     autoCQModeCached = getMode();
     autoCQFreqCached = getBaseFrequency();
-    encodeAsync(msg, getMode(), 12000, getBaseFrequency())
+    // Same divergence as startEncode(): under Fake Split, ENCODE at the
+    // fixed sweet spot (not getBaseFrequency(), auto-CQ's actual target),
+    // and remember which so runLoop's delta computation for auto-CQ has
+    // something real to compare against — see autoCQFakeSplitEncodedHz's
+    // own comment. autoCQFreqCached still tracks getBaseFrequency() (the
+    // TARGET, used for cache-invalidation below) regardless.
+    const encodedFakeSplitHz = fakeSplitOn ? fakeSplitSweetSpotHz : undefined;
+    const encodeHz = encodedFakeSplitHz ?? autoCQFreqCached;
+    encodeAsync(msg, getMode(), 12000, encodeHz)
       .then(samples => {
         // Superseded by a newer rebuildAutoCQCache() call while this one
         // was still encoding — skip both the state write and the upload
@@ -929,14 +983,18 @@ export function createFTTransmit(
         // match (see autoCQGeneration's own comment for why that
         // comparison alone isn't a strong enough guard).
         if (myGeneration !== autoCQGeneration) return;
-        // Only store if message/mode/freq haven't changed since we started
+        // Only store if message/mode/freq/Fake-Split-state haven't changed
+        // since we started — a mid-encode fakeSplit toggle or sweet-spot
+        // change must not let a stale (wrong-tone) waveform through.
         if (
           autoCQMsgCached  === msg &&
           autoCQModeCached === getMode() &&
-          autoCQFreqCached === getBaseFrequency()
+          autoCQFreqCached === getBaseFrequency() &&
+          encodedFakeSplitHz === (fakeSplitOn ? fakeSplitSweetSpotHz : undefined)
         ) {
           autoCQSamples = samples;
-          uploadIfBridgeSink(TX_SLOT_AUTOCQ, msg, 'CQ (auto)', samples, 12000, autoCQFreqCached);
+          autoCQFakeSplitEncodedHz = encodedFakeSplitHz;
+          uploadIfBridgeSink(TX_SLOT_AUTOCQ, msg, 'CQ (auto)', samples, 12000, encodeHz);
         }
       })
       .catch(() => { autoCQSamples = null; });
@@ -1043,10 +1101,10 @@ export function createFTTransmit(
       let txLabel   = '';
       let txId      = '';
       let txAudioHz = getBaseFrequency();
-      // Set only when this entry was encoded under Fake Split (see
-      // startEncode's own comment) — auto-CQ never carries a QSY intent, so
-      // it's always encoded at getBaseFrequency() with nothing to shift via
-      // VFO, hence no separate fakeSplitEncodedHz value needed for it.
+      // Set only when this transmission was encoded under Fake Split (see
+      // startEncode's/rebuildAutoCQCache's own comments) — mirrors
+      // TxQueueEntry.fakeSplitEncodedHz for whichever source (queue entry
+      // or auto-CQ cache) actually supplied `samples` below.
       let fakeSplitEncodedHz: number | undefined;
 
       if (useAutoCQ) {
@@ -1054,6 +1112,7 @@ export function createFTTransmit(
         txMessage = autoCQMsgCached;
         txLabel   = 'CQ (auto)';
         txId      = ''; // filled in below from windowStart
+        fakeSplitEncodedHz = autoCQFakeSplitEncodedHz;
       } else {
         // Re-read from queue — entry may have been dequeued or its samples updated
         const live = queue.find(e => e.id === queuedEntry!.id) ?? queuedEntry!;
@@ -1103,34 +1162,48 @@ export function createFTTransmit(
       setState(prev => ({ ...prev, status: 'playing', error: null }));
 
       // Fake Split (see doc/FAKE_SPLIT_AND_WINDOW_PARITY_DESIGN.md): retune
-      // the VFO BEFORE PTT keys so the panel's Audio Hz — always what's
-      // actually encoded when Fake Split is on, see startEncode — comes out
-      // at the frequency the operator actually intends (their normal Audio
-      // Hz for a plain CQ, or the QSY-adjusted entry.audioHz for a reply).
+      // the VFO BEFORE PTT keys so the operator's actual intended TX
+      // frequency (their Audio Hz / the entry's pinned audioHz — txAudioHz)
+      // is preserved on air, even though `samples` was encoded at the FIXED
+      // sweet spot instead (see startEncode's/rebuildAutoCQCache's own
+      // comments — those two are deliberately different values now).
       // Awaited: an unconfirmed/unsettled retune must not let audio start,
       // or the first symbol(s) go out at the wrong frequency with no local
       // sign anything went wrong. Restored after PTT-off, below.
       let fakeSplitOriginalVfoHz: number | null = null;
       const onSetFrequency = getOnSetFrequency();
       if (fakeSplitOn && onSetFrequency) {
-        const desiredHz = txAudioHz; // entry.audioHz ?? getBaseFrequency() — what SHOULD go out
-        const sweetSpotHz = fakeSplitEncodedHz ?? getBaseFrequency(); // what's ACTUALLY encoded
-        const delta = desiredHz - sweetSpotHz;
-        if (delta !== 0) {
-          const originalVfoHz = getVfoFrequency();
-          try {
-            await Promise.race([
-              onSetFrequency(originalVfoHz + delta),
-              new Promise<void>((_, reject) => setTimeout(() => reject(new Error('Fake Split retune timeout')), 1500)),
-            ]);
-            fakeSplitOriginalVfoHz = originalVfoHz;
-            if (FAKE_SPLIT_SETTLE_MS > 0) await sleep(FAKE_SPLIT_SETTLE_MS);
-          } catch {
-            // CAT not connected, timed out, or unconfirmed — proceed without
-            // the shift rather than silently transmit off-frequency AND
-            // blow the window; the operator sees this via the normal "not
-            // confirmed" CAT error surfacing (see useRadioCAT's
-            // noteConfirmFailure), not a separate Fake Split error path.
+        const desiredHz = txAudioHz; // what SHOULD go out over the air
+        // fakeSplitEncodedHz reflects what `samples` was ACTUALLY encoded
+        // at, captured at encode time — NOT re-read from the live
+        // fakeSplitSweetSpotHz setting here, and deliberately not defaulted
+        // to getBaseFrequency() on a miss either: doing either would silently
+        // compute a delta against the WRONG baseline the moment Fake Split
+        // was toggled on/changed after this entry was already encoded (a
+        // real race — syncParams()'s re-encode is debounced/async, not
+        // synchronous with the toggle). Missing entirely means "not
+        // encoded under Fake Split yet" — skip the shift outright rather
+        // than transmit at the sweet spot's audio while shifting the VFO by
+        // a bogus amount.
+        if (fakeSplitEncodedHz !== undefined) {
+          const delta = desiredHz - fakeSplitEncodedHz;
+          if (delta !== 0) {
+            const originalVfoHz = getVfoFrequency();
+            try {
+              await Promise.race([
+                onSetFrequency(originalVfoHz + delta),
+                new Promise<void>((_, reject) => setTimeout(() => reject(new Error('Fake Split retune timeout')), 1500)),
+              ]);
+              fakeSplitOriginalVfoHz = originalVfoHz;
+              if (FAKE_SPLIT_SETTLE_MS > 0) await sleep(FAKE_SPLIT_SETTLE_MS);
+            } catch {
+              // CAT not connected, timed out, or unconfirmed — proceed
+              // without the shift rather than silently transmit
+              // off-frequency AND blow the window; the operator sees this
+              // via the normal "not confirmed" CAT error surfacing (see
+              // useRadioCAT's noteConfirmFailure), not a separate Fake
+              // Split error path.
+            }
           }
         }
       }
@@ -1282,24 +1355,45 @@ export function createFTTransmit(
   // no dependency tracking of its own on the getter functions.
   let lastSyncedMode = getMode();
   let lastSyncedFreq = getBaseFrequency();
+  // Tracked alongside mode/freq: what a stale entry should be re-encoded AT
+  // (encodeHz — sweet spot vs. target) depends on these too, not just on
+  // getBaseFrequency() itself. Initialized eagerly so a syncParams() call
+  // made before setFakeSplit()/setFakeSplitSweetSpotHz() ever ran doesn't
+  // spuriously see a "change" on its first real invocation.
+  let lastSyncedFakeSplit = fakeSplitOn;
+  let lastSyncedSweetSpot = fakeSplitSweetSpotHz;
   function syncParams() {
     const mode = getMode();
     const freq = getBaseFrequency();
     const modeChanged = mode !== lastSyncedMode;
     const freqChanged = freq !== lastSyncedFreq;
-    if (modeChanged || freqChanged) {
+    // A Fake Split on/off flip or sweet-spot change alone (Audio Hz and
+    // mode both unchanged) still means every already-encoded entry's
+    // encodeHz is now wrong — see startEncode's own comment on why
+    // encodeHz and entry.audioHz/getBaseFrequency() diverge under Fake
+    // Split. Tracked separately from freqChanged because it invalidates
+    // MORE than a plain freq change does (see fakeSplitChanged's use
+    // below) — a pinned per-entry audioHz normally survives a freq-only
+    // change, but must NOT survive a Fake Split toggle, since Fake Split
+    // changes what tone gets encoded regardless of any per-entry pin.
+    const fakeSplitChanged = fakeSplitOn !== lastSyncedFakeSplit ||
+      (fakeSplitOn && fakeSplitSweetSpotHz !== lastSyncedSweetSpot);
+    if (modeChanged || freqChanged || fakeSplitChanged) {
       lastSyncedMode = mode;
       lastSyncedFreq = freq;
+      lastSyncedFakeSplit = fakeSplitOn;
+      lastSyncedSweetSpot = fakeSplitSweetSpotHz;
       if (autoCQMessage) rebuildAutoCQCache(autoCQMessage);
       // Queued entries were encoded with the params captured at enqueue time —
       // a later Audio Hz (or mode) change must re-encode them, or they'd still
       // transmit on the old frequency. Entries with a pinned per-conversation
       // audioHz don't follow the global Audio Hz, so a freq-only change leaves
-      // them alone; a mode change invalidates everything. Mark stale entries
+      // them alone; a mode change (or a Fake Split change — see
+      // fakeSplitChanged above) invalidates everything. Mark stale entries
       // pending first so the TX loop can't send old samples mid-re-encode;
       // the encode worker is FIFO, so a re-encode's result always lands after
       // any in-flight first encode for the same entry.
-      const stale = queue.filter(e => modeChanged || e.audioHz === undefined);
+      const stale = queue.filter(e => modeChanged || fakeSplitChanged || e.audioHz === undefined);
       if (stale.length > 0) {
         const staleIds = new Set(stale.map(e => e.id));
         setState(prev => {
@@ -1502,6 +1596,12 @@ export function createFTTransmit(
     setState(prev => ({ ...prev, fakeSplit: v }));
   }
 
+  function setFakeSplitSweetSpotHz(v: number) {
+    saveFakeSplitSweetSpotHz(v); // clamps internally
+    fakeSplitSweetSpotHz = loadFakeSplitSweetSpotHz(); // re-read the clamped value
+    setState(prev => ({ ...prev, fakeSplitSweetSpotHz }));
+  }
+
   function setTxWindowParity(v: 'even' | 'odd') {
     txWindowParity = v;
     saveTxWindowParity(v);
@@ -1605,6 +1705,7 @@ export function createFTTransmit(
     setAutoPTT,
     setAllowConsecutiveTx,
     setFakeSplit,
+    setFakeSplitSweetSpotHz,
     setTxWindowParity,
     setPreKeyMs,
     setPostKeyMs,
