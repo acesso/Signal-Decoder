@@ -676,6 +676,20 @@ export function qsyAudioOffsetHz(cqTag: string | undefined, vfoHz: number): numb
 // A received 73 is never answered — replying to a sign-off would 73-ping-pong
 // between two auto-sequencers.
 //
+// EXCEPTION to the retry rule above: rr73/tx73 are ABSORBING states, not
+// steps awaiting acknowledgment. Every other retry branch re-sends because
+// the peer's repeat is a request for something we can still usefully
+// re-send an ack for; but there is no ack that follows a goodbye — once WE
+// say 73 or RR73, the exchange is over on our end regardless of what the
+// peer's radio or sequencer does afterward. REAL-TRAFFIC BUG this fixes
+// (reported 2026-09-02): a peer's RR73/RRR (or, for rr73, their repeated
+// report) redecoding in a LATER window — genuinely new per the caller's
+// fingerprint, not a stale/duplicate decode — repeatedly satisfied the old
+// retry branches below, so the app kept re-transmitting the same 73/RR73
+// (seen twice, identically, in the same 30s window pair, in production
+// logs) with no way to ever stop, since there is no further peer message
+// that could signal "they got it" for a message that itself needs no ack.
+//
 // foxHound: DXpedition Fox/Hound mode (WSJT-X "Type F/H") compresses the
 // Hound's side of the exchange — Fox logs the Hound after a single report and
 // never round-trips an R+report acknowledgment, so once Fox reports us we
@@ -726,21 +740,14 @@ export function nextTxMsgType(lastSent: MsgType | null, lastRx: MsgType | null, 
     return 'r_report';
   }
 
-  // We sent RR73/RRR: their 73 (or anything new like a fresh CQ) → done;
-  // a repeated R+report/report means they missed it → re-send RR73;
-  // their RR73 crossing ours → 73.
-  if (lastSent === 'rr73' || lastSent === 'rrr') {
-    if (lastRx === 'r_report' || lastRx === 'report' || lastRx === 'rrr') return 'rr73';
-    if (lastRx === 'rr73')                                                return 'tx73';
-    return 'cq';
-  }
+  // We sent RR73/RRR: absorbing state — see this function's own comment on
+  // why terminal messages don't get the general retry treatment. Whatever
+  // the peer sends next (their 73, a crossing RR73, a repeated report —
+  // even in a genuinely later window), our side of the exchange is done.
+  if (lastSent === 'rr73' || lastSent === 'rrr') return 'cq';
 
-  // We sent 73: only a repeated RR73/RRR (they missed our 73) warrants
-  // re-sending it — never reply to their 73.
-  if (lastSent === 'tx73') {
-    if (lastRx === 'rr73' || lastRx === 'rrr') return 'tx73';
-    return 'cq';
-  }
+  // We sent 73: absorbing state, same reasoning — never re-send a goodbye.
+  if (lastSent === 'tx73') return 'cq';
 
   return 'cq';
 }
