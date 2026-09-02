@@ -398,7 +398,8 @@ switched on.
    Sequencing above). Needs an initial conservative default plus
    real-hardware measurement across at least the TS-480-direct-serial and
    ESP32-bridge paths before trusting a single global constant.
-2. `fakeSplitSweetSpotHz` has no panel UI control yet — only
-   `setFakeSplitSweetSpotHz()` on the API, defaulting to 1750 Hz. An
-   operator whose radio's filter response wants a different sweet spot has
-   no way to change it from the UI today.
+
+`fakeSplitSweetSpotHz` now has a panel UI control (a "Sweet Spot" NumberField
+next to Pre-key/Post-key/Auto-CQ-interval in `FTTransmitPanel.tsx`, gated
+the same way — greyed out unless Fake Split is on, 300–2800 Hz bounds
+matching `setFakeSplitSweetSpotHz()`'s own clamp) — no longer API-only.
