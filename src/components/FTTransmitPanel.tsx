@@ -1111,6 +1111,24 @@ export default function FTTransmitPanel(props: FTTransmitPanelProps): JSX.Elemen
               class="bg-[#0d1117] border border-[#30363d] rounded px-1.5 py-1 text-xs font-mono text-[#c9d1d9] w-12 focus:outline-none focus:border-[#388bfd] disabled:cursor-not-allowed" />
             <span class="text-[10px] text-[#8b949e] whitespace-nowrap">min</span>
           </div>
+          {/* Fake Split sweet-spot tone — the fixed frequency TX audio is
+              always encoded at while Fake Split is on (see useFTTransmit.ts's
+              fakeSplitSweetSpotHz and doc/FAKE_SPLIT_AND_WINDOW_PARITY_DESIGN.md).
+              Only meaningful with Fake Split actually on — greyed out
+              otherwise, same pattern as Pre-key/Post-key gating on Auto-PTT
+              above. Bounds (300-2800 Hz) match setFakeSplitSweetSpotHz's own
+              clamp, which mirrors the passband floor/ceiling most SSB TX
+              audio chains enforce. */}
+          <div class={`flex items-center gap-1 ${!tx.state().fakeSplit ? 'opacity-40' : ''}`}
+            title="Fixed audio tone Fake Split always encodes at — the VFO shifts to compensate so your chosen TX frequency still goes out over the air">
+            <span class="text-[10px] text-[#8b949e] whitespace-nowrap">Sweet Spot</span>
+            <NumberField value={tx.state().fakeSplitSweetSpotHz}
+              onCommit={tx.setFakeSplitSweetSpotHz}
+              disabled={!tx.state().fakeSplit}
+              min={300} max={2800} step={10}
+              class="bg-[#0d1117] border border-[#30363d] rounded px-1.5 py-1 text-xs font-mono text-[#c9d1d9] w-16 focus:outline-none focus:border-[#388bfd] disabled:cursor-not-allowed" />
+            <span class="text-[10px] text-[#8b949e] whitespace-nowrap">Hz</span>
+          </div>
         </div>
 
         {/* Toggle chips — 2 columns x N rows, pushed to the row's far right.
