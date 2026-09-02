@@ -4,11 +4,27 @@ Two independent TX-panel features, bundled here because both are toggle
 chips on `FTTransmitPanel` persisted the same way as `autoCQ`/`autoPTT`/
 `allowConsecutiveTx`. Either can ship without the other.
 
-Implemented in `useFTTransmit.ts` (`fakeSplit`/`txWindowParity` state,
-`isWrongWindowParity()`, the Fake Split retune/restore in `runLoop()`),
-`useRadioCAT.ts` (`getTransportKind()`), and `FTTransmitPanel.tsx` (the Fake
-Split and Even/Odd chips). `FAKE_SPLIT_SETTLE_MS` (currently 75ms) is a
-placeholder default — see "Remaining open question" below, still open.
+Implemented in `useFTTransmit.ts` (`fakeSplit`/`fakeSplitSweetSpotHz`/
+`txWindowParity` state, `isWrongWindowParity()`, the Fake Split retune/
+restore in `runLoop()`), `useRadioCAT.ts` (`getTransportKind()`), and
+`FTTransmitPanel.tsx` (the Fake Split and Even/Odd chips). `FAKE_SPLIT_SETTLE_MS`
+(currently 75ms) is a placeholder default — see "Remaining open question"
+below, still open.
+
+**Post-implementation correction (2026-09-02):** the first cut of this
+feature had a real bug, caught before it shipped further: it used the
+operator's own Audio Hz as the "sweet spot" (see the old "How this differs
+from WSJT-X" section this replaced), which made the VFO delta silently
+collapse to zero for ALL ordinary traffic — a plain CQ or reply with no
+per-entry pinned tone always has `entry.audioHz ?? getBaseFrequency() ===
+getBaseFrequency()`, so "sweet spot" and "desired tone" were always the
+same value and nothing ever got shifted. Fixed by introducing a genuinely
+separate `fakeSplitSweetSpotHz` setting (default 1750 Hz — center of
+WSJT-X's own 1500–2000 Hz range), independent of Audio Hz, matching WSJT-X's
+actual architecture (see below) rather than the collapsed one-concept
+version. A parallel copy of the same bug existed in the auto-CQ path
+(`rebuildAutoCQCache`, a separate encode cache from the queue/`startEncode`)
+and needed the identical fix.
 
 ## Feature 1 — Fake Split
 
@@ -45,23 +61,22 @@ Sources: [WSJT-X User Guide § Split Operation](https://wsjt.sourceforge.io/wsjt
 [K0PIR: WSJT-X Split Operation](https://k0pir.us/wsjt-x-split-operation/),
 [groups.io: Split Operation: Rig or Fake it?](https://wsjtx.groups.io/g/main/topic/split_operation_rig_or_fake/88996981).
 
-### How this differs from WSJT-X (deliberate deviation, not an oversight)
+### How this differs from WSJT-X (one deliberate difference, otherwise the same mechanism)
 
 WSJT-X's sweet spot is an **internal fixed constant** (1500–2000 Hz) that
-the operator never sets directly — "what tone do I want to send" and
-"where does Fake It park the audio" are two separate concepts in WSJT-X's
-model, with the operator's intended TX frequency living in "Tx Freq" and
-Fake It's own internal target being independent of it.
+the operator never sets directly — "what tone do I want to send" (Audio Hz
+/ a per-message pinned tone) and "where does Fake It park the audio" (the
+sweet spot) are two separate concepts in WSJT-X's model, and this app's
+implementation now matches that exactly: `fakeSplitSweetSpotHz` is a
+genuinely independent value from `getBaseFrequency()`/`entry.audioHz`.
 
-This app instead **collapses those into one concept**: the sweet spot *is*
-whatever the operator already has in the panel's Audio Hz field. Turning
-Fake Split on changes what that field *means* — from "the tone that gets
-sent" to "the tone we always send; any per-message deviation (e.g. a QSY
-reply) goes out via VFO shift instead" — rather than introducing a second,
-separately-configured constant alongside it. One fewer setting for the
-operator to reconcile, at the cost of the mapping not matching WSJT-X's
-internals 1:1. Worth calling out explicitly here so nobody reads the code
-later, notices it doesn't match WSJT-X's source, and "fixes" it back.
+The one deliberate difference: this app exposes the sweet spot as a
+**configurable setting** (`fakeSplitSweetSpotHz`, default 1750 Hz — center
+of WSJT-X's range) rather than a truly hardcoded, non-configurable
+constant, since a given radio's actual filter response can differ enough
+to want tuning. There is currently no panel UI control for changing it
+(only `setFakeSplitSweetSpotHz()` on the API) — see "Remaining open
+question" below.
 
 ### Requires CAT
 
@@ -71,39 +86,53 @@ Unlike auto-PTT this feature is useless without a *readable* VFO frequency
 too (`getVfoFrequency()`/`cat.state().frequency`), so the gate should be
 "CAT connected AND frequency known", not just "PTT settable".
 
-### Mechanism
+### Mechanism (corrected — see "Post-implementation correction" above)
 
-**Sweet-spot tone is not a hardcoded constant — it's the panel's existing
-Audio Hz setting** (`baseFreq`/`getBaseFrequency()`). This is a deliberate
-choice (confirmed with the operator) rather than copying WSJT-X's fixed
-1500–2000 Hz literally: it keeps a single "what tone am I sending" mental
-model — the operator already tunes Audio Hz for their rig's cleanest
-passband spot (filter shape, ALC behavior, etc. all vary per radio), so
-that's exactly the value Fake Split should be defending, not a separate
-independently-configured constant that could disagree with it.
+**Sweet-spot tone is a genuinely independent setting** (`fakeSplitSweetSpotHz`,
+default `DEFAULT_FAKE_SPLIT_SWEET_SPOT_HZ = 1750`), NOT the panel's Audio Hz
+— conflating the two was the original bug: for ordinary traffic (no pinned
+per-entry tone), `entry.audioHz ?? getBaseFrequency()` always equals
+`getBaseFrequency()`, so if the sweet spot is *also* `getBaseFrequency()`
+the delta is always zero and the VFO never moves. The sweet spot must be a
+fixed reference point the operator's target frequency is measured *against*,
+not the target itself.
 
-Consequence: **every fake-split transmission encodes at `getBaseFrequency()`**,
-full stop — including when a per-entry `entry.audioHz` would normally
-override it (e.g. `qsyAudioOffsetHz()` replies to a station's numeric QSY
-request, `parser.ts:655-665`). The QSY intent is preserved, just moved
-entirely into the VFO delta instead of partly-audio/partly-VFO:
+**Every fake-split transmission encodes at `fakeSplitSweetSpotHz`**, full
+stop — including a plain CQ with no pinned tone, and including when a
+per-entry `entry.audioHz` would normally override the panel's Audio Hz
+(e.g. `qsyAudioOffsetHz()` replies to a station's numeric-tag CQ request,
+`parser.ts:655-665`). The operator's actual intended tone is preserved
+entirely as a VFO delta instead of partly-audio/partly-VFO:
 
 ```
-desiredAudioHz = entry.audioHz ?? getBaseFrequency()   // what a normal TX would've encoded at
-sweetSpotHz    = getBaseFrequency()                     // what fake-split always encodes at instead
-delta          = desiredAudioHz - sweetSpotHz           // can be + or -, 0 for a plain CQ/non-QSY entry
-txVfoHz        = originalVfoHz + delta
+desiredHz    = entry.audioHz ?? getBaseFrequency()   // operator's actual intended TX tone
+sweetSpotHz  = fakeSplitSweetSpotHz                  // fixed, independent of desiredHz
+delta        = desiredHz - sweetSpotHz               // nonzero for ANY desiredHz != sweetSpotHz —
+                                                      // including the common plain-CQ case now
+txVfoHz      = originalVfoHz + delta
 ```
 
-Encoding: whenever fake-split is on, force `encodeHz = getBaseFrequency()`
-at `useFTTransmit.ts:769` (ignoring `entry.audioHz` for the *encode* call
-specifically — it still flows into the `delta` computation above). Note this
-means `getBaseFrequency()` must be read at *encode* time and again at *TX*
-time — if the operator changes Audio Hz between an entry's enqueue and its
-actual TX window, re-deriving `delta` from whatever `entry.samples` was
-actually encoded at (not a fresh `getBaseFrequency()` read) avoids the two
-going out of sync; carry the sweet-spot value the entry was encoded against
-alongside `entry.samples` rather than re-reading the live setting at TX time.
+Encoding: whenever fake-split is on, force `encodeHz = fakeSplitSweetSpotHz`
+in both `startEncode()` (queued entries) and `rebuildAutoCQCache()` (the
+auto-CQ cache — a SEPARATE encode path from the queue, needing the
+identical fix independently; see the correction note above). The value
+actually encoded at is captured onto the entry as `fakeSplitEncodedHz` (or
+`autoCQFakeSplitEncodedHz` for the auto-CQ cache) at encode time, and
+`runLoop()`'s delta computation reads THAT captured value rather than a
+fresh `fakeSplitSweetSpotHz` read — if the operator changes the sweet spot
+(or toggles Fake Split) between an entry's enqueue and its actual TX
+window, comparing against the live setting instead of what was actually
+baked into `entry.samples` would compute a delta against the wrong
+baseline. `syncParams()` treats a Fake Split on/off flip or sweet-spot
+change as invalidating every queued entry (not just ones with no pinned
+tone, unlike a plain Audio-Hz change) precisely because it changes
+`encodeHz` regardless of any per-entry pin.
+
+If `fakeSplitEncodedHz` is missing on an entry (not yet re-encoded under
+the current Fake Split state — a real race, since `syncParams()`'s
+re-encode is debounced/async, not synchronous with the toggle),
+`runLoop()` skips the VFO shift for that transmission entirely rather than
+compute a delta against a guessed/wrong baseline — see its own comment.
 
 ### Sequencing — the real risk
 
@@ -197,6 +226,19 @@ end up applying back-to-back on a fake-split TX.
   *for*, which is a good sign for this app's primary target, but the ESP32
   bridge path adds its own WebSocket round-trip on top of the radio's own
   CAT latency and should be measured separately.
+- **Every transmission now retunes, not just QSY replies.** With the
+  corrected mechanism (sweet spot independent of Audio Hz), the delta is
+  nonzero for essentially ALL traffic whenever the operator's Audio Hz
+  differs from the sweet spot — which is the common case, not a rare
+  exception. This makes the "auto-CQ / unattended operation" gotcha above
+  apply to ordinary CQ beacon operation too, not just QSY-reply edge cases:
+  an unattended auto-CQ station with Fake Split on and Auto-PTT off will
+  have its VFO jump on every single beacon transmission. This is the
+  correct/intended behavior (it's exactly what WSJT-X's Fake It does too),
+  but it raises the practical stakes of the Auto-PTT warning above — worth
+  re-confirming operators actually see and understand that warning, since
+  it now governs much more frequent VFO movement than the original
+  (buggy, QSY-only) implementation ever produced.
 
 ## Feature 2 — TX window-parity toggle (0/30 vs 15/45)
 
@@ -307,11 +349,14 @@ as the chip's neutral/default-looking state (consistent with Even being the
 default), the same way e.g. Consecutive-TX's chip looks neutral until
 switched on.
 
-## Remaining open question before implementation
+## Remaining open questions
 
-`fakeSplitSettleMs` (the guard delay after a confirmed VFO retune, before
-audio/PTT proceeds) — no source gives a universal number (see Sequencing
-above). Needs an initial conservative default plus real-hardware
-measurement across at least the TS-480-direct-serial and ESP32-bridge
-paths before trusting a single global constant; flag this explicitly in the
-PR rather than treating a guessed value as validated.
+1. `FAKE_SPLIT_SETTLE_MS` (the guard delay after a confirmed VFO retune,
+   before audio/PTT proceeds) — no source gives a universal number (see
+   Sequencing above). Needs an initial conservative default plus
+   real-hardware measurement across at least the TS-480-direct-serial and
+   ESP32-bridge paths before trusting a single global constant.
+2. `fakeSplitSweetSpotHz` has no panel UI control yet — only
+   `setFakeSplitSweetSpotHz()` on the API, defaulting to 1750 Hz. An
+   operator whose radio's filter response wants a different sweet spot has
+   no way to change it from the UI today.
