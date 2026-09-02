@@ -1231,6 +1231,31 @@ export default function FTTransmitPanel(props: FTTransmitPanelProps): JSX.Elemen
           </Show>
         </div>
       </div>
+
+      {/* Fake Split stale-restore warning — see useFTTransmit.ts's
+          fakeSplitStaleRestoreHz/loadPendingFakeSplitRestoreHz comments.
+          Means the app shut down (reload/crash) mid-TX before a Fake Split
+          VFO shift was confirmed restored, so the radio may still be
+          sitting on a shifted frequency with no other record of it
+          anywhere. Kept to one compact line (not a full-width block banner
+          like the error box below) — noticeable via the amber color and
+          persisting until acted on, but not competing for space with the
+          rest of the panel. */}
+      <Show when={tx.state().fakeSplitStaleRestoreHz !== null}>
+        <div class="flex items-center gap-1.5 text-[10px] text-[#e3b341]">
+          <span>⚠ Fake Split VFO may not have been restored (interrupted mid-TX) — radio may still be shifted to {tx.state().fakeSplitStaleRestoreHz} Hz.</span>
+          <Show when={props.onSetFrequency}>
+            <button onClick={() => void tx.revertStaleFakeSplitVfo()}
+              class="text-[#e3b341] underline hover:text-[#f0c964] shrink-0">
+              Revert now
+            </button>
+          </Show>
+          <button onClick={() => tx.dismissStaleFakeSplitVfo()}
+            class="shrink-0 text-[#484f58] hover:text-[#c9d1d9] px-1"
+            title="Dismiss">✕</button>
+        </div>
+      </Show>
+
       {/* ── Active TX banner ── */}
       <Show when={isPlaying()}>
         <div class="flex items-center gap-3 bg-[#2ea043]/10 border border-[#2ea043]/40 rounded px-3 py-2">

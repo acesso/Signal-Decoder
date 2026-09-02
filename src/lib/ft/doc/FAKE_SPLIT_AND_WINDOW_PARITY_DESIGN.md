@@ -5,11 +5,12 @@ chips on `FTTransmitPanel` persisted the same way as `autoCQ`/`autoPTT`/
 `allowConsecutiveTx`. Either can ship without the other.
 
 Implemented in `useFTTransmit.ts` (`fakeSplit`/`fakeSplitSweetSpotHz`/
-`txWindowParity` state, `isWrongWindowParity()`, the Fake Split retune/
-restore in `runLoop()`), `useRadioCAT.ts` (`getTransportKind()`), and
-`FTTransmitPanel.tsx` (the Fake Split and Even/Odd chips). `FAKE_SPLIT_SETTLE_MS`
-(currently 75ms) is a placeholder default — see "Remaining open question"
-below, still open.
+`fakeSplitStaleRestoreHz`/`txWindowParity` state, `isWrongWindowParity()`,
+the Fake Split retune/restore in `runLoop()`, the crash-recovery marker —
+see its own section below), `useRadioCAT.ts` (`getTransportKind()`), and
+`FTTransmitPanel.tsx` (the Fake Split and Even/Odd chips, plus the
+stale-restore warning line). `FAKE_SPLIT_SETTLE_MS` (currently 75ms) is a
+placeholder default — see "Remaining open questions" below, still open.
 
 **Post-implementation correction (2026-09-02):** the first cut of this
 feature had a real bug, caught before it shipped further: it used the
@@ -191,6 +192,47 @@ to validate against real hardware (TS-480, uSDX, ESP32-bridge round-trip
 adds its own latency on top) rather than a constant to trust blindly. This
 is separate from `preKeyMs` (the existing PA/relay warm-up hold) — both may
 end up applying back-to-back on a fake-split TX.
+
+### Crash/reload recovery — the pending-restore marker
+
+`fakeSplitOriginalVfoHz` in `runLoop()` is a plain local `let`, scoped to a
+single loop iteration — a page reload or crash between the pre-TX retune
+and the post-TX restore loses it completely, leaving the radio parked on
+the shifted frequency with **zero durable trace** of what it should be
+restored to (flagged by the user directly: "assume an accidental page
+reload during a fake split tx... on page reload the web app can notice
+that the current VFO is possibly wrong").
+
+Fixed with a localStorage marker (`loadPendingFakeSplitRestoreHz()` /
+`savePendingFakeSplitRestoreHz()` / `clearPendingFakeSplitRestoreHz()`),
+written **before** the retune command is even sent (not after it resolves
+— a crash during the CAT round-trip itself must still leave a record) and
+cleared only once the restore is **confirmed** successful. On a failed
+restore attempt, the marker is deliberately left in place rather than
+cleared: a timeout/rejection means the confirm cycle didn't succeed, not
+that the radio definitely never applied the command (especially over the
+websocket/bridge transport, where the SET can land while only the
+verification read fails) — leaving a false-positive warning up is a much
+smaller cost than silently abandoning a radio that's actually shifted.
+
+On `createFTTransmit()` construction (i.e. every fresh page load), a
+leftover marker is read straight into `FTTransmitState.fakeSplitStaleRestoreHz`
+and the panel shows a compact one-line amber warning (not a full-width
+block banner — kept small deliberately per explicit direction) with the
+stale frequency, a **Revert now** button (`revertStaleFakeSplitVfo()` —
+only shown when a CAT frequency setter is currently available) that
+retunes the VFO back and clears the marker on success, and a dismiss `✕`
+(`dismissStaleFakeSplitVfo()`) for "I already fixed it manually" or a
+false alarm. Neither action is automatic — the app never retunes the radio
+on the operator's behalf without an explicit click, for the same reason
+Fake Split itself only ever shifts around an operator-visible TX cycle.
+
+The same underlying gap existed for a **deliberate** Stop mid-TX, not just
+a crash: `stop()` unkeys PTT but, before this fix, never touched the VFO at
+all, since `fakeSplitOriginalVfoHz` lived inside `runLoop()`'s loop body
+and was unreachable from `stop()`. Now `stop()` reads the same persisted
+marker and attempts an immediate best-effort restore, falling back to the
+same stale-restore warning if that also fails.
 
 ### Gotchas to design around
 
