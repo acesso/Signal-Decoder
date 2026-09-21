@@ -436,6 +436,25 @@ function TxRingMini(props: { status: string; windowSec: number; playing: boolean
     cy = 36
   const circ = 2 * Math.PI * r
 
+  // Mirror the reactive props into plain locals, tracked by a createEffect
+  // that runs under this component's owner. The rAF loop below then reads
+  // these instead of props.
+  //
+  // Reading props.status/props.windowSec directly from inside the rAF
+  // callback is what this avoids: the call site passes computed
+  // expressions (status={...isRunning ? ... : 'idle'}), which solid's JSX
+  // transform compiles to LAZY getters that build their memo on first
+  // access. Inside requestAnimationFrame there is no Owner, so each such
+  // access created an unowned computation — "computations created outside
+  // a `createRoot` or `render` will never be disposed", once per frame,
+  // for as long as the panel stayed mounted.
+  let status = props.status
+  let windowSec = props.windowSec
+  createEffect(() => {
+    status = props.status
+    windowSec = props.windowSec
+  })
+
   onMount(() => {
     const tick = () => {
       const svg = svgEl
@@ -443,7 +462,7 @@ function TxRingMini(props: { status: string; windowSec: number; playing: boolean
         rafId = requestAnimationFrame(tick)
         return
       }
-      const totalMs = props.windowSec * 1000
+      const totalMs = windowSec * 1000
       const now = new Date()
       const elapsed = (now.getSeconds() * 1000 + now.getMilliseconds()) % totalMs
       const progress = elapsed / totalMs
@@ -453,7 +472,7 @@ function TxRingMini(props: { status: string; windowSec: number; playing: boolean
         return
       }
       prevSecVal = secVal
-      const color = TX_STATUS_COLOR[props.status] ?? '#484f58'
+      const color = TX_STATUS_COLOR[status] ?? '#484f58'
       const filled = circ * progress
       svg.querySelector<SVGCircleElement>('.mring-arc')?.setAttribute('stroke', color)
       svg.querySelector<SVGCircleElement>('.mring-arc')?.setAttribute('stroke-dasharray', `${filled} ${circ - filled}`)

@@ -106,12 +106,26 @@ function TxRing(props: { status: string; windowSec: number; playing: boolean }) 
   const r = 28, cx = 36, cy = 36
   const circ = 2 * Math.PI * r
 
+  // Mirrored into plain locals by an effect running under this component's
+  // owner, so the rAF loop below never reads props directly. The call site
+  // passes computed expressions, which solid's JSX transform compiles to
+  // lazy getters that build their memo on first access — and inside
+  // requestAnimationFrame there is no Owner, so each access leaked an
+  // undisposable computation ("computations created outside a
+  // `createRoot` or `render`..."), once per frame while mounted.
+  let status = props.status
+  let windowSec = props.windowSec
+  createEffect(() => {
+    status = props.status
+    windowSec = props.windowSec
+  })
+
   onMount(() => {
     const tick = () => {
       const svg = svgEl
       if (!svg) { raf = requestAnimationFrame(tick); return }
 
-      const totalMs  = props.windowSec * 1000
+      const totalMs  = windowSec * 1000
       // Epoch-based (not Date.getSeconds()) to match useFTTransmit's own
       // boundary math exactly. At the precise zero-crossing instant this
       // collapses to elapsed=0 — treat that as "just completed a full cycle"
@@ -128,15 +142,15 @@ function TxRing(props: { status: string; windowSec: number; playing: boolean }) 
       if (secVal === prev) { raf = requestAnimationFrame(tick); return }
       prev = secVal
 
-      const color  = STATUS_COLOR[props.status] ?? '#484f58'
+      const color  = STATUS_COLOR[status] ?? '#484f58'
       const filled = circ * progress
 
       svg.querySelector<SVGCircleElement>('.tx-arc')?.setAttribute('stroke', color)
       svg.querySelector<SVGCircleElement>('.tx-arc')?.setAttribute('stroke-dasharray', `${filled} ${circ - filled}`)
       const sec = svg.querySelector<SVGTextElement>('.tx-sec')
-      if (sec) sec.textContent = props.status === 'idle' ? '--' : secVal
+      if (sec) sec.textContent = status === 'idle' ? '--' : secVal
       const lbl = svg.querySelector<SVGTextElement>('.tx-lbl')
-      if (lbl) { lbl.setAttribute('fill', color); lbl.textContent = STATUS_LABEL[props.status] ?? props.status.toUpperCase() }
+      if (lbl) { lbl.setAttribute('fill', color); lbl.textContent = STATUS_LABEL[status] ?? status.toUpperCase() }
 
       raf = requestAnimationFrame(tick)
     }

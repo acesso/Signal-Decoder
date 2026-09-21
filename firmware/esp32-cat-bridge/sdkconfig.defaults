@@ -177,3 +177,15 @@ CONFIG_ESP_TASK_WDT_PANIC=y
 # scripts/tx-plus-iqspectrum-profile.ts's own header for reference; don't
 # re-apply this specific change without re-confirming against real
 # hardware first.
+
+# ── OTA (POST /ota — see http_control.c's ota_handler) ──────────────────────
+# Rollback: an image written over the air boots ONCE in
+# ESP_OTA_IMG_PENDING_VERIFY. app_main marks it valid at the end of startup
+# (see its esp_ota_mark_app_valid_cancel_rollback() call); an image that
+# crashes or aborts before reaching that point is reverted to the previous
+# slot by the bootloader on the next reset. This matters specifically
+# because the bridge normally lives attached to the radio, out of UART
+# reach — without rollback, one bad OTA means physically fetching the unit,
+# which is the exact problem OTA was added to solve.
+CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
+

@@ -349,7 +349,8 @@ void ws_server_start(void) {
     // /wifi-tx-power, /rx-slot, /led-enable, /alc, /noise-gate, /cpu-freq,
     // /system-stats, /adc-hpf, /sample-rate, /input-mode, /cat-log-enable,
     // /speaker-amp, /cat-log, /cat-log/clear, /tx-audio, /tx-play,
-    // /tx-status, /tx-stop, /* OPTIONS, plus control_page's /, /style.css,
+    // /tx-status, /tx-stop, /ota, /ota-status, /* OPTIONS, plus
+    // control_page's /, /style.css,
     // /app.js, plus /iq-data and /audio-mic-sniff), so the default
     // silently overflows (ESP_ERR_HTTPD_HANDLERS_FULL, a boot-loop on real
     // hardware — this cap has already been hit and bumped multiple times:

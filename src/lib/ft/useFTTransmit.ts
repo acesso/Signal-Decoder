@@ -491,6 +491,16 @@ const TX_SLOT_COUNT = 4;
 const TX_SLOT_AUTOCQ = 0;
 const TX_SLOT_QUEUE_LOOKAHEAD = [1, 2] as const;
 
+// How long after POST /tx-play a reported playing:false can still mean "the
+// playback task hasn't been scheduled yet" rather than "playback finished".
+// The firmware flips its playing flag from inside that task, not in the HTTP
+// handler, so there is a real window where 200-OK has come back but status
+// still reads false (see playBridgeSlotAndWait's own comment). Generous
+// relative to the ESP32's actual task-start latency (single-digit ms) because
+// erring long only costs a few idle polls inside a window we are committed to
+// transmitting in anyway, while erring short replays the message on air.
+const TX_PLAY_START_GRACE_MS = 1500;
+
 function emptyBridgeSlots(): BridgeSlotInfo[] {
   return Array.from({ length: TX_SLOT_COUNT }, (_, slot) => ({ slot, message: '', label: '', uploaded: false, audioHz: 0 }));
 }
@@ -681,13 +691,22 @@ async function refreshSlotHashCache(wsUrl: string): Promise<BridgeSlotInfo[] | n
 // (no buffer uploaded to this slot, bridge unreachable, another slot
 // already playing, or the /tx-play call itself failed) — the caller treats
 // that the same as "audio playback failed" on the local-speaker path.
-async function playBridgeSlotAndWait(wsUrl: string, slot: number, isRunning: () => boolean): Promise<boolean> {
+export async function playBridgeSlotAndWait(wsUrl: string, slot: number, isRunning: () => boolean): Promise<boolean> {
   const playUrl = bridgeHttpUrl(wsUrl, '/tx-play', `slot=${slot}`);
   const statusUrl = bridgeHttpUrl(wsUrl, '/tx-status');
   if (!playUrl || !statusUrl) return false;
+  // /tx-play answers {"slot":N,"playing":true,"duration_ms":U} — duration_ms
+  // is how long the firmware says this slot's audio runs for. Captured here
+  // because it's the only trustworthy lower bound on "playback is still in
+  // flight": see the startup-race comment on the poll loop below.
+  let durationMs = 0;
   try {
     const playRes = await fetch(playUrl, { method: 'POST' });
     if (!playRes.ok) return false;
+    try {
+      const played = await playRes.json() as { duration_ms?: number };
+      if (typeof played.duration_ms === 'number' && played.duration_ms > 0) durationMs = played.duration_ms;
+    } catch { /* older firmware without a JSON body — fall back to the grace period below */ }
   } catch {
     return false;
   }
@@ -697,16 +716,42 @@ async function playBridgeSlotAndWait(wsUrl: string, slot: number, isRunning: () 
   // bridge's httpd worker over what's otherwise an idle WiFi link for the
   // whole ~1.4-15s a message plays.
   const POLL_MS = 150;
+  // Startup race: the firmware sets its `playing` flag from INSIDE the
+  // spawned playback task, NOT in the /tx-play httpd handler (see
+  // s_tx_play_task_alive_slot's comment in audio_monitor.c). So /tx-status
+  // legitimately reports playing:false for a moment AFTER /tx-play has
+  // returned 200, until that task is scheduled. Believing that first
+  // false meant "finished" returned from here ~150ms into a 12.6s FT8
+  // window — the TX loop then fell through to its next iteration while
+  // still inside the SAME window and, with the queue entry not yet
+  // removed, keyed up and played the identical message again, over and
+  // over, for the rest of the window. Hence: playing:false only counts as
+  // "finished" once we've actually SEEN playback start, or once enough
+  // time has passed that it can no longer plausibly be starting up.
+  const startedByMs = Date.now() + Math.max(durationMs, 0) + TX_PLAY_START_GRACE_MS;
+  let sawPlaying = false;
   for (;;) {
     if (!isRunning()) return true; // caller is stopping — don't keep polling a session nobody's waiting on
     await new Promise(resolve => setTimeout(resolve, POLL_MS));
     try {
       const res = await fetch(statusUrl);
-      if (!res.ok) return true; // bridge dropped mid-playback — nothing more to wait for
+      // A dropped bridge or a failed status poll mid-playback isn't worth
+      // retrying indefinitely — but it is NOT evidence that playback
+      // finished, so it must not shortcut the wait either. Keep the loop's
+      // own timing intact by treating it the same as "still playing" until
+      // the duration we were promised has elapsed; only then give up.
+      if (!res.ok) {
+        if (Date.now() >= startedByMs) return true;
+        continue;
+      }
       const data = await res.json() as { playing?: boolean; playing_slot?: number };
-      if (!data.playing || data.playing_slot !== slot) return true;
+      if (data.playing && data.playing_slot === slot) { sawPlaying = true; continue; }
+      // Not (or no longer) playing our slot. Genuine completion only if we
+      // ever saw it running; otherwise we're still in the startup window
+      // and must keep waiting until it can't be startup any more.
+      if (sawPlaying || Date.now() >= startedByMs) return true;
     } catch {
-      return true; // same reasoning — a status-poll failure mid-playback isn't worth retrying indefinitely
+      if (Date.now() >= startedByMs) return true;
     }
   }
 }
@@ -1398,6 +1443,20 @@ export function createFTTransmit(
       }));
       if (!useAutoCQ) {
         queue = queue.filter(q => q.id !== txId);
+      }
+
+      // Leave this window before looping. Defence in depth: this loop used
+      // to rely purely on playback having consumed the window, which holds
+      // for the speaker sink (Web Audio blocks for the waveform's full
+      // ~12.6s/4.5s) but is only as good as the bridge's remote
+      // playback-finished signal. When that signal came back early, the
+      // next iteration ran INSIDE the same window and retransmitted the
+      // same message repeatedly — the consecutive-TX guard below couldn't
+      // help, since it's gated on allowConsecutiveTx. Sleeping to the
+      // boundary here makes "one transmission per window" structural
+      // rather than a property of how long playback happened to take.
+      if (Date.now() - txWindowBucket < windowMs) {
+        await sleepToNextBoundary(windowSec);
       }
     }
     setState(prev => ({ ...prev, status: 'idle' }));
