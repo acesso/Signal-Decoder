@@ -45,6 +45,20 @@ function ClockRing(props: { status: string; windowSec: number }) {
   let rafId: number | null = null
   let prevSecVal = ''
 
+  // Mirrored into plain locals by an effect running under this component's
+  // owner, so the rAF loop below never reads props directly. The call site
+  // passes computed expressions, which solid's JSX transform compiles to
+  // lazy getters that build their memo on first access — and inside
+  // requestAnimationFrame there is no Owner, so each access leaked an
+  // undisposable computation ("computations created outside a
+  // `createRoot` or `render`..."), once per frame while mounted.
+  let status = props.status
+  let windowSec = props.windowSec
+  createEffect(() => {
+    status = props.status
+    windowSec = props.windowSec
+  })
+
   onMount(() => {
     const tick = () => {
       const svg = svgEl
@@ -53,7 +67,7 @@ function ClockRing(props: { status: string; windowSec: number }) {
         return
       }
 
-      const totalMs = props.windowSec * 1000
+      const totalMs = windowSec * 1000
       const now = new Date()
       const elapsed = (now.getSeconds() * 1000 + now.getMilliseconds()) % totalMs
       const progress = elapsed / totalMs
@@ -66,15 +80,15 @@ function ClockRing(props: { status: string; windowSec: number }) {
       }
       prevSecVal = secVal
 
-      const arcColor = props.status === 'recording' ? '#2ea043' : props.status === 'decoding' ? '#e3b341' : '#30363d'
-      const lblColor = props.status === 'recording' ? '#2ea043' : props.status === 'decoding' ? '#e3b341' : '#484f58'
-      const label = props.status === 'decoding' ? 'DEC' : props.status === 'recording' ? 'REC' : 'WAIT'
+      const arcColor = status === 'recording' ? '#2ea043' : status === 'decoding' ? '#e3b341' : '#30363d'
+      const lblColor = status === 'recording' ? '#2ea043' : status === 'decoding' ? '#e3b341' : '#484f58'
+      const label = status === 'decoding' ? 'DEC' : status === 'recording' ? 'REC' : 'WAIT'
       const filled = circ * progress
 
       svg.querySelector<SVGCircleElement>('.ft-arc')?.setAttribute('stroke', arcColor)
       svg.querySelector<SVGCircleElement>('.ft-arc')?.setAttribute('stroke-dasharray', `${filled} ${circ - filled}`)
       const txt = svg.querySelector<SVGTextElement>('.ft-sec')
-      if (txt) txt.textContent = props.status === 'idle' ? '--' : secVal
+      if (txt) txt.textContent = status === 'idle' ? '--' : secVal
       const lbl = svg.querySelector<SVGTextElement>('.ft-lbl')
       if (lbl) {
         lbl.setAttribute('fill', lblColor)

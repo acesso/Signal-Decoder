@@ -12,6 +12,18 @@ them into a version section when cutting a release.
 
 ## [Unreleased]
 
+## [0.17.0] - 2026-09-21
+
+### Added
+
+- ESP32 bridge: **OTA firmware updates over Wi-Fi** — `POST /ota` streams a new image straight into the inactive app slot and reboots into it (~8s for a ~1.1MB image), so the bridge no longer has to be physically fetched and flashed over USB-UART for every change. `GET /ota-status` reports which slot is running and which is the update target. The partition table moves from one 1500K `factory` slot to two 1600K OTA slots (`nvs` keeps its offset, so Wi-Fi credentials and settings survive the change). Bootloader rollback is enabled and the image is only marked valid at the very end of startup, so a build that crashes during bringup reverts itself rather than stranding a unit that's out of UART reach. The first OTA-capable image still has to arrive over UART, since moving to the two-slot table is itself a partition-table change. See `firmware/esp32-cat-bridge/README.md`.
+- `scripts/tx-playback-rate-probe.ts` — replays a slot the bridge already holds and tracks its reported `position_ms` against wall clock, to diagnose bridge playback-timing problems over Wi-Fi with no serial console attached.
+
+### Fixed
+
+- Fixed FT8/FT4 TX audio playing at **half speed** when the bridge is in I/Q input mode — one over took ~2 window-lengths, which on air is indistinguishable from the message being transmitted twice back to back (and overran the following window). `audio_monitor_set_tx_slot()` reconfigured the TX I2S channel to mono, but in I/Q mode that channel is opened stereo (`esp_codec_dev_open()` forces both directions to the same channel count) and the write path correspondingly duplicates each mono sample onto both slots; the mismatch left the driver pacing that buffer as twice as many mono frames. It ran on every I/Q-mode boot. Measured on real hardware before/after on the same 12.639s waveform: 2.047x → 1.024x stretch, 24080 → 48740 samples/s drain rate against a configured 48000.
+- Hardened the bridge TX playback wait: a `/tx-status` poll that fails, or that reports `playing:false` during the brief window after `POST /tx-play` returns but before the firmware's playback task has been scheduled, is no longer treated as "playback finished". The TX loop also now sleeps to the next window boundary after transmitting instead of relying on playback having consumed the window, making one-transmission-per-window structural rather than a property of how long playback happened to take.
+- Fixed the three rAF-driven countdown rings (TX panel, FT decoder, and the collapsed-panel mini ring) leaking an undisposable reactive computation on every animation frame — they read component props from inside their `requestAnimationFrame` callback, where Solid has no owner, and each call site passes a computed expression that compiles to a lazy memo getter. Dev consoles filled with "computations created outside a `createRoot` or `render` will never be disposed" in steadily growing bursts.
 ## [0.16.0] - 2026-09-02
 
 ### Added

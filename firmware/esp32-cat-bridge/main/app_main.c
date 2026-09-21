@@ -12,6 +12,7 @@
 // pinned exclusively to core 1 (see bridge_config.h's task-placement
 // notes), so radio I/O timing is never contended with network stack activity.
 #include "esp_log.h"
+#include "esp_ota_ops.h"
 
 #include "audio_monitor.h"
 #include "audio_sniff.h"
@@ -48,5 +49,30 @@ void app_main(void) {
     cat_bridge_start(ws_server_send_to_client);
     audio_monitor_start();    // needs audio_ws_start() already registered its rx callback slot
 
+
+    // OTA rollback gate (see partitions.csv / ota_handler()). With
+    // CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE, an image written by POST /ota
+    // boots exactly ONCE in ESP_OTA_IMG_PENDING_VERIFY; if it never marks
+    // itself valid, the bootloader reverts to the previous slot on the next
+    // reset. Marking here — at the END of app_main, after every subsystem
+    // above has started — means a build that crashes or aborts during
+    // bringup (the realistic way a bad flash bricks this unit, since the
+    // bridge is normally out of UART reach) rolls itself back instead of
+    // needing the cable. Deliberately NOT gated on WiFi having associated:
+    // the bridge must stay recoverable when it boots somewhere its
+    // configured AP doesn't exist, and rolling back over a missing network
+    // would strand a perfectly good image.
+    const esp_partition_t *running = esp_ota_get_running_partition();
+    esp_ota_img_states_t ota_state;
+    if (running && esp_ota_get_state_partition(running, &ota_state) == ESP_OK &&
+        ota_state == ESP_OTA_IMG_PENDING_VERIFY) {
+        esp_err_t mark_err = esp_ota_mark_app_valid_cancel_rollback();
+        if (mark_err == ESP_OK) {
+            ESP_LOGW(TAG, "OTA image on '%s' marked valid — rollback cancelled", running->label);
+        } else {
+            ESP_LOGE(TAG, "failed to mark OTA image valid (%s) — this build will roll back on next reset",
+                     esp_err_to_name(mark_err));
+        }
+    }
     ESP_LOGI(TAG, "bridge running");
 }

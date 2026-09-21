@@ -33,6 +33,7 @@ idf_component_register(
         esp_pm
         heap
         esp_partition
+        app_update
 )
 
 # Bakes spiffs_data/ (the standalone control page's HTML/CSS/JS) into a

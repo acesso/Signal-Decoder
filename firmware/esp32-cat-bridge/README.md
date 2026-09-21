@@ -539,11 +539,63 @@ idf.py -p /dev/ttyUSB0 flash monitor   # adjust the port — the A1S's "UART"
 `build/` are gitignored — never commit `sdkconfig`.
 
 Flash layout is a custom table (`partitions.csv`, not the ESP-IDF default)
-so there's room for both the app and the control page's SPIFFS partition on
-the same 4MB chip: a 1.5MB app slot (no OTA — same single-slot model as the
-default single-app table, just resized) plus a 256KB `storage` partition
-for `spiffs_data/`. `idf.py flash` writes both; editing anything under
-`spiffs_data/` just needs a rebuild + reflash, same as any other source change.
+so there's room for the app, the control page's SPIFFS partition and the
+CAT log on the same 4MB chip: **two 1600KB app slots** (`ota_0`/`ota_1`)
+plus an 8KB `otadata`, a 256KB `storage` partition for `spiffs_data/`, and
+a 512KB raw `catlog` partition. `idf.py flash` writes all of them; editing
+anything under `spiffs_data/` just needs a rebuild + reflash, same as any
+other source change.
+
+### OTA updates (over Wi-Fi)
+
+The bridge normally lives attached to the radio, not on a desk, so after
+the first UART flash further updates go over the network:
+
+```bash
+idf.py build
+curl -X POST --data-binary @build/esp32-cat-bridge.bin \
+     http://usdx-bridge.local/ota
+# -> {"ok":true,"bytes":1136096,"partition":"ota_1","rebooting":true}
+```
+
+The image is streamed straight into whichever app slot isn't running,
+validated by `esp_ota_end()` (a truncated or corrupt upload is rejected
+there, before anything points the bootloader at it), then the bridge
+reboots into it. ~8s for a ~1.1MB image on a normal LAN.
+
+`GET /ota-status` reports which slot is running and which is the update
+target — the slot flips on every successful update, which is the simplest
+confirmation the new image actually took:
+
+```bash
+curl http://usdx-bridge.local/ota-status
+# {"ota_supported":true,"running":"ota_1","running_size":1638400,
+#  "update_target":"ota_0","update_slot_size":1638400,"pending_verify":false}
+```
+
+**Rollback.** `CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE` is on: a freshly
+written image boots once in `ESP_OTA_IMG_PENDING_VERIFY`, and `app_main`
+marks it valid only at the very end of startup, after every subsystem has
+come up. A build that crashes or aborts during bringup — the realistic way
+a bad flash strands a unit that's out of UART reach — is reverted to the
+previous slot by the bootloader on the next reset. `pending_verify:true`
+from `/ota-status` means that gate hasn't been passed yet.
+
+Two constraints worth knowing:
+
+- **The first OTA-capable image must arrive over UART.** A unit still
+  running the old single-slot (`factory`) table has nowhere to put a second
+  image; it reports `ota_supported:false` and rejects `POST /ota`. Moving to
+  the OTA table is a partition-table change, so it needs a full
+  `idf.py flash`, not an app-only write.
+- **`POST /ota` refuses while a TX slot is playing** (same guard as
+  `POST /tx-audio`) — erasing the inactive slot is flash-bus-heavy and ends
+  in a reboot, which must not happen mid-transmission.
+
+`nvs` stays at the same offset across the table change, so Wi-Fi
+credentials and settings survive it. `storage` and `catlog` move: SPIFFS is
+rewritten from `spiffs_data/` by the same flash, and the CAT log ring (a
+debug feature, off by default) is lost.
 
 ## Known limitations (first pass — fine for now, worth revisiting later)
 

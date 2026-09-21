@@ -9,6 +9,8 @@
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_system.h"
+#include "esp_ota_ops.h"
+#include "esp_partition.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -138,12 +140,20 @@ static const char *TAG = "http_control";
 // underlying capability, additive per this file's versioning policy) —
 // gate on BRIDGE_FIRMWARE_VERSION >= 0.6.0 (GET /info) if a browser client
 // needs to distinguish the single-buffer wire shape from the pooled one.
+// "ota" means: POST /ota and GET /ota-status exist — push a new firmware
+// image over WiFi (see ota_handler()) instead of fetching the unit and
+// flashing it over USB-UART. Requires the two-app-slot partition table
+// (partitions.csv); a unit still running a pre-OTA single-slot table
+// reports ota_supported:false from GET /ota-status and rejects POST /ota,
+// since the very first OTA-capable image necessarily has to arrive over
+// UART.
 static const char *const BRIDGE_FEATURES[] = {
     "cat", "wifi_config", "wifi_scan", "reset", "audio", "cat_baud", "pa_watchdog",
     "audio_input_select", "mic_gain", "rx_slot_select", "led_enable",
     "alc_control", "noise_gate_control", "cpu_monitor", "wifi_tx_power_control",
     "adc_hpf_control", "sample_rate_select", "speaker_amp_control", "cat_log",
     "audio_mic_sniff", "input_mode_select", "tx_buffer_playback", "speaker_vol", "tx_slot_select",
+    "ota",
 };
 
 // The uSDX firmware's own CAT_BAUD menu setting (usdxBLACKBRICK.ino) only
@@ -1608,6 +1618,172 @@ static esp_err_t system_stats_handler(httpd_req_t *req) {
 
 // Browsers preflight cross-origin POST with OPTIONS — answer it so the web
 // app's fetch() to any POST route doesn't fail the preflight before the
+
+// ── OTA firmware update (POST /ota, GET /ota-status) ────────────────────────
+// The bridge lives attached to the radio, not on a desk. Before this, every
+// firmware change meant physically fetching the unit and flashing it over
+// USB-UART (idf.py -p /dev/ttyUSB0 flash) — see the README's Build/flash
+// section. Two app slots (partitions.csv) let a new image be pushed over
+// WiFi instead.
+//
+// Deliberately a PUSH endpoint (the browser/CLI POSTs the .bin body) rather
+// than esp_https_ota's pull model: pull would need the bridge to reach an
+// HTTPS server holding the image, which means TLS certs and a place to host
+// builds, for a device whose only client is already on the same LAN and
+// already holds the freshly-built binary. Push keeps the whole flow
+// `curl --data-binary @build/esp32-cat-bridge.bin`.
+//
+// Body-read loop mirrors tx_audio_handler()'s (see its own comment): a
+// ~1.1MB body never arrives in one httpd_req_recv() call, and unlike that
+// handler there is no reason to buffer the whole thing — esp_ota_write()
+// takes it incrementally, so this streams straight to flash in
+// OTA_CHUNK_BYTES pieces and never allocates a megabyte of PSRAM.
+#define OTA_CHUNK_BYTES 4096
+
+// Refuses to start while a TX slot is playing — same guard reasoning as
+// tx_audio_handler()'s, but the stakes are higher here: erasing the
+// inactive app slot is flash-bus-heavy work, and this ends in a reboot.
+// Interrupting a transmission mid-over would key the radio and then yank
+// the firmware out from under it.
+static esp_err_t ota_handler(httpd_req_t *req) {
+    audio_monitor_tx_status_t tx_status;
+    audio_monitor_tx_get_status(&tx_status);
+    if (tx_status.playing) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "a TX slot is playing — wait for it to finish before updating firmware");
+        return ESP_FAIL;
+    }
+
+    size_t content_len = req->content_len;
+    if (content_len == 0) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "empty body — POST the .bin image as the request body");
+        return ESP_FAIL;
+    }
+
+    const esp_partition_t *running = esp_ota_get_running_partition();
+    const esp_partition_t *target  = esp_ota_get_next_update_partition(NULL);
+    if (!target) {
+        // Single-slot (pre-OTA) partition table still flashed — there is no
+        // second app slot to write into. Recoverable only over UART, so say
+        // so explicitly rather than failing somewhere less obvious.
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
+                            "no OTA partition available — this build was flashed with a pre-OTA partition table; reflash once over UART");
+        return ESP_FAIL;
+    }
+    if (content_len > target->size) {
+        char err_msg[128];
+        snprintf(err_msg, sizeof(err_msg), "image (%u bytes) is larger than the OTA slot (%u bytes)",
+                 (unsigned)content_len, (unsigned)target->size);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, err_msg);
+        return ESP_FAIL;
+    }
+
+    ESP_LOGW(TAG, "OTA starting: %u bytes -> partition '%s' (running from '%s')",
+             (unsigned)content_len, target->label, running ? running->label : "?");
+
+    esp_ota_handle_t ota = 0;
+    // content_len (not OTA_SIZE_UNKNOWN): lets esp_ota_begin() erase exactly
+    // the sectors this image needs instead of the whole slot, which on a
+    // 1600K partition is the difference between a short erase and a long one
+    // with the HTTP socket sitting idle meanwhile.
+    esp_err_t err = esp_ota_begin(target, content_len, &ota);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "esp_ota_begin failed: %s", esp_err_to_name(err));
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, esp_err_to_name(err));
+        return ESP_FAIL;
+    }
+
+    char *buf = malloc(OTA_CHUNK_BYTES);
+    if (!buf) {
+        esp_ota_abort(ota);
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "failed to allocate OTA receive buffer");
+        return ESP_FAIL;
+    }
+
+    size_t received_total = 0;
+    while (received_total < content_len) {
+        size_t want = content_len - received_total;
+        if (want > OTA_CHUNK_BYTES) want = OTA_CHUNK_BYTES;
+        int received = httpd_req_recv(req, buf, want);
+        if (received <= 0) {
+            if (received == HTTPD_SOCK_ERR_TIMEOUT) continue; // same retry as tx_audio_handler's
+            ESP_LOGE(TAG, "OTA body recv failed at %u/%u bytes", (unsigned)received_total, (unsigned)content_len);
+            free(buf);
+            esp_ota_abort(ota); // leaves the running slot untouched — nothing has been switched yet
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "failed to read full body");
+            return ESP_FAIL;
+        }
+        err = esp_ota_write(ota, buf, (size_t)received);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "esp_ota_write failed at %u bytes: %s", (unsigned)received_total, esp_err_to_name(err));
+            free(buf);
+            esp_ota_abort(ota);
+            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, esp_err_to_name(err));
+            return ESP_FAIL;
+        }
+        received_total += (size_t)received;
+    }
+    free(buf);
+
+    // Validates the image header/checksum — a truncated or corrupt upload
+    // fails HERE, before anything points the bootloader at it.
+    err = esp_ota_end(ota);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "esp_ota_end failed: %s", esp_err_to_name(err));
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
+                            err == ESP_ERR_OTA_VALIDATE_FAILED ? "image failed validation (corrupt or not an ESP32 app image)" : esp_err_to_name(err));
+        return ESP_FAIL;
+    }
+    err = esp_ota_set_boot_partition(target);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "esp_ota_set_boot_partition failed: %s", esp_err_to_name(err));
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, esp_err_to_name(err));
+        return ESP_FAIL;
+    }
+
+    ESP_LOGW(TAG, "OTA complete (%u bytes) — rebooting into '%s'", (unsigned)received_total, target->label);
+    httpd_resp_set_type(req, "application/json");
+    set_cors(req);
+    char body[160];
+    int n = snprintf(body, sizeof(body),
+                     "{\"ok\":true,\"bytes\":%u,\"partition\":\"%s\",\"rebooting\":true}",
+                     (unsigned)received_total, target->label);
+    httpd_resp_send(req, body, n);
+    // Same deferred-restart pattern as reset_handler() — let the response
+    // reach the client before the reboot tears the socket down.
+    xTaskCreate(restart_task, "bridge_restart", 2048, NULL, tskIDLE_PRIORITY + 1, NULL);
+    return ESP_OK;
+}
+
+// GET /ota-status — which slot is running, what state it's in, and whether
+// this build can even be updated over the air. Exists so the uploader can
+// confirm the new image actually took (running partition flips ota_0 <->
+// ota_1 across a successful update) rather than inferring it from a
+// version string alone, and so a pre-OTA unit reports that clearly instead
+// of failing only once someone tries to push an image at it.
+static esp_err_t ota_status_handler(httpd_req_t *req) {
+    const esp_partition_t *running = esp_ota_get_running_partition();
+    const esp_partition_t *next    = esp_ota_get_next_update_partition(NULL);
+
+    // Pending-verify means the app booted from a freshly written slot and
+    // has not yet been marked valid — see app_main's
+    // esp_ota_mark_app_valid_cancel_rollback() call for when that happens.
+    esp_ota_img_states_t state = ESP_OTA_IMG_UNDEFINED;
+    bool have_state = running && esp_ota_get_state_partition(running, &state) == ESP_OK;
+
+    httpd_resp_set_type(req, "application/json");
+    set_cors(req);
+    char body[224];
+    int n = snprintf(body, sizeof(body),
+                     "{\"ota_supported\":%s,\"running\":\"%s\",\"running_size\":%u,"
+                     "\"update_target\":\"%s\",\"update_slot_size\":%u,\"pending_verify\":%s}",
+                     next ? "true" : "false",
+                     running ? running->label : "unknown",
+                     (unsigned)(running ? running->size : 0),
+                     next ? next->label : "none",
+                     (unsigned)(next ? next->size : 0),
+                     (have_state && state == ESP_OTA_IMG_PENDING_VERIFY) ? "true" : "false");
+    return httpd_resp_send(req, body, n);
+}
 // real request.
 static esp_err_t options_handler(httpd_req_t *req) {
     set_cors(req);
@@ -1656,6 +1832,8 @@ void http_control_start(void) {
     httpd_uri_t tx_clear_uri     = { .uri = "/tx-clear",   .method = HTTP_POST, .handler = tx_clear_handler };
     httpd_uri_t tone_uri         = { .uri = "/tone",       .method = HTTP_POST, .handler = tone_handler };
     httpd_uri_t tone_status_uri  = { .uri = "/tone",       .method = HTTP_GET,  .handler = tone_status_handler };
+    httpd_uri_t ota_uri          = { .uri = "/ota",        .method = HTTP_POST, .handler = ota_handler };
+    httpd_uri_t ota_status_uri   = { .uri = "/ota-status", .method = HTTP_GET,  .handler = ota_status_handler };
     httpd_uri_t options_uri      = { .uri = "/*",           .method = HTTP_OPTIONS, .handler = options_handler };
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &status_uri));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &info_uri));
@@ -1689,6 +1867,8 @@ void http_control_start(void) {
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &tx_clear_uri));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &tone_uri));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &tone_status_uri));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &ota_uri));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &ota_status_uri));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &options_uri));
 
     ESP_LOGI(TAG, "control endpoints ready: GET /status, GET /info, GET /wifi-scan, POST /reset, "

@@ -1480,7 +1480,28 @@ bool audio_monitor_set_tx_slot(audio_tx_slot_t slot) {
         return false;
     }
 
-    i2s_std_slot_config_t slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO);
+    // Slot MODE must match what the channel was opened with, which in
+    // AUDIO_INPUT_MODE_IQ is STEREO — esp_codec_dev_open() forces both
+    // directions to the same channel count (see the tx_slot_mode comment
+    // in audio_monitor_start()). Hardcoding MONO here was a real bug: it
+    // reconfigured the TX channel to mono while audio_rx_callback() kept
+    // writing stereo-duplicated frames, so i2s_channel_write() paced that
+    // buffer as twice as many mono frames and drained it at HALF rate.
+    //
+    // Confirmed on real hardware via GET /audio-mic-sniff: a 12.639s FT8
+    // waveform took 25.87s to play (stretch 2.047x), with sniffed samples
+    // arriving at 24080/s against a configured 48000. On air that is
+    // indistinguishable from the message being transmitted twice back to
+    // back, and it overran the next FT8 window.
+    //
+    // The DATA written is always mono either way — only the channel's
+    // frame geometry differs — which is what the "TX audio is always
+    // mono" reasoning at this function's startup call site got right
+    // about the buffer and wrong about the I2S channel.
+    i2s_slot_mode_t tx_slot_mode = audio_monitor_get_input_mode() == AUDIO_INPUT_MODE_IQ
+        ? I2S_SLOT_MODE_STEREO
+        : I2S_SLOT_MODE_MONO;
+    i2s_std_slot_config_t slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, tx_slot_mode);
     switch (slot) {
         case AUDIO_TX_SLOT_RIGHT: slot_cfg.slot_mask = I2S_STD_SLOT_RIGHT; break;
         case AUDIO_TX_SLOT_BOTH:  slot_cfg.slot_mask = I2S_STD_SLOT_BOTH;  break;
@@ -2094,12 +2115,14 @@ void audio_monitor_start(void) {
     // Must ALSO run after esp_codec_dev_open() — same clobbering mechanism
     // as RX above, applied to the TX/output side instead (see
     // audio_tx_slot_t's own comment for the real bug this fixes: TX was
-    // always left-only). UNLIKE RX, this runs regardless of iq_mode — TX
-    // audio (mic-send AND /tx-play) is always mono, in both input modes
-    // (see the tx_slot_mode comment above this function's own I2S TX
-    // channel setup for why: "the TX/DAC side... is always mono data
-    // regardless of input mode, since I/Q only concerns the ADC capture
-    // side").
+    // always left-only). UNLIKE RX, this runs regardless of iq_mode — the
+    // TX audio DATA is always mono, in both input modes (I/Q only concerns
+    // the ADC capture side), so the slot MASK question applies either way.
+    //
+    // The channel's slot MODE is a separate axis and is NOT always mono:
+    // in I/Q mode esp_codec_dev_open() has forced this channel to stereo,
+    // and audio_monitor_set_tx_slot() matches that (see its own comment —
+    // getting this wrong drained TX audio at half rate).
     int8_t saved_tx_slot = bridge_settings_get_tx_slot();
     if (!audio_monitor_set_tx_slot((audio_tx_slot_t)saved_tx_slot)) {
         ESP_LOGW(TAG, "failed to re-apply saved TX slot (%d) after esp_codec_dev_open() reset it to left", saved_tx_slot);

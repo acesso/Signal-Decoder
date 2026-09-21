@@ -1,13 +1,31 @@
 # Name,     Type, SubType, Offset,   Size
-# Custom table (replaces the default "single app" table) to carve out a
-# small SPIFFS partition for the standalone control-page UI (see
-# main/control_page.c) alongside the existing single OTA-less app slot.
-# 4MB flash total; app currently ~870KB — 1.5MB leaves headroom for the
-# planned audio/WebRTC feature without needing another partition-table
-# change later. nvs/phy sizes match ESP-IDF's own default single-app table.
+# Custom table (replaces the default "single app" table) carving out a small
+# SPIFFS partition for the standalone control-page UI (see main/control_page.c)
+# alongside TWO app slots for OTA.
+#
+# OTA layout (was: one 1500K "factory" slot, no OTA). The bridge lives with
+# the radio, not on a desk, and every firmware change previously meant
+# physically fetching the unit and flashing it over USB-UART
+# (idf.py -p /dev/ttyUSB0 flash). Two app slots let POST /ota push a new
+# image over WiFi instead — see ota_handler() in http_control.c.
+#
+# Sizing, from the real 4MB budget:
+#   bootloader + partition table + nvs + phy_init   ~64K
+#   storage (SPIFFS, control page)                   256K
+#   catlog (raw, CAT-traffic ring buffer)            512K
+#   -> 3200K left for app slots = 1600K each (64K-aligned, as OTA requires)
+# The app is currently ~1100K, so each slot keeps ~500K of headroom — more
+# than the 1500K single slot had spare, since that one also had to leave
+# room for growth with no second copy to fall back on.
+#
+# otadata records which slot to boot and tracks rollback state; it MUST be
+# 0x2000 (two 4K sectors — ESP-IDF writes them alternately for power-fail
+# safety) and must come before the app slots.
 nvs,        data, nvs,     0x9000,   0x6000,
 phy_init,   data, phy,     0xf000,   0x1000,
-factory,    app,  factory, 0x10000,  1500K,
+otadata,    data, ota,     0x10000,  0x2000,
+ota_0,      app,  ota_0,   0x20000,  1600K,
+ota_1,      app,  ota_1,   ,         1600K,
 storage,    data, spiffs,  ,         256K,
 # Raw partition (NOT a filesystem) for cat_log.c's persistent CAT-traffic
 # ring buffer — see that file for the full design. Deliberately sized far
