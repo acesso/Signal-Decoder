@@ -7,8 +7,10 @@
 // useIQBridge.ts's setPassband()). Retires IQSpectrumPanel.tsx, whose
 // job (an I/Q-aware GLSpectrogram view) this component now covers with a
 // real marker/bandwidth system instead of that panel's plain zoom slider.
-import { createEffect, createMemo, createSignal, For, onCleanup, onMount, type JSX } from 'solid-js'
+import { createEffect, createMemo, createSignal, For, onCleanup, onMount, Show, type JSX } from 'solid-js'
 import GLSpectrogram, { TEX_H, type GLSpectrogramHandle, type SpectroBand } from './GLSpectrogram'
+import GLSpectrum, { type GLSpectrumHandle } from './GLSpectrum'
+import { createFpsBadge } from './FpsBadge'
 import { loadNumber, saveNumber, loadString, saveString } from '$decoder-lib/storage'
 import { buildColormapLUT, COLORMAPS, COLORMAP_LABEL, type ColormapName } from '$decoder-lib/colormaps'
 import NumberField from './NumberField'
@@ -620,7 +622,15 @@ export default function SignalAnalysisPanel(props: Props): JSX.Element {
   // on cleanup to release this panel's own count.
   createEffect(() => {
     const isRaw = source() instanceof IQSpectrumSourceAdapter
-    props.iqSource?.computer.setActive?.(isRaw)
+    // Only a TRUE run takes a reference, and only a run that took one
+    // releases it. Previously this called setActive(isRaw) unconditionally
+    // and then always released on cleanup, so a non-raw run decremented
+    // twice for an increment it never made. The computer's own
+    // Math.max(0, ...) clamp hid that with a single panel mounted, but with
+    // two panels the spare decrements could pin the count at 0 and switch
+    // the raw FFT off for a panel that was still displaying it.
+    if (!isRaw) return
+    props.iqSource?.computer.setActive?.(true)
     onCleanup(() => props.iqSource?.computer.setActive?.(false))
   })
   // I/Q mode's passband marker is presented through the exact same
@@ -723,6 +733,12 @@ export default function SignalAnalysisPanel(props: Props): JSX.Element {
   const [sgView, setSgView] = createSignal<SpectrogramView>(loadString(LS_SG_VIEW, 'waterfall', SPECTROGRAM_VIEWS))
   // WebGL init/shader failure → swap the spectrogram to the CPU 2D pipeline.
   const [glFailed, setGlFailed] = createSignal(false)
+  // Same contract for the spectrum TRACE (GLSpectrum) as glFailed above is
+  // for the spectrogram: WebGL init/shader failure, or a browser that has
+  // run out of live contexts, swaps that one plot back to the CPU stroke
+  // inside drawSpectrum(). Tracked separately from glFailed because the two
+  // are independent contexts — either can fail without the other.
+  const [glSpecFailed, setGlSpecFailed] = createSignal(false)
   // Palette — persisted PER MODE (unlike view/gamma/speed, which are global):
   // each decoder gets its own preference via storageKeyPrefix.
   const lsCmap = props.storageKeyPrefix ? `${props.storageKeyPrefix}_sg_colormap` : 'sg_colormap'
@@ -766,6 +782,12 @@ export default function SignalAnalysisPanel(props: Props): JSX.Element {
   // 2D line-drawing; a sibling canvas is the minimal change.
   let glGridEl: HTMLCanvasElement | undefined
   const glSg: { current: GLSpectrogramHandle | null } = { current: null }
+  const glSpec: { current: GLSpectrumHandle | null } = { current: null }
+  // Render-rate readouts — ticked from the draw loop below, displayed only
+  // in debug mode (see createFpsBadge). One per plot, since the two are
+  // gated at different rates and either can stall independently.
+  const { counter: specFps, Badge: SpecFpsBadge } = createFpsBadge("Spectrum")
+  const { counter: sgFps, Badge: SgFpsBadge } = createFpsBadge("Spectrogram")
   let rafId: number | null = null
   let sgContainerEl: HTMLDivElement | undefined
   const [sgH, setSgH] = createSignal(300)
@@ -914,13 +936,29 @@ export default function SignalAnalysisPanel(props: Props): JSX.Element {
       : Math.round((displayMinHz() + displayMaxHz()) / 2)
   })
 
+  // Draws the spectrum plot and returns the visible bin slice (which the
+  // caller also feeds to the waterfall). The TRACE itself goes to the GPU
+  // whenever GLSpectrum is up (see glSpecFailed) — this 2D context then
+  // only paints the overlays, which are a fixed handful of draw calls
+  // regardless of bin count. When WebGL is unavailable the same function
+  // strokes the trace here instead, so the fallback is one branch rather
+  // than a separate code path.
+  // Reused scratch for the zero-padded view slice (see drawSpectrum) —
+  // per-instance, not module-level, so two mounted panels never share it.
+  let visPad: Uint8Array | null = null
   function drawSpectrum(canvas: HTMLCanvasElement): Uint8Array | null {
     const ctx = canvas.getContext('2d')
     if (!ctx) return null
     const minHz = displayMinHz(),
       maxHz = displayMaxHz()
-    ctx.fillStyle = '#0a0a0a'
-    ctx.fillRect(0, 0, canvas.width, CANVAS_H)
+    const gpuTrace = !glSpecFailed()
+    // The GPU clears its own canvas; this 2D layer sits ON TOP of it, so it
+    // must stay transparent there or it would hide the trace underneath.
+    ctx.clearRect(0, 0, canvas.width, CANVAS_H)
+    if (!gpuTrace) {
+      ctx.fillStyle = '#0a0a0a'
+      ctx.fillRect(0, 0, canvas.width, CANVAS_H)
+    }
     const src = source()
     if (!src) return null
     drawGridLines(ctx, canvas.width, PLOT_H, minHz, maxHz, gridVAlpha())
@@ -935,23 +973,53 @@ export default function SignalAnalysisPanel(props: Props): JSX.Element {
     const bc = d.length
     const srcSpan = src.maxHz - src.minHz
     const bin0 = Math.floor(((minHz - src.minHz) / srcSpan) * bc)
-    const bin1 = Math.min(Math.ceil(((maxHz - src.minHz) / srcSpan) * bc), bc)
-    const vis = d.subarray(Math.max(0, bin0), Math.max(0, bin1))
+    const bin1 = Math.ceil(((maxHz - src.minHz) / srcSpan) * bc)
+    // The requested view can extend BEYOND what this source actually covers
+    // — e.g. a view still set to I/Q's -12000..+6000 while the "Decoded
+    // audio" tap only spans 0..24000. Clamping the slice to what exists and
+    // handing that over unchanged was wrong: every renderer downstream
+    // stretches whatever array it gets across the FULL plot width, so 6kHz
+    // of real data got drawn as though it spanned the whole 18kHz view —
+    // the plot squeezed to the left and faded out to the right, taking weak
+    // signals near the right edge with it. Instead, pad the out-of-range
+    // part with zeroes so the returned array always represents exactly
+    // [minHz, maxHz]: bins that genuinely have no data read as floor, and
+    // everything that does have data stays at its correct x position.
+    let vis: Uint8Array
+    if (bin0 >= 0 && bin1 <= bc) {
+      vis = d.subarray(bin0, bin1) // fully inside the source — no copy needed
+    } else {
+      const n = Math.max(1, bin1 - bin0)
+      if (!visPad || visPad.length !== n) visPad = new Uint8Array(n)
+      else visPad.fill(0)
+      const from = Math.max(0, bin0)
+      const to = Math.min(bc, bin1)
+      if (to > from) visPad.set(d.subarray(from, to), from - bin0)
+      vis = visPad
+    }
 
     const ms = effectiveMarkers()
     const showGrid = props.showGrid ?? false
-    ctx.globalAlpha = showGrid ? 0.3 : 1
-    ctx.strokeStyle = '#2ea043'
-    ctx.lineWidth = 1.5
-    ctx.beginPath()
-    const bw = canvas.width / Math.max(1, vis.length)
-    for (let i = 0; i < vis.length; i++) {
-      const x = i * bw,
-        y = PLOT_H - (vis[i] / 255) * PLOT_H
-      i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y)
+    // Trace opacity is the same in both paths — dimmed while the squelch
+    // grid is overlaid so the grid stays readable through it.
+    const traceAlpha = showGrid ? 0.3 : 1
+    if (gpuTrace) {
+      glSpec.current?.setAlpha(traceAlpha)
+      glSpec.current?.pushFrame(vis)
+    } else {
+      ctx.globalAlpha = traceAlpha
+      ctx.strokeStyle = '#2ea043'
+      ctx.lineWidth = 1.5
+      ctx.beginPath()
+      const bw = canvas.width / Math.max(1, vis.length)
+      for (let i = 0; i < vis.length; i++) {
+        const x = i * bw,
+          y = PLOT_H - (vis[i] / 255) * PLOT_H
+        i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y)
+      }
+      ctx.stroke()
+      ctx.globalAlpha = 1
     }
-    ctx.stroke()
-    ctx.globalAlpha = 1
 
     const squelch = props.squelch ?? 0
     if (showGrid) {
@@ -1052,6 +1120,7 @@ export default function SignalAnalysisPanel(props: Props): JSX.Element {
         gg = glGridEl
       if (sp && now - spLastTs >= 33) {
         spLastTs = now
+        specFps.tick()
         const fd = drawSpectrum(sp)
         if (fd) {
           if (glFailed()) {
@@ -1059,15 +1128,18 @@ export default function SignalAnalysisPanel(props: Props): JSX.Element {
             if (sg && now - sg2dLastTs >= sg2dSpeed()) {
               sg2dLastTs = now
               drawSpectrogram(sg, fd)
+              sgFps.tick()
             }
           } else if (now - glLastTs >= glRowInterval()) {
             glLastTs = now
             glSg.current?.pushRow(fd)
+            sgFps.tick()
           }
         }
       }
       if (ov && glFailed()) drawSgOverlay(ov)
       if (gg && !glFailed()) drawGlGrid(gg)
+      glSpec.current?.render()
       glSg.current?.render()
       rafId = requestAnimationFrame(tick)
     }
@@ -1229,16 +1301,31 @@ export default function SignalAnalysisPanel(props: Props): JSX.Element {
 
         <div class="flex items-stretch gap-1">
           <div ref={specWrapEl} class="relative min-w-0 flex-1">
+            {/* GPU trace underneath, 2D overlay (grid/markers/squelch) on
+                top. The 2D canvas keeps its ORIGINAL intrinsic-size layout
+                (width/height attributes + w-full) so the box's responsive
+                height is unchanged from the pre-GPU version; the GL canvas
+                is absolutely positioned to match it rather than the other
+                way round, so adding the GPU layer can't alter panel layout.
+                The overlay clears transparent while the GPU layer is live
+                (see drawSpectrum's gpuTrace branch) and paints its own
+                opaque background only in the CPU fallback. */}
+            <Show when={!glSpecFailed()}>
+              <div class="pointer-events-none absolute inset-0 overflow-hidden rounded">
+                <GLSpectrum handle={glSpec} height={CANVAS_H} colormap={colormap()} class="h-full w-full" onFailed={() => setGlSpecFailed(true)} />
+              </div>
+            </Show>
             <canvas
               ref={specEl}
               width={640}
               height={CANVAS_H}
-              class={`block w-full touch-manipulation rounded border border-[#30363d] bg-[#0a0a0a] ${
-                hasMarkerDrag() ? 'cursor-ew-resize' : props.onSquelchChange ? 'cursor-ns-resize' : 'cursor-crosshair'
-              }`}
+              class={`relative block w-full touch-manipulation rounded border border-[#30363d] ${
+                glSpecFailed() ? 'bg-[#0a0a0a]' : ''
+              } ${hasMarkerDrag() ? 'cursor-ew-resize' : props.onSquelchChange ? 'cursor-ns-resize' : 'cursor-crosshair'}`}
               onMouseDown={hasMarkerDrag() || props.onSquelchChange ? handleSpectrumMouseDown : undefined}
               onMouseMove={props.onSquelchChange ? handleSpectrumHover : undefined}
             />
+            <SpecFpsBadge />
             <MarkerGrips host={() => specWrapEl} />
             {props.onSquelchChange && (
               <div
@@ -1414,6 +1501,7 @@ export default function SignalAnalysisPanel(props: Props): JSX.Element {
             )}
             {/* Grips over the waterfall — terrain excluded: its markers sit in a
                 rotating 3D projection, so a flat grip row would misalign. */}
+            <SgFpsBadge />
             {(sgView() === 'waterfall' || glFailed()) && <MarkerGrips host={() => sgContainerEl} />}
           </div>
           {/* Time axis ruler — a real sibling OUTSIDE the plot (not an

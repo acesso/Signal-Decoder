@@ -27,7 +27,7 @@ export type AudioSinkKind = 'speaker' | 'bridge'
 // intentional, per the operator's own explicit choice — this override
 // exists to give the operator direct control, not another layer of
 // automatic correction on top of it.
-export type AudioSourceOverride = 'auto' | 'microphone' | 'bridge-audio' | 'bridge-iq'
+export type AudioSourceOverride = 'auto' | 'microphone' | 'bridge-audio' | 'bridge-iq' | 'soundcard-iq'
 
 // Single shared precedence rule, extracted from what all 5 decoders
 // (FTDecoder, CWDecoder, RTTYDecoder, SSTVDecoder, MFSKDecoder) used to
@@ -41,7 +41,12 @@ export function resolveAudioSource(
   audioBridge: { state(): { playbackActive: boolean } } | undefined,
 ): { kind: AudioSourceKind; bridge: AudioBridge | IQBridge | undefined } {
   if (override === 'microphone') return { kind: 'microphone', bridge: undefined }
-  if (override === 'bridge-iq') return { kind: 'bridge', bridge: iqBridge as IQBridge | undefined }
+  // 'soundcard-iq' reads from the SAME IQBridge object as 'bridge-iq' — see
+  // useIQBridge's connectSoundcard(): a soundcard feeds the identical
+  // demodulator/playback graph, so the handle a decoder gets is the same
+  // shape and getPlaybackSource() is what it reads either way. The two
+  // differ only in which source App.tsx connected.
+  if (override === 'bridge-iq' || override === 'soundcard-iq') return { kind: 'bridge', bridge: iqBridge as IQBridge | undefined }
   if (override === 'bridge-audio') return { kind: 'bridge', bridge: audioBridge as AudioBridge | undefined }
   // 'auto' — same precedence every decoder already used: iqBridge first,
   // since audioBridge is never connected while the bridge is in "iq" input

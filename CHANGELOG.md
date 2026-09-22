@@ -12,6 +12,21 @@ them into a version section when cutting a release.
 
 ## [Unreleased]
 
+## [0.18.0] - 2026-09-21
+
+### Added
+
+- **Soundcard I/Q input** — a new "Soundcard (I/Q)" audio source for a direct-sampling/quadrature receiver (SoftRock, QRP Labs, an SDR feeding a line input) on an ordinary stereo device, I on the left channel and Q on the right. It joins the same pipeline the ESP32 bridge's I/Q stream already uses, so it inherits every existing control unchanged — passband, AGC, noise reduction, the DC/imbalance/swap-negate corrections, the spectrum view and speaker monitoring — and decoders read it through the same handle. Pick the device in the gear panel; the capture opens on Start Decoding and is released on Stop, so it never holds the audio device (and the browser's recording indicator) open with nothing consuming it. Browser echo-cancellation, noise-suppression and auto-gain are all disabled on this input: each rescales the two channels independently and would destroy the phase/amplitude relationship that carries the signal.
+- **GPU-rendered spectrum trace** — the green plot at the top of the Signal Analysis panel now renders on the GPU, the last plot still drawn per-bin on the CPU (the waterfall/terrain view moved to WebGL earlier). Falls back to the previous 2D-canvas path automatically if WebGL is unavailable or a browser runs out of live contexts — no setting, no new control.
+- The spectrum trace is now **coloured by magnitude** using the same palette the waterfall below it uses, driven by the same Colors selector, instead of a single flat green varying only in opacity. A carrier that reads bright in the waterfall reads bright in the trace directly above it.
+- **Debug mode** — a toggle in the gear panel (under Diagnostics, next to the audio ring buffer settings) that shows a small render-rate readout on each graph. Off by default, persisted. The counters are ticked from each plot's actual draw calls rather than from `requestAnimationFrame`, so they report what a plot really achieves rather than the animation frame rate, and drop to zero when a plot stops drawing.
+- `scripts/tx-playback-rate-probe.ts` — replays a slot the bridge already holds and tracks its reported `position_ms` against wall clock, to diagnose bridge playback-timing problems over Wi-Fi with no serial console attached.
+
+### Fixed
+
+- Fixed the spectrum and waterfall squeezing into the left portion of their box whenever the selected View range extended beyond what the current signal source covers — reported as the trace "fading out" from left to right and hiding weak signals near the right edge. The visible slice was clamped to what the source had, but every renderer stretches whatever it receives across the full plot width, so (for example) 6 kHz of real data was painted as though it spanned an 18 kHz view. The slice is now zero-padded to represent exactly the requested range, so bins with no data read as floor and bins with data sit at their correct frequency. Present since at least 0.16.0.
+- Fixed a per-frame reactive leak in the three rAF-driven countdown rings (TX panel, FT decoder, and the collapsed-panel mini ring): they read component props from inside their `requestAnimationFrame` callback, where Solid has no owner, and each call site passes a computed expression that compiles to a lazy memo getter. Dev consoles filled with "computations created outside a `createRoot` or `render` will never be disposed" in steadily growing bursts.
+- Fixed a reference-counting bug that could switch the raw I/Q FFT off for a Signal Analysis panel still displaying it, when two panels were mounted at once.
 ## [0.17.0] - 2026-09-21
 
 ### Added
