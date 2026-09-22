@@ -439,6 +439,12 @@ interface FTTransmitPanelProps {
   mode: FTMode;
   contacts: Map<string, Contact>;
   vfoFrequency?: number;
+  /** VFO plus the I/Q passband offset — the reference DECODED contact
+   *  frequencies are stored against (see App.tsx's effectiveVfoHz). Used
+   *  only for comparing against those; the real TX frequency and Fake
+   *  Split still use vfoFrequency, since transmit goes out through the
+   *  radio, not through the I/Q receive passband. */
+  effectiveVfoHz?: number;
   audioBridge?: AudioBridge;
   /** For the "Suspend I/Q spectrum during TX" toggle — only shown while the
    *  bridge is actually in I/Q input mode (relocated here from
@@ -856,7 +862,7 @@ export default function FTTransmitPanel(props: FTTransmitPanelProps): JSX.Elemen
   const myGridUp = createMemo(() => myGrid().toUpperCase())
 
   const allSuggestions = createMemo(
-    () => buildSuggestions(myCallUp(), myGridUp(), props.contacts, props.vfoFrequency ?? 0, foxHound()),
+    () => buildSuggestions(myCallUp(), myGridUp(), props.contacts, props.effectiveVfoHz ?? props.vfoFrequency ?? 0, foxHound()),
   )
 
   const myLatLon = createMemo(
@@ -884,7 +890,7 @@ export default function FTTransmitPanel(props: FTTransmitPanelProps): JSX.Elemen
   const cqSug = createMemo(() => allSuggestions()[0])
   const contactSugs = createMemo(() => allSuggestions().slice(1))
   const suggestions = createMemo(() => {
-    const vfo = props.vfoFrequency ?? 0
+    const vfo = props.effectiveVfoHz ?? props.vfoFrequency ?? 0
     const latestCutoff = Date.now() - SUG_LATEST_WINDOW_MS
     // A station that has directly answered our callsign is mid-QSO with us —
     // the discovery chips (CQ only, special, country, VFO, latest) exist to

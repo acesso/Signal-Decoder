@@ -3,6 +3,7 @@ import { createEffect, createMemo, createSignal, For, onCleanup, onMount, Show, 
 import type { DecoderControls } from '../lib/decoderControls'
 import { fmtAbsHz } from '$decoder-lib/formatFreq'
 import SignalAnalysisPanel from './SignalAnalysisPanel'
+import { callsignColor } from '$decoder-lib/ft/callsignColor'
 import { createFTProcessor, DEFAULT_EARLY_DECODE_MS } from '../lib/ft/processor'
 import { type FTMode, type FTMessage, FT_WINDOW_SECONDS } from '$decoder-lib/ft/decoder'
 import {
@@ -11,7 +12,7 @@ import {
   parseFTMsgCached,
   parseADIF,
   gridToLatLon,
-  CONTACT_PALETTE,
+
   type MergeStats,
   type QSORecord,
   extractQSORecords,
@@ -357,6 +358,9 @@ interface Props {
   onTxAudioHzChange?: (hz: number, committed: boolean) => void
   analyser?: AnalyserNode | null
   vfoFrequency?: number
+  /** VFO plus the I/Q passband offset — what decoded audio is actually
+   *  measured from. See App.tsx's effectiveVfoHz. */
+  effectiveVfoHz?: number
   onStateChange?: (controls: DecoderControls) => void
   handle?: { current: FTDecoderHandle | null }
   audioBridge?: AudioBridge
@@ -420,10 +424,20 @@ export default function FTDecoder(props: Props): JSX.Element {
   const [msgQuery, setMsgQuery] = createSignal('')
 
   let prevResultLen = 0
-  // Always-current VFO — readable synchronously without stale closure.
-  let vfoVal = props.vfoFrequency ?? 0
+  // The frequency decoded audio is measured FROM — the VFO on an ordinary
+  // audio input, but VFO + passband offset in I/Q mode, where the app tunes
+  // within the received spectrum itself rather than relying on the radio's
+  // own passband. Computed once in App.tsx (see effectiveVfoHz there for
+  // the full reasoning) and passed in, so the message table, the contact
+  // merge and the QSO log all agree on one reference.
+  //
+  // Falls back to vfoFrequency when the prop is absent, keeping every
+  // existing caller and test working unchanged.
+  const effectiveVfo = () => props.effectiveVfoHz ?? props.vfoFrequency ?? 0
+  // Always-current value, readable synchronously without stale closure.
+  let vfoVal = effectiveVfo()
   createEffect(() => {
-    vfoVal = props.vfoFrequency ?? 0
+    vfoVal = effectiveVfo()
   })
 
   // Stable contact accessor for message rows: reads through a plain mutable
@@ -549,7 +563,7 @@ export default function FTDecoder(props: Props): JSX.Element {
         ...msg,
         freq: vfo > 0 ? vfo + msg.freq : msg.freq,
       }))
-      const { contacts: mergedContacts, stats } = mergeContacts(next, r.windowStart, freshMsgs, 0, gate)
+      const { contacts: mergedContacts, stats } = mergeContacts(next, r.windowStart, freshMsgs, gate)
       next = mergedContacts
       statDeltas.set(key, stats)
       mergedCount.set(key, r.messages.length)
@@ -640,7 +654,6 @@ export default function FTDecoder(props: Props): JSX.Element {
       contactsAuth,
       windowStart,
       [{ msg, freq, snr: TX_SELF_SNR }],
-      0,
     )
     contactsAuth = merged
 
@@ -712,13 +725,12 @@ export default function FTDecoder(props: Props): JSX.Element {
           comment: r.comment,
         })
         if (next.has(r.call)) continue
-        const idx = next.size % CONTACT_PALETTE.length
         const c: Contact = {
           callsign: r.call,
           grid: r.gridsquare?.toUpperCase(),
           grids: r.gridsquare ? [r.gridsquare.toUpperCase()] : [],
           latLon: r.gridsquare ? (gridToLatLon(r.gridsquare.toUpperCase()) ?? undefined) : undefined,
-          color: CONTACT_PALETTE[idx],
+          color: callsignColor(r.call),
           msgs: [],
           peers: new Set<string>(),
           firstSeen: ts,
@@ -1131,7 +1143,7 @@ export default function FTDecoder(props: Props): JSX.Element {
             mode={props.ftMode}
             myCall={props.myCall ?? ''}
             myGrid={props.myGrid ?? ''}
-            vfoHz={props.vfoFrequency ?? 0}
+            vfoHz={vfoVal}
             onClearContacts={() => {
               // Clear the authoritative holder too, or the next decode's
               // publish would resurrect every cleared contact from it.

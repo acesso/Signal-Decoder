@@ -2,6 +2,7 @@ import type { FTMode } from './decoder';
 import { isExactKnownPrefix, callsignCountry } from './prefixes';
 import { latLonPlausibleForCountry } from './geo';
 import { DecodeGate, isNearTwin, type HoldReason, type PendingMsg } from './gate';
+import { callsignColor } from './callsignColor';
 
 export type MsgType = 'cq' | 'answer' | 'report' | 'r_report' | 'rrr' | 'rr73' | 'tx73' | 'other';
 
@@ -330,12 +331,6 @@ export function haversineKm(a: [number, number], b: [number, number]): number {
   return 2 * R * Math.asin(Math.sqrt(s));
 }
 
-export const CONTACT_PALETTE = [
-  '#79c0ff', '#ffa657', '#7ee787', '#ff7b72', '#d2a8ff',
-  '#e3b341', '#39d353', '#58a6ff', '#bc8cff', '#ff6e64',
-  '#f0883e', '#56d364', '#a5d6ff', '#ffab70', '#cae8ff',
-];
-
 export interface ContactMsg {
   windowStart: Date;
   raw: string;
@@ -402,7 +397,6 @@ export function mergeContacts(
   existing: Map<string, Contact>,
   windowStart: Date,
   messages: MergeMsgIn[],
-  colorOffset: number,
   gate?: DecodeGate,
 ): { contacts: Map<string, Contact>; stats: MergeStats } {
   const contacts = new Map(existing);
@@ -411,11 +405,10 @@ export function mergeContacts(
 
   const getOrCreate = (callsign: string, when: Date): Contact => {
     if (!contacts.has(callsign)) {
-      const idx = (contacts.size + colorOffset) % CONTACT_PALETTE.length;
       contacts.set(callsign, {
         callsign,
         grids: [],
-        color: CONTACT_PALETTE[idx],
+        color: callsignColor(callsign),
         msgs: [],
         peers: new Set(),
         firstSeen: when,
