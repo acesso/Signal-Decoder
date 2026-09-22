@@ -14,7 +14,7 @@ function run(windows: MergeMsgIn[][]) {
   let contacts = new Map();
   const stats = [];
   for (let i = 0; i < windows.length; i++) {
-    const r = mergeContacts(contacts, W(i), windows[i], 0, gate);
+    const r = mergeContacts(contacts, W(i), windows[i], gate);
     contacts = r.contacts;
     stats.push(r.stats);
   }
@@ -161,10 +161,10 @@ describe('mergeContacts with gate', () => {
   it('does not advance the cycle when an older window is revisited by late partials', () => {
     const gate = new DecodeGate();
     let contacts = new Map();
-    ({ contacts } = mergeContacts(contacts, W(0), [msg('CQ K1ABC FN42', 0)], 0, gate)); // held, cycle 1
+    ({ contacts } = mergeContacts(contacts, W(0), [msg('CQ K1ABC FN42', 0)], gate)); // held, cycle 1
     // Windows interleave: W1 begins, then W0's late partials arrive, then W1 again…
     const seq = [W(1), W(0), W(1), W(0), W(1)];
-    for (const w of seq) ({ contacts } = mergeContacts(contacts, w, [msg('CQ PY2AB GG66')], 0, gate));
+    for (const w of seq) ({ contacts } = mergeContacts(contacts, w, [msg('CQ PY2AB GG66')], gate));
     // Only 2 distinct windows so far — nowhere near the 6-cycle expiry.
     expect(gate.isHeld('K1ABC')).toBe(true);
   });
@@ -172,8 +172,8 @@ describe('mergeContacts with gate', () => {
   it('does not double-count messages when partials stream the same window twice', () => {
     const gate = new DecodeGate();
     let contacts = new Map();
-    ({ contacts } = mergeContacts(contacts, W(0), [msg('CQ PU7FTW HI22')], 0, gate));
-    ({ contacts } = mergeContacts(contacts, W(0), [msg('K1AA PU7FTW +05')], 0, gate));
+    ({ contacts } = mergeContacts(contacts, W(0), [msg('CQ PU7FTW HI22')], gate));
+    ({ contacts } = mergeContacts(contacts, W(0), [msg('K1AA PU7FTW +05')], gate));
     expect(contacts.get('PU7FTW')!.msgs.length).toBe(2);
     expect(gate.beginWindow(W(0))).toEqual([]); // same window — no cycle advance
   });

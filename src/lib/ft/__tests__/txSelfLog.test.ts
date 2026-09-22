@@ -43,7 +43,6 @@ function buildContacts(msgs: Msg[], includeMine: boolean): Map<string, Contact> 
       contacts,
       W(i),
       [{ msg: m.msg, freq: VFO + AUDIO_HZ, snr: m.fromMe ? 0 : -9 }],
-      0,
     ));
   });
   return contacts;

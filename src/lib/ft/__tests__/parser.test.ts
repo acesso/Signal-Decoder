@@ -253,7 +253,7 @@ describe('classifyCallsign', () => {
 describe('mergeContacts', () => {
   const t = new Date('2026-06-12T12:00:00Z');
   const merge = (msgs: string[]) =>
-    mergeContacts(new Map(), t, msgs.map(msg => ({ msg, freq: 1500, snr: -10 })), 0).contacts;
+    mergeContacts(new Map(), t, msgs.map(msg => ({ msg, freq: 1500, snr: -10 }))).contacts;
 
   it('records grids from partial captures (the old bug)', () => {
     const contacts = merge(['<...> PU7FTW HI72']);
@@ -326,7 +326,7 @@ describe('generateADIF', () => {
     `${me} ${them} RR73`,
   ];
   const merge = (msgs: string[]) =>
-    mergeContacts(new Map(), t, msgs.map(msg => ({ msg, freq: 1500, snr: -10 })), 0).contacts;
+    mergeContacts(new Map(), t, msgs.map(msg => ({ msg, freq: 1500, snr: -10 }))).contacts;
 
   it('never emits a record for our own callsign (the self-QSO bug)', () => {
     const contacts = merge(qsoMsgs);
@@ -413,7 +413,7 @@ describe('QSO log records — capture at decode time, export after rotation', ()
   ];
 
   it('extracts a confirmed record with report, counts, and exchange time span', () => {
-    const { contacts } = mergeContacts(new Map(), t, qsoMsgs.map(msg => ({ msg, freq: 21_075_500, snr: -7 })), 0);
+    const { contacts } = mergeContacts(new Map(), t, qsoMsgs.map(msg => ({ msg, freq: 21_075_500, snr: -7 })));
     const recs = extractQSORecords(contacts.get(them)!, me, 'FT8' as any);
     expect(recs).toHaveLength(1);
     const r = recs[0];
@@ -428,7 +428,7 @@ describe('QSO log records — capture at decode time, export after rotation', ()
   });
 
   it('a record captured before message rotation still exports after the QSO rotates out of the contact', () => {
-    let contacts = mergeContacts(new Map(), t, qsoMsgs.map(msg => ({ msg, freq: 1500, snr: -10 })), 0).contacts;
+    let contacts = mergeContacts(new Map(), t, qsoMsgs.map(msg => ({ msg, freq: 1500, snr: -10 }))).contacts;
     // Capture at decode time — what FTDecoder feeds the persistent QSO log.
     const recs = extractQSORecords(contacts.get(them)!, me, 'FT8' as any);
     expect(recs).toHaveLength(1);
@@ -437,7 +437,7 @@ describe('QSO log records — capture at decode time, export after rotation', ()
     // of the contact's 60-message ring.
     const later = new Date(t.getTime() + 60_000);
     const cqSpam = Array.from({ length: 60 }, () => ({ msg: `CQ ${them} FN42`, freq: 1500, snr: -10 }));
-    contacts = mergeContacts(contacts, later, cqSpam, 0).contacts;
+    contacts = mergeContacts(contacts, later, cqSpam).contacts;
 
     // Deriving from live contacts now silently loses the QSO — the old export bug.
     expect(isConfirmedQSO(contacts.get(them)!, me)).toBe(false);
@@ -453,7 +453,7 @@ describe('QSO log records — capture at decode time, export after rotation', ()
   });
 
   it('rounds raw decoder SNR floats in RST fields', () => {
-    const { contacts } = mergeContacts(new Map(), t, qsoMsgs.map(msg => ({ msg, freq: 21_075_500, snr: -8.161644894026992 })), 0);
+    const { contacts } = mergeContacts(new Map(), t, qsoMsgs.map(msg => ({ msg, freq: 21_075_500, snr: -8.161644894026992 })));
     const recs = extractQSORecords(contacts.get(them)!, me, 'FT8' as any);
     expect(recs[0].rstRcvd).toBe(-8);
     const adif = generateADIFFromRecords(recs, { myCall: me });
@@ -467,7 +467,7 @@ describe('QSO log records — capture at decode time, export after rotation', ()
 
   it('falls back to the export-time VFO for records captured without one (audio offset only)', () => {
     // Decoded with no radio connected: message freqs are bare audio offsets.
-    const { contacts } = mergeContacts(new Map(), t, qsoMsgs.map(msg => ({ msg, freq: 1500, snr: -10 })), 0);
+    const { contacts } = mergeContacts(new Map(), t, qsoMsgs.map(msg => ({ msg, freq: 1500, snr: -10 })));
     const recs = extractQSORecords(contacts.get(them)!, me, 'FT8' as any, 0);
     expect(recs[0].freqHz).toBe(0);
     expect(recs[0].audioHz).toBe(1500);
@@ -482,19 +482,19 @@ describe('QSO log records — capture at decode time, export after rotation', ()
 
   it('a handshake-only exchange yields an unconfirmed (partial) record', () => {
     const handshake = [`CQ ${them} FN42`, `${them} ${me} FN31`, `${me} ${them} FN42`];
-    const { contacts } = mergeContacts(new Map(), t, handshake.map(msg => ({ msg, freq: 1500, snr: -10 })), 0);
+    const { contacts } = mergeContacts(new Map(), t, handshake.map(msg => ({ msg, freq: 1500, snr: -10 })));
     const recs = extractQSORecords(contacts.get(them)!, me, 'FT8' as any);
     expect(recs).toHaveLength(1);
     expect(recs[0].confirmed).toBe(false);
   });
 
   it('a station merely heard (no exchange with me) yields no record', () => {
-    const { contacts } = mergeContacts(new Map(), t, [{ msg: `CQ ${them} FN42`, freq: 1500, snr: -10 }], 0);
+    const { contacts } = mergeContacts(new Map(), t, [{ msg: `CQ ${them} FN42`, freq: 1500, snr: -10 }]);
     expect(extractQSORecords(contacts.get(them)!, me, 'FT8' as any)).toHaveLength(0);
   });
 
   it('never yields a record for my own contact entry', () => {
-    const { contacts } = mergeContacts(new Map(), t, qsoMsgs.map(msg => ({ msg, freq: 1500, snr: -10 })), 0);
+    const { contacts } = mergeContacts(new Map(), t, qsoMsgs.map(msg => ({ msg, freq: 1500, snr: -10 })));
     expect(extractQSORecords(contacts.get(me)!, me, 'FT8' as any)).toHaveLength(0);
   });
 });

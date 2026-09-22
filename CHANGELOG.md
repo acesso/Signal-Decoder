@@ -12,6 +12,15 @@ them into a version section when cutting a release.
 
 ## [Unreleased]
 
+## [0.19.0] - 2026-09-22
+
+### Changed
+
+- **Callsign colours are now derived from the callsign itself**, so the same station gets the same colour in every session, on every band, in every browser — with nothing stored. Previously a station's colour was assigned from a 15-entry palette by *when* it was first heard, so the same operator came up a different colour every session, changed colour whenever the contact list was cleared, and swapped with someone else if two stations happened to be heard in a different order. The new scheme hashes the callsign (FNV-1a with a MurmurHash3 finisher) into 315 colours generated in the same visual family as the palette it replaces — saturation and lightness bands matched to that palette's own measured range so colours stay legible on the dark UI, with the muddy yellow-greens excluded. Compound and portable calls (PU7FTW/P) keep their own identity, since the app already tracks them as separate contacts.
+
+### Fixed
+
+- Fixed decoded messages being reported at the wrong RF frequency in I/Q mode whenever the passband was tuned away from the VFO. In I/Q mode the app tunes *within* the received spectrum — the Signal Analysis passband marker drives the demodulator's complex mixer — so a decode at audio frequency `f` sits at `VFO + passband offset + f`. The message table, contact merge and QSO log all computed `VFO + f`, ignoring the offset. That is harmless while the passband sits on the dial and wrong by exactly the offset when it does not, which is a normal thing to do in I/Q mode (parking the passband away from a noise peak is one of the reasons to use it). Reported from real use at a 6500 Hz offset, where every decode was listed outside the window actually being heard. The ADIF export and the map's VFO filter, which compare stored contact frequencies against the dial, are corrected to match. The spectrum plots and the real TX frequency are deliberately unchanged: those reference the raw VFO.
 ## [0.18.0] - 2026-09-21
 
 ### Added

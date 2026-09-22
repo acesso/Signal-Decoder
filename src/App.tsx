@@ -26,6 +26,7 @@ import { debugMode, setDebugMode } from '$decoder-lib/debugMode'
 import type { CapturedImage } from '$decoder-lib/sstv/audioProcessor'
 import { trackEvent } from '$decoder-lib/analytics'
 import { loadObject, saveObject, loadString, saveString } from '$decoder-lib/storage'
+import { effectiveVfoForIQ } from '$decoder-lib/ft/iqFreq'
 import { type AudioSourceOverride, resolveAudioSource } from '$decoder-lib/audio/audioSource'
 
 type DecoderMode = 'rtty' | 'sstv' | 'cw' | 'ft' | 'mfsk'
@@ -735,6 +736,13 @@ function App(): JSX.Element {
   // it actually is.
   const iqBridge = useIQBridge()
 
+  // What decoded audio is measured from — the VFO on an ordinary input, but
+  // VFO + passband offset in I/Q mode. See effectiveVfoForIQ's own comment
+  // for the full reasoning and the bug it fixes. Threaded to the FT decoder
+  // and TX panel (for comparing against decoded frequencies only) rather
+  // than recomputed in each, so there is one definition of "the dial".
+  const effectiveVfoHz = createMemo(() => effectiveVfoForIQ(vfoFrequency(), iqBridge.state()))
+
   function handleAudioSourceOverrideChange(v: AudioSourceOverride) {
     setAudioSourceOverride(v)
     saveString(LS_AUDIO_SOURCE_OVERRIDE, v)
@@ -1170,6 +1178,7 @@ function App(): JSX.Element {
                   mode={ftMode()}
                   contacts={ftContacts()}
                   vfoFrequency={vfoFrequency()}
+                  effectiveVfoHz={effectiveVfoHz()}
                   audioBridge={audioBridge}
                   iqBridge={iqBridge}
                   bridgeWsUrl={bridgeWsUrl()}
@@ -1301,6 +1310,7 @@ function App(): JSX.Element {
             onContactsChange={setFtContacts}
             analyser={globalAudio.analyser()}
             vfoFrequency={vfoFrequency()}
+            effectiveVfoHz={effectiveVfoHz()}
             txAudioHz={txAudioHz()}
             onTxAudioHzChange={(hz, committed) => setTxBaseFreq?.(hz, committed)}
             audioBridge={audioBridge}
