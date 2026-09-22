@@ -20,6 +20,7 @@
 // BridgeStatusPanel.
 import { createSignal, onCleanup } from 'solid-js'
 import type { CATMode } from './useRadioCAT'
+import { createIQCaptureNode } from '$decoder-lib/audio/captureNode'
 
 // Always-on, matching useAudioBridge.ts's log() — see that file's comment
 // for why silent failure here was a real, hard-to-diagnose bug once
@@ -274,6 +275,10 @@ export interface IQBridgeState {
   // the UI tell "connected, but the bridge is in audio mode so nothing
   // meaningful will ever arrive" apart from "connected and actually
   // streaming I/Q," without a second /status poll of its own.
+  // Which I/Q source is feeding the pipeline: the ESP32 bridge's WebSocket
+  // or a local soundcard (see connectSoundcard()). Lets the UI label what
+  // it is showing without inferring it from which connect() ran.
+  source: 'bridge' | 'soundcard'
   inputMode: InputMode
   sampleRateHz: number
   // Count of interleaved I/Q sample PAIRS received in the most recent
@@ -1459,6 +1464,7 @@ export function useIQBridge() {
   const [state, setState] = createSignal<IQBridgeState>({
     connected: false,
     reconnecting: false,
+    source: 'bridge',
     inputMode: 'audio',
     sampleRateHz: FALLBACK_SAMPLE_RATE,
     lastFramePairs: 0,
@@ -1618,6 +1624,52 @@ export function useIQBridge() {
     setState((s) => ({ ...s, iqSignalDbfs: dbfs }))
   }
 
+  // The single choke point every I/Q frame passes through, whatever its
+  // source — the bridge WebSocket below, or the soundcard capture path
+  // (startSoundcard()). Runs every correction stage on one buffer in a
+  // fixed order, so the spectrum display and the demodulated audio always
+  // agree on exactly what correction(s) are active.
+  //
+  // Order: DC removal first (so the imbalance corrector's E[I]≈0/E[Q]≈0
+  // assumption actually holds — a DC bias would bias its E[I²]/E[Q²]/E[IQ]
+  // estimates), then imbalance correction, then swap/negate last (those
+  // reindex/sign-flip which physical channel is "I" and which is "Q" —
+  // applying them last means DC removal and the imbalance estimator's g/φ
+  // operate on the channels in their pre-swap physical roles, which is what
+  // a hardware defect actually affects; swap/negate is closer to "how the
+  // app INTERPRETS the two channels" than a per-channel property to correct
+  // before that).
+  //
+  // No retry/replay/buffering: a dropped or late frame is simply gone. This
+  // is a live receive path — re-playing a stale frame later would put
+  // out-of-order audio into the demodulator and a misleading column into
+  // the spectrum, both worse than the gap.
+  //
+  // `iq` is interleaved I,Q pairs already normalized to roughly [-1,1], and
+  // is MUTATED in place by the correction stages.
+  function feedIQSamples(iq: Float64Array, sampleRateHz: number) {
+    if (dcRemovalEnabled) dcRemover.process(iq)
+    if (imbalanceCorrectionEnabled) imbalanceCorrector.process(iq)
+    switch (iqCorrection) {
+      case 'swap':
+        for (let n = 0; n + 1 < iq.length; n += 2) {
+          const tmp = iq[n]
+          iq[n] = iq[n + 1]
+          iq[n + 1] = tmp
+        }
+        break
+      case 'negateI':
+        for (let n = 0; n < iq.length; n += 2) iq[n] = -iq[n]
+        break
+      case 'negateQ':
+        for (let n = 1; n < iq.length; n += 2) iq[n] = -iq[n]
+        break
+    }
+    spectrum.feed(iq)
+    playDemodulatedFrame(iq, sampleRateHz)
+    setState((s) => ({ ...s, lastFramePairs: iq.length >> 1 }))
+  }
+
   function playDemodulatedFrame(iq: Float64Array, sampleRateHz: number) {
     if (!playCtx) return
     let floatSamples: Float32Array<ArrayBuffer> = demod.demodulate(iq, sideband, sampleRateHz)
@@ -1713,6 +1765,11 @@ export function useIQBridge() {
   let reconnectAttempt = 0
   let connectGeneration = 0
 
+  // Stops the BRIDGE source. Also stops a soundcard capture if one is
+  // running, since both feed the same single demodulator/spectrum and
+  // "disconnect the I/Q input" should mean exactly that from the UI's point
+  // of view, whichever source is live. connectSoundcard() calls this first
+  // for the same reason — the two sources are mutually exclusive.
   function disconnect() {
     wantConnected = false
     connectGeneration++
@@ -1722,9 +1779,10 @@ export function useIQBridge() {
     clearSilenceTimer()
     ws?.close()
     ws = null
+    stopSoundcard()
     teardownPlayback()
     meterPeakRms = 0
-    setState((s) => ({ ...s, connected: false, reconnecting: false, lastFramePairs: 0, iqSignalDbfs: null }))
+    setState((s) => ({ ...s, connected: false, reconnecting: false, lastFramePairs: 0, iqSignalDbfs: null, source: 'bridge' }))
   }
 
   // True once this connect() session's socket has opened successfully at
@@ -1803,43 +1861,143 @@ export function useIQBridge() {
       armSilenceTimer(socket)
       if (!(ev.data instanceof ArrayBuffer)) return
       const int16 = new Int16Array(ev.data)
-      // Convert to float once, here, then run every correction stage on
-      // that SAME buffer in a fixed order — the single choke point both
-      // spectrum.feed() and playDemodulatedFrame() read from, so the
-      // spectrum display and the demodulated audio always agree on
-      // exactly what correction(s) are active.
-      //
-      // Order: DC removal first (so the imbalance corrector's E[I]≈0/
-      // E[Q]≈0 assumption actually holds — a DC bias would bias its
-      // E[I²]/E[Q²]/E[IQ] estimates), then imbalance correction, then
-      // swap/negate last (those reindex/sign-flip which physical channel
-      // is "I" and which is "Q" — applying them last means DC removal and
-      // the imbalance estimator's g/φ operate on the channels in their
-      // pre-swap physical roles, which is what a hardware defect actually
-      // affects; swap/negate is closer to "how the app INTERPRETS the two
-      // channels" than a per-channel property to correct before that).
+      // Convert to float once, here, then hand off to the shared pipeline
+      // (see feedIQSamples) that the soundcard path also uses.
       const iq = new Float64Array(int16.length)
       for (let n = 0; n < int16.length; n++) iq[n] = int16[n] / 32768
-      if (dcRemovalEnabled) dcRemover.process(iq)
-      if (imbalanceCorrectionEnabled) imbalanceCorrector.process(iq)
-      switch (iqCorrection) {
-        case 'swap':
-          for (let n = 0; n + 1 < iq.length; n += 2) {
-            const tmp = iq[n]
-            iq[n] = iq[n + 1]
-            iq[n + 1] = tmp
-          }
-          break
-        case 'negateI':
-          for (let n = 0; n < iq.length; n += 2) iq[n] = -iq[n]
-          break
-        case 'negateQ':
-          for (let n = 1; n < iq.length; n += 2) iq[n] = -iq[n]
-          break
+      feedIQSamples(iq, state().sampleRateHz)
+    }
+  }
+
+  // ── Soundcard I/Q input ───────────────────────────────────────────────────
+  // A direct-sampling/quadrature receiver (SoftRock, a QRP Labs board, an
+  // SDR feeding a line input) presents I on the left channel and Q on the
+  // right of an ordinary stereo audio device. That is the same interleaved
+  // stream the ESP32 bridge sends over its WebSocket, so it joins the
+  // pipeline at exactly the same place (feedIQSamples) and inherits every
+  // existing control unchanged: passband, AGC, noise reduction, the
+  // DC/imbalance/swap corrections, the spectrum view, speaker monitoring.
+  //
+  // Deliberately part of useIQBridge rather than a parallel module: a
+  // second implementation would have to duplicate all of the above and
+  // would drift from it. "Bridge" in this file's name is now a slight
+  // misnomer — it is the I/Q RECEIVE path, and the bridge is one of two
+  // sources feeding it.
+  let scStream: MediaStream | null = null
+  let scCtx: AudioContext | null = null
+  let scNode: { node: AudioWorkletNode; disconnect(): void } | null = null
+  let scSource: MediaStreamAudioSourceNode | null = null
+
+  // Batch size in I/Q PAIRS. Matches the ~50ms cadence the bridge's own
+  // frames arrive at (its firmware read window), so downstream timing
+  // behaves the same for both sources rather than one delivering 128-sample
+  // quanta 375 times a second.
+  const SC_PAIRS_PER_CHUNK = 2048
+
+  async function connectSoundcard(deviceId?: string): Promise<boolean> {
+    // Never run both sources at once — they would interleave frames from
+    // two unrelated receivers into one demodulator and one spectrum.
+    disconnect()
+
+    try {
+      scStream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          deviceId: deviceId ? { exact: deviceId } : undefined,
+          channelCount: 2,
+          // Every browser "cleanup" stage is destructive to I/Q: AGC
+          // rescales the two channels independently (destroying their
+          // relative amplitude, which IS the signal), noise suppression and
+          // echo cancellation are voice-band assumptions that mangle a
+          // wideband quadrature stream. All three must be off for the
+          // phase/amplitude relationship between I and Q to survive.
+          echoCancellation: false,
+          noiseSuppression: false,
+          autoGainControl: false,
+        },
+      })
+    } catch (err) {
+      setState((s) => ({ ...s, error: err instanceof Error ? err.message : 'microphone permission denied' }))
+      return false
+    }
+
+    try {
+      scCtx = new AudioContext()
+      // The device's real rate, not an assumed one — it sets the frequency
+      // scale for the whole spectrum and the demodulator's mixer, so
+      // guessing here would put every displayed frequency off by the ratio.
+      const rate = scCtx.sampleRate
+      scSource = scCtx.createMediaStreamSource(scStream)
+      scNode = await createIQCaptureNode(scCtx, SC_PAIRS_PER_CHUNK, (interleaved) => {
+        // Float32 [-1,1] from the soundcard -> Float64, the width every
+        // correction stage and the demodulator already work in.
+        const iq = new Float64Array(interleaved.length)
+        for (let n = 0; n < interleaved.length; n++) iq[n] = interleaved[n]
+        feedIQSamples(iq, rate)
+      })
+      scSource.connect(scNode.node)
+      // The worklet has an output but nothing downstream needs it; leaving
+      // it unconnected is fine and keeps the captured signal off the
+      // speakers (monitoring goes through the demodulated path's own
+      // speakersGainNode, same as the bridge source).
+
+      // Playback graph for the DEMODULATED audio — the same one connect()
+      // builds, so getPlaybackSource() works identically and decoders can
+      // read from a soundcard I/Q source with no changes.
+      if (!playCtx) {
+        playCtx = new AudioContext()
+        playAnalyserNode = playCtx.createAnalyser()
+        playAnalyserNode.fftSize = 2048
+        speakersGainNode = playCtx.createGain()
+        speakersGainNode.gain.value = speakersOn ? 1 : 0
+        playAnalyserNode.connect(speakersGainNode)
+        speakersGainNode.connect(playCtx.destination)
       }
-      spectrum.feed(iq)
-      playDemodulatedFrame(iq, state().sampleRateHz)
-      setState((s) => ({ ...s, lastFramePairs: iq.length >> 1 }))
+      if (scCtx.state === 'suspended') await scCtx.resume()
+    } catch (err) {
+      stopSoundcard()
+      setState((s) => ({ ...s, error: err instanceof Error ? err.message : 'failed to open the audio device' }))
+      return false
+    }
+
+    setState((s) => ({
+      ...s,
+      connected: true,
+      reconnecting: false,
+      error: null,
+      source: 'soundcard',
+      inputMode: 'iq',
+      sampleRateHz: scCtx!.sampleRate,
+    }))
+    return true
+  }
+
+  function stopSoundcard() {
+    scNode?.disconnect()
+    scNode = null
+    scSource?.disconnect()
+    scSource = null
+    scStream?.getTracks().forEach((t) => t.stop())
+    scStream = null
+    scCtx?.close().catch(() => null)
+    scCtx = null
+  }
+
+  // Kept as a named alias so a UI that only knows about the soundcard
+  // source has an obvious call, but there is exactly one teardown path —
+  // disconnect() stops whichever source is live.
+  const disconnectSoundcard = disconnect
+
+  /** Input devices the browser will let us open, for the picker. Requires
+   *  permission to have been granted at least once or labels come back
+   *  empty (a browser privacy rule, not a bug). */
+  async function listSoundcardDevices(): Promise<{ deviceId: string; label: string }[]> {
+    try {
+      const all = await navigator.mediaDevices.enumerateDevices()
+      return all
+        .filter((d) => d.kind === 'audioinput')
+        .map((d, i) => ({ deviceId: d.deviceId, label: d.label || `Audio input ${i + 1}` }))
+    } catch {
+      return []
     }
   }
 
@@ -1949,10 +2107,14 @@ export function useIQBridge() {
     setState((s) => ({ ...s, playThroughSpeakers: enabled }))
   }
 
-  onCleanup(disconnect)
+  onCleanup(() => {
+    disconnect()
+    stopSoundcard()
+  })
 
   return {
     state, connect, disconnect, refreshInfo, spectrum, setCatMode, setPassband, getPlaybackSource,
+    connectSoundcard, disconnectSoundcard, listSoundcardDevices,
     setPlayThroughSpeakers, setIQCorrection, setDCRemoval, setImbalanceCorrection, setForceIQMode,
     setForceSampleRateHz, setAGCEnabled, setAGCLevel, setHighpassEnabled, setNoiseReducerEnabled,
   }

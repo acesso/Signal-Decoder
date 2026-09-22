@@ -85,3 +85,62 @@ export async function createCaptureNode(
     },
   };
 }
+
+/**
+ * Stereo capture node for soundcard I/Q: emits interleaved I,Q,I,Q…
+ * Float32 buffers (left channel = I, right = Q), batched to `pairSize`
+ * PAIRS per callback.
+ *
+ * Separate from createCaptureNode above rather than a channel-count option
+ * on it: that one forwards a single channel and is used by every mono
+ * decoder, and quietly changing its shape to sometimes-interleaved would
+ * put a format question into call sites that have no I/Q concept at all.
+ */
+export async function createIQCaptureNode(
+  ctx: AudioContext,
+  pairSize: number,
+  onChunk: (interleaved: Float32Array) => void,
+): Promise<CaptureNode> {
+  await ensureWorkletModule(ctx);
+
+  const node = new AudioWorkletNode(ctx, 'iq-capture-forwarder', {
+    numberOfInputs: 1,
+    numberOfOutputs: 1,
+    channelCount: 2,
+    // 'explicit' so a mono device is up-mixed to two channels rather than
+    // silently giving the processor one channel to duplicate — and so a
+    // >2-channel device is down-mixed instead of having channels 2+ decide
+    // the node's layout.
+    channelCountMode: 'explicit',
+    channelInterpretation: 'discrete',
+  });
+
+  const bufferLen = pairSize * 2;
+  let acc = new Float32Array(bufferLen);
+  let accLen = 0;
+
+  node.port.onmessage = (e: MessageEvent<Float32Array>) => {
+    const quantum = e.data;
+    let offset = 0;
+    while (offset < quantum.length) {
+      const space = bufferLen - accLen;
+      const copyLen = Math.min(space, quantum.length - offset);
+      acc.set(quantum.subarray(offset, offset + copyLen), accLen);
+      accLen += copyLen;
+      offset += copyLen;
+      if (accLen === bufferLen) {
+        onChunk(acc);
+        acc = new Float32Array(bufferLen);
+        accLen = 0;
+      }
+    }
+  };
+
+  return {
+    node,
+    disconnect() {
+      node.port.onmessage = null;
+      node.disconnect();
+    },
+  };
+}

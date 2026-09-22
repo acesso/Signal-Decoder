@@ -40,3 +40,37 @@ class CaptureForwarderProcessor extends AudioWorkletProcessor {
 }
 
 registerProcessor('capture-forwarder', CaptureForwarderProcessor);
+
+// Stereo variant, for soundcard I/Q capture (see useIQBridge.ts's
+// startSoundcard()). A direct-sampling/quadrature receiver presents I on the
+// left channel and Q on the right, so both channels have to reach the main
+// thread — capture-forwarder above deliberately forwards only channel 0,
+// which is correct for every mono decoder but would silently discard Q here.
+//
+// Forwards ONE interleaved I,Q,I,Q... buffer rather than two arrays: that is
+// exactly the layout useIQBridge's whole pipeline already expects from the
+// bridge WebSocket (feedIQSamples), so the soundcard path joins it with no
+// reshaping and no second format to keep in sync.
+class IQCaptureForwarderProcessor extends AudioWorkletProcessor {
+  /** @param {Float32Array[][]} inputs */
+  process(inputs) {
+    const input = inputs[0];
+    const i = input?.[0];
+    // A mono device connected by mistake would leave [1] undefined; fall
+    // back to the same channel so the stream stays well-formed (it will
+    // demodulate as a real-valued signal with mirrored spectrum, which is
+    // a legible symptom, rather than throwing on every quantum).
+    const q = input?.[1] ?? i;
+    if (i && i.length > 0 && q) {
+      const out = new Float32Array(i.length * 2);
+      for (let n = 0; n < i.length; n++) {
+        out[n * 2] = i[n];
+        out[n * 2 + 1] = q[n];
+      }
+      this.port.postMessage(out, [out.buffer]);
+    }
+    return true;
+  }
+}
+
+registerProcessor('iq-capture-forwarder', IQCaptureForwarderProcessor);

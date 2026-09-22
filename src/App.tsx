@@ -22,6 +22,7 @@ import type { DecoderControls } from './lib/decoderControls'
 import { type FTDecoderStats, type FTDecoderStatus, type FTMode, subscribeDecoderStats, subscribeDecoderStatus } from '$decoder-lib/ft/decoder'
 import type { Contact } from '$decoder-lib/ft/parser'
 import { audioRecorder, REC_DURATION_CHOICES_SEC } from '$decoder-lib/audio/ringRecorder'
+import { debugMode, setDebugMode } from '$decoder-lib/debugMode'
 import type { CapturedImage } from '$decoder-lib/sstv/audioProcessor'
 import { trackEvent } from '$decoder-lib/analytics'
 import { loadObject, saveObject, loadString, saveString } from '$decoder-lib/storage'
@@ -58,7 +59,7 @@ function saveFTMode(v: FTMode) {
 // second-guessed against the bridge's actual live firmware mode — see
 // AudioSourceOverride's own comment. ──────────────────────────────────────
 const LS_AUDIO_SOURCE_OVERRIDE = 'audio_source_override'
-const VALID_AUDIO_SOURCE_OVERRIDES: AudioSourceOverride[] = ['auto', 'microphone', 'bridge-audio', 'bridge-iq']
+const VALID_AUDIO_SOURCE_OVERRIDES: AudioSourceOverride[] = ['auto', 'microphone', 'bridge-audio', 'bridge-iq', 'soundcard-iq']
 function loadAudioSourceOverride(): AudioSourceOverride {
   return loadString(LS_AUDIO_SOURCE_OVERRIDE, 'auto', VALID_AUDIO_SOURCE_OVERRIDES)
 }
@@ -233,6 +234,11 @@ function TopBar(props: {
   // reconnecting field. Shown next to Start Decoding/Stop so "why did
   // decoding just go quiet" has an answer without opening the Bridge panel.
   bridgeReconnecting: boolean
+  // Soundcard I/Q device picker — lives in the gear panel because it is a
+  // setup choice made once, not something toggled while operating.
+  soundcardIQDeviceId: string
+  onSoundcardIQDeviceIdChange: (v: string) => void
+  listSoundcardDevices: () => Promise<{ deviceId: string; label: string }[]>
 }): JSX.Element {
   const isRecording = () => props.controls?.isRecording ?? false
   const isSupported = () => props.controls?.isSupported ?? true
@@ -242,6 +248,15 @@ function TopBar(props: {
   // interval only causes re-renders while the buffered amount is changing.
   const [recStatus, setRecStatus] = createSignal(audioRecorder.status())
   const [showGlobals, setShowGlobals] = createSignal(false)
+  // Input devices for the soundcard I/Q picker. Enumerated lazily (on focus
+  // and when the panel opens) rather than on mount: before permission has
+  // been granted the browser returns entries with EMPTY labels, so listing
+  // them eagerly would show a dropdown of blanks.
+  const [devices, setDevices] = createSignal<{ deviceId: string; label: string }[]>([])
+  const refreshDevices = async () => setDevices(await props.listSoundcardDevices())
+  createEffect(() => {
+    if (showGlobals()) void refreshDevices()
+  })
   onMount(() => {
     const tick = () =>
       setRecStatus((prev) => {
@@ -364,6 +379,7 @@ function TopBar(props: {
               <option value="microphone">Microphone</option>
               <option value="bridge-audio">Bridge (radio audio)</option>
               <option value="bridge-iq">Bridge (I/Q)</option>
+              <option value="soundcard-iq">Soundcard (I/Q)</option>
             </select>
           </div>
           {/* Only meaningful in Auto — a forced choice already says exactly
@@ -415,6 +431,45 @@ function TopBar(props: {
             Clear
           </button>
           <span class="italic">Rec saves each stream as its own mono 16-bit WAV — capture runs whenever decoding is on.</span>
+          {/* Diagnostics — separated from the ring-buffer controls above by a
+              full-width break so it reads as its own concern rather than
+              another recording setting. */}
+          <div class="flex w-full items-center gap-x-4 gap-y-2 border-t border-[#30363d] pt-3">
+            <span class="font-semibold text-[#c9d1d9]">Diagnostics</span>
+            <label class="flex cursor-pointer items-center gap-1.5 select-none">
+              <input
+                type="checkbox"
+                checked={debugMode()}
+                onChange={(e) => setDebugMode(e.currentTarget.checked)}
+                class="accent-[#58a6ff]"
+              />
+              Debug mode
+            </label>
+            <span class="italic">Shows a render-rate (FPS) readout on each graph.</span>
+          </div>
+          {/* Soundcard I/Q input — for a direct-sampling/quadrature
+              receiver on a stereo line input (I on left, Q on right).
+              Selecting the device here is separate from USING it: the
+              "Soundcard (I/Q)" entry in the Audio source selector is what
+              actually routes decoding through it. */}
+          <div class="flex w-full flex-wrap items-center gap-x-4 gap-y-2 border-t border-[#30363d] pt-3">
+            <span class="font-semibold text-[#c9d1d9]">Soundcard I/Q input</span>
+            <label class="flex items-center gap-1.5">
+              device
+              <select
+                value={props.soundcardIQDeviceId}
+                onFocus={() => void refreshDevices()}
+                onChange={(e) => props.onSoundcardIQDeviceIdChange(e.currentTarget.value)}
+                class="max-w-[22rem] rounded border border-[#30363d] bg-[#0d1117] px-2 py-1 text-[#c9d1d9]"
+              >
+                <option value="">System default input</option>
+                <For each={devices()}>{(d) => <option value={d.deviceId}>{d.label}</option>}</For>
+              </select>
+            </label>
+            <span class="italic">
+              Stereo device, I on left / Q on right. Pick "Soundcard (I/Q)" in Audio source to use it.
+            </span>
+          </div>
         </div>
       </Show>
     </div>
@@ -609,6 +664,16 @@ function App(): JSX.Element {
   const [mode, setMode] = createSignal<DecoderMode>(loadMode())
   const [ftMode, setFTMode] = createSignal<FTMode>(loadFTMode())
   const [audioSourceOverride, setAudioSourceOverride] = createSignal<AudioSourceOverride>(loadAudioSourceOverride())
+  // Which input device the 'soundcard-iq' source opens. Empty = the
+  // browser's default input. Persisted so an operator with a dedicated I/Q
+  // interface doesn't re-pick it every session.
+  const [soundcardIQDeviceId, setSoundcardIQDeviceIdSignal] = createSignal(
+    typeof window === 'undefined' ? '' : (localStorage.getItem('soundcard_iq_device') ?? ''),
+  )
+  const setSoundcardIQDeviceId = (v: string) => {
+    setSoundcardIQDeviceIdSignal(v)
+    saveString('soundcard_iq_device', v)
+  }
   const [ftContacts, setFtContacts] = createSignal<Map<string, Contact>>(new Map())
   const [ftMyCall, setFtMyCall] = createSignal('')
   const [ftMyGrid, setFtMyGrid] = createSignal('')
@@ -799,6 +864,23 @@ function App(): JSX.Element {
     // function should silently paper over.
     const override = audioSourceOverride()
     if (override !== 'auto') {
+      // 'soundcard-iq' is the one forced value that has to CONNECT
+      // something here. The two bridge values read a socket the operator
+      // opens from the Bridge panel, and 'microphone' is opened by
+      // globalAudio itself — but a soundcard I/Q device has no panel of its
+      // own to connect from, so "Start Decoding" is the moment to open it.
+      // Idempotent: if a soundcard capture is already running (the operator
+      // stopped and restarted decoding), this leaves it alone rather than
+      // re-prompting for the device.
+      if (override === 'soundcard-iq' && !(iqBridge.state().connected && iqBridge.state().source === 'soundcard')) {
+        const ok = await iqBridge.connectSoundcard(soundcardIQDeviceId() || undefined)
+        if (!ok) {
+          setBridgeAudioFallbackWarning(
+            `Could not open the soundcard I/Q input (${iqBridge.state().error ?? 'unknown error'}) — pick a device in the gear panel, or choose a different audio source.`,
+          )
+          return
+        }
+      }
       const { kind, bridge } = resolveAudioSource(override, iqBridge, audioBridge)
       globalAudio.configureSource(kind, bridge)
       setDecodingFromBridgeMode(null)
@@ -809,7 +891,6 @@ function App(): JSX.Element {
       }
       return
     }
-
     // If the CAT connection is over the ESP32 bridge, decode from the
     // bridge's own live radio audio instead of always prompting for a
     // local mic — auto-opening the /audio connection here (same as
@@ -883,6 +964,13 @@ function App(): JSX.Element {
     setDecodingFromBridgeMode(null)
     activeHandle().current?.stop()
     globalAudio.stop()
+    // Release the soundcard I/Q capture too. Unlike the bridge sources —
+    // which the operator opens and closes deliberately from the Bridge
+    // panel, and may well want to keep running (spectrum, speaker
+    // monitoring) after stopping decode — this one was opened implicitly by
+    // handleStart(), so leaving it running would hold the audio device and
+    // the browser's recording indicator open with nothing consuming it.
+    if (iqBridge.state().source === 'soundcard' && iqBridge.state().connected) iqBridge.disconnectSoundcard()
   }
 
   // ── Bridge-mode mismatch recovery ─────────────────────────────────────────
@@ -1033,6 +1121,9 @@ function App(): JSX.Element {
           onFTModeChange={handleFTModeChange}
           audioSource={audioSourceDisplay()}
           audioSourceOverride={audioSourceOverride()}
+          soundcardIQDeviceId={soundcardIQDeviceId()}
+          onSoundcardIQDeviceIdChange={setSoundcardIQDeviceId}
+          listSoundcardDevices={iqBridge.listSoundcardDevices}
           onAudioSourceOverrideChange={handleAudioSourceOverrideChange}
           bridgeReconnecting={bridgeReconnecting()}
         />
