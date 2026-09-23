@@ -11,6 +11,7 @@ import { createEffect, createMemo, createSignal, For, onCleanup, onMount, Show, 
 import GLSpectrogram, { TEX_H, type GLSpectrogramHandle, type SpectroBand } from './GLSpectrogram'
 import GLSpectrum, { type GLSpectrumHandle } from './GLSpectrum'
 import { createFpsBadge } from './FpsBadge'
+import { axisRefForTap } from '$decoder-lib/ft/iqFreq'
 import { loadNumber, saveNumber, loadString, saveString } from '$decoder-lib/storage'
 import { buildColormapLUT, COLORMAPS, COLORMAP_LABEL, type ColormapName } from '$decoder-lib/colormaps'
 import NumberField from './NumberField'
@@ -646,6 +647,12 @@ export default function SignalAnalysisPanel(props: Props): JSX.Element {
   // false whenever there's no I/Q tap choice at all (ordinary audio-mode
   // decoders, hasBothTaps()===false) OR the operator picked "processed".
   const onRawTap = createMemo(() => hasBothTaps() && iqTap() === 'raw')
+
+  // The frequency the horizontal axis is measured FROM. The raw I/Q tap's
+  // bins are centred on the dial; the processed tap's are baseband audio
+  // measured from the passband. See axisRefForTap's own comment for the
+  // bug this fixes.
+  const axisVfoHz = createMemo(() => axisRefForTap(props.vfoFrequency, onRawTap(), props.passband?.centerHz))
   const effectiveMarkers = createMemo<AudioMarker[]>(() => {
     // props.markers (tone/channel markers) describe positions in
     // DEMODULATED AUDIO — meaningless on the raw wideband I/Q spectrum, so
@@ -1211,28 +1218,32 @@ export default function SignalAnalysisPanel(props: Props): JSX.Element {
       class={`flex flex-col rounded-lg border border-[#30363d] bg-[#161b22] p-3 sm:p-4${props.class ? ` ${props.class}` : ''}`}
       style={props.style}
     >
-      <div class="mb-2 shrink-0 flex items-center justify-between gap-3">
-        <div class="flex items-center gap-3">
-          <h2 class="text-lg font-semibold sm:text-xl">Signal Analysis</h2>
-          {/* Moved here from the Spectrogram controls row (bottom of the
-              panel) — right after the title is a much more discoverable
-              spot for "which pipeline stage am I even looking at" than
-              buried among Colors/Range/Contrast/Speed. Only shown when
-              there's genuinely a choice — see hasBothTaps's own comment. */}
-          {hasBothTaps() && (
-            <label class="flex items-center gap-1.5 text-xs text-[#8b949e]" title="Where in the I/Q processing pipeline this view taps the signal">
-              Signal source
-              <select
-                value={iqTap()}
-                onChange={(e) => setIqTap(e.currentTarget.value as IQTapPoint)}
-                class="cursor-pointer rounded border border-[#30363d] bg-[#0d1117] px-1.5 py-0.5 text-[#c9d1d9] focus:border-[#2ea043] focus:outline-none"
-              >
-                <option value="raw">Raw I/Q (before demodulation)</option>
-                <option value="processed">Decoded audio (after AGC/filters/NR)</option>
-              </select>
-            </label>
-          )}
-        </div>
+      {/* Single left-aligned group rather than a justify-between row: the
+          meter used to be pinned to the far right edge, which left a wide
+          empty gap between the Signal-source selector and it on a panel
+          that is otherwise tight for width. Sitting immediately after the
+          selector it reads as part of the same header and gives that space
+          back to the plots. */}
+      <div class="mb-2 shrink-0 flex items-center gap-3">
+        <h2 class="text-lg font-semibold sm:text-xl">Signal Analysis</h2>
+        {/* Moved here from the Spectrogram controls row (bottom of the
+            panel) — right after the title is a much more discoverable
+            spot for "which pipeline stage am I even looking at" than
+            buried among Colors/Range/Contrast/Speed. Only shown when
+            there's genuinely a choice — see hasBothTaps's own comment. */}
+        {hasBothTaps() && (
+          <label class="flex items-center gap-1.5 text-xs text-[#8b949e]" title="Where in the I/Q processing pipeline this view taps the signal">
+            Signal source
+            <select
+              value={iqTap()}
+              onChange={(e) => setIqTap(e.currentTarget.value as IQTapPoint)}
+              class="cursor-pointer rounded border border-[#30363d] bg-[#0d1117] px-1.5 py-0.5 text-[#c9d1d9] focus:border-[#2ea043] focus:outline-none"
+            >
+              <option value="raw">Raw I/Q (before demodulation)</option>
+              <option value="processed">Decoded audio (after AGC/filters/NR)</option>
+            </select>
+          </label>
+        )}
         {/* Icon-only (bars, no number/text — RadioCATPanel.tsx's
             IQSignalMeterDisplay already covers that) — I/Q mode only. */}
         {props.iqSource?.signalDbfs && <SignalStrengthMeter dbfs={props.iqSource.signalDbfs()} />}
@@ -1242,19 +1253,19 @@ export default function SignalAnalysisPanel(props: Props): JSX.Element {
         {effectiveMarkers().length > 0 && (
           <div class="mb-1.5 flex items-center gap-2 text-xs text-[#8b949e]">
             <span class="shrink-0">{props.markerFieldLabel ?? 'Center'}</span>
-            {props.vfoFrequency ? (
+            {axisVfoHz() !== undefined ? (
               // Absolute dial+audio frequency, editable, in kHz down to Hz
               // precision (21075.5 = 21,075,500 Hz) — commits back as an
               // audio-offset shift of the markers.
               <NumberField
-                value={Math.round(props.vfoFrequency + centerFreq()) / 1000}
+                value={Math.round(axisVfoHz()! + centerFreq()) / 1000}
                 // No min/max/step here — a strict live clamp made it hard to
                 // type a new value at all (each keystroke got clamped before
                 // the next digit landed). onCommit still gets whatever was
                 // actually typed; out-of-range results are the marker
                 // drag/drop logic's own business, not this field's.
                 parse={rawFreqParse}
-                onCommit={(khz) => applyCenterShift(Math.round(khz * 1000) - props.vfoFrequency!)}
+                onCommit={(khz) => applyCenterShift(Math.round(khz * 1000) - axisVfoHz()!)}
                 readOnly={!hasMarkerDrag()}
                 class={`w-28 rounded border border-[#30363d] bg-[#0d1117] px-2 py-0.5 font-mono text-xs text-[#c9d1d9] focus:border-[#2ea043] focus:outline-none ${!hasMarkerDrag() ? 'cursor-default opacity-60' : ''}`}
               />
@@ -1355,7 +1366,7 @@ export default function SignalAnalysisPanel(props: Props): JSX.Element {
           {source() && <AxisRuler side="right" ticks={computeDbTicks(source()!.minDb, source()!.maxDb)} />}
         </div>
         <div class="flex items-center gap-1">
-          <FreqRuler minHz={displayMinHz()} maxHz={displayMaxHz()} vfoHz={props.vfoFrequency} />
+          <FreqRuler minHz={displayMinHz()} maxHz={displayMaxHz()} vfoHz={axisVfoHz()} />
           {source() && <div class="w-9 shrink-0" />}
         </div>
 
@@ -1520,7 +1531,7 @@ export default function SignalAnalysisPanel(props: Props): JSX.Element {
         </div>
         {(sgView() === 'waterfall' || glFailed()) && (
           <div class="flex items-center gap-1">
-            <FreqRuler minHz={displayMinHz()} maxHz={displayMaxHz()} vfoHz={props.vfoFrequency} />
+            <FreqRuler minHz={displayMinHz()} maxHz={displayMaxHz()} vfoHz={axisVfoHz()} />
             <div class="w-9 shrink-0" />
           </div>
         )}

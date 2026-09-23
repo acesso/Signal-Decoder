@@ -12,6 +12,15 @@ them into a version section when cutting a release.
 
 ## [Unreleased]
 
+## [0.19.1] - 2026-09-22
+
+### Fixed
+
+- Fixed the Signal Analysis frequency axis being labelled against the bare VFO on the "Decoded audio" tap in I/Q mode. That tap reads the post-demodulation analyser, whose bins are baseband audio measured from the *passband* — the demodulator's mixer has already shifted the passband centre down to 0 Hz — so both taps ended up drawing the same span and the decoded signal appeared well below the window actually being demodulated (with the passband at 21075.5 kHz and the dial at 21069.0, it was drawn around 21.069–21.071 instead of inside 21.0755–21.0785). The raw I/Q tap is unchanged: its bins genuinely are centred on the dial. This completes 0.19.0's decoded-frequency fix, which corrected the message table and logs but deliberately left the plots alone.
+
+### Changed
+
+- The I/Q signal-strength meter in the Signal Analysis header now sits immediately after the Signal source selector instead of being pinned to the far right edge, reclaiming the empty gap between them on a panel that is otherwise tight for width.
 ## [0.19.0] - 2026-09-22
 
 ### Changed
