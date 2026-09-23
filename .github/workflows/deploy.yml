@@ -37,6 +37,13 @@ jobs:
         uses: actions/configure-pages@v5
       - name: Install dependencies
         run: npm ci
+      # The FULL suite, deliberately — the selective scripts
+      # (test:changed/test:since/test:fast) exist to keep the local loop
+      # fast, and this is the backstop that makes relying on them safe.
+      # Nothing ran tests in CI before, so a local run skipped for any
+      # reason reached production unchecked.
+      - name: Test
+        run: npm test
       - name: Build
         run: npm run build
         env:

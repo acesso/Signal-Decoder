@@ -93,3 +93,35 @@ avrdude -c usbasp -p m328p -B 4 -v \
 - **CAT protocol unit tests** (pure logic, no hardware, run any time): `npm test -- src/lib/cat/__tests__/protocol.test.ts`. If the firmware change touches a CAT command's format, range, or semantics, update this test file to match — it must reflect actual firmware behavior, not the wire-format spec alone (e.g. a command can *accept* a value the running build never meaningfully distinguishes — check the firmware source, not just the inline comment on the command handler).
 - **CAT hardware test bed against the physical radio** (run after every flash): `npm run test:cat-hardware -- [/dev/ttyACM1] [baud]`. This is a TypeScript script (`scripts/cat-hardware-test.ts`, run via `tsx`) that talks to the real serial port and validates the IF frame, the full batched multi-command poll, and a SET→GET→restore round-trip. Don't rely on the unit tests alone to sign off a firmware change — they validate the JS-side parsing, not that the flashed `.hex` actually behaves as documented. All test bed tooling in this repo is TypeScript — do not write ad hoc Python (or other language) scripts for hardware validation; extend `scripts/cat-hardware-test.ts` instead.
 - **Full app test/build gate** if the change affects `src/lib/cat/useRadioCAT.ts` or `src/components/RadioCATPanel.tsx` too: `npm test`, `npx tsc -b --noEmit`, `npm run build`.
+
+## Unit tests — run a subset locally, the full suite in CI
+
+`npm test` runs all 45 suites and takes ~170s. That cost is concentrated
+almost entirely in five SSTV suites — `encoder`, `vis-detector`,
+`real-transmission`, `sync-interval-detector`, `slant-drift` — which
+together account for ~162s of it. They are slow because they encode and
+decode minutes of real SSTV audio through the actual DSP, not because of
+anything fixable in the tests; the remaining 40 suites finish in ~5s.
+
+Don't sit through the full run while iterating. Pick the narrowest thing
+that covers what changed:
+
+```bash
+npm run test:changed   # suites importing anything uncommitted (usually <2s)
+npm run test:since     # suites affected by this branch vs main
+npm run test:fast      # everything except the 5 slow SSTV suites (~5s, 718 tests)
+npm test               # all 45 suites / 757 tests — before committing
+```
+
+`--onlyChanged`/`--changedSince` follow the real import graph, not
+filenames: touching `src/lib/ft/parser.ts` correctly pulls in
+`callsignColor`, `gate`, `parser` and `txSelfLog`. That is why there are no
+hand-maintained test "categories" here — a manual grouping drifts silently
+as imports change, and this doesn't.
+
+**Run `npm test` in full before committing.** The selective scripts are for
+the edit loop; they can miss a suite when a change affects something the
+import graph doesn't capture (a fixture, a config, a shared constant read at
+runtime). CI now runs the full suite on every push to `main` (see
+`.github/workflows/deploy.yml`) as the backstop — before that, nothing ran
+tests in CI at all, so a skipped local run reached production unchecked.
