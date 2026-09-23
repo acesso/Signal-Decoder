@@ -652,7 +652,9 @@ export default function SignalAnalysisPanel(props: Props): JSX.Element {
   // bins are centred on the dial; the processed tap's are baseband audio
   // measured from the passband. See axisRefForTap's own comment for the
   // bug this fixes.
-  const axisVfoHz = createMemo(() => axisRefForTap(props.vfoFrequency, onRawTap(), props.passband?.centerHz))
+  const axisVfoHz = createMemo(() =>
+    axisRefForTap(props.vfoFrequency, onRawTap(), props.passband?.centerHz, props.passband?.bandwidthHz),
+  )
   const effectiveMarkers = createMemo<AudioMarker[]>(() => {
     // props.markers (tone/channel markers) describe positions in
     // DEMODULATED AUDIO — meaningless on the raw wideband I/Q spectrum, so

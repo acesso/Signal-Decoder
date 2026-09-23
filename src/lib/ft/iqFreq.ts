@@ -52,27 +52,33 @@ export function effectiveVfoForIQ(vfoHz: number | undefined, iq: IQTuneState | u
  * The frequency the Signal Analysis plot's horizontal axis is measured
  * from, for turning a bin offset into an absolute RF label.
  *
- * Distinct from effectiveVfoForIQ above because the panel has TWO taps and
- * they disagree:
+ * The panel has two taps and they need different references:
  *
- *  - raw I/Q, whose bins really are centred on the dial, so the VFO is the
- *    correct reference;
- *  - processed/decoded audio, whose bins are baseband measured from the
- *    passband (SSBDemodulator's mixer has already shifted passbandCenterHz
- *    to 0Hz), so the reference is VFO + passbandCenterHz.
+ *  - RAW I/Q: bins are centred on the dial, so the VFO is correct.
+ *  - PROCESSED (decoded audio): bins are baseband audio 0..Nyquist carrying
+ *    the demodulated passband, so audio 0 is the passband's LOW EDGE —
+ *    centerHz minus half the width. The passband marker is drawn as
+ *    centerHz +- bandwidthHz/2 (see drawChannelMarker), so a 3000Hz-wide
+ *    passband centred on 21075.5 covers 21074.0..21077.0, and the decoded
+ *    audio view should label exactly that span.
  *
- * Labelling the processed tap against the bare VFO drew the decoded signal
- * a passband-offset too low — with the passband at 21075.5 and the dial at
- * 21069.0 the audio view showed its signal around 21.069, the same span the
- * raw view used, instead of inside the 21.0755-21.0785 window actually
- * being demodulated.
+ * Referencing the CENTRE here (as an earlier version did) put the whole
+ * audio view half a bandwidth too high: with that same passband it labelled
+ * 21075.5..21078.5 instead of 21074.0..21077.0, so switching from the I/Q
+ * view to the demodulated one moved the signal to a frequency it isn't at.
+ *
+ * This affects ONLY the plot axis. The frequencies reported for decoded
+ * MESSAGES come from effectiveVfoForIQ above and are already correct — the
+ * decoder measures its audio from the same point the demodulator's mixer
+ * does, which is a separate question from where the axis tick labels go.
  */
 export function axisRefForTap(
   vfoHz: number | undefined,
   onRawTap: boolean,
   passbandCenterHz: number | undefined,
+  passbandBandwidthHz: number | undefined,
 ): number | undefined {
   if (vfoHz === undefined) return undefined
   if (onRawTap || passbandCenterHz === undefined) return vfoHz
-  return vfoHz + passbandCenterHz
+  return vfoHz + passbandCenterHz - (passbandBandwidthHz ?? 0) / 2
 }

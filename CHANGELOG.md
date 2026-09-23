@@ -12,6 +12,15 @@ them into a version section when cutting a release.
 
 ## [Unreleased]
 
+## [0.19.3] - 2026-09-23
+
+### Fixed
+
+- Fixed the "Decoded audio" view's frequency axis sitting half a passband too high in I/Q mode. 0.19.1 corrected that axis to follow the passband rather than the VFO, but referenced it to the passband *centre*; it should be the low edge, since the demodulated stream carries the whole passband as baseband audio `0..bandwidth`. With a 3000 Hz passband centred on 21075.5 kHz — which the marker draws as covering 21074.0–21077.0 — the audio view labelled 21075.5–21078.5, so switching between the I/Q and demodulated views appeared to move the signal. Both views now agree on where a signal is, which matters precisely because the passband selector exists to decode something that *isn't* at the dial centre. The frequencies reported for decoded messages are unchanged and were already correct.
+
+### Changed
+
+- Added selective test scripts for the development loop: `npm run test:changed` (suites importing anything uncommitted), `npm run test:since` (suites affected by the current branch), and `npm run test:fast` (everything except five slow SSTV DSP suites — 718 tests in ~5s, against ~170s for the full run). These use Jest's own import-graph tracking rather than hand-maintained groupings, so they can't drift as imports change. The full suite now also runs in CI on every push to `main`; previously nothing ran tests there.
 ## [0.19.2] - 2026-09-22
 
 ### Fixed
