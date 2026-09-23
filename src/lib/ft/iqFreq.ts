@@ -47,3 +47,32 @@ export function effectiveVfoForIQ(vfoHz: number | undefined, iq: IQTuneState | u
   if (!iq || !iq.connected || iq.inputMode !== 'iq') return vfoHz
   return vfoHz + iq.passbandCenterHz
 }
+
+/**
+ * The frequency the Signal Analysis plot's horizontal axis is measured
+ * from, for turning a bin offset into an absolute RF label.
+ *
+ * Distinct from effectiveVfoForIQ above because the panel has TWO taps and
+ * they disagree:
+ *
+ *  - raw I/Q, whose bins really are centred on the dial, so the VFO is the
+ *    correct reference;
+ *  - processed/decoded audio, whose bins are baseband measured from the
+ *    passband (SSBDemodulator's mixer has already shifted passbandCenterHz
+ *    to 0Hz), so the reference is VFO + passbandCenterHz.
+ *
+ * Labelling the processed tap against the bare VFO drew the decoded signal
+ * a passband-offset too low — with the passband at 21075.5 and the dial at
+ * 21069.0 the audio view showed its signal around 21.069, the same span the
+ * raw view used, instead of inside the 21.0755-21.0785 window actually
+ * being demodulated.
+ */
+export function axisRefForTap(
+  vfoHz: number | undefined,
+  onRawTap: boolean,
+  passbandCenterHz: number | undefined,
+): number | undefined {
+  if (vfoHz === undefined) return undefined
+  if (onRawTap || passbandCenterHz === undefined) return vfoHz
+  return vfoHz + passbandCenterHz
+}

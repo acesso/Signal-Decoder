@@ -10,7 +10,7 @@
 // Reported from real use with a 6500Hz offset — the operator had parked the
 // passband away from the dial to dodge a noise peak, and every decode was
 // displayed 6500Hz low. The numbers below are that exact session.
-import { effectiveVfoForIQ } from '../iqFreq';
+import { effectiveVfoForIQ, axisRefForTap } from '../iqFreq';
 
 const VFO = 21_069_000;        // dial, from the screenshot
 const PASSBAND_CENTER = 6_500; // offset within the I/Q spectrum
@@ -55,5 +55,42 @@ describe('effectiveVfoForIQ', () => {
 
   it('handles a zero offset (passband sitting on the dial)', () => {
     expect(effectiveVfoForIQ(VFO, { connected: true, inputMode: 'iq', passbandCenterHz: 0 })).toBe(VFO);
+  });
+});
+
+describe('axisRefForTap', () => {
+  const BW = 3000;
+
+  it('labels the raw I/Q axis against the bare VFO', () => {
+    // Raw I/Q bins really are centred on the dial, so -12000..+12000 spans
+    // VFO-12k..VFO+12k — matching what the reported screenshots showed for
+    // that tap (21.057 .. 21.081 around a 21.069 dial).
+    expect(axisRefForTap(VFO, true, PASSBAND_CENTER)).toBe(VFO);
+    expect(VFO - 12_000).toBe(21_057_000);
+    expect(VFO + 12_000).toBe(21_081_000);
+  });
+
+  it('labels the processed axis against the passband', () => {
+    expect(axisRefForTap(VFO, false, PASSBAND_CENTER)).toBe(PASSBAND_ABS);
+  });
+
+  it('puts the decoded audio band inside the passband window', () => {
+    // The bug: the processed view used the raw view's own axis, so the
+    // demodulated signal was drawn around 21.069-21.071 instead of inside
+    // the window actually being demodulated.
+    const ref = axisRefForTap(VFO, false, PASSBAND_CENTER)!;
+    expect(ref).toBe(21_075_500);
+    expect(ref + BW).toBe(21_078_500);
+    // ...and specifically NOT where it was being drawn before.
+    expect(ref).not.toBe(VFO);
+  });
+
+  it('falls back to the VFO when there is no passband to reference', () => {
+    // Ordinary audio-mode decoders pass no passband at all.
+    expect(axisRefForTap(VFO, false, undefined)).toBe(VFO);
+  });
+
+  it('passes an undefined VFO through', () => {
+    expect(axisRefForTap(undefined, false, PASSBAND_CENTER)).toBeUndefined();
   });
 });
