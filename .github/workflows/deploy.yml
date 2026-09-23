@@ -42,6 +42,11 @@ jobs:
         env:
           BASE_PATH: ${{ steps.pages.outputs.base_path }}
           VITE_GA_MEASUREMENT_ID: ${{ secrets.GA_MEASUREMENT_ID }}
+          # CARTO basemap key. Substituted into the published bundle, so it
+          # is readable by anyone using the site — the secret keeps it out of
+          # git, not out of the browser. Restrict it by referrer on CARTO's
+          # side. Unset in forks; the map then shows watermarked tiles.
+          VITE_CARTO_API_KEY: ${{ secrets.CARTO_API_KEY }}
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
         with:

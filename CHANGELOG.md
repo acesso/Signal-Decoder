@@ -12,6 +12,11 @@ them into a version section when cutting a release.
 
 ## [Unreleased]
 
+## [0.19.2] - 2026-09-22
+
+### Fixed
+
+- Fixed the contacts map showing "API KEY REQUIRED" watermarks across every tile. CARTO now requires a key for its basemap CDN — an unkeyed request still returns a real tile, just with the watermark burned in — so the key is now sent with each tile request. It is supplied at build time from the `CARTO_API_KEY` repository secret (see `.github/workflows/deploy.yml`), the same pattern already used for the analytics measurement ID. Builds without it — local development, and forks — fall back to the watermarked tiles rather than failing. Note that the key is substituted into the published bundle and is therefore readable by anyone using the site: the secret keeps it out of git history, not out of the browser, so it should carry a referrer restriction and a usage cap on CARTO's side.
 ## [0.19.1] - 2026-09-22
 
 ### Fixed

@@ -256,12 +256,40 @@ export interface FTLeafletMapProps {
   vfoFilterHz?: number
 }
 
+// CARTO began requiring an API key for its basemap CDN: an unkeyed request
+// still returns HTTP 200 with a real tile, but with an "API KEY REQUIRED"
+// watermark burned into it. A wrong/expired key behaves identically, so
+// there is no error to detect — the map keeps working either way and the
+// only symptom is the watermark.
+//
+// The key rides as ?key= — NOT ?apikey=, ?api_key= or ?access_token=, all
+// of which are silently ignored and return the watermarked tile (verified
+// against the live CDN; the byte counts differ, 9761 keyed vs 8503 not).
+//
+// Supplied at BUILD time from VITE_CARTO_API_KEY (see .github/workflows/
+// deploy.yml, which reads it from the CARTO_API_KEY repo secret). Absent in
+// dev and in any fork's build, which is fine: the map degrades to
+// watermarked tiles rather than failing.
+//
+// Worth being clear about what this does and does not protect. The app is a
+// static site with no server, so a VITE_ variable is substituted into the
+// published bundle and is readable by anyone who opens DevTools. Keeping it
+// in a repo secret keeps it out of git history; it does NOT keep it secret
+// from users. Protect the key on CARTO's side (referrer restriction to the
+// deployed origin, plus a usage cap), not by hiding it here.
+const CARTO_API_KEY: string | undefined = import.meta.env.VITE_CARTO_API_KEY
+
+function cartoTileUrl(style: 'dark_all' | 'light_all'): string {
+  const base = `https://{s}.basemaps.cartocdn.com/${style}/{z}/{x}/{y}{r}.png`
+  return CARTO_API_KEY ? `${base}?key=${encodeURIComponent(CARTO_API_KEY)}` : base
+}
+
 const TILE_LAYERS: Record<'dark' | 'light', { url: string }> = {
   dark: {
-    url: 'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png',
+    url: cartoTileUrl('dark_all'),
   },
   light: {
-    url: 'https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png',
+    url: cartoTileUrl('light_all'),
   },
 }
 
