@@ -433,12 +433,18 @@ function drawChannelMarker(
   halfBw: number,
   minHz: number,
   maxHz: number,
+  bandAlign: 'centered' | 'above' = 'centered',
 ) {
   const [r, g, b] = hexToRgb(color)
   const span = maxHz - minHz
   const tX = ((freq - minHz) / span) * cW
-  const lo = Math.max(0, ((freq - halfBw - minHz) / span) * cW)
-  const hi = Math.min(cW, ((freq + halfBw - minHz) / span) * cW)
+  // 'above': the band starts AT freq and runs upward (freq..freq+bw), which
+  // is how the I/Q passband actually works — see AudioMarker.bandAlign.
+  // halfBw is still half the width, so the full width is halfBw*2.
+  const bandLo = bandAlign === 'above' ? freq : freq - halfBw
+  const bandHi = bandAlign === 'above' ? freq + halfBw * 2 : freq + halfBw
+  const lo = Math.max(0, ((bandLo - minHz) / span) * cW)
+  const hi = Math.min(cW, ((bandHi - minHz) / span) * cW)
   ctx.fillStyle = `rgba(${r},${g},${b},.07)`
   ctx.fillRect(lo, 0, hi - lo, pH)
   ctx.lineWidth = 1
@@ -476,6 +482,21 @@ export interface AudioMarker {
   color: string
   label: string
   bandwidthHz?: number
+  /** Where the shaded band sits relative to `freq`.
+   *
+   *  'centered' (default) — freq +- bandwidthHz/2. Correct for tone and
+   *  channel markers, whose freq really is the middle of the signal.
+   *
+   *  'above' — freq .. freq + bandwidthHz. Correct for the I/Q passband
+   *  marker: the demodulator's mixer shifts centerHz to baseband 0Hz and
+   *  the wanted sideband then occupies audio 0..bandwidth (see
+   *  SSBDemodulator.setPassband), so centerHz is the BOTTOM of the
+   *  demodulated window, not its middle. Drawing it centred shaded 1500Hz
+   *  of spectrum below the marker that is never demodulated — and a real
+   *  report followed exactly from that: a strong signal sitting in that
+   *  phantom half never decoded, because it was never actually inside the
+   *  passband. */
+  bandAlign?: 'centered' | 'above'
 }
 
 interface GLBand {
@@ -652,9 +673,7 @@ export default function SignalAnalysisPanel(props: Props): JSX.Element {
   // bins are centred on the dial; the processed tap's are baseband audio
   // measured from the passband. See axisRefForTap's own comment for the
   // bug this fixes.
-  const axisVfoHz = createMemo(() =>
-    axisRefForTap(props.vfoFrequency, onRawTap(), props.passband?.centerHz, props.passband?.bandwidthHz),
-  )
+  const axisVfoHz = createMemo(() => axisRefForTap(props.vfoFrequency, onRawTap(), props.passband?.centerHz))
   const effectiveMarkers = createMemo<AudioMarker[]>(() => {
     // props.markers (tone/channel markers) describe positions in
     // DEMODULATED AUDIO — meaningless on the raw wideband I/Q spectrum, so
@@ -668,7 +687,10 @@ export default function SignalAnalysisPanel(props: Props): JSX.Element {
     // once they ARE passed in.
     const base = onRawTap() ? [] : (props.markers ?? [])
     if (!props.passband || !onRawTap()) return base
-    return [...base, { freq: props.passband.centerHz, color: '#58a6ff', label: 'Passband', bandwidthHz: props.passband.bandwidthHz }]
+    // bandAlign 'above': centerHz is the BOTTOM of the demodulated window
+    // (the mixer shifts it to audio 0), not its middle — see
+    // AudioMarker.bandAlign for the bug that drawing it centred caused.
+    return [...base, { freq: props.passband.centerHz, color: '#58a6ff', label: 'Passband', bandwidthHz: props.passband.bandwidthHz, bandAlign: 'above' as const }]
   })
   // The passband marker is the ONLY thing effectiveMarkers ever includes on
   // the raw tap (base is forced empty there — see effectiveMarkers' own
@@ -1053,7 +1075,7 @@ export default function SignalAnalysisPanel(props: Props): JSX.Element {
 
     for (const m of ms) {
       const halfBw = m.bandwidthHz != null ? m.bandwidthHz / 2 : 40
-      drawChannelMarker(ctx, canvas.width, PLOT_H, m.freq, m.color, m.label, halfBw, minHz, maxHz)
+      drawChannelMarker(ctx, canvas.width, PLOT_H, m.freq, m.color, m.label, halfBw, minHz, maxHz, m.bandAlign)
     }
     const txMarkerHz = props.txMarkerHz ?? 0
     if (txMarkerHz > 0) {

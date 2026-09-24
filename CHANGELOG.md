@@ -12,6 +12,12 @@ them into a version section when cutting a release.
 
 ## [Unreleased]
 
+## [0.19.4] - 2026-09-24
+
+### Fixed
+
+- Fixed the I/Q passband being drawn half a bandwidth below where it actually is, which made strong signals appear to sit inside the passband and then never decode. The passband marker's `centerHz` is the *bottom* of the demodulated window, not its middle — the demodulator's mixer shifts it to audio 0 and the wanted sideband occupies audio `0..bandwidth` — but the shaded band was drawn as `centerHz ± bandwidth/2`. For a 3000 Hz passband that claimed 1500 Hz of spectrum below the marker that is never demodulated, and omitted the top 1500 Hz that is. Signals in that phantom lower half looked like they should decode and never could. Confirmed on air: with the dial at 7.069.000 and the passband at 7074.971, a station decoded at 7.075.491 is 520 Hz above the passband value, which only holds if `centerHz` maps to audio 0.
+- Reverted 0.19.1/0.19.3's decoded-audio axis offset, which had been derived from that same wrongly-drawn shading and shifted the whole audio axis half a bandwidth low. The axis again references `VFO + centerHz`. The passband marker line itself, and the frequencies reported for decoded messages, were correct throughout and are unchanged.
 ## [0.19.3] - 2026-09-23
 
 ### Fixed

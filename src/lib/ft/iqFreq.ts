@@ -55,30 +55,30 @@ export function effectiveVfoForIQ(vfoHz: number | undefined, iq: IQTuneState | u
  * The panel has two taps and they need different references:
  *
  *  - RAW I/Q: bins are centred on the dial, so the VFO is correct.
- *  - PROCESSED (decoded audio): bins are baseband audio 0..Nyquist carrying
- *    the demodulated passband, so audio 0 is the passband's LOW EDGE —
- *    centerHz minus half the width. The passband marker is drawn as
- *    centerHz +- bandwidthHz/2 (see drawChannelMarker), so a 3000Hz-wide
- *    passband centred on 21075.5 covers 21074.0..21077.0, and the decoded
- *    audio view should label exactly that span.
+ *  - PROCESSED (decoded audio): bins are baseband audio, and the mixer
+ *    shifts centerHz to audio 0 (see SSBDemodulator.setPassband — the
+ *    wanted sideband then occupies baseband 0..+bw, entirely on one side of
+ *    zero). So the reference is vfo + centerHz.
  *
- * Referencing the CENTRE here (as an earlier version did) put the whole
- * audio view half a bandwidth too high: with that same passband it labelled
- * 21075.5..21078.5 instead of 21074.0..21077.0, so switching from the I/Q
- * view to the demodulated one moved the signal to a frequency it isn't at.
+ * centerHz is the BOTTOM of the demodulated window despite its name, not
+ * its middle. An earlier version of this function subtracted bandwidthHz/2
+ * to match the passband marker, which was drawn centred — but the marker
+ * was the thing that was wrong, and the subtraction put the whole decoded-
+ * audio axis half a bandwidth low. Confirmed against live signal: with the
+ * dial at 7.069.000 and the passband at 7074.971, a station decoded at
+ * 7.075.491 is 520Hz above the passband value, i.e. audio 520 — which only
+ * holds if centerHz maps to audio 0.
  *
- * This affects ONLY the plot axis. The frequencies reported for decoded
- * MESSAGES come from effectiveVfoForIQ above and are already correct — the
- * decoder measures its audio from the same point the demodulator's mixer
- * does, which is a separate question from where the axis tick labels go.
+ * Affects ONLY the plot axis. Decoded MESSAGE frequencies come from
+ * effectiveVfoForIQ above, which has always used this same reference and
+ * has always been right.
  */
 export function axisRefForTap(
   vfoHz: number | undefined,
   onRawTap: boolean,
   passbandCenterHz: number | undefined,
-  passbandBandwidthHz: number | undefined,
 ): number | undefined {
   if (vfoHz === undefined) return undefined
   if (onRawTap || passbandCenterHz === undefined) return vfoHz
-  return vfoHz + passbandCenterHz - (passbandBandwidthHz ?? 0) / 2
+  return vfoHz + passbandCenterHz
 }
