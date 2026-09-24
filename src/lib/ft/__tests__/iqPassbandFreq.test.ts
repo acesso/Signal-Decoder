@@ -59,55 +59,47 @@ describe('effectiveVfoForIQ', () => {
 });
 
 
+
 describe('axisRefForTap', () => {
   const BW = 3000;
-  // The passband marker is drawn as centre +- bw/2, so this passband covers
-  // 21074.0 .. 21077.0 kHz.
-  const LOW_EDGE = PASSBAND_ABS - BW / 2; // 21_074_000
 
   it('labels the raw I/Q axis against the bare VFO', () => {
     // Raw I/Q bins really are centred on the dial.
-    expect(axisRefForTap(VFO, true, PASSBAND_CENTER, BW)).toBe(VFO);
+    expect(axisRefForTap(VFO, true, PASSBAND_CENTER)).toBe(VFO);
     expect(VFO - 12_000).toBe(21_057_000);
     expect(VFO + 12_000).toBe(21_081_000);
   });
 
-  it('labels the decoded-audio axis from the passband LOW EDGE', () => {
-    // Audio 0 is the bottom of the demodulated passband, not its centre.
-    expect(axisRefForTap(VFO, false, PASSBAND_CENTER, BW)).toBe(LOW_EDGE);
-    expect(LOW_EDGE).toBe(21_074_000);
+  it('labels the decoded-audio axis at centerHz, which IS audio 0', () => {
+    // The mixer shifts centerHz to baseband 0, so centerHz is the bottom of
+    // the demodulated window despite its name — NOT its middle.
+    expect(axisRefForTap(VFO, false, PASSBAND_CENTER)).toBe(PASSBAND_ABS);
   });
 
-  it('spans exactly the passband the marker shows', () => {
-    // The reported bug: switching from the I/Q view to the demodulated one
-    // moved the signal to a frequency it isn't at, because the axis was
-    // referenced to the CENTRE — labelling 21075.5..21078.5 for a passband
-    // that actually covers 21074.0..21077.0.
-    const ref = axisRefForTap(VFO, false, PASSBAND_CENTER, BW)!;
-    expect(ref).toBe(21_074_000);
-    expect(ref + BW).toBe(21_077_000);
-    // ...and specifically not the half-bandwidth-high range it used to show.
-    expect(ref).not.toBe(PASSBAND_ABS);
-    expect(ref + BW).not.toBe(PASSBAND_ABS + BW);
+  it('matches a live-signal observation', () => {
+    // Dial 7.069.000, passband field 7074.971 (= vfo + centerHz), a station
+    // decoded at 7.075.491. That is passband + 520Hz, i.e. audio 520 — which
+    // only holds if centerHz maps to audio 0. A half-bandwidth offset (an
+    // earlier version of this function) would have put it at audio 2020.
+    const vfo = 7_069_000;
+    const centerHz = 7_074_971 - vfo;
+    const ref = axisRefForTap(vfo, false, centerHz)!;
+    expect(ref).toBe(7_074_971);
+    expect(7_075_491 - ref).toBe(520);
   });
 
-  it('tracks a width change, since the low edge moves with it', () => {
-    // Halving the width keeps the centre put and lifts the low edge.
-    expect(axisRefForTap(VFO, false, PASSBAND_CENTER, 1500)).toBe(PASSBAND_ABS - 750);
-    // A CW-width passband on the same centre.
-    expect(axisRefForTap(VFO, false, PASSBAND_CENTER, 500)).toBe(PASSBAND_ABS - 250);
+  it('does not shift by half the bandwidth', () => {
+    // Regression guard for the specific error this had: subtracting bw/2 to
+    // match a passband marker that was itself drawn wrongly centred.
+    expect(axisRefForTap(VFO, false, PASSBAND_CENTER)).not.toBe(PASSBAND_ABS - BW / 2);
   });
 
   it('falls back to the VFO when there is no passband to reference', () => {
     // Ordinary audio-mode decoders pass no passband at all.
-    expect(axisRefForTap(VFO, false, undefined, undefined)).toBe(VFO);
-  });
-
-  it('treats a missing width as zero rather than shifting by NaN', () => {
-    expect(axisRefForTap(VFO, false, PASSBAND_CENTER, undefined)).toBe(PASSBAND_ABS);
+    expect(axisRefForTap(VFO, false, undefined)).toBe(VFO);
   });
 
   it('passes an undefined VFO through', () => {
-    expect(axisRefForTap(undefined, false, PASSBAND_CENTER, BW)).toBeUndefined();
+    expect(axisRefForTap(undefined, false, PASSBAND_CENTER)).toBeUndefined();
   });
 });
