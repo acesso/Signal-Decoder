@@ -12,6 +12,17 @@ them into a version section when cutting a release.
 
 ## [Unreleased]
 
+## [0.21.1] - 2026-09-25
+
+### Fixed
+
+- **Transmissions in I/Q mode now go out on the frequency the operator is listening to.** When the passband is parked away from the dial — which is the normal way to work in I/Q mode, to dodge a noise peak — the operator's "Audio Hz" is measured from the passband, not from the dial. Receive already knew this, but transmit did not, so a reply went out one passband-offset *below* the station being answered: with the dial at 7.069.000, the passband at 7.074.000 and audio 800, the expected 7.074.800 was transmitted at 7.069.800. The two transmit paths did at least agree with each other — Fake Split's arithmetic was internally correct — so the fault was the reference, not the maths. The retune target is now dial-relative and applies whether or not Fake Split is on, since the offset needs correcting either way. Encoding the tone higher instead is not possible: the dial-relative target in that example is 5800 Hz, outside the radio's own SSB passband.
+- Fixed a phantom decode appearing several kHz away from the real traffic during a Fake Split transmission. The app can hear its own signal, and a Fake Split transmission retunes the dial — so a decode window sampled mid-transmission captured the shifted dial and then had the passband offset added on top, counting it twice. Decoding continues through transmissions (in I/Q mode there is often other traffic worth catching in that window); only the frequency stamp is corrected.
+- Fixed the Fake Split "Sweet Spot" field being impossible to type into. It committed on every keystroke into a setter that clamps to a 300 Hz minimum, so the first digit of "1000" was clamped to 300 and written straight back over what was being typed. The same applied to "Auto-CQ every". Both now commit on blur or Enter; bounds are still enforced.
+
+### Changed
+
+- The Transmit bar's toggle chips move from a two-column block pinned to the far right into a three-column group in the normal flow, with the numeric controls taking the slack — the chips were stacking three rows tall against the panel edge with a wide empty band beside them.
 ## [0.21.0] - 2026-09-24
 
 ### Added

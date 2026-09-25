@@ -24,6 +24,18 @@ interface Props {
   class?: string
   /** Parse+clamp a candidate string; return null to reject (leave DOM as-is, no commit). Default: parseFloat + min/max clamp. */
   parse?: (raw: string) => number | null
+  /** Commit only on blur/Enter instead of on every keystroke.
+   *
+   *  For fields whose setter CLAMPS. Committing per keystroke means typing
+   *  "1" into a field with min 300 commits 1, the setter clamps it to 300,
+   *  and state pushes 300 straight back into the input — so the operator
+   *  cannot type "1000" at all: the field fights them at the first digit.
+   *  A custom `parse` alone is not enough, because the clamp lives in the
+   *  setter rather than in the parse.
+   *
+   *  Values still flow through the same clamping setter, so bounds are
+   *  enforced exactly as before; only the MOMENT of commit changes. */
+  commitOnBlur?: boolean
   onBlurExtra?: () => void
   readOnly?: boolean
   disabled?: boolean
@@ -74,12 +86,25 @@ export default function NumberField(props: Props): JSX.Element {
       style={props.style}
       onClick={props.onClick}
       onInput={(e) => {
+        // commitOnBlur fields defer entirely — see that prop's comment for
+        // why a clamping setter makes per-keystroke commits unusable.
+        if (props.commitOnBlur) return
         const parsed = (props.parse ?? ((raw: string) => defaultParse(raw, props.min, props.max)))(e.currentTarget.value)
         if (parsed !== null) props.onCommit(parsed)
       }}
-      onBlur={() => {
+      onKeyDown={(e) => {
+        // Enter commits a deferred field without needing to click away.
+        if (props.commitOnBlur && e.key === 'Enter') e.currentTarget.blur()
+      }}
+      onBlur={(e) => {
+        if (props.commitOnBlur) {
+          const parsed = (props.parse ?? ((raw: string) => defaultParse(raw, props.min, props.max)))(e.currentTarget.value)
+          if (parsed !== null) props.onCommit(parsed)
+        }
         // Snap back to the authoritative value on blur — covers the case
-        // where the field was left empty, mid-edit, or otherwise unparsed.
+        // where the field was left empty, mid-edit, or otherwise unparsed,
+        // and (for commitOnBlur) shows whatever the setter's own clamp
+        // actually settled on.
         if (el) el.value = String(props.value)
         props.onBlurExtra?.()
       }}
