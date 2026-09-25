@@ -78,6 +78,22 @@ export interface FTTransmitState {
    *  restored to. The panel surfaces this as a small dismissable warning
    *  with a one-click "restore now" action (revertStaleFakeSplitVfo). */
   fakeSplitStaleRestoreHz: number | null;
+  /** The dial as it was BEFORE the current transmission's retune, while
+   *  that retune is in effect — null whenever the dial is where the
+   *  operator actually left it.
+   *
+   *  Exists for the decode path. The app can hear its own transmission (and
+   *  in I/Q mode there are signals worth decoding right through a TX
+   *  window), but a retune moves the dial out from under the decoder: a
+   *  window whose VFO is sampled mid-transmission captured the SHIFTED dial
+   *  and then had the I/Q passband offset added on top, reporting that
+   *  decode one offset too high. Observed as a phantom row at 21.079.864
+   *  while the real traffic sat at 21.074.8-21.075.0.
+   *
+   *  Consumers should prefer this over the live VFO when stamping a decode
+   *  window, so a window that straddles a transmission is labelled against
+   *  the dial the operator is actually tuned to. */
+  txRetuneOriginalVfoHz: number | null;
   error: string | null;
   outputDeviceId: string;
   txGain: number;
@@ -810,6 +826,24 @@ export function createFTTransmit(
   // it unconditional means the log no longer depends on the rig hearing
   // itself, which was never guaranteed on either path.
   getOnSentMessage: () => ((msg: string, windowStart: Date, vfoHz: number, audioHz: number) => void) | undefined = () => undefined,
+  // How far the I/Q passband sits above the radio's dial, in Hz — 0 for any
+  // audio-mode source.
+  //
+  // In I/Q mode the operator tunes WITHIN the received spectrum: they park
+  // the passband away from the dial to dodge a noise peak, and their "Audio
+  // Hz" is measured from the passband, not from the dial. RX already knows
+  // this (see iqFreq.ts's effectiveVfoForIQ, which is why a decode reports
+  // its true RF frequency). TX did not, so a reply went out one passband
+  // offset BELOW the station being answered — with the dial at 7.069.000
+  // and the passband at 7.074.000, audio 800 transmitted at 7.069.800
+  // instead of the expected 7.074.800.
+  //
+  // Kept separate from getVfoFrequency rather than folded into it because
+  // the two are genuinely different quantities and both are needed: the raw
+  // dial is what CAT commands and restores (a retune has to be expressed in
+  // real dial terms), while dial+offset is what the operator's audio is
+  // measured against and what the sent-log should record.
+  getIQTuneOffsetHz: () => number = () => 0,
 ) {
   const [state, setState] = createSignal<FTTransmitState>({
     status: 'idle',
@@ -823,6 +857,7 @@ export function createFTTransmit(
     fakeSplitSweetSpotHz: loadFakeSplitSweetSpotHz(),
     txWindowParity: loadTxWindowParity(),
     fakeSplitStaleRestoreHz: loadPendingFakeSplitRestoreHz(),
+    txRetuneOriginalVfoHz: null,
     error: null,
     outputDeviceId: loadOutputDevice(),
     txGain: loadTxGain(),
@@ -1199,7 +1234,9 @@ export function createFTTransmit(
           const sent: SentEntry = {
             id: live.id, message: live.message, label: live.label,
             windowStart: new Date(),
-            vfoHz: getVfoFrequency(), audioHz: live.audioHz ?? getBaseFrequency(),
+            // Same reasoning as sentVfoHz below — an error row still
+            // records a frequency, and it should agree with the rest.
+            vfoHz: getVfoFrequency() + getIQTuneOffsetHz(), audioHz: live.audioHz ?? getBaseFrequency(),
             error: live.encodeError,
           };
           setState(prev => ({
@@ -1250,21 +1287,51 @@ export function createFTTransmit(
       // sign anything went wrong. Restored after PTT-off, below.
       let fakeSplitOriginalVfoHz: number | null = null;
       const onSetFrequency = getOnSetFrequency();
-      if (fakeSplitOn && onSetFrequency) {
-        const desiredHz = txAudioHz; // what SHOULD go out over the air
-        // fakeSplitEncodedHz reflects what `samples` was ACTUALLY encoded
-        // at, captured at encode time — NOT re-read from the live
-        // fakeSplitSweetSpotHz setting here, and deliberately not defaulted
-        // to getBaseFrequency() on a miss either: doing either would silently
-        // compute a delta against the WRONG baseline the moment Fake Split
-        // was toggled on/changed after this entry was already encoded (a
-        // real race — syncParams()'s re-encode is debounced/async, not
-        // synchronous with the toggle). Missing entirely means "not
-        // encoded under Fake Split yet" — skip the shift outright rather
-        // than transmit at the sweet spot's audio while shifting the VFO by
-        // a bogus amount.
-        if (fakeSplitEncodedHz !== undefined) {
-          const delta = desiredHz - fakeSplitEncodedHz;
+      // A retune is needed whenever what the audio was ENCODED at differs
+      // from where it has to land relative to the DIAL. Two independent
+      // reasons for that, which used to be one:
+      //
+      //  - Fake Split: audio is deliberately encoded at a fixed sweet spot
+      //    rather than the operator's chosen tone, so the dial makes up the
+      //    difference.
+      //  - I/Q passband offset: the operator's tone is measured from the
+      //    passband, which sits away from the dial. Without a retune the
+      //    transmission goes out one passband-offset low — replying to a
+      //    station heard at 7.074.800 would transmit at 7.069.800.
+      //
+      // The second applies with Fake Split OFF too, which is why this is no
+      // longer gated on fakeSplitOn. Encoding the tone higher instead is not
+      // an option: a 5800Hz tone is outside the radio's own SSB passband and
+      // simply would not pass.
+      const iqTuneOffsetHz = getIQTuneOffsetHz();
+      if (onSetFrequency && (fakeSplitOn || iqTuneOffsetHz !== 0)) {
+        // What SHOULD go out over the air, expressed as an offset from the
+        // radio DIAL — which is what a VFO retune has to be computed in.
+        // In I/Q mode the operator.s txAudioHz is measured from the
+        // passband, so the dial-relative target is that plus the passband
+        // offset (see getIQTuneOffsetHz).
+        // What SHOULD go out over the air, expressed as an offset from the
+        // radio DIAL — which is what a VFO retune has to be computed in. In
+        // I/Q mode the operator's txAudioHz is measured from the passband,
+        // so the dial-relative target is that plus the passband offset.
+        const desiredHz = txAudioHz + iqTuneOffsetHz;
+        // What the audio was ACTUALLY encoded at. Under Fake Split that is
+        // the sweet spot captured at encode time (fakeSplitEncodedHz) —
+        // deliberately NOT re-read from the live setting here, and not
+        // defaulted either, since doing so would compute a delta against
+        // the wrong baseline the moment Fake Split was toggled or changed
+        // after this entry was encoded (a real race: syncParams()'s
+        // re-encode is debounced/async, not synchronous with the toggle).
+        //
+        // With Fake Split OFF there is no sweet spot: the audio was encoded
+        // at the operator's own tone, so that IS the encoded frequency and
+        // the whole delta comes from the I/Q passband offset.
+        const encodedAtHz = fakeSplitOn ? fakeSplitEncodedHz : txAudioHz;
+        // Under Fake Split, a missing fakeSplitEncodedHz means "not encoded
+        // under Fake Split yet" — skip rather than shift the VFO by a bogus
+        // amount against an unknown baseline.
+        if (encodedAtHz !== undefined) {
+          const delta = desiredHz - encodedAtHz;
           if (delta !== 0) {
             const originalVfoHz = getVfoFrequency();
             // Persisted BEFORE the retune command is even sent (not after
@@ -1273,6 +1340,11 @@ export function createFTTransmit(
             // to. See loadPendingFakeSplitRestoreHz's own comment; cleared
             // only once the restore below is confirmed.
             savePendingFakeSplitRestoreHz(originalVfoHz);
+            // Published BEFORE the CAT request too, and for the same
+            // reason: from here on the dial may already be moving, so any
+            // decode window opened now must be stamped against the dial the
+            // operator is really tuned to, not the transient one.
+            setState((prev) => ({ ...prev, txRetuneOriginalVfoHz: originalVfoHz }));
             try {
               await Promise.race([
                 onSetFrequency(originalVfoHz + delta),
@@ -1421,10 +1493,27 @@ export function createFTTransmit(
           clearPendingFakeSplitRestoreHz();
         } catch { /* CAT not connected or timed out — the pending-restore marker (and the panel's stale-restore warning) surfaces this */ }
       }
+      // Cleared unconditionally, NOT only on a confirmed restore: this drives
+      // how decode windows are stamped, and leaving it set after a failed or
+      // unconfirmed restore would mislabel every subsequent decode instead of
+      // just this one. The crash-recovery marker above is the thing that
+      // legitimately survives an unconfirmed restore; this is not.
+      if (fakeSplitOriginalVfoHz !== null) {
+        setState((prev) => ({ ...prev, txRetuneOriginalVfoHz: null }));
+      }
 
       getOnTxWindowEnd()?.();
 
-      const sentVfoHz = fakeSplitOriginalVfoHz ?? getVfoFrequency();
+      // The dial this transmission is logged against. Consumers add audioHz
+      // to it to get the on-air frequency, so in I/Q mode it must carry the
+      // passband offset — otherwise our own transmissions log one offset
+      // below the stations we were answering, and the QSO log disagrees
+      // with the decode list it sits next to.
+      //
+      // fakeSplitOriginalVfoHz is the PRE-retune dial, which is the right
+      // base: the retune exists precisely to make (dial + encoded) land on
+      // (originalDial + offset + audioHz).
+      const sentVfoHz = (fakeSplitOriginalVfoHz ?? getVfoFrequency()) + iqTuneOffsetHz;
       const sent: SentEntry = {
         id: txId, message: txMessage, label: txLabel, windowStart,
         vfoHz: sentVfoHz, audioHz: txAudioHz,

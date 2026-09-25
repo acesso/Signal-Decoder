@@ -352,6 +352,9 @@ interface Props {
   myGrid?: string
   onContactsChange?: (c: Map<string, Contact>) => void
   txAudioHz?: number
+  /** Pre-retune dial while a Fake Split transmission has the VFO moved,
+   *  else undefined. See useFTTransmit's txRetuneOriginalVfoHz. */
+  txRetuneOriginalVfoHz?: number | null
   // committed: false while the marker is still being dragged (position-only
   // preview) — only true once means it's safe to do real work (encode/
   // upload to the bridge). See SignalAnalysisPanel's onMarkerDrag comment.
@@ -539,7 +542,19 @@ export default function FTDecoder(props: Props): JSX.Element {
       return
     }
 
-    const currentVfo = vfoVal
+    // While a Fake Split transmission has the dial retuned, stamp windows
+    // against the dial the operator is ACTUALLY tuned to, not the transient
+    // one. Otherwise a window opened mid-transmission captures the shifted
+    // dial and then has the I/Q passband offset added on top, reporting that
+    // decode one offset high — observed as a phantom row at 21.079.864 while
+    // the real traffic sat at 21.074.8-21.075.0.
+    //
+    // We deliberately keep DECODING through a transmission (in I/Q mode
+    // there is real traffic worth catching in that window); only the
+    // frequency stamp is corrected.
+    const retuned = props.txRetuneOriginalVfoHz
+    const iqOffset = effectiveVfo() - (props.vfoFrequency ?? 0)
+    const currentVfo = retuned != null ? retuned + iqOffset : vfoVal
 
     if (frozenVfo.size > results.length + 10) {
       const live = new Set(results.map((r) => r.windowStart.getTime()))

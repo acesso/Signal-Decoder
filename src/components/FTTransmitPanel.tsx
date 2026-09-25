@@ -433,6 +433,10 @@ export interface TxStatus {
   allowConsecutiveTx: boolean;
   windowSec: number;
   txAudioHz: number;    // current TX audio frequency in Hz (baseFreq)
+  /** Pre-retune dial while Fake Split has the VFO moved, else null — the
+   *  decoder stamps windows against this so a decode caught mid-transmission
+   *  is not labelled against the transient dial. */
+  txRetuneOriginalVfoHz: number | null;
 }
 
 interface FTTransmitPanelProps {
@@ -584,6 +588,11 @@ export default function FTTransmitPanel(props: FTTransmitPanelProps): JSX.Elemen
     () => props.onTxWindowStart,
     () => props.onTxWindowEnd,
     () => props.onSentMessage,
+    // I/Q passband offset — the difference between the dial and what the
+    // operator's Audio Hz is actually measured from. 0 for audio sources.
+    () => (props.effectiveVfoHz ?? 0) > 0 && (props.vfoFrequency ?? 0) > 0
+      ? (props.effectiveVfoHz as number) - (props.vfoFrequency as number)
+      : 0,
   )
 
   // Keep the auto-CQ cache in sync with mode/baseFreq changes. Debounced:
@@ -752,6 +761,7 @@ export default function FTTransmitPanel(props: FTTransmitPanelProps): JSX.Elemen
       autoCQ: tx.state().autoCQ, autoCQIntervalMin: tx.state().autoCQIntervalMin,
       autoPTT: tx.state().autoPTT, allowConsecutiveTx: tx.state().allowConsecutiveTx,
       windowSec: FT_WINDOW_SECONDS[props.mode] ?? 15, txAudioHz: baseFreq(),
+      txRetuneOriginalVfoHz: tx.state().txRetuneOriginalVfoHz,
     })
   })
 
@@ -1079,11 +1089,11 @@ export default function FTTransmitPanel(props: FTTransmitPanelProps): JSX.Elemen
           </Show>
         </div>
 
-        {/* Start/Stop + the two auto-PTT timing fields — the parts of "TX
-            Engine" that are ordinary controls, not on/off toggle chips (see
-            the 2-column chip grid below, pushed to the row's far right via
-            ml-auto). */}
-        <div class="flex items-end gap-2 flex-wrap">
+        {/* Start/Stop plus the ordinary numeric controls — the parts of "TX
+            Engine" that are not on/off toggle chips (those are the 3-column
+            grid below). flex-1 so this block takes up the slack instead of
+            leaving a dead band between it and the chips. */}
+        <div class="flex flex-1 items-end gap-2 flex-wrap">
           <Show when={!isRunning()} fallback={
             <button onClick={handleStop}
               class="px-3 py-1.5 rounded text-xs font-semibold bg-[#da3633] text-white hover:bg-[#f85149] transition-colors">
@@ -1124,9 +1134,14 @@ export default function FTTransmitPanel(props: FTTransmitPanelProps): JSX.Elemen
           <div class={`flex items-center gap-1 ${!tx.state().autoCQ ? 'opacity-40' : ''}`}
             title="Minimum time between automatic CQ transmissions">
             <span class="text-[10px] text-[#8b949e] whitespace-nowrap">Auto-CQ every</span>
+            {/* commitOnBlur for the same reason as Sweet Spot below:
+                setAutoCQIntervalMin clamps to a minimum of 1, so typing the
+                first digit of "10" committed 1 and snapped the field back.
+                min/max stay for the spin buttons, which clamp deliberately. */}
             <NumberField value={tx.state().autoCQIntervalMin}
               onCommit={tx.setAutoCQIntervalMin}
               disabled={!tx.state().autoCQ}
+              commitOnBlur
               min={1} max={60} step={1}
               class="bg-[#0d1117] border border-[#30363d] rounded px-1.5 py-1 text-xs font-mono text-[#c9d1d9] w-12 focus:outline-none focus:border-[#388bfd] disabled:cursor-not-allowed" />
             <span class="text-[10px] text-[#8b949e] whitespace-nowrap">min</span>
@@ -1142,19 +1157,28 @@ export default function FTTransmitPanel(props: FTTransmitPanelProps): JSX.Elemen
           <div class={`flex items-center gap-1 ${!tx.state().fakeSplit ? 'opacity-40' : ''}`}
             title="Fixed audio tone Fake Split always encodes at — the VFO shifts to compensate so your chosen TX frequency still goes out over the air">
             <span class="text-[10px] text-[#8b949e] whitespace-nowrap">Sweet Spot</span>
+            {/* commitOnBlur: setFakeSplitSweetSpotHz CLAMPS (via
+                saveFakeSplitSweetSpotHz), so committing per keystroke made
+                the field impossible to type in — the first digit of "1000"
+                committed 1, the setter clamped to 300, and state pushed 300
+                back into the input. Bounds are still enforced by that same
+                setter; only the moment of commit moved. */}
             <NumberField value={tx.state().fakeSplitSweetSpotHz}
               onCommit={tx.setFakeSplitSweetSpotHz}
               disabled={!tx.state().fakeSplit}
-              min={300} max={2800}
+              commitOnBlur
               class="bg-[#0d1117] border border-[#30363d] rounded px-1.5 py-1 text-xs font-mono text-[#c9d1d9] w-16 focus:outline-none focus:border-[#388bfd] disabled:cursor-not-allowed" />
             <span class="text-[10px] text-[#8b949e] whitespace-nowrap">Hz</span>
           </div>
         </div>
 
-        {/* Toggle chips — 2 columns x N rows, pushed to the row's far right.
-            Was one long horizontal strip of 4 chips; grouping into a compact
-            grid keeps the whole top row single-line instead of wrapping. */}
-        <div class="grid grid-cols-2 gap-1.5 ml-auto">
+        {/* Toggle chips. Three columns rather than two, and NOT pushed to
+            the far right with ml-auto: at typical widths that left a wide
+            empty band between the numeric controls and the chips, with the
+            chips stacked tall against the panel edge. Sitting in the normal
+            flex flow they pack against the controls and the row gets
+            shorter instead of wider. */}
+        <div class="grid grid-cols-3 gap-1.5">
           {/* Auto-CQ */}
           <div onClick={() => tx.setAutoCQ(!tx.state().autoCQ)}
             title="Automatically send CQ when the queue is empty"

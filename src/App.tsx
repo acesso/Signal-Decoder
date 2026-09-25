@@ -1442,6 +1442,7 @@ function App(): JSX.Element {
             vfoFrequency={vfoFrequency()}
             effectiveVfoHz={effectiveVfoHz()}
             txAudioHz={txAudioHz()}
+            txRetuneOriginalVfoHz={txStatus()?.txRetuneOriginalVfoHz ?? null}
             onTxAudioHzChange={(hz, committed) => setTxBaseFreq?.(hz, committed)}
             audioBridge={audioBridge}
             iqBridge={iqBridge}
