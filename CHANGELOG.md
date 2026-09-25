@@ -12,6 +12,14 @@ them into a version section when cutting a release.
 
 ## [Unreleased]
 
+## [0.21.0] - 2026-09-24
+
+### Added
+
+- **I/Q signal controls beside the soundcard device picker** — invert (swap/negate I or Q), noise reduction, and a highpass on the decoded audio, alongside the device selection in the gear panel. The soundcard source previously had no controls of its own: these existed but were only reachable from the ESP32 bridge panel, which a soundcard operator has no reason to open. They drive the same pipeline stages either way, so a setting made in one place applies to whichever I/Q source is live, and all persist across sessions.
+- **The decoded-audio highpass corner is now selectable** (20–1000 Hz) instead of fixed at 300 Hz. The old fixed value came from the radio firmware's voice/CW setting, but FT8 and MFSK tones are routinely tuned near the low edge of the passband where a 300 Hz corner cuts real signal rather than just hum.
+- **Soundcard capture rate selection** (8 kHz through 1024 kHz, plus "Browser default"). The soundcard input previously opened its audio context without requesting a rate, so a specialised wideband card was opened at the browser's default — typically 48 kHz — and the rest of its spectrum discarded before the app ever saw it. Note that the browser may refuse or substitute a rate, so the rate actually obtained is read back rather than assumed, and a change takes effect the next time decoding starts (an audio context cannot change rate once created).
+- **Experimental WebUSB input for RTL-SDR dongles**, as another entry in the Audio source selector, reading raw I/Q directly over USB bulk transfers into the same pipeline as every other I/Q source. **This is untested against real hardware** — the USB identifiers, endpoint and register sequence come from the published protocol and existing open-source implementations, not from observation. It is also Chromium-only (WebUSB is not implemented in Firefox or Safari), so the option is hidden entirely in browsers without it. The tuner chip is not yet configured, so centre frequency is not settable: tuning is done with the passband marker within whatever the dongle powers up receiving. The default rate is 250 kS/s rather than the RTL-SDR's own 2.4 MS/s, which would exceed one CPU core at the current demodulator cost.
 ## [0.20.0] - 2026-09-24
 
 ### Changed

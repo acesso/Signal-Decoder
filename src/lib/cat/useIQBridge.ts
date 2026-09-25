@@ -20,6 +20,35 @@
 // BridgeStatusPanel.
 import { createSignal, onCleanup } from 'solid-js'
 import type { CATMode } from './useRadioCAT'
+
+// Minimal WebUSB surface — only what this file actually calls. Declared
+// inline rather than pulling in @types/w3c-web-usb, matching how
+// useRadioCAT.ts already declares the Web Serial types it needs: both APIs
+// are Chromium-only, so neither is in the default TS lib, and a dependency
+// for five interfaces is not worth the supply-chain surface.
+declare global {
+  interface USBInTransferResult {
+    data?: DataView
+    status: 'ok' | 'stall' | 'babble'
+  }
+  interface USBDevice {
+    readonly productName?: string
+    readonly configuration: unknown | null
+    open(): Promise<void>
+    close(): Promise<void>
+    selectConfiguration(n: number): Promise<void>
+    claimInterface(n: number): Promise<void>
+    releaseInterface(n: number): Promise<void>
+    controlTransferOut(
+      setup: { requestType: string; recipient: string; request: number; value: number; index: number },
+      data?: BufferSource,
+    ): Promise<unknown>
+    transferIn(endpointNumber: number, length: number): Promise<USBInTransferResult>
+  }
+  interface USB {
+    requestDevice(options: { filters: { vendorId?: number; productId?: number }[] }): Promise<USBDevice>
+  }
+}
 import { createIQCaptureNode } from '$decoder-lib/audio/captureNode'
 
 // Always-on, matching useAudioBridge.ts's log() — see that file's comment
@@ -51,6 +80,41 @@ const LS_AGC_ENABLED = 'iq_agc_enabled'
 const LS_AGC_LEVEL = 'iq_agc_level'
 const LS_HIGHPASS_ENABLED = 'iq_highpass_enabled'
 const LS_NOISE_REDUCER_ENABLED = 'iq_noise_reducer_enabled'
+// Highpass CORNER, in Hz. Was a fixed 300 (the uSDX firmware's own voice/CW
+// value) — but FT8/MFSK tones are routinely tuned near the low edge of the
+// passband, where a 300Hz corner cuts real signal. Configurable so an
+// operator can set it below their lowest wanted tone, or raise it to kill
+// mains hum on a noisy soundcard input.
+const LS_HIGHPASS_HZ = 'iq_highpass_hz'
+
+// Capture rates offered for the soundcard I/Q input, in Hz. This is the
+// INPUT gate: how much RF bandwidth the card is asked to deliver, which
+// for quadrature sampling equals the sample rate (an I/Q stream at N Hz
+// spans N Hz of spectrum, -N/2..+N/2 around the dial).
+//
+// Distinct from the passband WIDTH, which is a filter applied to the
+// captured spectrum to pick out what the decoder sees. A specialised card
+// can deliver hundreds of kHz here while the decoder still works on a 3kHz
+// slice of it — that is the point of a wideband capture.
+//
+// The browser is asked for the chosen rate via AudioContext({sampleRate}).
+// It may refuse or silently substitute, so the rate actually obtained is
+// read back from the live context rather than assumed — see
+// connectSoundcard, which reports the real value.
+const SOUNDCARD_RATE_STEPS_HZ = [
+  8_000, 16_000, 22_050, 44_100, 48_000, 96_000, 192_000, 384_000, 768_000, 1_024_000,
+]
+
+const LS_SOUNDCARD_RATE = 'iq_soundcard_rate_hz'
+/** 0 = let the browser pick (its default, usually 48000). */
+function loadSoundcardRateHz(): number {
+  if (typeof window === 'undefined') return 0
+  const n = parseInt(localStorage.getItem(LS_SOUNDCARD_RATE) ?? '', 10)
+  return Number.isFinite(n) && n > 0 ? n : 0
+}
+function saveSoundcardRateHz(v: number) {
+  if (typeof window !== 'undefined') localStorage.setItem(LS_SOUNDCARD_RATE, String(v))
+}
 const LS_PLAY_THROUGH_SPEAKERS = 'iq_play_through_speakers'
 const LS_FORCE_IQ_MODE = 'iq_force_mode'
 const LS_FORCE_SAMPLE_RATE = 'iq_force_sample_rate'
@@ -127,6 +191,24 @@ function loadHighpassEnabled(): boolean {
 }
 function saveHighpassEnabled(v: boolean) {
   if (typeof window !== 'undefined') localStorage.setItem(LS_HIGHPASS_ENABLED, String(v))
+}
+
+// Range the UI offers and this clamps to. 20Hz is below anything a receiver
+// passes usefully; 1000Hz is already above most FT8 tones, so going higher
+// would only ever be self-defeating.
+export const HIGHPASS_HZ_MIN = 20
+export const HIGHPASS_HZ_MAX = 1000
+export const HIGHPASS_HZ_DEFAULT = 300
+
+function loadHighpassHz(): number {
+  if (typeof window === 'undefined') return HIGHPASS_HZ_DEFAULT
+  const raw = localStorage.getItem(LS_HIGHPASS_HZ)
+  const n = raw === null ? NaN : parseInt(raw, 10)
+  if (!Number.isFinite(n)) return HIGHPASS_HZ_DEFAULT
+  return Math.min(HIGHPASS_HZ_MAX, Math.max(HIGHPASS_HZ_MIN, n))
+}
+function saveHighpassHz(v: number) {
+  if (typeof window !== 'undefined') localStorage.setItem(LS_HIGHPASS_HZ, String(v))
 }
 // Defaults OFF — unlike agcEnabled/highpassEnabled above (both direct
 // ports of a real radio's own long-proven DSP), NoiseReducer is genuinely
@@ -278,7 +360,10 @@ export interface IQBridgeState {
   // Which I/Q source is feeding the pipeline: the ESP32 bridge's WebSocket
   // or a local soundcard (see connectSoundcard()). Lets the UI label what
   // it is showing without inferring it from which connect() ran.
-  source: 'bridge' | 'soundcard'
+  source: 'bridge' | 'soundcard' | 'usb'
+  /** Product name of the selected WebUSB device, for the picker's label.
+   *  Empty until one is chosen. */
+  usbDeviceName: string
   inputMode: InputMode
   sampleRateHz: number
   // Count of interleaved I/Q sample PAIRS received in the most recent
@@ -324,6 +409,11 @@ export interface IQBridgeState {
   // `highpass` field comment (ported from the uSDX firmware's own
   // filt_var corner). Also post-demod, alongside agcEnabled above.
   highpassEnabled: boolean
+  /** Highpass corner in Hz (see setHighpassHz) — was a fixed 300. */
+  highpassHz: number
+  /** Requested soundcard capture rate (0 = browser default). The rate
+   *  actually in use is sampleRateHz, read back from the live context. */
+  soundcardRateHz: number
   // Spectral noise reduction (FFT-overlap-add, Wiener gain) — see
   // NoiseReducer's own header comment. Last stage in the post-demod
   // chain, after agcEnabled/highpassEnabled above. Off by default — see
@@ -1510,6 +1600,7 @@ export class SSBDemodulator {
   // ever constructs one directly without going through that hook.
   private highpass = new FIRFilter()
   private highpassEnabled = false
+  private highpassHz = HIGHPASS_HZ_DEFAULT
   // Set by setPassband. decimation is how many input samples produce one
   // output sample; outputRateHz is the rate the demodulated audio comes out
   // at (and what callers must label their AudioBuffer / hand the decoder).
@@ -1616,7 +1707,10 @@ export class SSBDemodulator {
     // filt_var stage. Built at the OUTPUT rate, since it runs on the final
     // decimated audio — using a higher rate here would place its corner at
     // a multiple of 300Hz, cutting straight through the FT8 audio band.
-    this.highpass.setTaps(highPassTaps(300, 300, this.outputRateHz))
+    // transWidth equal to the corner itself, same 100%-relative reasoning
+    // as before — a narrow transition here would need a very long kernel
+    // for essentially no audible benefit at this corner.
+    this.highpass.setTaps(highPassTaps(this.highpassHz, this.highpassHz, this.outputRateHz))
     // Hilbert/delay pair only depends on sampleRateHz (see
     // estimateHilbertTapCount()'s own comment) — rebuilding them here
     // regardless of whether bw changed is harmless (this whole block
@@ -1635,6 +1729,16 @@ export class SSBDemodulator {
 
   setHighpassEnabled(enabled: boolean): void {
     this.highpassEnabled = enabled
+  }
+
+  /** Corner frequency in Hz. Rebuilds the kernel, so callers should only
+   *  call this when it actually changes — setPassband would otherwise have
+   *  to know about it too. */
+  setHighpassHz(hz: number): void {
+    const clamped = Math.min(HIGHPASS_HZ_MAX, Math.max(HIGHPASS_HZ_MIN, Math.round(hz)))
+    if (clamped === this.highpassHz) return
+    this.highpassHz = clamped
+    this.highpass.setTaps(highPassTaps(clamped, clamped, this.outputRateHz))
   }
 
   // sideband: true = USB, false = LSB — matches the uSDX's own mode==USB
@@ -1736,6 +1840,7 @@ export function useIQBridge() {
     connected: false,
     reconnecting: false,
     source: 'bridge',
+    usbDeviceName: '',
     inputMode: 'audio',
     sampleRateHz: FALLBACK_SAMPLE_RATE,
     lastFramePairs: 0,
@@ -1749,6 +1854,8 @@ export function useIQBridge() {
     agcEnabled: loadAGCEnabled(),
     agcLevel: loadAGCLevel(),
     highpassEnabled: loadHighpassEnabled(),
+    highpassHz: loadHighpassHz(),
+    soundcardRateHz: loadSoundcardRateHz(),
     noiseReducerEnabled: loadNoiseReducerEnabled(),
     forceIQMode: loadForceIQMode(),
     forceSampleRateHz: loadForceSampleRateHz(),
@@ -1816,6 +1923,15 @@ export function useIQBridge() {
     saveHighpassEnabled(enabled)
     setState((s) => ({ ...s, highpassEnabled: enabled }))
   }
+  /** Highpass corner in Hz — see LS_HIGHPASS_HZ. Applies immediately and
+   *  persists, same "remembered until changed again" shape as every other
+   *  setter here. */
+  function setHighpassHz(hz: number) {
+    demod.setHighpassHz(hz)
+    const clamped = Math.min(HIGHPASS_HZ_MAX, Math.max(HIGHPASS_HZ_MIN, Math.round(hz)))
+    saveHighpassHz(clamped)
+    setState((s) => ({ ...s, highpassHz: clamped }))
+  }
   let noiseReducerEnabled = loadNoiseReducerEnabled()
   function setNoiseReducerEnabled(enabled: boolean) {
     noiseReducerEnabled = enabled
@@ -1840,6 +1956,11 @@ export function useIQBridge() {
   // agree from the very first frame instead of only syncing once the
   // operator drags the marker again after a reload.
   demod.setPassband(state().passbandCenterHz, state().passbandBandwidthHz, state().sampleRateHz)
+  // AFTER setPassband: the highpass kernel is built against outputRateHz,
+  // which setPassband is what establishes. Applying the stored corner
+  // before it would build the kernel at a stale rate and then be silently
+  // overwritten by setPassband's own default-300 rebuild.
+  demod.setHighpassHz(loadHighpassHz())
   function setPassband(centerHz: number, bandwidthHz: number) {
     demod.setPassband(centerHz, bandwidthHz, state().sampleRateHz)
     savePassbandCenterHz(centerHz)
@@ -2056,6 +2177,7 @@ export function useIQBridge() {
     ws?.close()
     ws = null
     stopSoundcard()
+    void stopUSB()
     teardownPlayback()
     meterPeakRms = 0
     setState((s) => ({ ...s, connected: false, reconnecting: false, lastFramePairs: 0, iqSignalDbfs: null, source: 'bridge' }))
@@ -2197,8 +2319,27 @@ export function useIQBridge() {
     }
 
     try {
-      scCtx = new AudioContext()
-      // The device's real rate, not an assumed one — it sets the frequency
+      // Ask for the operator-selected capture rate. This is the INPUT gate:
+      // a specialised card can deliver hundreds of kHz, and without asking,
+      // the browser opens at its own default (typically 48kHz) and that
+      // wider spectrum is discarded at the door.
+      //
+      // The browser may refuse the request or silently substitute another
+      // rate, so what it ACTUALLY gave us is read back below from the live
+      // context rather than assumed. Falling back to an unconstrained
+      // context on failure keeps a card that cannot do the chosen rate
+      // working at its default instead of failing to open at all.
+      const wantRate = loadSoundcardRateHz()
+      if (wantRate > 0) {
+        try {
+          scCtx = new AudioContext({ sampleRate: wantRate })
+        } catch {
+          scCtx = new AudioContext()
+        }
+      } else {
+        scCtx = new AudioContext()
+      }
+      // The rate actually obtained, not the one requested — it sets the frequency
       // scale for the whole spectrum and the demodulator's mixer, so
       // guessing here would put every displayed frequency off by the ratio.
       const rate = scCtx.sampleRate
@@ -2262,6 +2403,205 @@ export function useIQBridge() {
   // source has an obvious call, but there is exactly one teardown path —
   // disconnect() stops whichever source is live.
   const disconnectSoundcard = disconnect
+
+  /** Capture rate for the soundcard input, in Hz. 0 means "let the browser
+   *  choose". Takes effect on the NEXT connect — an AudioContext cannot
+   *  change its rate once created, so an already-running capture keeps the
+   *  rate it opened with until the operator restarts decoding. */
+  function setSoundcardRateHz(hz: number) {
+    saveSoundcardRateHz(hz)
+    setState((s) => ({ ...s, soundcardRateHz: hz }))
+  }
+
+  /** The rates offered, and the one currently selected. */
+  function soundcardRateOptions(): number[] {
+    return SOUNDCARD_RATE_STEPS_HZ
+  }
+
+  // ── WebUSB I/Q input (EXPERIMENTAL, UNTESTED) ─────────────────────────────
+  // Reads raw I/Q straight off an RTL-SDR dongle over USB bulk transfers,
+  // joining the same pipeline as the bridge and soundcard sources
+  // (feedIQSamples), so it inherits every existing control unchanged.
+  //
+  // HONEST STATUS: written against the published RTL2832U register protocol
+  // and the prior art (rtlsdrjs, webrtlsdr), but NEVER RUN AGAINST REAL
+  // HARDWARE. The USB identifiers, endpoint and register sequence below are
+  // from documentation, not observation. Treat a first run as debugging,
+  // not as a feature that works.
+  //
+  // Constraints, none of which are avoidable:
+  //  - WebUSB is Chromium-only (Chrome/Edge/Opera). Firefox and Safari do
+  //    not implement it and are not planning to. Same situation as the Web
+  //    Serial CAT transport this app already ships, and handled the same
+  //    way: feature-detect and say so plainly.
+  //  - requestDevice() needs a secure context (GitHub Pages is HTTPS) AND
+  //    transient user activation, so device selection must happen inside a
+  //    real click handler — it cannot be done automatically on start.
+  //  - On Linux the device needs udev permissions, and on Windows a WinUSB
+  //    driver binding, or requestDevice() will list nothing.
+  //
+  // CPU: an RTL-SDR's own default is 2.4 MS/s. Extrapolating this app's
+  // measured demodulator cost (18.3% of a core at 392kHz) that is ~112% of
+  // a core — i.e. it would not keep up. The default below is deliberately
+  // 250 kS/s, which is ample for the narrowband modes this app decodes and
+  // roughly 12%. Higher rates are selectable and honestly expensive until
+  // the passband-first restructure in doc/IQ_CPU_DESIGN_NOTE.md lands.
+  const RTLSDR_VENDOR_ID = 0x0bda
+  const RTLSDR_BULK_ENDPOINT = 1 // EP 0x81 IN, 512-byte packets
+  const RTLSDR_DEFAULT_RATE_HZ = 250_000
+  // One bulk read. A multiple of 512 (the endpoint's max packet size) and
+  // big enough that the per-transfer overhead is negligible, small enough
+  // that one read is a fraction of a decode window.
+  const RTLSDR_XFER_BYTES = 16384
+
+  let usbDevice: USBDevice | null = null
+  let usbReading = false
+
+  /** Vendor request helper — the RTL2832U is configured entirely through
+   *  control transfers on the default endpoint before any bulk read. */
+  async function usbControl(dev: USBDevice, index: number, value: number, data: Uint8Array): Promise<void> {
+    await dev.controlTransferOut(
+      { requestType: 'vendor', recipient: 'device', request: 0, value, index },
+      data as unknown as BufferSource,
+    )
+  }
+
+  /** Minimal RTL2832U bring-up: reset the demodulator, put it in the
+   *  passthrough mode that yields raw 8-bit I/Q, and set the sample rate.
+   *
+   *  Deliberately does NOT attempt tuner-chip configuration (E4000, R820T,
+   *  R828D and friends each need their own register sequence). The tuner is
+   *  left at whatever it powered up with, which means centre frequency is
+   *  not controllable from here yet — the operator tunes with the passband
+   *  marker within whatever the dongle happens to be receiving. Adding
+   *  per-tuner support is the obvious next step once this is testable. */
+  async function rtlsdrInit(dev: USBDevice, sampleRateHz: number): Promise<void> {
+    // Demod reset: write 0x14 then 0x10 to USB_SYSCTL.
+    await usbControl(dev, 0x0100, 0x2000, new Uint8Array([0x14]))
+    await usbControl(dev, 0x0100, 0x2000, new Uint8Array([0x10]))
+    // Enable the bulk FIFO and select raw-I/Q output.
+    await usbControl(dev, 0x0100, 0x2010, new Uint8Array([0x02]))
+    // Sample rate: the demod divides a 28.8MHz clock; the ratio is written
+    // as a 16.16 fixed-point value across two registers.
+    const RTL_XTAL_HZ = 28_800_000
+    const ratio = Math.floor(((RTL_XTAL_HZ * 2 ** 22) / sampleRateHz) & 0x0ffffffc)
+    await usbControl(dev, 0x0300, 0x009f, new Uint8Array([(ratio >> 24) & 0xff, (ratio >> 16) & 0xff]))
+    await usbControl(dev, 0x0300, 0x00a1, new Uint8Array([(ratio >> 8) & 0xff, ratio & 0xff]))
+  }
+
+  /** Prompts for a device. MUST be called from a user gesture — WebUSB
+   *  requires transient activation and will reject otherwise. */
+  async function requestUSBDevice(): Promise<boolean> {
+    const usb = (navigator as unknown as { usb?: USB }).usb
+    if (!usb) {
+      setState((s) => ({ ...s, error: 'WebUSB not supported — use Chrome, Edge or Opera' }))
+      return false
+    }
+    try {
+      usbDevice = await usb.requestDevice({ filters: [{ vendorId: RTLSDR_VENDOR_ID }] })
+      setState((s) => ({ ...s, error: null, usbDeviceName: usbDevice?.productName ?? 'RTL-SDR' }))
+      return true
+    } catch (err) {
+      // A user dismissing the chooser throws too; not worth surfacing as an
+      // error, so only report something that looks like a real failure.
+      const msg = err instanceof Error ? err.message : String(err)
+      if (!/cancel|no device selected/i.test(msg)) setState((s) => ({ ...s, error: msg }))
+      return false
+    }
+  }
+
+  async function connectUSB(sampleRateHz = RTLSDR_DEFAULT_RATE_HZ): Promise<boolean> {
+    // Mutually exclusive with the other sources — they all feed one
+    // demodulator and one spectrum.
+    disconnect()
+    if (!usbDevice) {
+      setState((s) => ({ ...s, error: 'No USB device selected — pick one first' }))
+      return false
+    }
+    try {
+      await usbDevice.open()
+      if (usbDevice.configuration === null) await usbDevice.selectConfiguration(1)
+      await usbDevice.claimInterface(0)
+      await rtlsdrInit(usbDevice, sampleRateHz)
+    } catch (err) {
+      setState((s) => ({ ...s, error: err instanceof Error ? err.message : 'failed to open the USB device' }))
+      await stopUSB()
+      return false
+    }
+
+    // Playback graph for the demodulated audio, same as the other sources
+    // build, so getPlaybackSource() works identically and decoders need no
+    // knowledge that a USB device is involved.
+    if (!playCtx) {
+      playCtx = new AudioContext()
+      playAnalyserNode = playCtx.createAnalyser()
+      playAnalyserNode.fftSize = 2048
+      speakersGainNode = playCtx.createGain()
+      speakersGainNode.gain.value = speakersOn ? 1 : 0
+      playAnalyserNode.connect(speakersGainNode)
+      speakersGainNode.connect(playCtx.destination)
+    }
+
+    setState((s) => ({
+      ...s,
+      connected: true,
+      reconnecting: false,
+      error: null,
+      source: 'usb',
+      inputMode: 'iq',
+      sampleRateHz,
+    }))
+
+    usbReading = true
+    void usbReadLoop(sampleRateHz)
+    return true
+  }
+
+  /** Continuous bulk-read loop. Runs until stopUSB() clears usbReading or a
+   *  transfer fails — a failed transfer usually means the device was
+   *  unplugged, which is a disconnect rather than something to retry. */
+  async function usbReadLoop(sampleRateHz: number): Promise<void> {
+    while (usbReading && usbDevice) {
+      let result: USBInTransferResult
+      try {
+        result = await usbDevice.transferIn(RTLSDR_BULK_ENDPOINT, RTLSDR_XFER_BYTES)
+      } catch (err) {
+        if (usbReading) {
+          setState((s) => ({ ...s, error: err instanceof Error ? err.message : 'USB transfer failed' }))
+          await stopUSB()
+        }
+        return
+      }
+      if (!result.data || result.data.byteLength === 0) continue
+      const raw = new Uint8Array(result.data.buffer, result.data.byteOffset, result.data.byteLength)
+      // RTL-SDR emits UNSIGNED 8-bit I/Q pairs centred on 127.5 — convert to
+      // the normalized [-1,1] float64 interleaved form feedIQSamples takes,
+      // the same contract the bridge and soundcard paths already satisfy.
+      const iq = new Float64Array(raw.length)
+      for (let n = 0; n < raw.length; n++) iq[n] = (raw[n] - 127.5) / 127.5
+      feedIQSamples(iq, sampleRateHz)
+    }
+  }
+
+  async function stopUSB(): Promise<void> {
+    usbReading = false
+    const dev = usbDevice
+    usbDevice = null
+    if (!dev) return
+    try {
+      await dev.releaseInterface(0)
+    } catch { /* already gone (unplugged) — nothing to release */ }
+    try {
+      await dev.close()
+    } catch { /* same */ }
+  }
+
+  /** True when this browser implements WebUSB at all. The UI gates its
+   *  option on this rather than letting the operator pick something that
+   *  can never work. */
+  function isUSBSupported(): boolean {
+    return typeof navigator !== 'undefined' && 'usb' in navigator
+  }
 
   /** Input devices the browser will let us open, for the picker. Requires
    *  permission to have been granted at least once or labels come back
@@ -2390,9 +2730,10 @@ export function useIQBridge() {
 
   return {
     state, connect, disconnect, refreshInfo, spectrum, setCatMode, setPassband, getPlaybackSource,
-    connectSoundcard, disconnectSoundcard, listSoundcardDevices,
+    connectSoundcard, disconnectSoundcard, listSoundcardDevices, setSoundcardRateHz, soundcardRateOptions,
+    requestUSBDevice, connectUSB, isUSBSupported,
     setPlayThroughSpeakers, setIQCorrection, setDCRemoval, setImbalanceCorrection, setForceIQMode,
-    setForceSampleRateHz, setAGCEnabled, setAGCLevel, setHighpassEnabled, setNoiseReducerEnabled,
+    setForceSampleRateHz, setAGCEnabled, setAGCLevel, setHighpassEnabled, setHighpassHz, setNoiseReducerEnabled,
   }
 }
 

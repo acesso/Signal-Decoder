@@ -13,7 +13,7 @@ import FTTransmitPanel, { type TxStatus } from './components/FTTransmitPanel'
 import type { RTTYConfig } from '$decoder-lib/rtty/decoder'
 import RadioCATPanel, { useRadioCAT } from './components/RadioCATPanel'
 import { useAudioBridge } from './lib/cat/useAudioBridge'
-import { useIQBridge } from './lib/cat/useIQBridge'
+import { useIQBridge, type IQCorrection } from './lib/cat/useIQBridge'
 import { loadSuspendIQDuringTx } from './lib/ft/useFTTransmit'
 import PWAInstallPrompt from './components/PWAInstallPrompt'
 import UpdateAvailablePrompt from './components/UpdateAvailablePrompt'
@@ -60,7 +60,7 @@ function saveFTMode(v: FTMode) {
 // second-guessed against the bridge's actual live firmware mode — see
 // AudioSourceOverride's own comment. ──────────────────────────────────────
 const LS_AUDIO_SOURCE_OVERRIDE = 'audio_source_override'
-const VALID_AUDIO_SOURCE_OVERRIDES: AudioSourceOverride[] = ['auto', 'microphone', 'bridge-audio', 'bridge-iq', 'soundcard-iq']
+const VALID_AUDIO_SOURCE_OVERRIDES: AudioSourceOverride[] = ['auto', 'microphone', 'bridge-audio', 'bridge-iq', 'soundcard-iq', 'usb-iq']
 function loadAudioSourceOverride(): AudioSourceOverride {
   return loadString(LS_AUDIO_SOURCE_OVERRIDE, 'auto', VALID_AUDIO_SOURCE_OVERRIDES)
 }
@@ -90,6 +90,11 @@ const IQ_PASSBAND_DEFAULTS: Record<DecoderMode, IQPassbandSetting> = {
   sstv: { centerHz: 1500, bandwidthHz: 2700 }, // voice-bandwidth-ish audio
   rtty: { centerHz: 1000, bandwidthHz: 1200 }, // covers RTTYDecoder.tsx's own DISPLAY_MAX_HZ=1500 range with margin
   cw: { centerHz: 700, bandwidthHz: 500 }, // one narrow tone
+}
+/** kHz above 1000Hz, plain Hz below — "500 Hz" reads better than "0.5 kHz",
+ *  and "192 kHz" better than "192000 Hz". */
+function formatBandwidth(hz: number): string {
+  return hz >= 1000 ? `${hz / 1000} kHz` : `${hz} Hz`
 }
 function loadPassbandByMode(): Record<DecoderMode, IQPassbandSetting> {
   return loadObject(LS_IQ_PASSBAND_BY_MODE, IQ_PASSBAND_DEFAULTS)
@@ -240,6 +245,22 @@ function TopBar(props: {
   soundcardIQDeviceId: string
   onSoundcardIQDeviceIdChange: (v: string) => void
   listSoundcardDevices: () => Promise<{ deviceId: string; label: string }[]>
+  // I/Q signal conditioning — shared with the bridge source (one pipeline).
+  iqCorrection: IQCorrection
+  onIQCorrectionChange: (v: IQCorrection) => void
+  /** Requested soundcard capture rate, 0 = browser default. */
+  iqSoundcardRateHz: number
+  onIQSoundcardRateChange: (hz: number) => void
+  iqSoundcardRateOptions: number[]
+  /** Whether this browser implements WebUSB at all — gates the USB SDR
+   *  option, since it can never work without it. */
+  usbSupported: boolean
+  iqNoiseReducer: boolean
+  onIQNoiseReducerChange: (v: boolean) => void
+  iqHighpassEnabled: boolean
+  onIQHighpassEnabledChange: (v: boolean) => void
+  iqHighpassHz: number
+  onIQHighpassHzChange: (hz: number) => void
 }): JSX.Element {
   const isRecording = () => props.controls?.isRecording ?? false
   const isSupported = () => props.controls?.isSupported ?? true
@@ -381,6 +402,9 @@ function TopBar(props: {
               <option value="bridge-audio">Bridge (radio audio)</option>
               <option value="bridge-iq">Bridge (I/Q)</option>
               <option value="soundcard-iq">Soundcard (I/Q)</option>
+              <Show when={props.usbSupported}>
+                <option value="usb-iq">USB SDR (I/Q, experimental)</option>
+              </Show>
             </select>
           </div>
           {/* Only meaningful in Auto — a forced choice already says exactly
@@ -470,6 +494,75 @@ function TopBar(props: {
             <span class="italic">
               Stereo device, I on left / Q on right. Pick "Soundcard (I/Q)" in Audio source to use it.
             </span>
+          </div>
+
+          {/* Soundcard I/Q signal conditioning. These drive the SAME
+              useIQBridge stages the ESP32 bridge's own panel exposes (the
+              two sources share one pipeline — see feedIQSamples), so a
+              setting made here is the setting in effect whichever I/Q
+              source is live. They live here because the soundcard has no
+              panel of its own: its device picker is here, so its controls
+              belong beside it. All persist via useIQBridge's own
+              localStorage keys. */}
+          <div class="flex w-full flex-wrap items-center gap-x-4 gap-y-2 border-t border-[#30363d] pt-3">
+            <span class="font-semibold text-[#c9d1d9]">I/Q signal</span>
+
+            <label class="flex items-center gap-1.5" title="Swaps or inverts the I and Q channels. A receiver wired the other way round, or a soundcard with reversed channels, mirrors the spectrum — signals appear on the wrong side of centre. Fix it here rather than rewiring.">
+              invert
+              <select
+                value={props.iqCorrection}
+                onChange={(e) => props.onIQCorrectionChange(e.currentTarget.value as IQCorrection)}
+                class="rounded border border-[#30363d] bg-[#0d1117] px-2 py-1 text-[#c9d1d9]"
+              >
+                <option value="none">None</option>
+                <option value="swap">Swap I/Q</option>
+                <option value="negateI">Negate I</option>
+                <option value="negateQ">Negate Q</option>
+              </select>
+            </label>
+            <label class="flex items-center gap-1.5" title="How much RF bandwidth to capture from the card. For quadrature sampling this equals the sample rate — an I/Q stream at N Hz spans N Hz of spectrum. A specialised card can deliver hundreds of kHz; without asking, the browser opens at its own default (usually 48 kHz) and the rest is discarded. Takes effect next time decoding starts.">
+              input rate
+              <select
+                value={props.iqSoundcardRateHz}
+                onChange={(e) => props.onIQSoundcardRateChange(Number(e.currentTarget.value))}
+                class="rounded border border-[#30363d] bg-[#0d1117] px-2 py-1 text-[#c9d1d9]"
+              >
+                <option value="0">Browser default</option>
+                <For each={props.iqSoundcardRateOptions}>
+                  {(hz) => <option value={hz}>{formatBandwidth(hz)}</option>}
+                </For>
+              </select>
+            </label>
+
+            <label class="flex cursor-pointer items-center gap-1.5 select-none" title="Estimates the noise floor per frequency bin and suppresses it. Experimental, and it costs CPU — leave it off unless it demonstrably helps.">
+              <input
+                type="checkbox"
+                checked={props.iqNoiseReducer}
+                onChange={(e) => props.onIQNoiseReducerChange(e.currentTarget.checked)}
+                class="accent-[#58a6ff]"
+              />
+              noise reduction
+            </label>
+
+            <label class="flex items-center gap-1.5" title="Highpass corner applied to the DECODED audio. Set it below your lowest wanted tone — FT8/MFSK signals are often tuned near the passband's low edge, where too high a corner cuts real signal rather than just hum.">
+              <input
+                type="checkbox"
+                checked={props.iqHighpassEnabled}
+                onChange={(e) => props.onIQHighpassEnabledChange(e.currentTarget.checked)}
+                class="accent-[#58a6ff]"
+              />
+              highpass
+              <select
+                value={props.iqHighpassHz}
+                disabled={!props.iqHighpassEnabled}
+                onChange={(e) => props.onIQHighpassHzChange(Number(e.currentTarget.value))}
+                class="rounded border border-[#30363d] bg-[#0d1117] px-2 py-1 text-[#c9d1d9] disabled:opacity-40"
+              >
+                <For each={[20, 50, 100, 150, 200, 300, 400, 500, 700, 1000]}>
+                  {(hz) => <option value={hz}>{hz} Hz</option>}
+                </For>
+              </select>
+            </label>
           </div>
         </div>
       </Show>
@@ -889,6 +982,28 @@ function App(): JSX.Element {
           return
         }
       }
+      // Same shape as the soundcard branch above: a source with no panel of
+      // its own, so Start Decoding is where it gets opened.
+      //
+      // requestUSBDevice() prompts the browser's device chooser, which needs
+      // transient user activation — this runs inside the Start click, which
+      // satisfies it. Doing it anywhere non-interactive would be rejected.
+      if (override === 'usb-iq' && !(iqBridge.state().connected && iqBridge.state().source === 'usb')) {
+        const picked = await iqBridge.requestUSBDevice()
+        if (!picked) {
+          setBridgeAudioFallbackWarning(
+            `No USB SDR selected (${iqBridge.state().error ?? 'chooser dismissed'}) — WebUSB needs Chrome/Edge/Opera, and on Linux a udev rule granting access to the device.`,
+          )
+          return
+        }
+        const ok = await iqBridge.connectUSB()
+        if (!ok) {
+          setBridgeAudioFallbackWarning(
+            `Could not open the USB SDR (${iqBridge.state().error ?? 'unknown error'}) — this input is experimental and untested against real hardware.`,
+          )
+          return
+        }
+      }
       const { kind, bridge } = resolveAudioSource(override, iqBridge, audioBridge)
       globalAudio.configureSource(kind, bridge)
       setDecodingFromBridgeMode(null)
@@ -978,7 +1093,10 @@ function App(): JSX.Element {
     // monitoring) after stopping decode — this one was opened implicitly by
     // handleStart(), so leaving it running would hold the audio device and
     // the browser's recording indicator open with nothing consuming it.
-    if (iqBridge.state().source === 'soundcard' && iqBridge.state().connected) iqBridge.disconnectSoundcard()
+    // Same reasoning for the USB SDR: opened implicitly by handleStart, so
+    // leaving it claimed would hold the device against other software.
+    const src = iqBridge.state().source
+    if (iqBridge.state().connected && (src === 'soundcard' || src === 'usb')) iqBridge.disconnectSoundcard()
   }
 
   // ── Bridge-mode mismatch recovery ─────────────────────────────────────────
@@ -1132,6 +1250,18 @@ function App(): JSX.Element {
           soundcardIQDeviceId={soundcardIQDeviceId()}
           onSoundcardIQDeviceIdChange={setSoundcardIQDeviceId}
           listSoundcardDevices={iqBridge.listSoundcardDevices}
+          iqCorrection={iqBridge.state().iqCorrection}
+          onIQCorrectionChange={iqBridge.setIQCorrection}
+          iqSoundcardRateHz={iqBridge.state().soundcardRateHz}
+          onIQSoundcardRateChange={iqBridge.setSoundcardRateHz}
+          iqSoundcardRateOptions={iqBridge.soundcardRateOptions()}
+          usbSupported={iqBridge.isUSBSupported()}
+          iqNoiseReducer={iqBridge.state().noiseReducerEnabled}
+          onIQNoiseReducerChange={iqBridge.setNoiseReducerEnabled}
+          iqHighpassEnabled={iqBridge.state().highpassEnabled}
+          onIQHighpassEnabledChange={iqBridge.setHighpassEnabled}
+          iqHighpassHz={iqBridge.state().highpassHz}
+          onIQHighpassHzChange={iqBridge.setHighpassHz}
           onAudioSourceOverrideChange={handleAudioSourceOverrideChange}
           bridgeReconnecting={bridgeReconnecting()}
         />
