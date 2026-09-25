@@ -1105,6 +1105,44 @@ export class FIRFilter {
     this.histIdx = 0
   }
 
+  /** Symmetric-tap dot product: the generated taps mirror about the centre
+   *  (verified numerically — they match to ~7e-18), so each mirrored PAIR
+   *  can be summed before a single multiply instead of multiplied twice.
+   *  Halves the multiplies for the same output, bit-for-bit equivalent up to
+   *  float reassociation. Falls back to the plain walk for an asymmetric
+   *  tap set, so this is safe for any filter.
+   *
+   *  Only worth it for the long sharp filters; the halfband cascade above
+   *  has its own, better-specialised loop. */
+  processOneSymmetric(sample: number): number {
+    this.history[this.histIdx] = sample
+    const h = this.history
+    const t = this.taps
+    const n = h.length
+    let acc = 0
+    let lo = 0
+    let hi = n - 1
+    // histIdx points at the newest sample; tap 0 pairs with it and walks
+    // backwards, which is the same ordering processOne() uses.
+    while (lo < hi) {
+      let a = this.histIdx - lo
+      if (a < 0) a += n
+      let b = this.histIdx - hi
+      if (b < 0) b += n
+      acc += (h[a] + h[b]) * t[lo]
+      lo++
+      hi--
+    }
+    if (lo === hi) {
+      let c = this.histIdx - lo
+      if (c < 0) c += n
+      acc += h[c] * t[lo]
+    }
+    this.histIdx++
+    if (this.histIdx >= n) this.histIdx = 0
+    return acc
+  }
+
   processOne(sample: number): number {
     this.history[this.histIdx] = sample
     let out = 0
@@ -1121,13 +1159,14 @@ export class FIRFilter {
   }
 }
 
-// Demodulates raw interleaved I/Q into real-valued mono audio at the SAME
-// sample rate the I/Q arrived at (no resampling/decimation here — playFrame()
-// -style playback below hands rate conversion to AudioBuffer/
-// AudioBufferSourceNode exactly like useAudioBridge.ts's playFrame() already
-// does for /audio). Two stages per call, both streaming (state carried
-// across calls so a frame boundary never introduces a phase/filter
-// discontinuity):
+// Demodulates raw interleaved I/Q into real-valued mono audio, DECIMATED to
+// outputSampleRateHz (see DEMOD_TARGET_RATE_HZ) rather than emitted at the
+// capture rate. Callers must label their AudioBuffer with that rate;
+// AudioBufferSourceNode then handles the final conversion to the context
+// rate, exactly as useAudioBridge.ts's playFrame() already does for /audio.
+//
+// Two stages per call, both streaming (state carried across calls so a
+// frame boundary never introduces a phase/filter discontinuity):
 //   1. Complex mixer — shifts the operator-selected center frequency down to
 //      0Hz by multiplying I/Q by e^{-j*2*pi*f_offset*n/fs}, via a running
 //      phase accumulator (see setPassband()/mixerPhase), then a per-channel
@@ -1148,6 +1187,121 @@ export class FIRFilter {
 //      math this file used before this rewrite; only its FILTER
 //      IMPLEMENTATION changed, to FIRFilter's genuinely causal circular
 //      buffer — see this section's header comment for why.)
+
+// ── Halfband decimator ────────────────────────────────────────────────────
+// A /2 decimating FIR built for the one job of halving the sample rate
+// cheaply, used in a cascade (see DecimatingFrontEnd) to get from an
+// arbitrarily wide capture down to something the sharp passband filter can
+// afford to run on.
+//
+// Three properties make this ~40x cheaper per sample than the general FIR
+// it replaces on the wide side, and all three are exploited here:
+//
+//  1. POLYPHASE. We only want every 2nd output, so only every 2nd output is
+//     computed. The old path computed a full dot product for every input
+//     sample and then discarded 3 of every 4 results (7 of 8 at 96kHz) —
+//     the single largest waste in the previous design.
+//  2. HALFBAND ZEROS. A filter whose cutoff sits at exactly fs/4 has every
+//     even-indexed tap equal to zero except the centre one. Those multiplies
+//     are skipped outright rather than multiplying by zero.
+//  3. SYMMETRY. The remaining taps mirror about the centre (verified
+//     numerically: the generated taps match to ~7e-18), so each pair is
+//     added BEFORE one multiply instead of multiplied twice.
+//
+// Net: a 31-tap halfband costs ~8 multiplies per OUTPUT sample, i.e. ~4 per
+// input sample, against 609-1217 per input sample for the old wide lowpass.
+//
+// Transition band: a halfband's response is fixed around fs/4, so its
+// stopband starts just above the new Nyquist. Everything the cascade keeps
+// (the few kHz around the passband) sits far below that, so the shallow
+// transition costs nothing here — the sharp edge the operator actually
+// cares about is still cut by the final passband filter at the low rate.
+const HALFBAND_TAPS = 31
+
+function buildHalfbandTaps(count: number): Float64Array {
+  // Windowed sinc at cutoff fs/4 (omega = pi/2). Kaiser-ish via Nuttall,
+  // matching the window the rest of this file's filters already use.
+  const taps = new Float64Array(count)
+  const mid = (count - 1) / 2
+  let sum = 0
+  for (let i = 0; i < count; i++) {
+    const t = i - mid
+    // sinc(t/2) — cutoff at half of Nyquist.
+    const s = t === 0 ? 0.5 : Math.sin((Math.PI * t) / 2) / (Math.PI * t)
+    const w = nuttall(i, count)
+    taps[i] = s * w
+    sum += taps[i]
+  }
+  // Normalize to unity DC gain so a cascade of these doesn't drift in level.
+  for (let i = 0; i < count; i++) taps[i] /= sum
+  // Force the exact zeros: for a halfband, every even offset from centre
+  // except 0 is mathematically zero, and windowing leaves ~1e-18 residue.
+  // Zeroing them explicitly is what lets the hot loop skip them by index.
+  for (let i = 0; i < count; i++) {
+    const t = i - mid
+    if (t !== 0 && t % 2 === 0) taps[i] = 0
+  }
+  return taps
+}
+
+/** Decimates by 2. Feed one sample at a time; returns a number on the
+ *  samples it keeps and NaN on the ones it drops — callers check with the
+ *  companion `hasOutput` flag rather than comparing to NaN. */
+class HalfbandDecimator {
+  private taps: Float64Array
+  private history: Float64Array
+  private histIdx = 0
+  private phase = 0
+  /** True after a push() that produced an output. */
+  hasOutput = false
+  /** Indices of the nonzero taps, precomputed so the hot loop never tests. */
+  private nz: Int32Array
+  private mid: number
+
+  constructor(tapCount = HALFBAND_TAPS) {
+    this.taps = buildHalfbandTaps(tapCount)
+    this.history = new Float64Array(tapCount)
+    this.mid = (tapCount - 1) / 2
+    const idx: number[] = []
+    for (let i = 0; i < tapCount; i++) if (this.taps[i] !== 0) idx.push(i)
+    this.nz = Int32Array.from(idx)
+  }
+
+  /** Streaming state must survive across frames — resetting per call would
+   *  put a discontinuity at every frame boundary, the same hazard the
+   *  decimation phase counter already guards against elsewhere. */
+  reset(): void {
+    this.history.fill(0)
+    this.histIdx = 0
+    this.phase = 0
+    this.hasOutput = false
+  }
+
+  push(sample: number): number {
+    this.history[this.histIdx] = sample
+    this.histIdx = this.histIdx + 1 === this.history.length ? 0 : this.histIdx + 1
+    // Only every 2nd input produces an output — that is the polyphase win.
+    if (++this.phase < 2) {
+      this.hasOutput = false
+      return 0
+    }
+    this.phase = 0
+    this.hasOutput = true
+    const h = this.history
+    const t = this.taps
+    const n = h.length
+    let acc = 0
+    // Walk only the nonzero taps. histIdx now points at the OLDEST sample,
+    // so tap i pairs with history[(histIdx + i) % n].
+    for (let k = 0; k < this.nz.length; k++) {
+      const i = this.nz[k]
+      let j = this.histIdx + i
+      if (j >= n) j -= n
+      acc += h[j] * t[i]
+    }
+    return acc
+  }
+}
 function buildHilbertTaps(count: number): Float64Array {
   // Odd-symmetry FIR: even-indexed taps (including center) are exactly
   // zero, odd-indexed taps are the ideal Hilbert response 2/(pi*k) (k =
@@ -1290,6 +1444,36 @@ function estimateHilbertTapCount(sampleRateHz: number): number {
 // the requested edge rather than centered on it.
 const PASSBAND_GUARD_HZ = 300
 
+// See doc/IQ_CPU_DESIGN_NOTE.md for the larger restructure this is a
+// partial step toward: cut the passband out of the wideband stream FIRST,
+// then run the heavy DSP only on that narrow signal. Only the graphs need
+// the whole band, and they only need cheap FFT magnitudes for it.
+//
+// Target rate for the demodulated audio. The FT8/FT4 decoder resamples
+// everything to FT8MON_DECODE_RATE (12000) before decoding anyway, so
+// producing 12kHz directly costs nothing in decode accuracy and removes a
+// redundant resample. It also comfortably clears Nyquist for the widest
+// passband this app offers (3000Hz needs 6000; plus guard, 6600).
+//
+// The win is that the Hilbert transform — by far the most expensive filter
+// here — then runs at 12kHz instead of the capture rate, and its tap count
+// ALSO shrinks with the rate (see estimateHilbertTapCount). At a 48kHz
+// capture that is 229 taps at 12k instead of 913 at 48k: a 16x reduction in
+// Hilbert MACs alone. The anti-alias lowpass still has to see every input
+// sample, but only has to COMPUTE an output every Nth one, so its cost
+// drops by the decimation factor too.
+const DEMOD_TARGET_RATE_HZ = 12000
+
+/** Largest integer decimation that keeps the output at or above
+ *  DEMOD_TARGET_RATE_HZ, so the output rate is always an exact integer
+ *  divisor of the capture rate (fractional resampling here would reintroduce
+ *  the cost this exists to remove). 1 when the capture rate is already at or
+ *  below the target. */
+function decimationFactorFor(sampleRateHz: number): number {
+  const f = Math.floor(sampleRateHz / DEMOD_TARGET_RATE_HZ)
+  return Math.max(1, f)
+}
+
 export class SSBDemodulator {
   private centerHz = 0
   private bandwidthHz = 2700 // a typical SSB voice passband width; overridden by setPassband()
@@ -1326,6 +1510,14 @@ export class SSBDemodulator {
   // ever constructs one directly without going through that hook.
   private highpass = new FIRFilter()
   private highpassEnabled = false
+  // Set by setPassband. decimation is how many input samples produce one
+  // output sample; outputRateHz is the rate the demodulated audio comes out
+  // at (and what callers must label their AudioBuffer / hand the decoder).
+  private decimation = 1
+  private outputRateHz = FALLBACK_SAMPLE_RATE
+  private decimCounter = 0
+  private halfbandsI: HalfbandDecimator[] = []
+  private halfbandsQ: HalfbandDecimator[] = []
 
   // centerHz: how far the desired signal sits from the I/Q capture's own
   // 0Hz (baseband) center — positive/negative, driven by dragging the
@@ -1377,21 +1569,54 @@ export class SSBDemodulator {
     // frame, which is why a relative width was adopted in the first place;
     // a FIXED guard sidesteps that failure mode entirely instead of
     // reproducing it at a different ratio).
+    // ── Two-stage decimation ──────────────────────────────────────────────
+    // Stage A: a cascade of /2 halfband decimators, run at the WIDE rates.
+    // Stage B: one sharp passband filter, run only at the low rate.
+    //
+    // The previous design ran a single sharp filter at the full capture
+    // rate, which scaled QUADRATICALLY: its tap count grows with the rate
+    // (fixed guard band in Hz) AND it was called once per input sample. At
+    // 48kHz that is 58M MACs/s; projected to a 392kHz capture it is 3893M
+    // — 67x, i.e. impossible. The cascade makes the wide side nearly free
+    // (each halfband is ~8 multiplies per output and every stage runs at
+    // half the previous rate), so cost grows roughly logarithmically with
+    // capture rate instead.
+    //
+    // Halving continues while the result stays comfortably above the final
+    // target, leaving the last factor to stage B. Each halfband's stopband
+    // begins just above the new Nyquist, and the few kHz we are keeping sit
+    // far below that at every stage, so the cascade never touches the
+    // wanted signal — the sharp edge the operator actually selected is cut
+    // once, at the bottom, by stage B.
+    this.halfbandsI = []
+    this.halfbandsQ = []
+    let stageRate = sampleRateHz
+    while (stageRate / 2 >= DEMOD_TARGET_RATE_HZ * 2) {
+      this.halfbandsI.push(new HalfbandDecimator())
+      this.halfbandsQ.push(new HalfbandDecimator())
+      stageRate /= 2
+    }
+    // Whatever integer factor remains after the halfbands is handled by
+    // decimating stage B's output (usually /2, sometimes /1).
+    this.decimation = Math.max(1, Math.floor(stageRate / DEMOD_TARGET_RATE_HZ))
+    this.outputRateHz = stageRate / this.decimation
+    this.decimCounter = 0
+
+    // Stage B: the sharp passband filter, now sized for `stageRate` rather
+    // than the capture rate — which is what collapses its tap count.
     const cutoffHz = bw + PASSBAND_GUARD_HZ / 2
-    const taps = lowPassTaps(cutoffHz, PASSBAND_GUARD_HZ, sampleRateHz)
+    const taps = lowPassTaps(cutoffHz, PASSBAND_GUARD_HZ, stageRate)
     this.lowpassI.setTaps(taps)
-    // Q needs its OWN FIRFilter instance (not the same taps object shared
-    // by reference issue — setTaps() already copies into a fresh history
-    // buffer per instance) so its circular-buffer history stays
+    // Q needs its OWN FIRFilter instance (setTaps() allocates a fresh
+    // history buffer per instance) so its circular-buffer history stays
     // independent of I's, even though the tap coefficients themselves are
     // identical real values applied to both rails.
     this.lowpassQ.setTaps(taps)
     // 300Hz highpass, same fixed corner as the uSDX firmware's own
-    // filt_var stage — see this.highpass's own comment. transWidth equal
-    // to the cutoff itself, same 100%-relative reasoning as the lowpass
-    // above (a narrow transition here would need a very long kernel for
-    // essentially no audible benefit at this specific corner).
-    this.highpass.setTaps(highPassTaps(300, 300, sampleRateHz))
+    // filt_var stage. Built at the OUTPUT rate, since it runs on the final
+    // decimated audio — using a higher rate here would place its corner at
+    // a multiple of 300Hz, cutting straight through the FT8 audio band.
+    this.highpass.setTaps(highPassTaps(300, 300, this.outputRateHz))
     // Hilbert/delay pair only depends on sampleRateHz (see
     // estimateHilbertTapCount()'s own comment) — rebuilding them here
     // regardless of whether bw changed is harmless (this whole block
@@ -1399,9 +1624,13 @@ export class SSBDemodulator {
     // early-return above) and keeps this rebuild colocated with every
     // other sampleRateHz-dependent filter in this method rather than
     // needing its own separate dirty-check.
-    const hilbertTapCount = estimateHilbertTapCount(sampleRateHz)
+    // The Hilbert pair runs AFTER decimation too, so it is sized for the
+    // decimated rate — which shrinks its tap count as well as the number of
+    // samples it sees. This is where most of the saving comes from.
+    const hilbertTapCount = estimateHilbertTapCount(this.outputRateHz)
     this.hilbertDelay.setDelay((hilbertTapCount - 1) / 2)
     this.hilbertQ.setTaps(buildHilbertTaps(hilbertTapCount))
+    this.decimCounter = 0
   }
 
   setHighpassEnabled(enabled: boolean): void {
@@ -1427,36 +1656,78 @@ export class SSBDemodulator {
     let mixPhase = this.mixerPhase
     const sign = sideband ? 1 : -1
 
+    let outLen = 0
+    const hbI = this.halfbandsI
+    const hbQ = this.halfbandsQ
+    const stages = hbI.length
     for (let n = 0; n < pairCount; n++) {
       const i = iq[n * 2]
       const q = iq[n * 2 + 1]
 
-      // Stage 1: complex mixer (shift centerHz to 0Hz) then per-channel
-      // lowpass — complex multiply (i + jq) * (c + js) = (i*c - q*s) +
-      // j(i*s + q*c).
+      // Stage 1: complex mixer (shift centerHz to 0Hz) — complex multiply
+      // (i + jq) * (c + js) = (i*c - q*s) + j(i*s + q*c).
       const mc = Math.cos(mixPhase)
       const ms = Math.sin(mixPhase)
-      const mixedI = i * mc - q * ms
-      const mixedQ = i * ms + q * mc
+      let sI = i * mc - q * ms
+      let sQ = i * ms + q * mc
       mixPhase += mixAngStep
 
-      const filtI = this.lowpassI.processOne(mixedI)
-      const filtQ = this.lowpassQ.processOne(mixedQ)
+      // Stage A: halfband cascade. Each stage consumes two inputs to emit
+      // one output, so the whole chain short-circuits on most samples —
+      // this is why the wide side is cheap. `continue` here costs nothing
+      // downstream because nothing after it has consumed anything yet.
+      let alive = true
+      for (let s = 0; s < stages; s++) {
+        sI = hbI[s].push(sI)
+        sQ = hbQ[s].push(sQ)
+        if (!hbI[s].hasOutput) { alive = false; break }
+      }
+      if (!alive) continue
+
+      // Stage B: the sharp passband filter, at the decimated rate. Folded
+      // (symmetric taps) for half the multiplies — see
+      // FIRFilter.processOneSymmetric.
+      const filtI = this.lowpassI.processOneSymmetric(sI)
+      const filtQ = this.lowpassQ.processOneSymmetric(sQ)
+
+      // Any residual integer decimation the halfbands could not cover.
+      // decimCounter is an instance field, not a local, so the phase
+      // carries across calls: resetting it per call would drop or duplicate
+      // samples at every frame boundary.
+      if (++this.decimCounter < this.decimation) continue
+      this.decimCounter = 0
 
       // Stage 2: Hilbert-transform phasing combine — delayedI (via a pure
       // delay FIRFilter matching the Hilbert filter's own group delay) ±
       // Hilbert(Q), sign by sideband.
       const delayedI = this.hilbertDelay.processOne(filtI)
+      // NOT processOneSymmetric: the Hilbert kernel is ODD-symmetric
+      // (taps[k] = -taps[-k], see buildHilbertTaps), so folding by ADDING
+      // mirrored pairs cancels them to zero and destroys image rejection
+      // entirely — caught by the image-rejection tests, which dropped from
+      // >40dB to ~0dB. Folding an anti-symmetric kernel needs a SUBTRACT;
+      // not worth a second variant for one filter that is already only 3M
+      // MACs/s at the decimated rate.
       const hilbertQ = this.hilbertQ.processOne(filtQ)
       const combined = delayedI + sign * hilbertQ
-      out[n] = this.highpassEnabled ? this.highpass.processOne(combined) : combined
+      out[outLen++] = this.highpassEnabled ? this.highpass.processOneSymmetric(combined) : combined
     }
 
     // Wrap to keep phase from growing unbounded over a long-running session
     // (float precision would otherwise degrade after many hours).
     this.mixerPhase = mixPhase % (2 * Math.PI)
 
-    return out
+    // Exact length: pairCount/decimation, but the carried decimCounter means
+    // a given call can emit one more or one fewer than that, so return the
+    // real count rather than a computed one.
+    return out.subarray(0, outLen) as Float32Array<ArrayBuffer>
+  }
+
+  /** The rate `demodulate` actually emits at — capture rate divided by the
+   *  decimation factor. Callers must use this, not the capture rate, when
+   *  labelling an AudioBuffer or handing samples to a decoder. */
+  get outputSampleRateHz(): number {
+    return this.outputRateHz
   }
 }
 
@@ -1673,6 +1944,11 @@ export function useIQBridge() {
   function playDemodulatedFrame(iq: Float64Array, sampleRateHz: number) {
     if (!playCtx) return
     let floatSamples: Float32Array<ArrayBuffer> = demod.demodulate(iq, sideband, sampleRateHz)
+    // The demodulator DECIMATES (see DEMOD_TARGET_RATE_HZ), so its output is
+    // at demod.outputSampleRateHz, not the capture rate. Everything below —
+    // the AudioBuffer, and the analyser graph decoders read from — must be
+    // labelled with that or the audio plays (and decodes) at the wrong speed.
+    const audioRateHz = demod.outputSampleRateHz
     if (floatSamples.length === 0) return
     updateSignalMeter(floatSamples)
     if (agcEnabled) agc.process(floatSamples)
@@ -1689,7 +1965,7 @@ export function useIQBridge() {
       if (floatSamples.length === 0) return
     }
 
-    const buffer = playCtx.createBuffer(1, floatSamples.length, sampleRateHz)
+    const buffer = playCtx.createBuffer(1, floatSamples.length, audioRateHz)
     buffer.copyToChannel(floatSamples, 0)
 
     const source = playCtx.createBufferSource()
