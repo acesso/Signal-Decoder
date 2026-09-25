@@ -46,8 +46,8 @@ describe('SSBDemodulator', () => {
     }
     const out = demod.demodulate(makeComplexTone(toneRfHz, SAMPLE_RATE, 4800), true, SAMPLE_RATE)
 
-    const magAtAudioHz = goertzelMagnitude(out, audioHz, SAMPLE_RATE)
-    const magAtWrongHz = goertzelMagnitude(out, audioHz + 1000, SAMPLE_RATE)
+    const magAtAudioHz = goertzelMagnitude(out, audioHz, demod.outputSampleRateHz)
+    const magAtWrongHz = goertzelMagnitude(out, audioHz + 1000, demod.outputSampleRateHz)
     expect(magAtAudioHz).toBeGreaterThan(0.05)
     expect(magAtAudioHz).toBeGreaterThan(magAtWrongHz * 5)
   })
@@ -81,7 +81,7 @@ describe('SSBDemodulator', () => {
       // Both the wanted tone and its image demodulate to the SAME audio
       // frequency (|audioHz|) — rejection shows up as reduced AMPLITUDE at
       // that frequency when fed the image alone, not a different frequency.
-      return goertzelMagnitude(out.subarray(out.length - 8000), audioHz, SAMPLE_RATE)
+      return goertzelMagnitude(out.subarray(out.length - 8000), audioHz, demod.outputSampleRateHz)
     }
 
     const wantedMag = measureAt(wantedRfHz)
@@ -118,8 +118,8 @@ describe('SSBDemodulator', () => {
       demod.demodulate(makeComplexTone(6000 + audioHz, SAMPLE_RATE, 2400), true, SAMPLE_RATE)
     }
     const out = demod.demodulate(makeComplexTone(6000 + audioHz, SAMPLE_RATE, 4800), true, SAMPLE_RATE)
-    const mag = goertzelMagnitude(out, audioHz, SAMPLE_RATE)
-    const magAtWrongHz = goertzelMagnitude(out, audioHz + 1000, SAMPLE_RATE)
+    const mag = goertzelMagnitude(out, audioHz, demod.outputSampleRateHz)
+    const magAtWrongHz = goertzelMagnitude(out, audioHz + 1000, demod.outputSampleRateHz)
     expect(mag).toBeGreaterThan(0.05)
     expect(mag).toBeGreaterThan(magAtWrongHz * 5)
   })
@@ -150,13 +150,13 @@ describe('SSBDemodulator', () => {
       const demodWanted = demod
       for (let i = 0; i < 10; i++) demodWanted.demodulate(makeComplexTone(wantedHz, SAMPLE_RATE, 2400), usb, SAMPLE_RATE)
       const outWanted = demodWanted.demodulate(makeComplexTone(wantedHz, SAMPLE_RATE, sampleCount), usb, SAMPLE_RATE)
-      const magWanted = goertzelMagnitude(outWanted, audioHz, SAMPLE_RATE)
+      const magWanted = goertzelMagnitude(outWanted, audioHz, demod.outputSampleRateHz)
 
       const demodImage = new SSBDemodulator()
       demodImage.setPassband(centerHz, 2700, SAMPLE_RATE)
       for (let i = 0; i < 10; i++) demodImage.demodulate(makeComplexTone(imageHz, SAMPLE_RATE, 2400), usb, SAMPLE_RATE)
       const outImage = demodImage.demodulate(makeComplexTone(imageHz, SAMPLE_RATE, sampleCount), usb, SAMPLE_RATE)
-      const magImage = goertzelMagnitude(outImage, audioHz, SAMPLE_RATE)
+      const magImage = goertzelMagnitude(outImage, audioHz, demod.outputSampleRateHz)
 
       expect(magWanted).toBeGreaterThan(0.3)
       expect(magWanted).toBeGreaterThan(magImage * 5)
@@ -188,21 +188,34 @@ describe('SSBDemodulator', () => {
     const chunked = new SSBDemodulator()
     chunked.setPassband(centerHz, 2700, SAMPLE_RATE)
     const chunkSize = 137 // deliberately not a divisor of sampleCount or of any filter length
-    const chunkedOut = new Float32Array(sampleCount)
-    let offset = 0
-    while (offset < sampleCount) {
-      const n = Math.min(chunkSize, sampleCount - offset)
-      const chunk = fullTone.subarray(offset * 2, (offset + n) * 2)
+    // Output is DECIMATED, so a chunk of n input pairs yields about
+    // n/decimation samples — and "about", not exactly, because the
+    // decimation phase carries across calls (which is precisely the
+    // streaming behaviour this test exists to pin). Track the output cursor
+    // separately from the input cursor rather than assuming they advance
+    // together.
+    const chunkedOut = new Float32Array(wholeOut.length)
+    let inOffset = 0
+    let outOffset = 0
+    while (inOffset < sampleCount) {
+      const n = Math.min(chunkSize, sampleCount - inOffset)
+      const chunk = fullTone.subarray(inOffset * 2, (inOffset + n) * 2)
       const out = chunked.demodulate(chunk, true, SAMPLE_RATE)
-      chunkedOut.set(out, offset)
-      offset += n
+      chunkedOut.set(out.subarray(0, Math.min(out.length, chunkedOut.length - outOffset)), outOffset)
+      outOffset += out.length
+      inOffset += n
     }
+
+    // The two paths must emit the SAME NUMBER of samples — a decimation
+    // phase that reset per call would drop or duplicate one at every chunk
+    // boundary, which is the specific regression this guards.
+    expect(outOffset).toBe(wholeOut.length)
 
     // Skip the first ~2 filter lengths (mixer/lowpass/Hilbert group delay +
     // settling) — only the STEADY-STATE streaming behavior needs to match
     // exactly, not the transient while filters are still filling.
     let maxDiff = 0
-    for (let i = 1000; i < sampleCount; i++) {
+    for (let i = 1000; i < wholeOut.length; i++) {
       maxDiff = Math.max(maxDiff, Math.abs(wholeOut[i] - chunkedOut[i]))
     }
     // 1e-6, not tighter — demodulate() returns Float32Array, so both paths
@@ -227,14 +240,14 @@ describe('SSBDemodulator', () => {
     withHighpass.setHighpassEnabled(true)
     for (let i = 0; i < 10; i++) withHighpass.demodulate(makeComplexTone(centerHz + lowAudioHz, SAMPLE_RATE, 2400), true, SAMPLE_RATE)
     const outWithHighpass = withHighpass.demodulate(makeComplexTone(centerHz + lowAudioHz, SAMPLE_RATE, sampleCount), true, SAMPLE_RATE)
-    const magWithHighpass = goertzelMagnitude(outWithHighpass, lowAudioHz, SAMPLE_RATE)
+    const magWithHighpass = goertzelMagnitude(outWithHighpass, lowAudioHz, withHighpass.outputSampleRateHz)
 
     const withoutHighpass = new SSBDemodulator()
     withoutHighpass.setPassband(centerHz, 2700, SAMPLE_RATE)
     withoutHighpass.setHighpassEnabled(false)
     for (let i = 0; i < 10; i++) withoutHighpass.demodulate(makeComplexTone(centerHz + lowAudioHz, SAMPLE_RATE, 2400), true, SAMPLE_RATE)
     const outWithoutHighpass = withoutHighpass.demodulate(makeComplexTone(centerHz + lowAudioHz, SAMPLE_RATE, sampleCount), true, SAMPLE_RATE)
-    const magWithoutHighpass = goertzelMagnitude(outWithoutHighpass, lowAudioHz, SAMPLE_RATE)
+    const magWithoutHighpass = goertzelMagnitude(outWithoutHighpass, lowAudioHz, withoutHighpass.outputSampleRateHz)
 
     expect(magWithoutHighpass).toBeGreaterThan(0.3)
     expect(magWithHighpass).toBeLessThan(magWithoutHighpass * 0.3)

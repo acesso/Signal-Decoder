@@ -12,6 +12,28 @@ them into a version section when cutting a release.
 
 ## [Unreleased]
 
+## [0.20.0] - 2026-09-24
+
+### Changed
+
+- **I/Q demodulation is now 7–20× cheaper**, which is what makes decoding in one tab while another decodes alongside it practical. Profiling found the SSB demodulator consuming ~51% of a CPU core in real time at a 48 kHz capture, all of it on the main thread competing with decode and rendering; the spectrum FFT was ~1% and the mixer's per-sample trig ~0.1%, so essentially the entire cost was one wide FIR filter.
+
+  Two changes address it. The demodulator now **decimates to 12 kHz** — the FT8/FT4 decoder resamples everything to that rate before decoding anyway, so running long filters at the capture rate was pure waste. And the single wide lowpass is replaced by a **cascade of halfband decimators** feeding one sharp passband filter at the low rate, exploiting polyphase evaluation (only computing outputs that are kept), halfband zero taps, and symmetric-tap folding.
+
+  Measured on the same synthetic I/Q, with the test tone recovered at exactly the right frequency and adjacent bins at zero in every case:
+
+  | capture rate | before | after |
+  |---|---|---|
+  | 48 kHz | 50.6% of a core | **7.0%** |
+  | 96 kHz | ~200% | **9.7%** |
+  | 192 kHz | — | **11.4%** |
+  | 392 kHz | ~3893M MACs/s (infeasible) | **18.3%** |
+
+  The old design scaled quadratically with capture rate (tap count grew with the rate *and* the filter ran once per input sample). It now scales roughly logarithmically: 8× the capture rate costs 2.6×, not 67×. A 392 kHz capture is now cheaper than 48 kHz was before this work, which matters for wider bandwidths on future hardware.
+
+### Added
+
+- `doc/IQ_CPU_DESIGN_NOTE.md` — records the remaining restructure (cut the passband out of the wideband stream before any heavy DSP, since only the graphs need the full band and they only need cheap FFT magnitudes), and the still-open question of moving the demodulator off the main thread.
 ## [0.19.4] - 2026-09-24
 
 ### Fixed
