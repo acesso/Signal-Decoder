@@ -1,0 +1,13 @@
+{
+  "name": "pskreporter-proxy-worker",
+  "private": true,
+  "description": "Relays Signal-Decoder's PSK Reporter spots over TCP, which a browser cannot open itself.",
+  "scripts": {
+    "check": "wrangler deploy --dry-run",
+    "deploy": "wrangler deploy",
+    "tail": "wrangler tail"
+  },
+  "devDependencies": {
+    "wrangler": "^4.42.0"
+  }
+}

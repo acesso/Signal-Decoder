@@ -1,3 +1,10 @@
+// jsdom omits the TextEncoder/TextDecoder globals that browsers provide, so any
+// module that encodes bytes (e.g. src/lib/ft/pskreporter/ipfix.ts) cannot even
+// be imported under test. Borrow Node's, without shadowing a real global.
+const { TextEncoder, TextDecoder } = require('node:util')
+if (typeof global.TextEncoder === 'undefined') global.TextEncoder = TextEncoder
+if (typeof global.TextDecoder === 'undefined') global.TextDecoder = TextDecoder
+
 // Mock Web Audio API
 global.AudioContext = jest.fn().mockImplementation(() => ({
   createAnalyser: jest.fn().mockReturnValue({

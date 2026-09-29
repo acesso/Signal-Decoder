@@ -54,6 +54,9 @@ jobs:
           # git, not out of the browser. Restrict it by referrer on CARTO's
           # side. Unset in forks; the map then shows watermarked tiles.
           VITE_CARTO_API_KEY: ${{ secrets.CARTO_API_KEY }}
+          # Optional override for the PSK Reporter relay, which is otherwise
+          # hard-coded. Leave the secret unset to use the default Worker.
+          VITE_PSKREPORTER_PROXY_URL: ${{ secrets.PSKREPORTER_PROXY_URL }}
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
         with:

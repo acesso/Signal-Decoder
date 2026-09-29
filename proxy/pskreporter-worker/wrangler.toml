@@ -1,0 +1,22 @@
+# Deployed as https://pskreporter.signal-decoder.workers.dev
+# The hostname is <name>.<your workers.dev subdomain>, so renaming this worker
+# changes the URL the app posts to (src/lib/ft/pskreporter/usePskReporter.ts).
+name = "pskreporter"
+main = "src/index.ts"
+compatibility_date = "2026-09-01"
+
+[observability]
+enabled = true
+
+# Coarse abuse guard only: the binding's period can be 10s or 60s, and the
+# pacing the protocol actually asks for is enforced in the browser, in
+# src/lib/ft/pskreporter/spotQueue.ts. Keyed on the receiver callsign parsed out
+# of the packet, so one misbehaving reporter cannot drown the rest.
+#
+# The headroom is for per-window cadence: an FT4 decoder uploading as each
+# window closes sends 8 packets a minute, FT8 sends 4, and a failed send may
+# retry on top of that.
+[[ratelimits]]
+name = "PSK_RATE_LIMIT"
+namespace_id = "1001"
+simple = { limit = 12, period = 60 }
