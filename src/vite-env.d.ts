@@ -13,6 +13,11 @@ interface ImportMetaEnv {
   // where the map falls back to watermarked tiles. See FTLeafletMap.tsx's
   // cartoTileUrl() for why this is NOT a secret once published.
   readonly VITE_CARTO_API_KEY?: string
+  // Overrides the hard-coded PSK Reporter relay in
+  // src/lib/ft/pskreporter/usePskReporter.ts — for pointing a build at a
+  // different Worker while testing. Normally unset; the default relay is a
+  // public endpoint, not a secret.
+  readonly VITE_PSKREPORTER_PROXY_URL?: string
 }
 
 interface ImportMeta {

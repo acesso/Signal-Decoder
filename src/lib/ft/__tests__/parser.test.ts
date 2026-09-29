@@ -6,6 +6,7 @@ import {
 } from '../parser';
 import { encodeFT8 } from '@e04/ft8ts';
 import { callsignCountry } from '../prefixes';
+import { DecodeGate } from '../gate';
 
 describe('parseFTMsg', () => {
   it('parses CQ with grid', () => {
@@ -697,5 +698,53 @@ describe('buildFTMessage — hashed exchange for nonstandard calls', () => {
     // — it does NOT throw. This is why the hashed forms above exist and why
     // the transmit panel refuses to enqueue this shape.
     expect(() => encodeFT8('YS3/PY8WW PU7FTW HI22', { sampleRate: 12000, baseFrequency: 1500 })).not.toThrow();
+  });
+});
+
+describe('mergeContacts admitted decodes', () => {
+  const t0 = new Date('2026-06-12T12:00:00Z');
+  const t1 = new Date('2026-06-12T12:00:15Z');
+  const msg = (m: string, osd?: number) => ({ msg: m, freq: 14074500, snr: -12, osd });
+
+  it('lists the transmitting station, not the one being addressed', () => {
+    // PSK Reporter wants stations actually heard. The callee is only mentioned
+    // by someone else and may be nowhere near the receiver.
+    const { admitted } = mergeContacts(new Map(), t0, [msg('K1ABC W9XYZ FN42')]);
+    expect(admitted.map(a => a.callsign)).toEqual(['W9XYZ']);
+  });
+
+  it('carries the grid, frequency, SNR and window of the decode', () => {
+    const { admitted } = mergeContacts(new Map(), t0, [msg('CQ PU7FTW HI72')]);
+    expect(admitted).toEqual([
+      { callsign: 'PU7FTW', grid: 'HI72', windowStart: t0, freq: 14074500, snr: -12 },
+    ]);
+  });
+
+  it('omits garbled decodes', () => {
+    const { admitted } = mergeContacts(new Map(), t0, [msg('K1ABC GARBAGE1X ##')]);
+    expect(admitted).toEqual([]);
+  });
+
+  it('omits a callsign the gate is holding', () => {
+    // A never-heard callsign arriving only via an OSD decode is quarantined,
+    // and quarantined decodes must never reach a public reporting network.
+    const gate = new DecodeGate();
+    const { admitted } = mergeContacts(new Map(), t0, [msg('CQ PU7FTW HI72', 2)], gate);
+    expect(admitted).toEqual([]);
+  });
+
+  it('lists it once a clean decode releases it', () => {
+    const gate = new DecodeGate();
+    const held = mergeContacts(new Map(), t0, [msg('CQ PU7FTW HI72', 2)], gate);
+    const released = mergeContacts(held.contacts, t1, [msg('CQ PU7FTW HI72')], gate);
+    expect(released.admitted.map(a => a.callsign)).toContain('PU7FTW');
+  });
+
+  it('reports one entry per decode, so repeats within a window are visible', () => {
+    const { admitted } = mergeContacts(new Map(), t0, [
+      msg('CQ PU7FTW HI72'),
+      msg('CQ K1ABC FN42'),
+    ]);
+    expect(admitted.map(a => a.callsign)).toEqual(['PU7FTW', 'K1ABC']);
   });
 });

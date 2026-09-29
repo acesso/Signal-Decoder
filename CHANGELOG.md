@@ -12,6 +12,14 @@ them into a version section when cutting a release.
 
 ## [Unreleased]
 
+## [0.22.0] - 2026-09-29
+
+### Added
+
+- **PSK Reporter spotting.** Decodes that clear the confidence gate can now be uploaded to [pskreporter.info](https://pskreporter.info), off by default and inert until a callsign and grid are set. Only the transmitting station is reported, only on FT8 and FT4, only when a radio has supplied a real dial frequency — a spot on the wrong band is worse than no spot — and each station at most once per five minutes, as the protocol asks. Sends are jittered rather than aligned to the clock so reporters do not all fire on the same boundary.
+- Reporting cadence is selectable: every N minutes (default 5, what the protocol recommends) or as each decode window finishes, which gets new stations onto the map within seconds. Either way a station is still reported at most once per five minutes. Window-triggered uploads are scattered over a few seconds because FT windows are UTC-aligned and would otherwise have every decoder uploading on the same instant.
+- PSK Reporter ingests IPFIX over UDP, which no browser can send and which Cloudflare Workers cannot send either — `connect()` is TCP-only. The collector turns out to accept the same messages over TCP, so uploads go through a small Worker (`proxy/pskreporter-worker/`) that checks the request origin and validates the packet before relaying it, which keeps it from being usable as a reflector. The relay URL is hard-coded, so a fork gets working reporting without configuring anything; `VITE_PSKREPORTER_PROXY_URL` overrides it for testing against another relay.
+
 ## [0.21.1] - 2026-09-25
 
 ### Fixed

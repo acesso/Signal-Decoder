@@ -295,6 +295,74 @@ Callsigns are extracted from decoded messages and tracked as contacts with full 
 - **Sorting**: By last activity, TX count, or callsign — click the active sort again to reverse
 - **ADIF export**: Download the QSO log as a standard `.adi` file for import into any logger. QSOs are captured into a persistent log the moment they are decoded, so they survive contact-list rotation and page reloads; the Clear button empties both the contacts and this log
 
+## PSK Reporter Spotting
+
+Optionally uploads decodes to [pskreporter.info](https://pskreporter.info), the
+propagation-reporting network WSJT-X and friends feed. Off by default; nothing
+leaves the browser until you switch it on in the **PSK Reporter** panel and set a
+callsign and grid (the same ones the transmit panel uses).
+
+### What gets reported
+
+Only decodes that cleared the [confidence gate](#decode-confidence-gate) — a
+clean parse, an ITU-valid callsign, no OSD quarantine, no geographically
+implausible grid. OSD "best guess" decodes are false-positive-prone by design,
+and a busted callsign on PSK Reporter is everyone's problem, not just yours. On
+top of that:
+
+- **Only the transmitting station.** The station being *addressed* in a message
+  was not necessarily heard here.
+- **Only FT8 and FT4.** FT2 is this app's own experiment and PSK Reporter has no
+  name for it, so those decodes are never reported rather than mislabelled.
+- **Only with a real frequency.** Decodes carry a bare audio offset until a radio
+  reports its dial frequency over CAT. Reporting a spot on the wrong band is
+  worse than reporting nothing, so without a connected radio the panel says it is
+  waiting for one and uploads nothing.
+- **Each station at most once per five minutes**, which is what the protocol asks
+  for. This holds whichever upload cadence is selected.
+
+Callsign and grid come from the Transmit panel (`ft_mycall` / `ft_mygrid`) and are
+shown read-only here, so the two panels cannot disagree about who you are.
+
+### Upload cadence
+
+Two options, both keeping the once-per-station-per-five-minutes rule:
+
+- **Every N minutes** (default 5, the protocol's own recommendation). Spots
+  accumulate and go out in one packet.
+- **As each decode window finishes.** New stations reach the map within seconds
+  instead of minutes, at the cost of many more, much smaller packets. FT windows
+  are UTC-aligned, so sends are scattered over a few seconds — without that,
+  every decoder running this way would upload on the same instant, which is
+  exactly the lockstep the protocol warns against.
+
+### Why there is a proxy
+
+PSK Reporter ingests reports as IPFIX (RFC 7011) datagrams over **UDP**, which a
+browser cannot send. A Cloudflare Worker cannot either — `connect()` in
+`cloudflare:sockets` is TCP-only. What makes this work is that the collector also
+accepts the same IPFIX messages over **TCP** on port 4739, so a Worker can relay
+them.
+
+The browser builds the packet (`src/lib/ft/pskreporter/ipfix.ts`) and POSTs the
+bytes to the Worker (`proxy/pskreporter-worker/`), which checks `Origin` and
+`Referer`, validates that the body really is a PSK Reporter message — so it
+cannot be used as a reflector — and opens the TCP socket.
+
+The relay URL is hard-coded, so forks get working reporting without configuring
+anything; it is a public endpoint that accepts packets from this app's origin and
+nothing else, not a secret. Deploy instructions are in that directory's README.
+Set `VITE_PSKREPORTER_PROXY_URL` only to point a build at a different relay.
+
+To check the encoder against PSK Reporter itself without sending live spots:
+
+```bash
+npm run test:pskreporter          # sends to the test listener on port 14739
+```
+
+That listener parses the packet and publishes what it saw at
+<https://report.pskreporter.info/cgi-bin/psk-analysis.pl>.
+
 ## Audio Ring Buffer (Rec)
 
 A global retroactive audio recorder: while decoding runs, ring buffers

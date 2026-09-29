@@ -384,6 +384,26 @@ export interface MergeStats {
   gridRejected: number;
 }
 
+/**
+ * A decode that was admitted — the transmitting station parsed cleanly and
+ * cleared the gate. This is the only set of decodes trustworthy enough to
+ * report onward to a public network (see src/lib/ft/pskreporter/), which is
+ * why the aggregate counts in MergeStats are not enough on their own.
+ *
+ * Only the CALLER is listed: it is the station actually heard. The callee is
+ * merely addressed by someone else and may be nowhere near the receiver.
+ */
+export interface AdmittedDecode {
+  /** The station heard transmitting (ParsedFTMsg.caller). */
+  callsign: string;
+  /** Its locator, only when present and geographically plausible. */
+  grid?: string;
+  windowStart: Date;
+  /** As supplied in MergeMsgIn — absolute RF Hz when the caller resolved one. */
+  freq: number;
+  snr: number;
+}
+
 // Is this lat/lon plausible for the country of this callsign's ITU prefix?
 // Compound/portable calls (PJ4/K1ABC) are exempt — operating away from the
 // home country is their whole point. Unknown prefix/table gaps fail open.
@@ -398,9 +418,10 @@ export function mergeContacts(
   windowStart: Date,
   messages: MergeMsgIn[],
   gate?: DecodeGate,
-): { contacts: Map<string, Contact>; stats: MergeStats } {
+): { contacts: Map<string, Contact>; stats: MergeStats; admitted: AdmittedDecode[] } {
   const contacts = new Map(existing);
   const stats: MergeStats = { newContacts: 0, held: 0, released: 0, expired: 0, gridRejected: 0 };
+  const admitted: AdmittedDecode[] = [];
   stats.expired = gate?.beginWindow(windowStart).length ?? 0;
 
   const getOrCreate = (callsign: string, when: Date): Contact => {
@@ -502,6 +523,16 @@ export function mergeContacts(
         } else if (parsed.grid && !gridOk) {
           stats.gridRejected++;
         }
+
+        // Recorded after the grid checks so a rejected locator is not passed on.
+        // Released replays land here too, at their original window time.
+        admitted.push({
+          callsign: parsed.caller,
+          grid: parsed.grid && gridOk ? parsed.grid : undefined,
+          windowStart: when,
+          freq,
+          snr,
+        });
         // Remember what the station CQs for (DX, POTA, …) — feeds the
         // contacts panel's directed-CQ filter chips.
         if (parsed.type === 'cq' && parsed.cqTag) {
@@ -558,7 +589,7 @@ export function mergeContacts(
     }
   }
 
-  return { contacts, stats };
+  return { contacts, stats, admitted };
 }
 
 export const MSG_TYPE_LABEL: Record<MsgType, string> = {

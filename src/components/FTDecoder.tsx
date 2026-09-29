@@ -21,6 +21,8 @@ import { qsoLogUpsert, qsoLogClear } from '$decoder-lib/ft/qsoLog'
 import { DecodeGate } from '$decoder-lib/ft/gate'
 import FTContactsPanel from './FTContactsPanel'
 import FTWasmPanel from './FTWasmPanel'
+import PskReporterPanel from './PskReporterPanel'
+import { createPskReporter } from '$decoder-lib/ft/pskreporter/usePskReporter'
 import VirtualList from './VirtualList'
 import { loadNumberArray, saveNumberArray, loadBoolean, saveBoolean, loadNumber, saveNumber } from '$decoder-lib/storage'
 import type { AudioBridge } from '$decoder-lib/cat/useAudioBridge'
@@ -510,8 +512,18 @@ export default function FTDecoder(props: Props): JSX.Element {
   const frozenVfo = new Map<number, number>()
   // Messages already merged into contacts, per window (windowStart ms -> count).
   const mergedCount = new Map<number, number>()
+  // Windows whose decode has finished and been handed to the reporter, so a
+  // window is not announced twice as partials keep arriving.
+  const reportedWindows = new Set<number>()
   // Admission gate for suspicious new callsigns — lives for the session.
   const gate = new DecodeGate()
+
+  // Uploads gate-admitted decodes to PSK Reporter. Inert until the operator
+  // switches it on, and it never sees a decode the gate held back.
+  const reporter = createPskReporter({
+    myCall: () => props.myCall,
+    myGrid: () => props.myGrid,
+  })
 
   const [windowStats, setWindowStats] = createSignal<Map<number, MergeStats>>(new Map())
 
@@ -536,6 +548,7 @@ export default function FTDecoder(props: Props): JSX.Element {
       prevResultLen = 0
       frozenVfo.clear()
       mergedCount.clear()
+      reportedWindows.clear()
       contactsAuth = new Map()
       gate.reset()
       setWindowStats((prev) => (prev.size ? new Map() : prev))
@@ -560,6 +573,7 @@ export default function FTDecoder(props: Props): JSX.Element {
       const live = new Set(results.map((r) => r.windowStart.getTime()))
       for (const k of frozenVfo.keys()) if (!live.has(k)) frozenVfo.delete(k)
       for (const k of mergedCount.keys()) if (!live.has(k)) mergedCount.delete(k)
+      for (const k of reportedWindows) if (!live.has(k)) reportedWindows.delete(k)
     }
 
     let next = contactsAuth
@@ -571,6 +585,13 @@ export default function FTDecoder(props: Props): JSX.Element {
       const key = r.windowStart.getTime()
       if (!frozenVfo.has(key)) frozenVfo.set(key, currentVfo)
       const vfo = frozenVfo.get(key)!
+      // A finished window is announced once, whether or not this pass found
+      // anything new in it — the reporter uses it purely as a send trigger.
+      if (!r.decoding && !reportedWindows.has(key)) {
+        reportedWindows.add(key)
+        reporter.notifyWindowComplete()
+      }
+
       const merged = mergedCount.get(key) ?? 0
       if (r.messages.length <= merged) continue
 
@@ -578,8 +599,11 @@ export default function FTDecoder(props: Props): JSX.Element {
         ...msg,
         freq: vfo > 0 ? vfo + msg.freq : msg.freq,
       }))
-      const { contacts: mergedContacts, stats } = mergeContacts(next, r.windowStart, freshMsgs, gate)
+      const { contacts: mergedContacts, stats, admitted } = mergeContacts(next, r.windowStart, freshMsgs, gate)
       next = mergedContacts
+      // r.mode, not props.ftMode: a window decoded before a mode switch must
+      // be reported as what it actually was.
+      reporter.report(admitted, r.mode)
       statDeltas.set(key, stats)
       mergedCount.set(key, r.messages.length)
       changed = true
@@ -1172,6 +1196,14 @@ export default function FTDecoder(props: Props): JSX.Element {
           />
         </div>
       </div>
+
+      {/* PSK Reporter */}
+      <PskReporterPanel
+        reporter={reporter}
+        myCall={props.myCall ?? ''}
+        myGrid={props.myGrid ?? ''}
+        mode={props.ftMode}
+      />
 
       {/* How to Use */}
       <details class="rounded-lg border border-[#30363d] bg-[#161b22]">
