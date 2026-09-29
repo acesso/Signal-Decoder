@@ -12,6 +12,29 @@ them into a version section when cutting a release.
 
 ## [Unreleased]
 
+## [0.23.0] - 2026-09-29
+
+### Added
+
+- **RTTY can transmit through the ESP32 bridge.** Previously only FT8/FT4 could; RTTY played to the computer's speakers, which in I/Q mode means the radio never hears it at all. Messages are now staged: type, click to upload into one of the bridge's four TX slots, then click a staged message to transmit it. The upload is a deliberate, visible step and the transmission is a separate act on a buffer already proven to be on the device — what contest and remote operation want. Transmitting keys PTT exactly as FT8 does, reusing the same pre-key/post-key holds so an external amplifier's timing is configured once rather than per mode.
+- The bridge's slot pool is now **shared across modes**. An operator can stage a RTTY exchange, switch to FT8, and still find it there. Each slot's owning mode is recorded in the 32-byte label the device already stores, so a reloaded page — or a different browser — can say whose audio a slot holds, with no firmware change. Allocation is first-free; a full pool is shown plainly rather than treated as an error. Only a mode's own slots are sendable from its panel.
+- **Per-decoder squelch for RTTY.** Each session already measured its own mark/space band, but shared a single threshold, so a setting that suited a loud local station muted a weak one in the next card. Each session now carries its own, set from a slider on the session card or by dragging the squelch line on the spectrum, which edits whichever session is active.
+- **A Clone button on each RTTY session card**, copying that decoder's settings — shift, baud, parity, sideband, squelch — into a new one, so a second signal can be chased from a known-good starting point. Decoded text is deliberately not copied: the clone never received that audio.
+- RTTY carrier shifts are now one shared list including 150 Hz, used by both the transmit composer and the decoder's quick-add, rather than two lists that had drifted apart.
+
+### Fixed
+
+- **PSK Reporter now reports from the published app.** It worked in development and silently never sent in production: GitHub Actions substitutes an unset secret as an empty string, and `??` only falls back on null/undefined, so the relay URL came out empty and the app reported itself blocked. The workflow already documented "leave the secret unset to use the default Worker"; the code now honours that.
+- **The spectrum's frequency ruler repeated its labels** — a 3 kHz view at 7.069 MHz showed "7.071" three times. Ticks were chosen on round *audio* offsets and then labelled as absolute frequency to kHz precision, so four consecutive ticks rounded to the same string. Ticks now land on round absolute frequencies, preferring whole-kHz steps so labels read like the radio's own display, with one prominent mark at the midpoint between labels and finer quarter marks below it.
+- **The zoom preset chips were near-impossible to click on the raw I/Q tap** — they blinked on hover and never took the click. The I/Q state object is replaced many times a second by the signal meter, so anything derived from it rebuilt at frame rate, recreating each chip button; a button replaced under the pointer loses hover and never receives the click.
+- **Zoom presets are centred on the carrier in raw I/Q view.** That spectrum runs either side of the dial, so a 24k preset selected [0, 24000] and discarded the entire lower half. A preset now names a width and is placed according to the source: centred when the source is bipolar, anchored at zero for decoded audio.
+- RTTY's one-shot transmit and live keying now respect the selected output sink at the hook level rather than relying on the UI to disable them, so neither can send audio to the local speakers while the operator believes it is going to the radio.
+- The bridge is now told to stop playing when transmission is stopped. It plays from its own memory, so a browser-side stop was only half a stop: PTT dropped while the device transmitted to the end of the buffer. This affected FT8 as well.
+
+### Changed
+
+- Live keying is unavailable when RTTY output is set to the bridge, and says so rather than being silently disabled. A slot holds a complete message uploaded before playback begins, so there is nothing to stage until the message is finished; per-character uploads would need a round-trip inside each 165 ms character period at 45.45 baud.
+
 ## [0.22.0] - 2026-09-29
 
 ### Added

@@ -1372,6 +1372,7 @@ function App(): JSX.Element {
                   vfoFrequency={vfoFrequency()}
                   onSetPTT={cat.state().connected ? cat.setPTT : undefined}
                   onStatusChange={setRttyTxStatus}
+                  bridgeWsUrl={bridgeWsUrl()}
                 />
               </div>
             </details>

@@ -27,6 +27,18 @@ const BAUDOT_SUBSTITUTIONS: Record<string, string> = {
   '—': '-', '–': '-', '\t': ' ',
 };
 
+/** Carrier shifts offered anywhere RTTY is configured — the TX composer and
+ *  the decoder's quick-add both read this one list, so a shift added here
+ *  shows up in every step rather than in whichever panel remembered it.
+ *
+ *  170Hz is the near-universal amateur standard; 425/450/850 cover common
+ *  commercial/military gear; 150Hz appears in some older and narrow-shift
+ *  work. Checked against the decoder's own filter sizing
+ *  (max(baud*0.6, min(shift/3, baud*4))): 150Hz gives a 50.0Hz cutoff at
+ *  45.45 baud, the same regime as 170Hz's 56.7Hz, so nothing downstream
+ *  needs to change to accept it. */
+export const CARRIER_SHIFTS = [150, 170, 200, 425, 450, 850] as const;
+
 export interface EncodeCharsResult {
   /** 5-bit Baudot code points in transmission order, including any LTRS/FIGS
    *  shift codes needed to reach each character. */

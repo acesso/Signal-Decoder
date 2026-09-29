@@ -7,7 +7,7 @@
 // useIQBridge.ts's setPassband()). Retires IQSpectrumPanel.tsx, whose
 // job (an I/Q-aware GLSpectrogram view) this component now covers with a
 // real marker/bandwidth system instead of that panel's plain zoom slider.
-import { createEffect, createMemo, createSignal, For, onCleanup, onMount, Show, type JSX } from 'solid-js'
+import { createEffect, createMemo, createSignal, For, Index, onCleanup, onMount, Show, type JSX } from 'solid-js'
 import GLSpectrogram, { TEX_H, type GLSpectrogramHandle, type SpectroBand } from './GLSpectrogram'
 import GLSpectrum, { type GLSpectrumHandle } from './GLSpectrum'
 import { createFpsBadge } from './FpsBadge'
@@ -102,6 +102,42 @@ export class IQSpectrumSourceAdapter implements SpectrumSource {
   }
 }
 
+const fmtKhz = (hz: number) => `${(hz / 1000).toFixed(hz % 1000 === 0 ? 0 : 1)}k`
+
+export interface ZoomPreset {
+  lo: number
+  hi: number
+  label: string
+}
+
+/** Places each fixed zoom width within a source's span — see zoomPresets'
+ *  own comment in the component for the full reasoning. Centred on 0 for a
+ *  bipolar (raw I/Q) source, anchored at the low edge otherwise. Pure and
+ *  exported so the placement is testable without a live spectrum source. */
+export function computeZoomPresets(srcLo: number, srcHi: number): ZoomPreset[] {
+  const fullWidth = srcHi - srcLo
+  if (fullWidth <= 0) return []
+  const bipolar = srcLo < 0
+
+  const place = (width: number): { lo: number; hi: number } =>
+    bipolar
+      ? { lo: Math.max(srcLo, -width / 2), hi: Math.min(srcHi, width / 2) }
+      : { lo: srcLo, hi: Math.min(srcHi, srcLo + width) }
+
+  const fixed = [1000, 2000, 3000, 6000]
+    .filter(width => width < fullWidth)
+    .map(width => ({ ...place(width), label: fmtKhz(width) }))
+
+  // The dynamic "full span" chip, unless a fixed preset already covers
+  // exactly that width (e.g. a 3000Hz-wide source would otherwise show a
+  // redundant "3k" twice).
+  const dynamic = fixed.some(f => f.hi - f.lo === fullWidth)
+    ? []
+    : [{ lo: srcLo, hi: srcHi, label: `${fmtKhz(fullWidth)} (full)` }]
+
+  return [...fixed, ...dynamic]
+}
+
 // Both views render on the GPU (GLSpectrogram); the old CPU 2D-canvas
 // pipeline survives only as an automatic fallback when WebGL init fails.
 // A previously-stored 'legacy' value fails validation in loadString and
@@ -143,36 +179,113 @@ function niceTicks(span: number): { maj: number; min: number } {
   return { maj: majStep, min: majStep / 5 }
 }
 
-interface FreqTick {
+// Tick steps for the ABSOLUTE-frequency ruler, in Hz. Strictly decimal
+// (1/2/5 x 10^n) so labels land on round values the way a dial reads —
+// 7.070, 7.071, 7.072 — rather than on round AUDIO offsets. The latter is
+// what produced "7.071" three times in a row: ticks were chosen at 250Hz
+// spacing in audio Hz and then labelled to kHz precision, so four
+// consecutive ticks rounded to the same label.
+//
+// WHOLE-kHz steps are strongly preferred, searching from 1kHz upward, so a
+// label needs only 3 decimals and reads like the radio's own display. Only
+// a span too narrow for any kHz step to give at least two majors falls back
+// to sub-kHz steps (and the extra decimal that then needs).
+//
+// Minor ticks HALVE the major, putting exactly ONE mark between labels, at
+// the midpoint. Subdividing by 5 (the conventional choice) leaves four
+// marks between 7.663 and 7.664, each worth 200Hz — which turns reading a
+// frequency off the ruler into counting ticks and multiplying. One mark
+// needs no counting at all: it is simply the half.
+function niceAbsTicks(span: number): { maj: number; min: number } {
+  const decades = [1, 2, 5]
+  const search = (fromExp: number, toExp: number): { maj: number; min: number } | null => {
+    for (let exp = fromExp; exp <= toExp; exp++) {
+      for (const d of decades) {
+        const step = d * Math.pow(10, exp)
+        if (span / step <= 8) return { maj: step, min: step / 2 }
+      }
+    }
+    return null
+  }
+  const khz = search(3, 7) ?? { maj: 1e7, min: 5e6 }
+  // Fewer than two majors means the kHz grid is too coarse to read against
+  // — a 500Hz-wide view would show one lonely label or none at all.
+  if (span / khz.maj >= 2) return khz
+  return search(1, 2) ?? khz
+}
+
+export type FreqTickKind =
+  /** Labelled. */
+  | 'maj'
+  /** The midpoint between two labels — one per interval, no counting. */
+  | 'mid'
+  /** Quarter marks, for judging a position within the half at a glance.
+   *  Deliberately faint: they are texture, not something to count. */
+  | 'sub'
+
+export interface FreqTick {
   x: number // 0..1 fraction across the span
   isMaj: boolean
+  kind: FreqTickKind
   label: string | null
 }
 
 // Pure tick geometry, shared by the canvas grid-line pass and the HTML ruler
 // rendered outside the plot box (see FreqRuler below).
-function computeTicks(minF: number, maxF: number, vfoHz = 0): FreqTick[] {
+export function computeTicks(minF: number, maxF: number, vfoHz = 0): FreqTick[] {
   const span = maxF - minF
   if (span <= 0) return []
-  const { maj, min } = niceTicks(span)
   const out: FreqTick[] = []
+
+  // With a VFO, the ruler reads ABSOLUTE frequency, so ticks must land on
+  // round absolute values — anchored to the VFO-offset grid, not to round
+  // audio offsets. Otherwise a 250Hz audio step labelled to kHz precision
+  // repeats the same label four times over (see niceAbsTicks).
+  if (vfoHz > 0) {
+    const { maj, min } = niceAbsTicks(span)
+    // Label precision follows the step, so two adjacent majors can never
+    // render as the same string: whole-kHz steps read as 7.070, and the
+    // narrow-span fallback below 1kHz takes the decimals it needs.
+    const decimals = maj >= 1000 ? 3 : maj >= 100 ? 4 : 5
+    const absMin = vfoHz + minF
+    const absMax = vfoHz + maxF
+    // Walk the SUB step (quarter of a major) so all three tiers fall out of
+    // one pass: labelled majors, the single midpoint between them, and the
+    // faint quarters between those.
+    const sub = min / 2
+    const firstSub = Math.ceil(absMin / sub) * sub
+    for (let abs = firstSub; abs <= absMax + sub * 0.5; abs += sub) {
+      const x = (abs - absMin) / span
+      if (x < 0 || x > 1) continue
+      // Integer-Hz comparison: `abs` accumulates float error across the
+      // loop, and a bare modulo would drop the odd major tick.
+      const hz = Math.round(abs)
+      const kind: FreqTickKind = hz % maj === 0 ? 'maj' : hz % min === 0 ? 'mid' : 'sub'
+      out.push({
+        x,
+        isMaj: kind === 'maj',
+        kind,
+        label: kind === 'maj' ? (abs / 1_000_000).toFixed(decimals) : null,
+      })
+    }
+    return out
+  }
+
+  const { maj, min } = niceTicks(span)
   const firstMin = Math.ceil(minF / min) * min
   for (let f = firstMin; f <= maxF + min * 0.5; f += min) {
     const x = (f - minF) / span
     if (x < 0 || x > 1) continue
     const isMaj = Math.round(f / maj) * maj === Math.round(f)
-    let label: string | null = null
-    if (isMaj) {
-      if (vfoHz > 0) {
-        const absHz = vfoHz + f
-        const mhzInt = Math.floor(absHz / 1_000_000)
-        const khzFrac = Math.round((absHz % 1_000_000) / 1000)
-        label = `${mhzInt}.${String(khzFrac).padStart(3, '0')}`
-      } else {
-        label = f >= 1000 ? `${(f / 1000).toFixed(f % 1000 === 0 ? 0 : 1)}k` : `${f}`
-      }
-    }
-    out.push({ x, isMaj, label })
+    out.push({
+      x,
+      isMaj,
+      // The audio-offset ruler keeps its existing two-tier shape — this
+      // path already subdivides by 5 and was never the one being read as
+      // absolute frequency.
+      kind: isMaj ? 'maj' : 'sub',
+      label: isMaj ? (f >= 1000 ? `${(f / 1000).toFixed(f % 1000 === 0 ? 0 : 1)}k` : `${f}`) : null,
+    })
   }
   return out
 }
@@ -230,7 +343,21 @@ function FreqRuler(props: { minHz: number; maxHz: number; vfoHz?: number }): JSX
           class="absolute top-0 flex flex-col items-center"
           style={{ left: `${t.x * 100}%`, transform: 'translateX(-50%)' }}
         >
-          <div class={`w-px ${t.isMaj ? 'h-2 bg-[#8b949e]' : 'h-1 bg-[#3d444d]'}`} />
+          {/* Three tiers, descending in weight: the labelled major, the
+              single midpoint between labels (drawn to be READ — it means
+              "the half", and there is only ever one to find), and the
+              quarter marks — visible enough to read a position against,
+              but kept SHORTER than the midpoint so the tiers stay
+              distinguishable by height rather than only by colour. */}
+          <div
+            class={`w-px ${
+              t.kind === 'maj'
+                ? 'h-2 bg-[#8b949e]'
+                : t.kind === 'mid'
+                  ? 'h-1.5 bg-[#6e7681]'
+                  : 'h-1 bg-[#57606a]'
+            }`}
+          />
           {t.label && <span class="font-mono text-[9px] text-[#8b949e] leading-tight">{t.label}</span>}
         </div>
       ))}
@@ -717,6 +844,47 @@ export default function SignalAnalysisPanel(props: Props): JSX.Element {
   // behavior byte-for-byte unchanged.
   const sourceMinHz = () => source()?.minHz ?? 0
   const sourceMaxHz = () => source()?.maxHz ?? (props.defaultMaxHz ?? 3000)
+
+  // Quick-set zoom presets — a few fixed widths plus one dynamic chip for
+  // the full currently-available span (e.g. the whole I/Q sample rate).
+  //
+  // Each preset names a WIDTH and is placed according to the source's own
+  // shape, because the two spectrum kinds have genuinely different origins:
+  //
+  //   - Decoded audio (AnalyserSpectrumSource, minHz = 0) runs 0..Nyquist,
+  //     so a 3k preset means [0, 3000] — a baseband view where 0 is the
+  //     bottom of the band.
+  //   - Raw I/Q (IQSpectrumSourceAdapter, minHz = -sampleRate/2) is
+  //     centred on the dial: 0 IS the carrier, with real signal either
+  //     side of it. A 24k preset there means [-12000, +12000], not
+  //     [0, 24000] — the latter throws away the entire lower half of the
+  //     spectrum, which is exactly as much signal as the upper half.
+  //
+  // Keying off sourceMinHz() < 0 rather than the tap setting means this
+  // follows the actual source: the adapter is the only thing that reports a
+  // negative minHz, and it is precisely the bipolar case.
+  //
+  // Every preset is clamped to the source's real span, so a fixed width can
+  // never ask for a range wider than the source — which is what made these
+  // silently get bounced straight back to [sourceMinHz(), sourceMaxHz()] by
+  // the reachability-clamp effect the instant they were clicked (a 6k chip
+  // on a source topping out at 2400Hz, say). The manual Hz fields remain
+  // for any custom value; these are only ever a convenience on top.
+  //
+  // Depends on the SPAN BOUNDS ALONE, via their own memo. That matters: in
+  // I/Q mode these resolve through iqBridge.state(), whose object is
+  // replaced many times a second by the signal meter (updateSignalMeter),
+  // so a memo reading them directly would recompute at frame rate even
+  // though the sample rate never changes. That rebuilt every chip button
+  // continuously — and a button replaced under the pointer loses :hover and
+  // never receives the click, which is exactly the "blinks but won't
+  // select" the operator hit on the raw I/Q tap.
+  // Compare by VALUE — the object is rebuilt on every state churn, so the
+  // default identity equality would defeat the whole point of this memo.
+  const presetSpanLoHz = createMemo(() => sourceMinHz())
+  const presetSpanHiHz = createMemo(() => sourceMaxHz())
+
+  const zoomPresets = createMemo(() => computeZoomPresets(presetSpanLoHz(), presetSpanHiHz()))
 
   const defaultMaxHz = () => props.defaultMaxHz ?? 3000
   const lsMinHz = props.storageKeyPrefix ? `${props.storageKeyPrefix}_sg_display_min_hz` : null
@@ -1418,46 +1586,29 @@ export default function SignalAnalysisPanel(props: Props): JSX.Element {
             class="w-16 rounded border border-[#30363d] bg-[#0d1117] px-1.5 py-0.5 font-mono text-[#c9d1d9] focus:border-[#2ea043] focus:outline-none"
           />
           <span class="shrink-0 text-[#484f58]">Hz</span>
-          {/* Quick-set zoom presets — 1k/2k/3k/6k fixed, plus one dynamic
-              chip for the full currently-available span (sourceMaxHz(),
-              e.g. half the I/Q sample rate). All share lo=0: unlike the
-              previous ± presets, these describe the same [0,hi] shape as
-              the manual Hz fields' own natural reading, and — critically —
-              each hi is capped to sourceMaxHz() so a fixed preset can never
-              ask for a range wider than the actual source, which is what
-              made these silently get bounced back to [sourceMinHz(),
-              sourceMaxHz()] by the reachability-clamp effect above the
-              instant they were clicked (a fixed 6k chip on a source whose
-              real span tops out at 2400Hz, for instance). The manual Hz
-              input fields remain for any custom/wider value the operator
-              wants — these are only ever a convenience on top of them. */}
-          {(() => {
-            const cap = sourceMaxHz()
-            const fixed = [1000, 2000, 3000, 6000]
-              .filter(hi => hi <= cap)
-              .map(hi => ({ hi, label: `${hi / 1000}k` }))
-            // Only add the dynamic "full span" chip when it's not already
-            // exactly one of the fixed presets above (e.g. a 3000Hz-wide
-            // I/Q source would otherwise show a redundant "3k" twice).
-            const dynamic = fixed.some(f => f.hi === cap)
-              ? []
-              : [{ hi: cap, label: `${(cap / 1000).toFixed(cap % 1000 === 0 ? 0 : 1)}k (full)` }]
-            return [...fixed, ...dynamic]
-          })().map(({ hi, label }) => (
-            <button
-              onClick={() => {
-                setDisplayMinHz(0)
-                setDisplayMaxHz(hi)
-              }}
-              class={`rounded border px-1.5 py-0.5 text-[9px] transition-colors ${
-                displayMinHz() === 0 && displayMaxHz() === hi
-                  ? 'border-[#2ea043]/50 bg-[#238636]/20 text-[#2ea043]'
-                  : 'border-[#30363d] text-[#484f58] hover:text-[#8b949e]'
-              }`}
-            >
-              {label}
-            </button>
-          ))}
+          {/* <Key>-style keying by value: <For> compares items by identity,
+              and these are freshly built objects, so it would recreate every
+              button whenever the array recomputed. <Index> keys by position
+              instead, which is stable here — the preset list only changes
+              when the source's span does. See zoomPresets' own comment for
+              why that distinction is load-bearing on the raw I/Q tap. */}
+          <Index each={zoomPresets()}>
+            {(preset) => (
+              <button
+                onClick={() => {
+                  setDisplayMinHz(preset().lo)
+                  setDisplayMaxHz(preset().hi)
+                }}
+                class={`shrink-0 rounded border px-2 py-1 text-[9px] transition-colors ${
+                  displayMinHz() === preset().lo && displayMaxHz() === preset().hi
+                    ? 'border-[#2ea043]/50 bg-[#238636]/20 text-[#2ea043]'
+                    : 'border-[#30363d] text-[#484f58] hover:border-[#8b949e]/40 hover:text-[#8b949e]'
+                }`}
+              >
+                {preset().label}
+              </button>
+            )}
+          </Index>
         </div>
 
         {(props.onSquelchChange || !props.isRecording) && (

@@ -15,6 +15,9 @@ import type { RTTYConfig } from './decoder';
 import { encodeRTTYSamples, encodeBaudotChars, encodeAsciiChars } from './encoder';
 import { audioRecorder } from '../audio/ringRecorder';
 import { createCaptureNode, type CaptureNode } from '../audio/captureNode';
+import type { AudioSinkKind } from '../audio/audioSource';
+import { createSlotStaging, type SlotStaging } from '../audio/slotStaging';
+import { loadPreKeyMs, loadPostKeyMs } from '../ft/useFTTransmit';
 import { loadString, saveString, loadNumber, saveNumber, loadBoolean, saveBoolean } from '../storage';
 
 export type TxPhase = 'idle' | 'encoding' | 'playing';
@@ -28,11 +31,22 @@ export interface RTTYTxState {
   sinkIdSupported: boolean;
   autoPTT: boolean;
   live: boolean;
+  /** Where TX audio goes. 'bridge' stages into the ESP32's TX slots instead
+   *  of playing locally — which is the only way to transmit RTTY at all when
+   *  the radio is reached over I/Q, since local playback would otherwise go
+   *  to the computer's speakers. Live keying is unavailable there (a slot is
+   *  a complete buffer; see slotStaging.ts). */
+  audioSink: AudioSinkKind;
 }
 
 const LS_OUTPUT = 'rtty_tx_output_device';
 const LS_GAIN = 'rtty_tx_gain';
 const LS_AUTOPTT = 'rtty_tx_auto_ptt';
+const LS_AUDIO_SINK = 'rtty_tx_audio_sink';
+
+function loadAudioSink(): AudioSinkKind {
+  return loadString(LS_AUDIO_SINK, 'speaker', ['speaker', 'bridge']) as AudioSinkKind;
+}
 const DEFAULT_GAIN = Math.pow(10, -12 / 20); // -12 dB, matches SSTV's near-line-level default
 
 function loadOutputDevice(): string {
@@ -68,7 +82,12 @@ function encodeAsync(text: string, config: RTTYConfig, sampleRate: number): Prom
   });
 }
 
-export function createRTTYTransmit(getOnSetPTT?: () => ((tx: boolean) => Promise<void>) | undefined) {
+export function createRTTYTransmit(
+  getOnSetPTT?: () => ((tx: boolean) => Promise<void>) | undefined,
+  // The bridge's CAT WebSocket URL, read live rather than captured — the CAT
+  // panel usually resolves it well after this hook is created.
+  getBridgeWsUrl: () => string | undefined = () => undefined,
+) {
   const [state, setState] = createSignal<RTTYTxState>({
     phase: 'idle',
     error: null,
@@ -78,6 +97,7 @@ export function createRTTYTransmit(getOnSetPTT?: () => ((tx: boolean) => Promise
     sinkIdSupported: typeof AudioContext !== 'undefined' && 'setSinkId' in AudioContext.prototype,
     autoPTT: loadBoolean(LS_AUTOPTT, false),
     live: false,
+    audioSink: loadAudioSink(),
   });
 
   let audioCtx: AudioContext | null = null;
@@ -88,6 +108,23 @@ export function createRTTYTransmit(getOnSetPTT?: () => ((tx: boolean) => Promise
   let autoPTTOn = loadBoolean(LS_AUTOPTT, false);
   let currentSource: AudioBufferSourceNode | null = null;
   let stopped = false;
+
+  // ── Bridge staging ────────────────────────────────────────────────────────
+  // Encode -> upload -> hold. The operator then transmits a staged slot by an
+  // explicit second action, which is the whole point for contest/remote use
+  // (see slotStaging.ts). Encoding runs on the same worker the local path
+  // uses, at the same rate, so a staged message is byte-identical to what the
+  // speaker sink would have played, modulo the wire resample.
+  const staging: SlotStaging<{ text: string; config: RTTYConfig }> = createSlotStaging({
+    getWsUrl: getBridgeWsUrl,
+    mode: 'RTTY',
+    getGain: () => gain,
+    encode: async ({ text, config }) => {
+      const { samples, dropped } = await encodeAsync(text, config, ENC_RATE);
+      if (dropped.length) setState(prev => ({ ...prev, droppedChars: dropped }));
+      return { samples, sampleRateHz: ENC_RATE };
+    },
+  });
 
   // ── Live-mode scheduling state ────────────────────────────────────────────
   let liveOn = false;
@@ -120,6 +157,14 @@ export function createRTTYTransmit(getOnSetPTT?: () => ((tx: boolean) => Promise
   // ── One-shot ──────────────────────────────────────────────────────────────
 
   async function encodeAndTransmit(text: string, config: RTTYConfig): Promise<void> {
+    // Under the bridge sink this would play to the computer's SPEAKERS —
+    // exactly the failure staging exists to prevent (in I/Q the radio is
+    // never on the local output). Stage instead of transmitting locally,
+    // rather than quietly sending audio somewhere the radio cannot hear.
+    if (state().audioSink === 'bridge') {
+      await stageToBridge(text, config);
+      return;
+    }
     stopped = false;
     setState((prev) => ({ ...prev, phase: 'encoding', error: null, droppedChars: [] }));
     let pttOn = false;
@@ -179,6 +224,10 @@ export function createRTTYTransmit(getOnSetPTT?: () => ((tx: boolean) => Promise
       try { currentSource.stop(); } catch { /* already stopped */ }
       currentSource = null;
     }
+    // A staged send plays from the DEVICE's own RAM, so clearing local state
+    // is only half a stop — without this the ESP32 transmits to the end of
+    // the buffer while the browser has already dropped PTT.
+    if (state().audioSink === 'bridge') void staging.stopPlayback();
     stopLive();
     setState((prev) => ({ ...prev, phase: 'idle' }));
   }
@@ -190,6 +239,13 @@ export function createRTTYTransmit(getOnSetPTT?: () => ((tx: boolean) => Promise
 
   async function startLive(): Promise<void> {
     if (liveOn) return;
+    // Live keying cannot work through slots — a slot is a complete buffer
+    // uploaded before playback begins. Starting it under the bridge sink
+    // would key PTT and play to the local speakers instead of the radio.
+    if (state().audioSink === 'bridge') {
+      setState(prev => ({ ...prev, error: 'Live keying is unavailable over the bridge — switch output to Local speaker' }));
+      return;
+    }
     liveOn = true;
     stopped = false;
     const ctx = await ensureAudioContext();
@@ -270,6 +326,84 @@ export function createRTTYTransmit(getOnSetPTT?: () => ((tx: boolean) => Promise
     if (!v) stopLive();
   }
 
+  // ── Bridge staging (public) ───────────────────────────────────────────────
+
+  /** Encode `text` and hold it in a bridge slot. Nothing goes on the air.
+   *
+   *  Staging during a transmission is legitimate — queueing up the next
+   *  message while the current one plays is much of why a slot pool exists —
+   *  so this must not drive the shared `phase`, which describes what is on
+   *  the air. Per-slot progress lives in bridgeSlots()'s own phase instead. */
+  async function stageToBridge(text: string, config: RTTYConfig): Promise<boolean> {
+    const trimmed = text.trim();
+    if (!trimmed) return false;
+    setState(prev => ({ ...prev, error: null, droppedChars: [] }));
+    // The slot's own label is only 32 bytes and `message` 48, so the device
+    // copy is a human label, not the payload — the audio is the payload.
+    const res = await staging.stage({ text: trimmed, config }, trimmed, trimmed);
+    if (!res.ok) setState(prev => ({ ...prev, error: res.error ?? 'Staging failed' }));
+    return res.ok;
+  }
+
+  /** Transmit an already-staged slot, keying PTT around it exactly as FT8's
+   *  TX loop does: key, hold preKeyMs for an external PA/relay to switch,
+   *  play, hold postKeyMs, unkey. The hold values are FT's own persisted
+   *  settings rather than a second RTTY-specific pair, so an operator
+   *  configures their amplifier's timing once (see the design doc).
+   *
+   *  Deliberately NOT gated on the local AudioContext — bridge playback
+   *  happens on the device, so nothing here needs Web Audio at all. */
+  async function sendStagedSlot(slot: number): Promise<boolean> {
+    if (state().phase !== 'idle') return false;
+    stopped = false;
+    setState(prev => ({ ...prev, phase: 'playing', error: null }));
+
+    const onSetPTT = getOnSetPTT?.();
+    let pttOn = false;
+    if (autoPTTOn && onSetPTT) {
+      try {
+        await Promise.race([
+          onSetPTT(true),
+          new Promise<void>((_, reject) => setTimeout(() => reject(new Error('PTT timeout')), 500)),
+        ]);
+        pttOn = true;
+      } catch { /* CAT not connected or timed out */ }
+    }
+
+    try {
+      const preKeyMs = loadPreKeyMs();
+      if (preKeyMs > 0 && pttOn) await new Promise(r => setTimeout(r, preKeyMs));
+      if (stopped) return false;
+
+      const ok = await staging.send(slot, () => !stopped);
+      if (!ok) setState(prev => ({ ...prev, error: staging.error() ?? 'Bridge playback failed' }));
+
+      const postKeyMs = loadPostKeyMs();
+      if (postKeyMs > 0 && pttOn) await new Promise(r => setTimeout(r, postKeyMs));
+      return ok;
+    } finally {
+      if (pttOn) {
+        const onSetPTTOff = getOnSetPTT?.();
+        try {
+          await Promise.race([
+            onSetPTTOff?.(false) ?? Promise.resolve(),
+            new Promise<void>((_, reject) => setTimeout(() => reject(new Error('PTT timeout')), 500)),
+          ]);
+        } catch { /* CAT not connected or timed out */ }
+      }
+      setState(prev => ({ ...prev, phase: 'idle' }));
+    }
+  }
+
+  function setAudioSink(kind: AudioSinkKind) {
+    saveString(LS_AUDIO_SINK, kind);
+    setState(prev => ({ ...prev, audioSink: kind }));
+    // Live keying cannot work through slots (see slotStaging.ts), so leaving
+    // it engaged while switching to the bridge would silently key a sink that
+    // can never carry it.
+    if (kind === 'bridge') stopLive();
+  }
+
   // ── Settings ──────────────────────────────────────────────────────────────
 
   function setAutoPTT(v: boolean) {
@@ -312,6 +446,13 @@ export function createRTTYTransmit(getOnSetPTT?: () => ((tx: boolean) => Promise
     setOutputDevice,
     setTxGain,
     setAutoPTT,
+    setAudioSink,
+    // Bridge staging
+    stageToBridge,
+    sendStagedSlot,
+    bridgeSlots: staging.slots,
+    clearBridgeSlot: staging.clear,
+    refreshBridgeSlots: staging.refresh,
     destroy,
   };
 }

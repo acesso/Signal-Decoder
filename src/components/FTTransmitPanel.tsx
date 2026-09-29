@@ -17,6 +17,7 @@ import { fmtAbsHz } from '$decoder-lib/formatFreq'
 import NumberField from './NumberField'
 import type { AudioBridge } from '$decoder-lib/cat/useAudioBridge'
 import type { AudioSinkKind } from '$decoder-lib/audio/audioSource'
+import { parseModeLabel } from '$decoder-lib/audio/bridgeSlots'
 import type { IQBridge } from '$decoder-lib/cat/useIQBridge'
 
 // rAF-driven countdown: seconds until next window boundary, updated at ~4 Hz.
@@ -977,6 +978,12 @@ export default function FTTransmitPanel(props: FTTransmitPanelProps): JSX.Elemen
   }
 
   const windowSec   = createMemo(() => FT_WINDOW_SECONDS[props.mode] ?? 15)
+
+  // Slot labels carry an owning-mode tag now that the bridge's slot pool is
+  // shared with RTTY (and SSTV later) — see bridgeSlots.ts.
+  const ftMode = () => (props.mode === 'FT4' ? 'FT4' : 'FT8')
+  const slotMode = (label: string) => parseModeLabel(label).mode
+  const slotDescription = (label: string) => parseModeLabel(label).description
   const isPlaying   = createMemo(() => tx.state().status === 'playing')
   const secToWindow = useWindowCountdown(windowSec)
 
@@ -1660,17 +1667,34 @@ export default function FTTransmitPanel(props: FTTransmitPanelProps): JSX.Elemen
                         </div>
                         <Show when={slot.uploaded}>
                           <div class="text-[#484f58] text-[9px] truncate">
-                            {[slot.audioHz > 0 ? `${slot.audioHz} Hz` : null, slot.label].filter(Boolean).join(' · ')}
+                            {[
+                              slot.audioHz > 0 ? `${slot.audioHz} Hz` : null,
+                              // Labels carry an owning-mode tag now that the
+                              // pool is shared. Show the mode only when it
+                              // ISN'T ours — "FT8 · CQ (auto)" in an FT panel
+                              // is just noise, but a RTTY-staged slot needs
+                              // to say so.
+                              slotMode(slot.label) && slotMode(slot.label) !== ftMode() ? slotMode(slot.label) : null,
+                              slotDescription(slot.label),
+                            ].filter(Boolean).join(' · ')}
                           </div>
                         </Show>
                       </div>
                       <Show when={slot.uploaded}>
                         {/* Requeue a slot staged in an earlier session — the
                             message/Hz come back from the device itself, so this
-                            works even for a slot this browser never staged. */}
+                            works even for a slot this browser never staged.
+                            NOT for another mode's slot, though: requeueing
+                            re-encodes the stored text as an FT message, which
+                            is meaningless for RTTY/SSTV audio. Clearing is
+                            still allowed — the pool is shared, and an operator
+                            must be able to free a slot from wherever they are. */}
                         <button onClick={() => tx.enqueueBridgeSlot(slot.slot)}
-                          class="shrink-0 text-[#484f58] hover:text-[#58a6ff] p-0.5"
-                          title="Requeue — send this staged message on the next window">
+                          disabled={!!slotMode(slot.label) && slotMode(slot.label) !== ftMode()}
+                          class="shrink-0 text-[#484f58] hover:text-[#58a6ff] p-0.5 disabled:cursor-not-allowed disabled:opacity-30 disabled:hover:text-[#484f58]"
+                          title={slotMode(slot.label) && slotMode(slot.label) !== ftMode()
+                            ? `Staged by ${slotMode(slot.label)} — requeue it from that mode's panel`
+                            : 'Requeue — send this staged message on the next window'}>
                           <svg class="w-3 h-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
                             <path d="M3 12a9 9 0 0 1 15.3-6.4L21 8" />
                             <path d="M21 3v5h-5" />

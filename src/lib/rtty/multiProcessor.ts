@@ -22,11 +22,26 @@ export interface ProcessorState {
   errorMessage: string | null
 }
 
+/** Should this session's decoder be gated, given its band energy?
+ *
+ *  Pure and exported so the per-session gate decision is testable without a
+ *  live AudioContext/AnalyserNode. `sql` is 0-100 (0 = open); `signalEnergy`
+ *  is an average FFT magnitude on the 0-255 byte scale, as bandEnergy()
+ *  returns for this session's own mark/space bands. */
+export function shouldGate(sql: number, signalEnergy: number): boolean {
+  if (sql <= 0) return false
+  return signalEnergy < (sql / 100) * 255
+}
+
 export function createMultiRTTYProcessor(
   onText: (sessionId: string, chars: string) => void,
-  // 0-100 (0 = open, matches cw/processor.ts's convention). One shared
-  // squelch level gates every session, each against its OWN mark/space band
-  // (sessions can be tuned to different frequencies).
+  // Squelch is PER-SESSION (config.squelch, 0-100, 0 = open — matching
+  // cw/processor.ts's convention), not a single shared level: sessions are
+  // routinely tuned to different signals at very different strengths, so one
+  // threshold that suits a loud local station would mute a weak DX one in
+  // the next card. Each session is gated against its OWN mark/space band.
+  // This callback is now only a fallback for a session whose config predates
+  // the field.
   getSquelch: () => number = () => 0,
   // Where capture comes from — see ft/processor.ts's identical params for
   // the full reasoning; audioSource.ts's shape is deliberately mode-agnostic.
@@ -67,13 +82,26 @@ export function createMultiRTTYProcessor(
     return sum / (b1 - b0 + 1)
   }
 
+  // A session's own threshold, falling back to the legacy shared one for a
+  // config that predates the field (0 = open either way).
+  function squelchFor(cfg: RTTYConfig): number {
+    return cfg.squelch ?? getSquelch()
+  }
+
   // Per-chunk squelch gate — same cadence as decoding (unlike computeSNR's
   // 200ms interval, which is too coarse relative to a symbol period at RTTY
-  // baud rates). Mirrors cw/processor.ts: binary gate (Infinity/0 there,
-  // closed/open here) from a single FFT read shared across all sessions.
+  // baud rates). Mirrors cw/processor.ts's binary gate (Infinity/0 there,
+  // closed/open here), but thresholded PER SESSION from one shared FFT read:
+  // the read is the expensive part and every session measures its own band
+  // out of the same buffer, so per-session thresholds cost nothing extra.
   function applySquelch() {
-    const sql = getSquelch()
-    if (sql === 0) {
+    // Nothing gated at all — skip the FFT read entirely, which is the common
+    // case when no session has set a threshold.
+    let anyGated = false
+    for (const cfg of configs.values()) {
+      if (squelchFor(cfg) > 0) { anyGated = true; break }
+    }
+    if (!anyGated) {
       decoders.forEach((d) => d.setSquelch(false))
       return
     }
@@ -83,11 +111,14 @@ export function createMultiRTTYProcessor(
     analyser.getByteFrequencyData(fftBuf)
     const nyquist = audioContext.sampleRate / 2
     const hzPerBin = nyquist / binCount
-    const thr = (sql / 100) * 255
 
     decoders.forEach((decoder, id) => {
       const cfg = configs.get(id)
       if (!cfg) return
+      const sql = squelchFor(cfg)
+      // An open session stays open regardless of what its neighbours are
+      // gating at.
+      if (sql === 0) { decoder.setSquelch(false); return }
       const halfShift = cfg.carrierShift / 2
       const markF = cfg.reverseShift ? cfg.centerFreq + halfShift : cfg.centerFreq - halfShift
       const spaceF = cfg.reverseShift ? cfg.centerFreq - halfShift : cfg.centerFreq + halfShift
@@ -96,7 +127,7 @@ export function createMultiRTTYProcessor(
         bandEnergy(fftBuf!, hzPerBin, markF - bw, markF + bw),
         bandEnergy(fftBuf!, hzPerBin, spaceF - bw, spaceF + bw),
       )
-      decoder.setSquelch(signalE < thr)
+      decoder.setSquelch(shouldGate(sql, signalE))
     })
   }
 

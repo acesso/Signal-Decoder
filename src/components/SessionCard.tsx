@@ -18,6 +18,7 @@ interface Props {
   canRemove: boolean
   vfoFrequency?: number
   onActivate: (id: string) => void
+  onClone: (id: string) => void
   onRemove: (id: string) => void
   onConfigChange: (id: string, patch: Partial<RTTYConfig>) => void
   onLabelChange: (id: string, label: string) => void
@@ -26,6 +27,10 @@ interface Props {
 
 export function SessionCard(props: Props) {
   const stopProp = (e: MouseEvent) => e.stopPropagation()
+
+  // Undefined for a session stored before squelch became per-session — 0
+  // (open) is the safe reading, since that is how it behaved then.
+  const squelch = () => props.session.config.squelch ?? 0
 
   let previewOuter: HTMLDivElement | undefined
   let previewInner: HTMLDivElement | undefined
@@ -78,6 +83,19 @@ export function SessionCard(props: Props) {
               Promote
             </button>
           )}
+          {/* Clone — copies this session's config (shift, baud, parity,
+              squelch, sideband) into a new decoder so a second signal can be
+              chased from a known-good starting point. Text is not copied. */}
+          <button
+            onClick={(e) => {
+              stopProp(e)
+              props.onClone(props.session.id)
+            }}
+            title="Clone this decoder's settings into a new one"
+            class="rounded border border-[#30363d] px-2 py-0.5 text-xs text-[#8b949e] transition-colors hover:border-[#58a6ff]/40 hover:text-[#58a6ff]"
+          >
+            Clone
+          </button>
           {props.canRemove && (
             <button
               onClick={(e) => {
@@ -154,6 +172,29 @@ export function SessionCard(props: Props) {
             {props.session.config.reverseShift ? 'LSB' : 'USB'}
           </button>
         </div>
+      </div>
+
+      {/* Squelch — per-session, gating THIS decoder against its own
+          mark/space band. Sessions are routinely tuned to signals at very
+          different strengths, so a threshold that suits a loud local station
+          would mute a weak one in the next card. */}
+      <div class="mb-2 flex items-center gap-2" onClick={stopProp}>
+        <span class="shrink-0 text-[10px] text-[#8b949e]">Squelch</span>
+        <input
+          type="range"
+          min={0}
+          max={100}
+          step={1}
+          value={squelch()}
+          onInput={(e) => {
+            stopProp(e as unknown as MouseEvent)
+            props.onConfigChange(props.session.id, { squelch: Number(e.currentTarget.value) })
+          }}
+          class="min-w-0 flex-1 cursor-pointer accent-[#2ea043]"
+        />
+        <span class="w-8 shrink-0 text-right font-mono text-[10px] text-[#c9d1d9]">
+          {squelch() === 0 ? 'off' : `${squelch()}%`}
+        </span>
       </div>
 
       {/* Color palette */}
