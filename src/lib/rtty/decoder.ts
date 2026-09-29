@@ -10,6 +10,13 @@ export interface RTTYConfig {
   // USB RTTY convention: mark = lower tone (default false = standard USB).
   // Set true for LSB or inverted signals ("Rev" mode).
   reverseShift?: boolean;
+  /** Squelch threshold, 0-100 (0 = open), gating THIS decoder against its
+   *  own mark/space band energy. Per-session rather than global: sessions
+   *  are routinely tuned to different signals at very different strengths,
+   *  so one threshold that suits a loud local station will mute a weak DX
+   *  one in the next card. Undefined means open, matching an older stored
+   *  session that predates the field. */
+  squelch?: number;
 }
 
 type FSMState = 'IDLE' | 'DATA' | 'PARITY' | 'STOP';

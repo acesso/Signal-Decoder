@@ -3,6 +3,7 @@
 // filled in via onMount, instead of forwardRef+useImperativeHandle.
 import { createEffect, createMemo, createSignal, For, onCleanup, onMount, Show, type JSX } from 'solid-js'
 import type { RTTYConfig } from '$decoder-lib/rtty/decoder'
+import { CARRIER_SHIFTS } from '$decoder-lib/rtty/encoder'
 import { loadNumberArray, saveNumberArray } from '$decoder-lib/storage'
 import { createMultiRTTYProcessor } from '../lib/rtty/multiProcessor'
 import { resolveAudioSource, type AudioSourceKind } from '../lib/audio/audioSource'
@@ -35,7 +36,6 @@ interface RTTYDecoderProps extends DecoderProps {
 export default function RTTYDecoder(props: RTTYDecoderProps): JSX.Element {
   const sessions = createSessionsStore(DEFAULT_CONFIG)
   const initialSession = sessions.initialSession
-  const [squelch, setSquelch] = createSignal(0)
   // See resolveAudioSource()'s own comment in audioSource.ts for the full
   // precedence (auto vs. the operator's forced override).
   const audioSourceKind = (): AudioSourceKind =>
@@ -45,7 +45,9 @@ export default function RTTYDecoder(props: RTTYDecoderProps): JSX.Element {
     (sessionId, chars) => {
       sessions.dispatch({ type: 'APPEND_TEXT', id: sessionId, chars })
     },
-    squelch,
+    // Squelch is per-session now (config.squelch); this legacy shared
+    // fallback stays open so a config predating the field behaves as before.
+    () => 0,
     audioSourceKind,
     getBridge,
   )
@@ -54,6 +56,13 @@ export default function RTTYDecoder(props: RTTYDecoderProps): JSX.Element {
     () => sessions.state().sessions.find((s) => s.id === sessions.state().activeSessionId) ?? sessions.state().sessions[0],
   )
   const activeConfig = createMemo(() => activeSession().config)
+
+  // The spectrum's draggable squelch line edits the ACTIVE session, since
+  // the spectrum shows that session's markers — each session carries its own
+  // threshold in config.squelch (see SessionCard's own slider).
+  const activeSquelch = () => activeConfig().squelch ?? 0
+  const setActiveSquelch = (v: number) =>
+    updateSessionConfig(sessions.state().activeSessionId, { squelch: v })
 
   let containerEl: HTMLDivElement | undefined
   const [panelWeights, setPanelWeights] = createSignal(loadNumberArray(LS_PANEL_WEIGHTS, DEFAULT_PANEL_WEIGHTS))
@@ -118,19 +127,26 @@ export default function RTTYDecoder(props: RTTYDecoderProps): JSX.Element {
     setAddPanelOpen(false)
   }
 
-  let prevSessionCount = sessions.state().sessions.length
+  // Registers a decoder for any session that appeared since the last run.
+  // Tracked by ID rather than by "the last element": a clone is inserted
+  // directly after the session it came from, so the new one is not
+  // necessarily at the end of the list.
+  let knownSessionIds = new Set(sessions.state().sessions.map((s) => s.id))
   createEffect(() => {
     const list = sessions.state().sessions
-    if (list.length > prevSessionCount) {
-      const newest = list[list.length - 1]
-      processor.addSession(newest.id, newest.config)
+    for (const s of list) {
+      if (!knownSessionIds.has(s.id)) processor.addSession(s.id, s.config)
     }
-    prevSessionCount = list.length
+    knownSessionIds = new Set(list.map((s) => s.id))
   })
 
   function removeSession(id: string) {
     sessions.dispatch({ type: 'REMOVE_SESSION', id })
     processor.removeSession(id)
+  }
+
+  function cloneSession(id: string) {
+    sessions.dispatch({ type: 'CLONE_SESSION', id })
   }
 
   function promoteSession(id: string) {
@@ -312,8 +328,8 @@ export default function RTTYDecoder(props: RTTYDecoderProps): JSX.Element {
                       : newHz - half
                 updateSessionConfig(sessions.state().activeSessionId, { centerFreq: Math.round(newCenter) })
               }}
-              squelch={squelch()}
-              onSquelchChange={setSquelch}
+              squelch={activeSquelch()}
+              onSquelchChange={setActiveSquelch}
               vfoFrequency={props.vfoFrequency}
               class="min-w-0"
               style={{ flex: panelWeights()[1] }}
@@ -354,8 +370,8 @@ export default function RTTYDecoder(props: RTTYDecoderProps): JSX.Element {
                     : newHz - half
               updateSessionConfig(sessions.state().activeSessionId, { centerFreq: Math.round(newCenter) })
             }}
-            squelch={squelch()}
-            onSquelchChange={setSquelch}
+            squelch={activeSquelch()}
+            onSquelchChange={setActiveSquelch}
             class="min-w-0"
             style={{ flex: panelWeights()[1] }}
           />
@@ -388,14 +404,14 @@ export default function RTTYDecoder(props: RTTYDecoderProps): JSX.Element {
                 Add
               </button>
               {addPanelOpen() && (
-                <div class="absolute top-full right-0 z-10 mt-1 w-48 rounded-lg border border-[#30363d] bg-[#161b22] p-3 shadow-lg">
+                <div class="absolute top-full right-0 z-10 mt-1 w-56 rounded-lg border border-[#30363d] bg-[#161b22] p-3 shadow-lg">
                   <div class="mb-2">
                     <div class="mb-1.5 text-[10px] text-[#8b949e]">Carrier Shift</div>
-                    <div class="flex gap-1">
-                      {[170, 200, 450].map((s) => (
+                    <div class="grid grid-cols-3 gap-1">
+                      {CARRIER_SHIFTS.map((s) => (
                         <button
                           onClick={() => setAddShift(s)}
-                          class={`flex-1 rounded border py-0.5 text-xs transition-colors ${
+                          class={`rounded border py-0.5 text-xs transition-colors ${
                             addShift() === s
                               ? 'border-[#2ea043]/60 bg-[#2ea043]/10 text-[#2ea043]'
                               : 'border-[#30363d] text-[#8b949e] hover:border-[#8b949e]/50'
@@ -450,6 +466,7 @@ export default function RTTYDecoder(props: RTTYDecoderProps): JSX.Element {
                     canRemove={sessions.state().sessions.length > 1}
                     vfoFrequency={props.vfoFrequency}
                     onActivate={promoteSession}
+                    onClone={cloneSession}
                     onRemove={removeSession}
                     onConfigChange={updateSessionConfig}
                     onLabelChange={(sid, label) => sessions.dispatch({ type: 'UPDATE_LABEL', id: sid, label })}

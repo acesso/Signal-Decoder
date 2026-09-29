@@ -9,7 +9,7 @@
 // as "playback finished" and resolved ~150ms into a 12.6s FT8 window; the
 // TX loop then ran its next iteration while still inside the SAME window
 // and keyed up the identical message again, repeatedly.
-import { playBridgeSlotAndWait } from '../useFTTransmit';
+import { playBridgeSlotAndWait } from '../bridgeSlots';
 
 const WS_URL = 'ws://10.0.0.5:80/ws';
 const SLOT = 1;

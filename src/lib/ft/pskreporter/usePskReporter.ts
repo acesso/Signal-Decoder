@@ -26,9 +26,16 @@ import type { PskReceiver } from './ipfix'
  * from this app's origin and nothing else — so it is hard-coded rather than
  * injected, and forks get working reporting without configuring anything.
  * VITE_PSKREPORTER_PROXY_URL overrides it for testing against another relay.
+ *
+ * `||`, not `??`: GitHub Actions substitutes an UNSET secret as the empty
+ * string, so the published bundle saw a DEFINED '' here and `??` passed it
+ * straight through. PROXY_URL then fell empty, and the app reported itself
+ * blocked with 'no-proxy' — reporting worked in dev (where the variable is
+ * genuinely absent, so the default applied) and silently never sent in
+ * production. Empty means "not configured", same as absent.
  */
 const DEFAULT_PROXY_URL = 'https://pskreporter.signal-decoder.workers.dev'
-const PROXY_URL: string = (import.meta.env.VITE_PSKREPORTER_PROXY_URL ?? DEFAULT_PROXY_URL).replace(/\/+$/, '')
+const PROXY_URL: string = (import.meta.env.VITE_PSKREPORTER_PROXY_URL || DEFAULT_PROXY_URL).replace(/\/+$/, '')
 
 /**
  * How often the queue is asked whether a send is due. Short enough that a

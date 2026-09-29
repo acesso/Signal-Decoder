@@ -31,6 +31,7 @@ export interface SessionsState {
 
 export type SessionsAction =
   | { type: 'ADD_SESSION';    config: RTTYConfig }
+  | { type: 'CLONE_SESSION';  id: string }
   | { type: 'REMOVE_SESSION'; id: string }
   | { type: 'ACTIVATE';       id: string }
   | { type: 'UPDATE_CONFIG';  id: string; patch: Partial<RTTYConfig> }
@@ -65,6 +66,22 @@ export function sessionsReducer(state: SessionsState, action: SessionsAction): S
     case 'ADD_SESSION': {
       const s = makeSession(action.config);
       return { ...state, sessions: [...state.sessions, s] };
+    }
+
+    // Copies a session's CONFIG only — not its decoded text. A clone exists
+    // to chase a second signal from a known-good starting point (same baud,
+    // parity, shift, squelch), and inheriting the original's transcript
+    // would put text in it that this decoder never actually received.
+    // Inserted directly after its source rather than appended, so a clone
+    // appears next to what it was cloned from.
+    case 'CLONE_SESSION': {
+      const src = state.sessions.find(s => s.id === action.id);
+      if (!src) return state;
+      const clone = makeSession(src.config);
+      const at = state.sessions.findIndex(s => s.id === action.id);
+      const sessions = [...state.sessions];
+      sessions.splice(at + 1, 0, clone);
+      return { ...state, sessions };
     }
 
     case 'REMOVE_SESSION': {
