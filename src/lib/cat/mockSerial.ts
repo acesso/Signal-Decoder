@@ -49,6 +49,7 @@ export function createMockSerialPort(opts: MockSerialOptions = {}) {
     agc: 1, agcLevel: 4, txTimeout: 30, filter: 1, volume: 10, att1: 0, att2: 0, nr: 0, drive: 4,
     sMeter: 7,
     backlight: 1,
+    cwTune: 0,                // CW Tune (TU, menu 2.3) — never stored, boots OFF
     pwmMin: 10, pwmMax: 130,  // PA bias endpoints (firmware defaults)
     fxtal: 25_000_000,        // reference oscillator (XF, menu "Ref frq")
     tx: false,
@@ -88,6 +89,14 @@ export function createMockSerialPort(opts: MockSerialOptions = {}) {
     if (aiSet) {
       rig.autoReport = aiSet[1] === '1';
       return `AI${rig.autoReport ? 1 : 0};`;
+    }
+    // CW Tune SET (TU0/TU1) — 3 chars too. 0/1 only; the echo returns the
+    // effective value, the old one if rejected, like the firmware.
+    const tuSet = cmd.match(/^TU(\d)$/);
+    if (tuSet) {
+      const v = parseInt(tuSet[1], 10);
+      if (v <= 1) rig.cwTune = v;
+      return `TU${rig.cwTune};`;
     }
     const ttSet = cmd.match(/^TT(\d+)$/);
     if (ttSet) {
@@ -154,6 +163,7 @@ export function createMockSerialPort(opts: MockSerialOptions = {}) {
       case 'FV': return 'FV4.01a;';  // firmware version (FV, read-only)
       case 'AI': return `AI${rig.autoReport ? 1 : 0};`;  // CAT auto-report state
       case 'BL': return `BL${rig.backlight};`;
+      case 'TU': return `TU${rig.cwTune};`;
       case 'PM': return `PM${rig.pwmMin};`;
       case 'PX': return `PX${rig.pwmMax};`;
       // Soft restart: real firmware acks SR1; then watchdog-reboots (offline

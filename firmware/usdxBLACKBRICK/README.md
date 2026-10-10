@@ -37,7 +37,8 @@ Enabled by default: startup diagnostics (DIAG), CW keyer (straight/iambic-A/B + 
 | `XF` ref-frequency calibration over CAT | PU7FTW | drives the web app's receive-only calibration wizard |
 | `SR`/`SR2` soft restart / factory reset over CAT | PU7FTW | SR2 realigns EEPROM after param-layout changes |
 | **AGC level (`AL`, menu 1.8)** | PU7FTW 2026-07-06 | target window for the M0PUB AGC, 1–14 (default 4 = the algorithm's original 1024…1536 window) |
-| **TX gate: only LSB/USB can key the PA** | PU7FTW 2026-07-06 | `switch_rxtx()` refuses TX in CW/AM/FM from PTT and CAT alike — can't transmit over a station you're listening to |
+| **TX gate: only LSB/USB can key the PA** | PU7FTW 2026-07-06 | `switch_rxtx()` refuses TX in CW/AM/FM from PTT and CAT alike — can't transmit over a station you're listening to. Since 2026-10-10 CW is allowed only with CW Tune ON (see below) |
+| **CW Tune carrier (menu 2.3, CAT `TU`)** | PU7FTW 2026-10-10 | for an external antenna tuner: with `CW Tune` ON, PTT or CAT `TX;` in CW mode keys an unmodulated carrier at the dial frequency (`dsp_tx_tune`, constant envelope at PA bias max). **NTX stays in its RX state during the carrier**, so the external miniPA70 is never keyed — the tuner sees only the uSDX's own power through the amp's bypass. Never stored — always boots OFF, 0 EEPROM bytes so the layout is unchanged. `TU0;`/`TU1;` sets it over CAT (echo), changes are auto-reported; `TU0` mid-carrier un-keys. TX time-out guard still applies. `TX0;`/`RX0;` status is now sent in CW too. +338 B flash total |
 | Baud-rate correction for the 20 MHz crystal | fork/PU7FTW | `Serial.begin(16000000ULL * baud / F_MCU)` |
 | Backlight on correct pin (PD3) + CAT `BL` control | PU7FTW 2026-07-04 | stock/fork drove the wrong pin on this hardware |
 

@@ -2367,6 +2367,12 @@ void dummy()
 {
 }
 
+volatile uint8_t cw_tune = 0;  // CW Tune (menu 2.3): 1 = PTT/CAT TX in CW keys an unmodulated carrier for an external antenna tuner; never stored, boots OFF
+void dsp_tx_tune()
+{
+	OCR1BL = lut[255];  // constant envelope at the configured PA bias max — no modulation, no sidetone
+}
+
 #ifdef CW_TX
 volatile int8_t p_sin = 0;     // initialized with A*sin(0) = 0
 volatile int8_t n_cos = 448 / 4; // initialized with A*cos(t) = A
@@ -4406,11 +4412,11 @@ volatile uint32_t tx_timeout_at = 0;
 void switch_rxtx(uint8_t tx_enable)
 {
 #ifndef AM_FM_TX
-	if (tx_enable && (mode != LSB) && (mode != USB)) return;  // Only SSB can key TX in this build: AM/FM/CW are RX-only (listening) modes — never transmit over the station being received, whether from PTT or CAT TX;. All TX audio comes from an external source via the mic input (digital modes).
+	if (tx_enable && (mode != LSB) && (mode != USB) && !((mode == CW) && cw_tune)) return;  // Only SSB can key TX in this build: AM/FM/CW are RX-only (listening) modes — never transmit over the station being received, whether from PTT or CAT TX;. All TX audio comes from an external source via the mic input (digital modes). Exception: CW with CW Tune ON keys a plain carrier (dsp_tx_tune) for an external tuner.
 #endif //!AM_FM_TX
 	//GW8RDI - NOTE: Best use the PA line to trigger the Spectrum mode instead of CAT as gives near instant audio control. TX RFI can interfere with RS232 as TX starts to xmit.
 #ifdef CAT_TX_CMD
-  if (cat_enabled && mode != CW)  // To mute Spectrum DSP audio in CW mode connect the PA line to the Spectrum module PA input.
+  if (cat_enabled)  // also in CW: CW TX is now only the CW Tune carrier, and the web app's bridge confirms PTT by this TX0;/RX0; reply
   {
     if (tx_enable)
     {
@@ -4436,10 +4442,10 @@ void switch_rxtx(uint8_t tx_enable)
 		if ((txdelay) && (tx_enable) && (!(tx))) {  // key-up TX relay in advance before actual transmission
 			digitalWrite(RX, LOW); // TX (disable RX)
 #ifdef NTX
-			digitalWrite(NTX, LOW);  // TX (enable TX)
+			if (mode != CW) digitalWrite(NTX, LOW);  // TX (enable TX) — but never in CW: CW TX is only the CW Tune carrier, which must leave the external PA (miniPA70, keyed by this line) unkeyed so the tuner sees just the uSDX's own ~5 W through the amp's bypass
 #endif //NTX
 #ifdef PTX
-			digitalWrite(PTX, HIGH);  // TX (enable TX)
+			if (mode != CW) digitalWrite(PTX, HIGH);  // TX (enable TX) — not in CW, see NTX above
 #endif //PTX
 			lcd.setCursor(15, 1); lcd.print('D');  // note that this enables interrupts again.
 			interrupts();    //hack.. to allow delay()
@@ -4470,6 +4476,8 @@ void switch_rxtx(uint8_t tx_enable)
       case LSB: func_ptr = dsp_tx; break;
 #ifdef CW_TX
 		  case CW:  func_ptr = dsp_tx_cw; break;
+#else
+		  case CW:  func_ptr = dsp_tx_tune; break;  // only reachable with CW Tune ON (gated at function entry)
 #endif //CW_TX
 #ifdef AM_FM_TX
 		  case AM:  func_ptr = dsp_tx_am; break;
@@ -4522,20 +4530,18 @@ void switch_rxtx(uint8_t tx_enable)
 
 			// GW8RDI Note: Enable TX before setting PLL frequency?????? todo revise
 #ifdef NTX
-			digitalWrite(NTX, LOW);  // TX (enable TX)
+			if (mode != CW) digitalWrite(NTX, LOW);  // TX (enable TX) — but never in CW: CW TX is only the CW Tune carrier, which must leave the external PA (miniPA70, keyed by this line) unkeyed so the tuner sees just the uSDX's own ~5 W through the amp's bypass
 #endif //NTX
 #ifdef PTX
-			digitalWrite(PTX, HIGH);  // TX (enable TX)
+			if (mode != CW) digitalWrite(PTX, HIGH);  // TX (enable TX) — not in CW, see NTX above
 #endif //PTX
 
 			lcd.setCursor(15, 1); lcd.print('T');   // Show Transmitting on LCD
 
-#ifdef CW_TX
 			if (mode == CW)
 			{
 				si5351.freq_calc_fast(-cw_offset); si5351.SendPLLRegisterBulk();
-			} // for CW, TX at freq
-#endif //CW_TX (CW is RX-only in this build — TX in CW mode is blocked at function entry)
+			} // for CW, TX at freq (RX sits at freq + cw_offset); only reachable with CW Tune ON
 #ifdef RIT_ENABLE   // GW8RDI mod - restore freq
 			else
 			{
@@ -4935,13 +4941,13 @@ const char* keyer_mode_label[] = { "IambicA", "IambicB","Straight" };  // GW8RDI
 
 #define _N(a) sizeof(a)/sizeof(a[0])
 
-#define N_PARAMS 47  // last visible menu param enum value (BACKL=47 after the AGC_LVL, TOT and CAT_AUTO enum insertions); update when adding/removing enum entries BEFORE BACKL — getting this wrong makes a blank "hidden" menu slot appear at the wrap and drops the Backlight item
+#define N_PARAMS 48  // last visible menu param enum value (BACKL=48 after the AGC_LVL, TOT, CAT_AUTO and CWTUNE enum insertions); update when adding/removing enum entries BEFORE BACKL — getting this wrong makes a blank "hidden" menu slot appear at the wrap and drops the Backlight item
 #ifdef KEEP_BAND_DATA
 #define I_PARAMS 5+9
-enum params_t { _NULL, VOLUME, MODE, FILTER, BAND, STEP, VFOSEL, RIT, AGC, AGC_LVL, NR, ATT, ATT2, SMETER, CWDEC, CWTONE, CWOFF, KEY_WPM, KEY_MODE, KEY_PIN, TONE_VOL, VOX, VOXGAIN, DRIVE, TOT, TXDELAY, MOX, CWINTERVAL, CWMSG1, CWMSG2, CWMSG3, CWMSG4, CWMSG5, CWMSG6, PWM_MIN, PWM_MAX, SIFXTAL, IQ_ADJ, CAT_ACTIVE, CAT_AUTO, CAT_BAUD, CALIB, SR, CPULOAD, PARAM_A, PARAM_B, PARAM_C, BACKL, FREQA, FREQB, MODEA, MODEB, VERS, BAND_DATA0, BAND_DATA1, BAND_DATA2, BAND_DATA3, BAND_DATA4, BAND_DATA5, BAND_DATA6, BAND_DATA7, BAND_DATA8, ALL = 0xff };
+enum params_t { _NULL, VOLUME, MODE, FILTER, BAND, STEP, VFOSEL, RIT, AGC, AGC_LVL, NR, ATT, ATT2, SMETER, CWDEC, CWTONE, CWOFF, CWTUNE, KEY_WPM, KEY_MODE, KEY_PIN, TONE_VOL, VOX, VOXGAIN, DRIVE, TOT, TXDELAY, MOX, CWINTERVAL, CWMSG1, CWMSG2, CWMSG3, CWMSG4, CWMSG5, CWMSG6, PWM_MIN, PWM_MAX, SIFXTAL, IQ_ADJ, CAT_ACTIVE, CAT_AUTO, CAT_BAUD, CALIB, SR, CPULOAD, PARAM_A, PARAM_B, PARAM_C, BACKL, FREQA, FREQB, MODEA, MODEB, VERS, BAND_DATA0, BAND_DATA1, BAND_DATA2, BAND_DATA3, BAND_DATA4, BAND_DATA5, BAND_DATA6, BAND_DATA7, BAND_DATA8, ALL = 0xff };
 #else
 #define I_PARAMS 5
-enum params_t { _NULL, VOLUME, MODE, FILTER, BAND, STEP, VFOSEL, RIT, AGC, AGC_LVL, NR, ATT, ATT2, SMETER, CWDEC, CWTONE, CWOFF, KEY_WPM, KEY_MODE, KEY_PIN, TONE_VOL, VOX, VOXGAIN, DRIVE, TOT, TXDELAY, MOX, CWINTERVAL, CWMSG1, CWMSG2, CWMSG3, CWMSG4, CWMSG5, CWMSG6, PWM_MIN, PWM_MAX, SIFXTAL, IQ_ADJ, CAT_ACTIVE, CAT_AUTO, CAT_BAUD, CALIB, SR, CPULOAD, PARAM_A, PARAM_B, PARAM_C, BACKL, FREQA, FREQB, MODEA, MODEB, VERS, ALL = 0xff };
+enum params_t { _NULL, VOLUME, MODE, FILTER, BAND, STEP, VFOSEL, RIT, AGC, AGC_LVL, NR, ATT, ATT2, SMETER, CWDEC, CWTONE, CWOFF, CWTUNE, KEY_WPM, KEY_MODE, KEY_PIN, TONE_VOL, VOX, VOXGAIN, DRIVE, TOT, TXDELAY, MOX, CWINTERVAL, CWMSG1, CWMSG2, CWMSG3, CWMSG4, CWMSG5, CWMSG6, PWM_MIN, PWM_MAX, SIFXTAL, IQ_ADJ, CAT_ACTIVE, CAT_AUTO, CAT_BAUD, CALIB, SR, CPULOAD, PARAM_A, PARAM_B, PARAM_C, BACKL, FREQA, FREQB, MODEA, MODEB, VERS, ALL = 0xff };
 #endif
 #define N_ALL_PARAMS (N_PARAMS+I_PARAMS)  // number of parameters
 
@@ -4988,6 +4994,7 @@ int8_t paramAction(uint8_t action, uint8_t id = ALL)  // list of parameters
 #ifdef FILTER_700HZ
 	case CWTONE:  if (dsp_cap) paramAction(action, cw_tone, 0x22, F("CW Tone"), cw_tone_label, 0, 1, false); break;
 #endif
+	case CWTUNE:  if (action <= UPDATE_MENU) paramAction(action, cw_tune, 0x23, F("CW Tune"), offon_label, 0, 1, false); break;  // display/edit only: no LOAD/SAVE/SKIP, so it occupies 0 EEPROM bytes (layout unchanged) and always boots OFF
 #if defined(KEYER) || defined(CW_MESSAGE)
 	case KEY_WPM:  paramAction(action, keyer_speed, 0x25, F("Keyer Speed"), NULL, 1, 60, false); break;
 #endif
@@ -5213,6 +5220,8 @@ void analyseCATcmd()    // Supported Kenwood TS-480 protocol CAT commands
 	// PU7FTW custom CAT commands
 	else if (CMD('B','L',';'))                              Command_BL_GET();
 	else if (CMD2('B','L') && CATcmd[3]==';')               Command_BL_SET(CATcmd[2]-'0');
+	else if (CMD('T','U',';'))                              Command_TU_GET();
+	else if (CMD2('T','U') && CATcmd[3]==';')               Command_TU_SET(CATcmd[2]-'0');
 	else if (CMD('V','O',';'))                              Command_VO_GET();
 	else if (CMD2('V','O') && isValidNumericSet(2))         Command_VO_SET();
 	else if (CMD('A','T',';'))                              Command_AT_GET();
@@ -5524,6 +5533,22 @@ void Command_BL_SET(uint8_t val)
 	Command_BL_GET();
 }
 
+// TU; → get CW Tune, TU0;/TU1; → set CW Tune (same flag as menu 2.3, never stored); other values are rejected (echo returns the old value)
+void Command_TU_GET()
+{
+	char buf[5];
+	sprintf(buf, "TU%u;", cw_tune ? 1 : 0);
+	Serial.print(buf);
+}
+void Command_TU_SET(uint8_t val)
+{
+	if (val <= 1) {
+		cw_tune = val;
+		if (!cw_tune && tx && (mode == CW)) switch_rxtx(0);  // disarming mid-carrier un-keys rather than leaving a carrier the gate would no longer allow
+	}
+	Command_TU_GET();
+}
+
 // VO; → get volume, VOnnnn; → set volume (-1..16)
 void Command_VO_GET()
 {
@@ -5789,7 +5814,7 @@ void catCheckReport()
 {
 	static uint32_t s_freq, s_fxtal;
 	static int8_t s_volume;
-	static uint8_t s_mode, s_filt, s_att, s_att2, s_nr, s_agc, s_agc_lvl, s_drive, s_tot, s_backlight, s_pwm_min, s_pwm_max, s_cat_auto;
+	static uint8_t s_mode, s_filt, s_att, s_att2, s_nr, s_agc, s_agc_lvl, s_drive, s_tot, s_backlight, s_cw_tune, s_pwm_min, s_pwm_max, s_cat_auto;
 	static int16_t s_dbm;
 	static uint32_t sm_hold_ms;
 	static bool primed = false;
@@ -5815,6 +5840,7 @@ void catCheckReport()
 	if (s_drive != drive)           { s_drive = drive;         if (live) Command_DR_GET(); }
 	if (s_tot != tot)               { s_tot = tot;             if (live) Command_TT_GET(); }
 	if (s_backlight != backlight)   { s_backlight = backlight; if (live) Command_BL_GET(); }
+	if (s_cw_tune != cw_tune)       { s_cw_tune = cw_tune;     if (live) Command_TU_GET(); }
 	if (s_pwm_min != pwm_min)       { s_pwm_min = pwm_min;     if (live) Command_PM_GET(); }
 	if (s_pwm_max != pwm_max)       { s_pwm_max = pwm_max;     if (live) Command_PX_GET(); }
 	if (s_fxtal != si5351.fxtal)    { s_fxtal = si5351.fxtal;  if (live) Command_XF_GET(); }

@@ -12,6 +12,23 @@ them into a version section when cutting a release.
 
 ## [Unreleased]
 
+## [0.24.0] - 2026-10-10
+
+### Added
+
+- **One-click TUNE for an external antenna tuner.** A TUNE button next to PTT (uSDX BLACK_BRICK profile) selects CW, arms the radio's new CW Tune mode and keys an unmodulated carrier on the dial frequency; a second click un-keys, disarms it and restores the mode it started from. The external amplifier is never keyed during a tune, so the tuner finds its match on the uSDX's own few watts. The radio's own TX time-out still ends a forgotten tune. Nothing new is polled: the radio's reply to the arm command is the firmware-support check, and changes made on the radio's menu arrive as auto-report pushes.
+- **A retune hint.** The tuner's match depends on frequency, so TUNE shows an amber "retune?" once the VFO crosses an amateur band edge, or drifts more than f (MHz) × 3.5 kHz from where it was last tuned — ±24.8 kHz at 7.074 MHz, ±73.8 kHz at 21.074 MHz. It is display only and never keys anything.
+- **uSDX firmware: CW Tune (menu 2.3, CAT `TU`).** With it ON, PTT or CAT `TX;` in CW mode keys a plain carrier at the configured PA bias max; OFF keeps CW receive-only as before. It is never stored and always boots OFF, so the EEPROM layout is unchanged and no settings reset is needed. `TU0;`/`TU1;` set it over CAT and echo the effective value; disarming it mid-carrier un-keys.
+
+### Fixed
+
+- **PTT now follows the radio when it un-keys by itself.** When the radio's TX time-out fired, the app kept showing PTT on until it was clicked. An `RX0;` the app did not ask for now means the radio stopped transmitting, outside a short grace window that absorbs the firmware's repeated status replies. A running tune finishes its stop sequence the same way.
+
+### Changed
+
+- uSDX firmware sends its `TX0;`/`RX0;` status in CW mode too. The exception dated from a Spectrum add-on; without the status, the bridge could not confirm a CW Tune key-up.
+- While a tune is running, other transmitters (FT8/FT4, RTTY, SSTV) cannot key, and an un-key request from any of them ends the tune cleanly.
+
 ## [0.23.0] - 2026-09-29
 
 ### Added

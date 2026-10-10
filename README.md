@@ -574,6 +574,7 @@ All commands terminate with `;`. All SET commands echo the effective value as a 
 | **A2** — digital attenuator | `A2;` → `A2n;` | `A2n;` | 0…16 | −6.02 dB per step |
 | **NR** — noise reduction | `NR;` → `NRn;` | `NRn;` | 0…8 | 0 = off |
 | **BL** — backlight | `BL;` → `BL0;`/`BL1;` | `BL0;`/`BL1;` | 0…1 | |
+| **TU** — CW Tune | `TU;` → `TU0;`/`TU1;` | `TU0;`/`TU1;` | 0…1 | same flag as menu 2.3, never stored (boots OFF). With `TU1`, TX in CW keys an unmodulated carrier at the dial frequency for an antenna tuner, the external PA (NTX) left unkeyed; `TU0` mid-carrier un-keys. Not polled — the web app's TUNE button sets it, rig-side changes arrive as auto-report pushes |
 | **AG0** — AGC on/off | `AG0;` → `AG0n;` | `AG0n;` | 0…1 | single algorithm (M0PUB fast-attack/slow-decay); values >1 rejected |
 | **AL** — AGC level | `AL;` → `ALn;` | `ALn;` | 1…14 | target window: output peaks held in [n·256 … n·384]; default 4 |
 | **FW** — filter BW | `FW;` → `FWn;` | `FWn;` | 0…7 | 0=Full 1=3k 2=2.4k 3=1.8k 4=500 5=200 6=100 7=50 Hz |
@@ -589,7 +590,7 @@ All commands terminate with `;`. All SET commands echo the effective value as a 
 | **SR2** — factory reset | `SR2;` → `SR2;` | — | | wipes ALL settings incl. band data and calibration, then reboots |
 | **TQ** — PTT state | `TQ;` → `TQ0;`/`TQ1;` | `TQ0;`/`TQ1;` | 0…1 | firmware also broadcasts `TQ0;`/`TQ1;` unsolicited on PTT transitions |
 
-Standard TS-480 commands also supported: `FA` (frequency get/set — single VFO), `MD` (mode; digits 4/5 = FM/AM are selectable for **RX only**, out-of-range digits clamp to LSB), `IF` (status frame), `TX`/`RX` (PTT — **ignored unless mode is LSB/USB**; AM/FM/CW are receive-only in this build), `ID`, `PS`, `AI`, `VX`.
+Standard TS-480 commands also supported: `FA` (frequency get/set — single VFO), `MD` (mode; digits 4/5 = FM/AM are selectable for **RX only**, out-of-range digits clamp to LSB), `IF` (status frame), `TX`/`RX` (PTT — **ignored unless mode is LSB/USB**, or CW with CW Tune ON; AM/FM are receive-only in this build. Every key transition — including the radio's own TX time-out — is announced as `TX0;`/`RX0;`, which the web app follows), `ID`, `PS`, `AI`, `VX`.
 
 > **Removed vs. earlier 4.00x builds (2026-07-06):** VOX + noise gate, RIT (`RTS` offset command), TX offset (`XO`), VFO B/Split, CW/AM/FM transmit, the Fast AGC variant (replaced by `AL` level control), and all float math (integer dBm S-meter). See [`firmware/usdxBLACKBRICK/README.md`](firmware/usdxBLACKBRICK/README.md) for the complete lineage vs. the original QCX-SSB R1.02w firmware.
 

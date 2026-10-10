@@ -185,6 +185,23 @@ describe('response parsing — custom BLACK_BRICK commands', () => {
     expect(parseBoolField('BL;', 'BL')).toBeNull();
   });
 
+  test('TU (CW Tune) — echo of TU0;/TU1; parses, firmware without TU never does', () => {
+    expect(parseIntField('TU1;', 'TU')).toBe(1);
+    expect(parseIntField('TU0;', 'TU')).toBe(0);
+    expect(parseIntField('TU;', 'TU')).toBeNull();
+    // Older firmware answers an unknown command with "?;" — the support check
+    // in startTune() must read that as "not supported", never as a value.
+    expect(parseIntField('?;', 'TU')).toBeNull();
+  });
+
+  test('TX/RX status echoes are recognizable by prefix (duplicates arrive unsolicited)', () => {
+    // switch_rxtx() prints each status twice; RX; adds its own RX0; — the
+    // app treats an RX0; it did not ask for (outside the grace window) as the
+    // radio un-keying by itself, e.g. its TX time-out firing.
+    for (const f of 'TX0;TX0;'.split(';').filter(Boolean)) expect(f.startsWith('TX')).toBe(true);
+    for (const f of 'RX0;RX0;RX0;'.split(';').filter(Boolean)) expect(f.startsWith('RX')).toBe(true);
+  });
+
   test('VO — parseIntField including mute (-1)', () => {
     expect(parseIntField('VO-1;', 'VO')).toBe(-1);
     expect(parseIntField('VO0;', 'VO')).toBe(0);
@@ -451,6 +468,10 @@ describe('BLACKBRICK_POLL_CMDS array', () => {
 
   test('DR; is included', () => {
     expect(BLACKBRICK_POLL_CMDS).toContain('DR;');
+  });
+
+  test('TU; is NOT polled — CW Tune changes arrive as auto-report pushes', () => {
+    expect(BLACKBRICK_POLL_CMDS).not.toContain('TU;');
   });
 
   test('BL; is included (backlight confirmed working since the PD3 pin fix)', () => {
