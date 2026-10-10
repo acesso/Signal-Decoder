@@ -121,7 +121,22 @@ export interface RadioState {
    *  confirmed RX0; comes back. Deliberately NOT cleared by setPTT(true) —
    *  arming TX again while this alarm is active would defeat its purpose. */
   pttConfirmAlarm: boolean;
+  /** CW Tune flag on the radio (TU — menu 2.3, firmware 4.02c+): 1 = PTT/CAT
+   *  TX in CW keys an unmodulated carrier for an external antenna tuner, with
+   *  the external PA left unkeyed. Never polled or queried on its own: set by
+   *  startTune()/stopTune()'s own TU echo, or by the radio's auto-report push
+   *  when it's toggled on the rig's menu. null = not seen this session. */
+  cwTune: number | null;
+  /** One-click TUNE sequence state (see startTune). */
+  tune: TuneState;
+  /** VFO frequency (Hz) of the last successful tune this session — input to
+   *  the retune suggestion (cwTune.ts). null = not tuned yet. */
+  lastTuneHz: number | null;
 }
+
+/** 'idle' → 'starting' (MD3, TU1, TX) → 'keyed' → 'stopping' (RX, TU0, mode
+ *  restore) → 'idle'. */
+export type TuneState = 'idle' | 'starting' | 'keyed' | 'stopping';
 
 /** PA bias PWM endpoints (see PM/PX commands) — not polled; fetched on demand. */
 export interface PABias {
@@ -162,7 +177,19 @@ export interface RadioCATControls {
   dismissError: () => void;
   setFrequency: (hz: number) => Promise<void>;
   setMode: (mode: CATMode) => Promise<void>;
+  /** Key/unkey TX. While a TUNE is running, a key-up request from any other
+   *  transmitter (FT8, RTTY, SSTV, the PTT button) is refused, and an unkey
+   *  request ends the tune through stopTune(). */
   setPTT: (tx: boolean) => Promise<void>;
+  /** One-click TUNE: remember the mode, MD3 (CW), TU1 (whose echo doubles as
+   *  the firmware-support check), then key. The radio sends an unmodulated
+   *  carrier at the dial frequency with the external PA unkeyed; its own TX
+   *  time-out (TT) still ends it. No-op unless idle and not transmitting. */
+  startTune: () => Promise<void>;
+  /** End a TUNE: RX (confirmed, same retry/alarm path as setPTT), TU0, then
+   *  restore the mode it started from. Also runs on its own when the radio
+   *  un-keys by itself (TX time-out, or CW Tune switched off on the rig). */
+  stopTune: () => Promise<void>;
   setVolume: (n: number) => Promise<void>;
   setAtt1: (n: number) => Promise<void>;
   setAtt2: (n: number) => Promise<void>;
@@ -430,6 +457,15 @@ function bridgeHttpBase(wsUrl: string): string | null {
 //                                   are ignored, echo returns the old value.
 //                                   NOT polled — fetched/set on demand from
 //                                   the advanced settings panel only.)
+// CW Tune:  TU; → TUn;  TU0;/TU1; → echo   (firmware 4.02c+, menu 2.3; never
+//                                   stored, boots OFF. With TU1 a CW-mode TX
+//                                   keys an unmodulated carrier for an antenna
+//                                   tuner, external PA (NTX) left unkeyed. TU0
+//                                   mid-carrier un-keys. Not polled: changes
+//                                   at the rig are auto-report pushes; the
+//                                   app only SETs it inside startTune/stopTune.)
+// TX status: the radio prints TX0;/RX0; (twice) on every key transition —
+//            including its own TX time-out, which the app follows.
 // The firmware supports serialized/batched queries in one write, e.g.
 // "FA;MD;AG0;FW;VO;AT;A2;NR;SM;DR;BL;AL;" — replies come back concatenated in the same order.
 
@@ -483,6 +519,7 @@ export function useRadioCAT(): RadioCATControls {
     agc: null, agcLevel: null, filter: null, sMeter: null, drive: null,
     backlight: null, firmwareVersion: null, autoReport: null,
     pttConfirmAlarm: false,
+    cwTune: null, tune: 'idle', lastTuneHz: null,
   });
 
   let port:      SerialPort | null = null;
@@ -555,6 +592,11 @@ export function useRadioCAT(): RadioCATControls {
 
   const lastSet = {
     frequency: 0, mode: 0, volume: 0, att1: 0, att2: 0, nr: 0, agc: 0, agcLevel: 0, filter: 0, drive: 0, backlight: 0,
+    // Not settings fields: ptt guards the unsolicited-RX0; handling (the
+    // firmware prints TX0;/RX0; twice per transition, plus RX;'s own RX0;, so
+    // trailing duplicates of OUR key/unkey must not read as the radio
+    // un-keying by itself), cwTune guards the TU push like any other SET.
+    ptt: 0, cwTune: 0,
   };
 
   const log = (level: 'debug' | 'info' | 'warn' | 'error', ...args: unknown[]) => {
@@ -985,6 +1027,25 @@ export function useRadioCAT(): RadioCATControls {
       applyAutoReportState(v >= 1);
       return true;
     }
+    if (msg.startsWith('TU')) {
+      const v = parseIntField(msg, 'TU');
+      if (v === null) return false;
+      if (graceOver('cwTune')) setState(prev => ({ ...prev, cwTune: v }));
+      return true;
+    }
+    if (msg.startsWith('TX')) return true;  // trailing duplicate of a key-up status echo — nothing to apply
+    if (msg.startsWith('RX')) {
+      // The radio un-keyed and nobody asked within the grace window: its own
+      // TX time-out (TT) fired, or CW Tune was switched off mid-carrier. The
+      // radio is the source of truth for being keyed, so follow it — the UI
+      // must never keep showing TX on a radio that stopped.
+      if (graceOver('ptt') && state().ptt) {
+        log('info', 'radio un-keyed on its own (RX0; pushed — TX time-out?)');
+        setState(prev => ({ ...prev, ptt: false }));
+        if (tuneActive && state().tune !== 'stopping') void stopTune();
+      }
+      return true;
+    }
     if (msg.startsWith('AG0')) {
       const v = parseIntField(msg, 'AG0');
       if (v === null) return false;
@@ -1181,11 +1242,14 @@ export function useRadioCAT(): RadioCATControls {
     ws     = null;
     rxBuf  = '';
     autoReportActive = false;
+    tuneActive = false;  // the radio's own TX time-out is the backstop once the link is gone
+    tuneRestoreMode = null;
     confirmErrors.forget();
     setState(prev => ({
       ...prev, connected: false, reconnecting: false, frequency: null, mode: null, ptt: false, error: null,
       volume: null, att1: null, att2: null, nr: null, agc: null, agcLevel: null, filter: null, sMeter: null, drive: null,
       backlight: null, firmwareVersion: null, autoReport: null, pttConfirmAlarm: false,
+      cwTune: null, tune: 'idle',
     }));
   }
 
@@ -1404,7 +1468,73 @@ export function useRadioCAT(): RadioCATControls {
   //     On repeated failure to confirm RX, ptt stays true (never optimistic)
   //     and pttConfirmAlarm fires — the radio's own TOT (TT;) is a separate,
   //     slower hardware backstop, not a reason to stay quiet here.
+  // ── CW Tune (one-click TUNE) ───────────────────────────────────────────────
+  // Lives here rather than in a component so it can be exclusive with every
+  // other transmitter: they all key through setPTT() below.
+  let tuneActive = false;
+  let tuneRestoreMode: CATMode | null = null;
+
+  // TU0;/TU1; — a PU7FTW extension SET that echoes the effective value.
+  // Always awaited (both transports): the echo is the only proof the
+  // firmware has CW Tune at all — older firmware answers ?;, which never
+  // matches the TU prefix and so reads as a timeout here.
+  const setCwTuneFlag = async (on: boolean): Promise<boolean> => {
+    const n = on ? 1 : 0;
+    lastSet.cwTune = Date.now();
+    for (let attempt = 1; attempt <= CONFIRM_RETRIES; attempt++) {
+      let reply = '';
+      try { reply = await query(`TU${n};`); } catch { reply = ''; }
+      const v = parseIntField(reply, 'TU');
+      if (v !== null) setState(prev => ({ ...prev, cwTune: v }));
+      if (v === n) return true;
+      log('warn', `setCwTune: TU${n}; → "${reply}" did not confirm (attempt ${attempt}/${CONFIRM_RETRIES})`);
+    }
+    return false;
+  };
+
+  const startTune = async () => {
+    const s = state();
+    if (tuneActive || !s.connected || s.ptt || s.pttConfirmAlarm) return;
+    tuneActive = true;
+    tuneRestoreMode = s.mode;
+    setState(prev => ({ ...prev, tune: 'starting' }));
+    log('info', 'startTune — from mode', s.mode, 'at', s.frequency);
+    if (s.mode !== 'CW') await setMode('CW');
+    if (!(await setCwTuneFlag(true))) {
+      noteConfirmFailure('The radio did not accept CW Tune (TU1;) — firmware without Tune support, or the CAT link dropped it.');
+      if (tuneRestoreMode && tuneRestoreMode !== 'CW') await setMode(tuneRestoreMode);
+      tuneActive = false;
+      setState(prev => ({ ...prev, tune: 'idle' }));
+      return;
+    }
+    if (!tuneActive) return;  // stopTune() ran meanwhile (e.g. disconnect) — don't key
+    await keyPTT(true);
+    setState(prev => ({ ...prev, tune: 'keyed', lastTuneHz: prev.frequency }));
+  };
+
+  const stopTune = async () => {
+    if (!tuneActive || state().tune === 'stopping') return;
+    setState(prev => ({ ...prev, tune: 'stopping' }));
+    log('info', 'stopTune');
+    await keyPTT(false);  // always — confirms RX even if the radio already un-keyed itself
+    await setCwTuneFlag(false);
+    if (tuneRestoreMode && tuneRestoreMode !== 'CW') await setMode(tuneRestoreMode);
+    tuneRestoreMode = null;
+    tuneActive = false;
+    setState(prev => ({ ...prev, tune: 'idle' }));
+  };
+
   const setPTT = async (tx: boolean) => {
+    if (tuneActive) {
+      if (tx) { log('warn', 'setPTT(true) refused — a TUNE is in progress'); return; }
+      await stopTune();
+      return;
+    }
+    await keyPTT(tx);
+  };
+
+  const keyPTT = async (tx: boolean) => {
+    lastSet.ptt = Date.now();
     log('info', 'setPTT →', tx ? 'TX' : 'RX');
     if (transportKind !== 'websocket') {
       setState(prev => ({ ...prev, ptt: tx }));
@@ -1804,7 +1934,7 @@ export function useRadioCAT(): RadioCATControls {
 
   return {
     state, getTransportKind: () => transportKind,
-    connect, disconnect, dismissError, setFrequency, setMode, setPTT,
+    connect, disconnect, dismissError, setFrequency, setMode, setPTT, startTune, stopTune,
     setVolume, setAtt1, setAtt2, setNR, setAGC, setAgcLevel, setFilter, setDrive,
     setBacklight, getPABias, setPABias, getTxTimeout, setTxTimeout, resetRadio,
     getFactoryDefaults, factoryResetRadio, getRefFreq, setRefFreq,

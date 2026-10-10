@@ -271,6 +271,26 @@ function main(): void {
       record('BL restored to its original value', parseIntField(blRestoreResp, 'BL') === blBefore, JSON.stringify(blRestoreResp));
     }
 
+    // ── CW Tune flag (TU, menu 2.3) SET/GET round-trip, restoring original.
+    // Only the flag is exercised — it never keys anything by itself (TX in CW
+    // with TU1 does, and that is deliberately NOT tested here; validate the
+    // carrier manually into a dummy load/tuner). ──
+    const tuBeforeResp = sendGet(fd, 'TU;', 'TU');
+    const tuBefore = parseIntField(tuBeforeResp, 'TU');
+    record('TU; GET returns 0/1', tuBefore === 0 || tuBefore === 1, JSON.stringify(tuBeforeResp));
+
+    if (tuBefore !== null) {
+      const tuProbe = tuBefore === 1 ? 0 : 1;
+      const tuSetResp = send(fd, `TU${tuProbe};`);
+      record('TU SET echoes the new value', parseIntField(tuSetResp, 'TU') === tuProbe, JSON.stringify(tuSetResp));
+      const tuGetResp = sendGet(fd, 'TU;', 'TU');
+      record('TU GET reflects the newly set value', parseIntField(tuGetResp, 'TU') === tuProbe, JSON.stringify(tuGetResp));
+      const tuBadResp = send(fd, 'TU7;');
+      record('TU SET of 7 is rejected (echo returns old value)', parseIntField(tuBadResp, 'TU') === tuProbe, JSON.stringify(tuBadResp));
+      const tuRestoreResp = sendSetVerified(fd, `TU${tuBefore};`, 'TU', tuBefore);
+      record('TU restored to its original value', parseIntField(tuRestoreResp, 'TU') === tuBefore, JSON.stringify(tuRestoreResp));
+    }
+
     // ── Mode changes over CAT (MD, Kenwood digits 1=LSB 2=USB 3=CW 4=FM 5=AM).
     // Since the 2026-07-06 build AM/FM/CW are selectable for RX (listening) while
     // TX is blocked outside LSB/USB *in the firmware* — TX blocking is deliberately

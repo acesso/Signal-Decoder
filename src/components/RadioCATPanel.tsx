@@ -10,7 +10,9 @@ import {
   type FactoryDefaults,
   type BridgeStatus,
   type BridgeInfo,
+  type TuneState,
 } from '../lib/cat/useRadioCAT'
+import { retuneSuggestion, type RetuneSuggestion } from '../lib/cat/cwTune'
 import type { AudioBridge } from '../lib/cat/useAudioBridge'
 import type { IQBridge } from '../lib/cat/useIQBridge'
 import CalibrationWizard from './CalibrationWizard'
@@ -237,6 +239,62 @@ function PTTButton(props: { ptt: boolean; onToggle: () => void; confirmAlarm?: b
       </button>
       <Show when={props.confirmAlarm}>
         <span class="text-[9px] font-bold text-[#f85149] whitespace-nowrap animate-pulse">⚠ TX NOT CONFIRMED OFF</span>
+      </Show>
+    </div>
+  )
+}
+
+// ── TuneButton ────────────────────────────────────────────────────────────────
+// One-click CW Tune (uSDX BLACK_BRICK, TU command): useRadioCAT.startTune()
+// keys an unmodulated carrier for the antenna tuner, stopTune() undoes it.
+// The amber "retune?" hint comes from cwTune.ts — display only, never keys.
+
+const TUNE_HELP =
+  'Tune — keys an unmodulated CW carrier on the dial frequency for the antenna tuner, at the uSDX\'s own power ' +
+  '(the external PA stays unkeyed). Click again to stop; the radio\'s TX time-out also ends it. ' +
+  'Re-tune after a band change or a large VFO move (more than ±MHz×3.5 kHz) — the tuner\'s SWR match depends on frequency.'
+
+function TuneButton(props: {
+  tune: TuneState
+  disabled: boolean
+  suggestion: RetuneSuggestion
+  lastTuneHz: number | null
+  onToggle: () => void
+}) {
+  const busy = () => props.tune === 'starting' || props.tune === 'stopping'
+  const hint = () => props.tune === 'idle' && props.suggestion.suggest && props.suggestion.reason !== 'never'
+  const title = () => {
+    if (props.tune === 'keyed') return 'Tuning — carrier on air. Click to stop.'
+    if (busy()) return props.tune === 'starting' ? 'Starting tune…' : 'Stopping tune…'
+    if (props.disabled) return 'Tune is unavailable while transmitting.'
+    const last = props.lastTuneHz !== null ? ` Last tuned at ${(props.lastTuneHz / 1e6).toFixed(3)} MHz.` : ' Not tuned yet this session.'
+    const why =
+      props.suggestion.reason === 'band' ? ' The VFO is on another band since the last tune — re-tune suggested.'
+      : props.suggestion.reason === 'drift' && props.suggestion.windowHz !== null
+        ? ` The VFO moved more than ±${(props.suggestion.windowHz / 1000).toFixed(1)} kHz from the last tune — re-tune suggested.`
+      : ''
+    return TUNE_HELP + last + why
+  }
+  return (
+    <div class="flex flex-col items-center gap-1 shrink-0">
+      <button
+        onClick={props.onToggle}
+        disabled={props.disabled || busy()}
+        title={title()}
+        class={`flex items-center justify-center gap-1.5 text-xs font-bold w-16 py-1.5 rounded-md transition-colors border disabled:opacity-50
+          ${props.tune === 'keyed'
+            ? 'bg-[#f85149] border-[#f85149] text-white animate-pulse'
+            : busy()
+              ? 'bg-[#21262d] border-[#d29922] text-[#d29922]'
+              : hint()
+                ? 'bg-[#21262d] border-[#d29922] text-[#d29922] hover:text-[#e3b341]'
+                : 'bg-[#21262d] border-[#30363d] text-[#8b949e] hover:text-[#c9d1d9] hover:border-[#8b949e]'
+          }`}
+      >
+        TUNE
+      </button>
+      <Show when={hint()}>
+        <span class="text-[9px] font-bold text-[#d29922] whitespace-nowrap">↻ retune?</span>
       </Show>
     </div>
   )
@@ -1886,8 +1944,9 @@ export default function RadioCATPanel(props: {
 
   const handleConnect    = () => { setShowSettings(false); cat.connect(config()).catch(() => {}) }
   const handleFreqCommit = (hz: number) => { cat.setFrequency(hz).catch(() => {}) }
-  const handleModeChange = (m: CATMode) => { cat.setMode(m).catch(() => {}) }
-  const handlePTTToggle  = () => { cat.setPTT(!state().ptt).catch(() => {}) }
+  const handleModeChange = (m: CATMode) => { if (state().tune === 'idle') cat.setMode(m).catch(() => {}) }  // locked while a TUNE owns the mode
+  const handlePTTToggle  = () => { cat.setPTT(!state().ptt).catch(() => {}) }  // unkeying during a TUNE ends it (setPTT → stopTune)
+  const handleTuneToggle = () => { (state().tune === 'idle' ? cat.startTune() : cat.stopTune()).catch(() => {}) }
   const handleVolume     = (n: number) => { cat.setVolume(n).catch(() => {}) }
   const handleAtt1       = (n: number) => { cat.setAtt1(n).catch(() => {}) }
   const handleAtt2       = (n: number) => { cat.setAtt2(n).catch(() => {}) }
@@ -2026,6 +2085,17 @@ export default function RadioCATPanel(props: {
 
           {/* PTT */}
           <PTTButton ptt={state().ptt} onToggle={handlePTTToggle} confirmAlarm={state().pttConfirmAlarm} />
+
+          {/* CW Tune (uSDX BLACK_BRICK TU command) */}
+          <Show when={config().rigProfile === 'usdx-blackbrick' && state().firmwareVersion !== null}>
+            <TuneButton
+              tune={state().tune}
+              disabled={state().tune === 'idle' && (state().ptt || state().pttConfirmAlarm)}
+              suggestion={retuneSuggestion(state().frequency ?? 0, state().lastTuneHz)}
+              lastTuneHz={state().lastTuneHz}
+              onToggle={handleTuneToggle}
+            />
+          </Show>
 
           {/* uSDX BLACK_BRICK 4.01a extensions */}
           <Show when={config().rigProfile === 'usdx-blackbrick' && state().firmwareVersion !== null && !props.collapsed}>
