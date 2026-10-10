@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>uSDX CAT bridge</title>
 <link rel="stylesheet" href="/style.css">
+<link rel="icon" href="data:,">
 </head>
 <body>
 <h1>uSDX CAT bridge</h1>
@@ -436,23 +437,6 @@
       (~-6dB below peak); watch it move as you adjust each trimpot.</p>
     </section>
 
-    <section id="tx-cache-card" class="card">
-      <div class="cat-header">
-        <h2>TX cache</h2>
-        <span id="tx-cache-readout" class="quality-readout">&mdash;</span>
-      </div>
-      <p class="hint">The four TX audio buffer slots
-      (<code>POST /tx-audio</code>), each holding one pre-encoded message the
-      device plays back from its own PSRAM on <code>POST /tx-play</code> &mdash;
-      uploading the whole message up front is what keeps Wi-Fi jitter out of
-      the transmitted signal. The message text and audio Hz shown here are
-      metadata the uploader supplied alongside the audio; the device stores
-      them verbatim and never interprets them (the Hz is already baked into
-      the samples themselves). Slot 0 is the standing auto-CQ waveform, 1&ndash;2
-      the head of the web app's TX queue, 3 spare.</p>
-      <div id="tx-cache-slots" class="tx-slot-list"></div>
-    </section>
-
     <section id="iq-spectrum-card" class="card">
       <div class="cat-header">
         <h2>I/Q spectrum</h2>
@@ -514,6 +498,70 @@
       </div>
     </section>
 
+    <section id="diag-card" class="card">
+      <div class="cat-header">
+        <h2>Diagnostic &mdash; live audio test</h2>
+        <span id="live-readout" class="quality-readout">idle</span>
+      </div>
+      <p class="hint">Tunes the bridge &rarr; radio audio path against what the radio's mic ADC actually
+      receives, without transmitting. In <strong>diagnostic mode</strong> the radio keys normally but sends
+      nothing to the HF line (no PA drive, no TX clock, external amp never keyed, TX time-out off) and shows
+      <strong>D</strong> instead of T. The live test plays the bridge test tone, keys a dry TX and plots every
+      ~0.5 s window the radio reports. The graph holds only the current run; Start clears it.</p>
+      <div id="diag-banner" class="diag-banner" hidden>DIAGNOSTIC MODE &mdash; nothing reaches the HF line.</div>
+      <div class="tx-controls">
+        <button id="diag-chip" type="button" class="chip" title="Radio diagnostic mode (CAT DG)">Diag mode: ?</button>
+        <label class="tx-key-label">Tone <input id="live-hz" type="number" min="300" max="2500" step="10" value="1500"> Hz</label>
+        <label class="tx-key-label">Level <input id="live-amp" type="range" min="0" max="100" step="1" value="50"> <span id="live-amp-val">50%</span></label>
+        <button id="live-btn" type="button" class="secondary" disabled>Start live test</button>
+      </div>
+      <div id="live-now" class="live-now" hidden></div>
+      <div id="live-charts" class="live-charts" hidden>
+        <div class="viz-legend" aria-hidden="true">
+          <span><i class="sw sw-1"></i>Drive (% of PA ceiling)</span>
+          <span><i class="sw sw-2"></i>At ceiling</span>
+          <span><i class="sw sw-3"></i>Carrier gated off</span>
+        </div>
+        <div class="viz-block"><div class="viz-title">Radio drive &mdash; % of window</div><div id="viz-pct" class="viz"></div></div>
+        <div class="viz-block"><div class="viz-title">Mic level at the radio &mdash; mV peak</div><div id="viz-mic" class="viz"></div></div>
+        <div class="viz-block"><div class="viz-title">Bridge DAC output &mdash; dBFS RMS</div><div id="viz-dac" class="viz"></div></div>
+        <div id="viz-tip" class="viz-tip" hidden></div>
+        <details class="viz-table-wrap">
+          <summary>Data table</summary>
+          <table class="viz-table"><thead><tr><th>t (s)</th><th>Drive %</th><th>At ceiling %</th><th>Gated off %</th><th>Mic mV</th><th>DAC dBFS</th></tr></thead><tbody id="viz-tbody"></tbody></table>
+        </details>
+      </div>
+    </section>
+
+    <section id="tx-cache-card" class="card">
+      <div class="cat-header">
+        <h2>TX cache</h2>
+        <span id="tx-cache-readout" class="quality-readout">&mdash;</span>
+      </div>
+      <p class="hint">The four TX audio buffer slots
+      (<code>POST /tx-audio</code>), each holding one pre-encoded message the
+      device plays back from its own PSRAM on <code>POST /tx-play</code> &mdash;
+      uploading the whole message up front is what keeps Wi-Fi jitter out of
+      the transmitted signal. The message text and audio Hz shown here are
+      metadata the uploader supplied alongside the audio; the device stores
+      them verbatim and never interprets them (the Hz is already baked into
+      the samples themselves). Slot 0 is the standing auto-CQ waveform, 1&ndash;2
+      the head of the web app's TX queue, 3 spare.</p>
+      <div class="tx-controls">
+        <button id="tx-autoptt-chip" type="button" class="chip">Auto-PTT</button>
+        <button id="tx-monitor-chip" type="button" class="chip" title="Listen to the playback in this browser, through the mic sniffer (exactly what the DAC feeds the radio)">Monitor in browser</button>
+        <label class="tx-key-label">Pre-key <input id="tx-prekey" type="number" min="0" max="2000" step="10"> ms</label>
+        <label class="tx-key-label">Post-key <input id="tx-postkey" type="number" min="0" max="2000" step="10"> ms</label>
+        <button id="tx-stop-btn" type="button" class="tx-stop" disabled>■ Stop</button>
+      </div>
+      <p id="tx-play-status" class="tx-play-status" role="status"></p>
+      <div id="tx-cache-slots" class="tx-slot-list"></div>
+      <p class="hint">▶ Play always plays the slot on the bridge DAC, into the radio's mic input &mdash; on its own
+      that never transmits (the radio has no VOX). With <strong>Auto-PTT</strong> the page keys the radio around it:
+      checks the radio is in LSB/USB, sends <code>TX;</code>, waits the pre-key time, plays, waits for the end and the
+      post-key time, then <code>RX;</code> &mdash; Stop and any error always send <code>RX;</code>.</p>
+    </section>
+
     <section id="cat-card" class="card">
       <div class="cat-header">
         <h2>CAT monitor</h2>
@@ -526,21 +574,45 @@
             <option value="57600">57600</option>
           </select>
           <button id="cat-baud-apply-btn" type="button">Apply</button>
-          <button id="cat-log-clear-btn" type="button" class="secondary">Clear</button>
           <label class="cat-pause-label">
             <input id="cat-log-pause" type="checkbox">
             Pause
           </label>
         </div>
       </div>
+      <div class="cat-filter-row">
+        <span class="cat-filter-label">Hide</span>
+        <span id="cat-hide-chips" class="chip-row"></span>
+        <select id="cat-filter-mode" aria-label="Text filter mode">
+          <option value="only">show only</option>
+          <option value="hide">hide</option>
+        </select>
+        <input id="cat-filter-text" type="text" placeholder="text filter, e.g. FA" autocomplete="off" spellcheck="false">
+        <span id="cat-hidden-count" class="cat-hidden-count"></span>
+        <button id="cat-log-clear-btn" type="button" class="secondary cat-clear-btn">Clear log</button>
+      </div>
+      <div class="cat-legend">
+        <span class="arrow arrow-in">◀ RADIO</span> from the radio
+        <span class="arrow arrow-out">▶ BRIDGE</span> sent from this bridge page
+        <span class="arrow arrow-other">▶ APP</span> sent by another client (web app)
+      </div>
       <div id="cat-log" class="cat-log" role="log" aria-live="polite"></div>
+      <div id="cat-txdiag" class="txdiag" hidden></div>
+      <div class="cat-quick-row">
+        <button id="cat-query-btn" type="button" class="secondary">Query radio</button>
+        <span id="cat-quick-chips" class="chip-row"></span>
+      </div>
       <form id="cat-send-form" class="row cat-send-row">
-        <input id="cat-send-input" type="text" placeholder="FA;" autocomplete="off" spellcheck="false">
+        <input id="cat-send-input" type="text" placeholder="FA; — or click chips above to build a command" autocomplete="off" spellcheck="false">
+        <button id="cat-send-clear" type="button" class="secondary" title="Clear the command line">✕</button>
         <button type="submit">Send</button>
       </form>
       <p class="hint">Live sniff of every CAT frame crossing the bridge in
-      either direction &mdash; <span class="arrow arrow-in">&#x2190;</span> from
-      the radio, <span class="arrow arrow-out">&#x2192;</span> to the radio.
+      either direction. Quick-command chips are the read-only queries the radio
+      lists (<code>CL;</code>) &mdash; never TX, restart or any SET. Clicking a chip
+      adds it to the command line; chain several, edit, then Send.
+      After every SSB transmission the radio reports what its mic input
+      received (<code>TA</code>); this page evaluates it into the panel above.
       Connects to the same <code>/cat</code> WebSocket the web app uses, so
       this is exactly what it sees. The baud rate here must match the
       radio's own CAT menu setting (there's no CAT command that reports or

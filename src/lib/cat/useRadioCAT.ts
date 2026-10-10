@@ -1033,6 +1033,10 @@ export function useRadioCAT(): RadioCATControls {
       if (graceOver('cwTune')) setState(prev => ({ ...prev, cwTune: v }));
       return true;
     }
+    // TX audio diagnostic (radio TX_DIAG) pushed after every SSB key-up — a
+    // bridge-hardware diagnostic evaluated on the bridge's own control page,
+    // not here; recognized only so it isn't logged as unexpected.
+    if (/^TA\d+,\d+,\d+;$/.test(msg)) return true;
     if (msg.startsWith('TX')) return true;  // trailing duplicate of a key-up status echo — nothing to apply
     if (msg.startsWith('RX')) {
       // The radio un-keyed and nobody asked within the grace window: its own

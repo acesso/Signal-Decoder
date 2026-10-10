@@ -240,6 +240,7 @@ Global variables use 1499 bytes (73%) of dynamic memory, leaving 549 bytes for l
 // Advanced configuration switches
 //#define CONDENSED      1   // Display in 4 line mode (for OLED and LCD2004 modules)
 #define TX_ENABLE        1   // Disable this for RX only (no transmit), e.g. to support uSDX for kids idea: https://groups.io/g/ucx/topic/81030243#6276
+#define TX_DIAG          1   // PU7FTW 2026-10-10: TX audio diagnostic — SSB TX records mic-ADC peak, envelope peak and clip share; pushed as TA<mic>,<env>,<clip%>; after every SSB TX (and on TA; query). ~720 B flash, 14 B RAM, ~1.5% CPU during TX only
 //#define SEMI_QSK       1   // Removed 2026-07-06 with the rest of CW TX (CW is RX-only now)   // Just after keying the transmitter, keeps the RX muted for a short amount of time in the anticipation for continued keying
 //#define CW_TX          1   // Removed 2026-07-06: CW transmit (dsp_tx_cw/sidetone/key shaping) — this rig transmits SSB only, fed by external audio; CW RX (narrow filters + cw_offset tuning) is kept and keying TX in CW mode is blocked in switch_rxtx
 //#define RIT_ENABLE       1  // Removed: digital-modes-only rig — RIT is pointless when the PC tunes via CAT   // Receive-In-Transit alternates the receiving frequency with an user-defined offset to compensate for any necessary tuning needed on receive
@@ -2236,6 +2237,26 @@ static uint8_t error_code = 0;      // G8RDI mod - added LCD error code
 
 volatile uint8_t quad = 0;
 
+#ifdef TX_DIAG
+volatile uint16_t txd_in_peak, txd_amp_peak, txd_clips, txd_gated, txd_samples, txd_settle;  // reset at every key-down (switch_rxtx)
+volatile uint32_t txd_amp_sum;
+volatile uint8_t txd_keyed;  // own keyed state: `tx` is NOT "keyed" here — with CARRIER_COMPLETELY_OFF_ON_LOW, _vox() reuses tx as the carrier gate's hang timer and it reaches 0 mid-TX whenever the audio is quiet
+volatile uint8_t txd_report_pending;  // set at SSB key-up, sent from catCheckReport() (see there for why not from switch_rxtx)
+#define TXD_SETTLE_SAMPLES  480  // ~100 ms at 4800 sps skipped after key-down: PC2 is driven LOW during RX and released at TX, so the mic input's coupling swings back to its bias — a step the ADC sees as a huge peak that says nothing about the audio
+#define TXD_WINDOW_SAMPLES  2400  // ~0.5 s at 4800 sps — live TA window while keyed in diagnostic mode
+#ifdef MULTI_ADC
+#define TXD_IN_BIAS  32  // = AF_BIAS in dsp_tx(): MULTI_ADC deliberately offsets the mic sample by +32 counts, so silence reads ~32 — removed before taking the mic peak
+#else
+#define TXD_IN_BIAS  0
+#endif
+// Diagnostic mode (CAT DG, menu): every TX runs exactly as normal — key-up path, relay, ADC/mic switch-over, timing,
+// TX_DIAG reports — except that nothing reaches the HF line: no Si5351 TX clock, no KEY_OUT PA drive (PWM never enabled,
+// envelope forced to 0), NTX/PTX not asserted (external PA never keyed). TX time-out is not armed (the `tot` setting is
+// kept as is). Never stored, boots OFF. LCD shows 'D' instead of 'T' while keyed. Windowed TA reports every ~0.5 s.
+volatile uint8_t diag_mode = 0;
+#else
+#define diag_mode 0  // TX_DIAG off: diagnostic mode compiled out, every gate below folds away
+#endif //TX_DIAG
 inline int16_t ssb(int16_t in)
 {
 	static int16_t dc, z1;
@@ -2284,6 +2305,18 @@ inline int16_t ssb(int16_t in)
 	//if(!(_amp > vox_thresh)) return 0;
 
 	uint32_t _amp32 = (uint32_t)_amp << (drive);  // widen before the shift: _amp<<drive can exceed 65535 (uint16_t) on loud peaks, wrapping past the clip check below instead of clamping
+#ifdef TX_DIAG
+	if (txd_settle) txd_settle--;  // still inside the key-down settling window — record nothing
+	else {
+		int16_t d = in - TXD_IN_BIAS; uint16_t a = (d < 0) ? -d : d; if (a > txd_in_peak) txd_in_peak = a;  // mic ADC deviation from mid-scale, ~1.07 mV/count (1.1 V ref)
+		if (_amp > txd_amp_peak) txd_amp_peak = _amp;  // envelope BEFORE the drive shift: full power needs >= 255 >> drive
+		if (txd_samples == 0xFFFF) { txd_samples >>= 1; txd_clips >>= 1; txd_gated >>= 1; txd_amp_sum >>= 1; }  // halve together on saturation: keeps ratio and average over the whole TX (~13.6 s per wrap)
+		txd_samples++; txd_amp_sum += _amp; if ((_amp32 > 255) || (drive == 8)) txd_clips++;
+#ifdef CARRIER_COMPLETELY_OFF_ON_LOW
+		if (!tx) txd_gated++;  // carrier switched off by the low-level gate (envelope <= vox_thresh for its ~58 ms hang time)
+#endif
+	}
+#endif //TX_DIAG
 	_amp = ((_amp32 > 255) || (drive == 8)) ? 255 : _amp32; // clip or when drive=8 use max output
 	amp = (tx) ? lut[_amp] : 0;
 
@@ -2324,7 +2357,7 @@ void dsp_tx()
 	ADCSRA |= (1 << ADSC);
 	//OCR1BL = amp;                        // submit amplitude to PWM register (actually this is done in advance (about 140us) of phase-change, so that phase-delays in key-shaping circuit filter can settle)
 	si5351.SendPLLRegisterBulk();       // submit frequency registers to SI5351 over 731kbit/s I2C (transfer takes 64/731 = 88us, then PLL-loopfilter probably needs 50us to stabalize)
-	OCR1BL = amp;                      // submit amplitude to PWM register (takes about 1/32125 = 31us+/-31us to propagate) -> amplitude-phase-alignment error is about 30-50us
+	OCR1BL = diag_mode ? 0 : amp;      // submit amplitude to PWM register (takes about 1/32125 = 31us+/-31us to propagate) -> amplitude-phase-alignment error is about 30-50us; diagnostic mode: no PA drive
 	adc += ADC;
 	ADCSRA |= (1 << ADSC);  // causes RFI on QCX-SSB units (not on units with direct biasing); ENABLE this line when using direct biasing!!
 	int16_t df = ssb(_adc >> MIC_ATTEN); // convert analog input into phase-shifts (carrier out by periodic frequency shifts)
@@ -2340,7 +2373,7 @@ void dsp_tx()
 	ADCSRA |= (1 << ADSC);    // start next ADC conversion (trigger ADC interrupt if ADIE flag is set)
 	//OCR1BL = amp;                        // submit amplitude to PWM register (actually this is done in advance (about 140us) of phase-change, so that phase-delays in key-shaping circuit filter can settle)
 	si5351.SendPLLRegisterBulk();       // submit frequency registers to SI5351 over 731kbit/s I2C (transfer takes 64/731 = 88us, then PLL-loopfilter probably needs 50us to stabalize)
-	OCR1BL = amp;                        // submit amplitude to PWM register (takes about 1/32125 = 31us+/-31us to propagate) -> amplitude-phase-alignment error is about 30-50us
+	OCR1BL = diag_mode ? 0 : amp;        // submit amplitude to PWM register (takes about 1/32125 = 31us+/-31us to propagate) -> amplitude-phase-alignment error is about 30-50us; diagnostic mode: no PA drive
 	int16_t adc = ADC - 512; // current ADC sample 10-bits analog input, NOTE: first ADCL, then ADCH
 	int16_t df = ssb(adc >> MIC_ATTEN);  // convert analog input into phase-shifts (carrier out by periodic frequency shifts)
 	si5351.freq_calc_fast(df);           // calculate SI5351 registers based on frequency shift and carrier frequency
@@ -2348,7 +2381,7 @@ void dsp_tx()
 
 #ifdef CARRIER_COMPLETELY_OFF_ON_LOW
 	if (tx == 1) { OCR1BL = 0; si5351.SendRegister(SI_CLK_OE, TX0RX0); }   // disable carrier
-	if (tx == 255) { si5351.SendRegister(SI_CLK_OE, TX1RX0); } // enable carrier
+	if ((tx == 255) && !diag_mode) { si5351.SendRegister(SI_CLK_OE, TX1RX0); } // enable carrier (never in diagnostic mode)
 #endif
 
 #ifdef MOX_ENABLE
@@ -2370,7 +2403,7 @@ void dummy()
 volatile uint8_t cw_tune = 0;  // CW Tune (menu 2.3): 1 = PTT/CAT TX in CW keys an unmodulated carrier for an external antenna tuner; never stored, boots OFF
 void dsp_tx_tune()
 {
-	OCR1BL = lut[255];  // constant envelope at the configured PA bias max — no modulation, no sidetone
+	OCR1BL = diag_mode ? 0 : lut[255];  // constant envelope at the configured PA bias max — no modulation, no sidetone (none at all in diagnostic mode)
 }
 
 #ifdef CW_TX
@@ -4427,6 +4460,8 @@ void switch_rxtx(uint8_t tx_enable)
     {
         Serial.print("RX0;");   // GW8RDI mod - advise going to Rx
 		Serial.print("RX0;");
+#ifdef TX_DIAG
+#endif //TX_DIAG
     }
   }
 #endif
@@ -4442,10 +4477,10 @@ void switch_rxtx(uint8_t tx_enable)
 		if ((txdelay) && (tx_enable) && (!(tx))) {  // key-up TX relay in advance before actual transmission
 			digitalWrite(RX, LOW); // TX (disable RX)
 #ifdef NTX
-			if (mode != CW) digitalWrite(NTX, LOW);  // TX (enable TX) — but never in CW: CW TX is only the CW Tune carrier, which must leave the external PA (miniPA70, keyed by this line) unkeyed so the tuner sees just the uSDX's own ~5 W through the amp's bypass
+			if ((mode != CW) && !diag_mode) digitalWrite(NTX, LOW);  // TX (enable TX) — not in diagnostic mode either (no HF output at all) — but never in CW: CW TX is only the CW Tune carrier, which must leave the external PA (miniPA70, keyed by this line) unkeyed so the tuner sees just the uSDX's own ~5 W through the amp's bypass
 #endif //NTX
 #ifdef PTX
-			if (mode != CW) digitalWrite(PTX, HIGH);  // TX (enable TX) — not in CW, see NTX above
+			if ((mode != CW) && !diag_mode) digitalWrite(PTX, HIGH);  // TX (enable TX) — not in CW or diagnostic mode, see NTX above
 #endif //PTX
 			lcd.setCursor(15, 1); lcd.print('D');  // note that this enables interrupts again.
 			interrupts();    //hack.. to allow delay()
@@ -4453,6 +4488,10 @@ void switch_rxtx(uint8_t tx_enable)
 			noInterrupts();  //end of hack
 		}
 #endif //TX_DELAY
+#ifdef TX_DIAG
+	if (tx_enable && !txd_keyed) { txd_in_peak = txd_amp_peak = txd_clips = txd_gated = txd_samples = 0; txd_amp_sum = 0; txd_settle = TXD_SETTLE_SAMPLES; txd_keyed = 1; }  // fresh diagnostic per key-down (interrupts are off here); a repeated TX; while keyed keeps accumulating
+	if (!tx_enable && txd_keyed) { txd_keyed = 0; if (txd_samples) txd_report_pending = 1; }  // key-up after an SSB TX: queue the report (CW Tune never runs ssb(), so it has no samples and reports nothing)
+#endif //TX_DIAG
 	tx = tx_enable;
 
 #ifdef CAT_XO_CMD
@@ -4465,7 +4504,7 @@ void switch_rxtx(uint8_t tx_enable)
 	if (tx_enable)
 	{
 		// TX
-		tx_timeout_at = (tot) ? millis() + 1000UL * tot : 0;  // arm the TX time-out guard
+		tx_timeout_at = (tot && !diag_mode) ? millis() + 1000UL * tot : 0;  // arm the TX time-out guard — not in diagnostic mode (no RF, nothing to protect); `tot` itself is untouched
 		_centiGain = centiGain;  // backup AGC setting
 #ifdef SEMI_QSK
 		semi_qsk_timeout = 0;
@@ -4530,13 +4569,13 @@ void switch_rxtx(uint8_t tx_enable)
 
 			// GW8RDI Note: Enable TX before setting PLL frequency?????? todo revise
 #ifdef NTX
-			if (mode != CW) digitalWrite(NTX, LOW);  // TX (enable TX) — but never in CW: CW TX is only the CW Tune carrier, which must leave the external PA (miniPA70, keyed by this line) unkeyed so the tuner sees just the uSDX's own ~5 W through the amp's bypass
+			if ((mode != CW) && !diag_mode) digitalWrite(NTX, LOW);  // TX (enable TX) — not in diagnostic mode either (no HF output at all) — but never in CW: CW TX is only the CW Tune carrier, which must leave the external PA (miniPA70, keyed by this line) unkeyed so the tuner sees just the uSDX's own ~5 W through the amp's bypass
 #endif //NTX
 #ifdef PTX
-			if (mode != CW) digitalWrite(PTX, HIGH);  // TX (enable TX) — not in CW, see NTX above
+			if ((mode != CW) && !diag_mode) digitalWrite(PTX, HIGH);  // TX (enable TX) — not in CW or diagnostic mode, see NTX above
 #endif //PTX
 
-			lcd.setCursor(15, 1); lcd.print('T');   // Show Transmitting on LCD
+			lcd.setCursor(15, 1); lcd.print(diag_mode ? 'D' : 'T');   // Show Transmitting on LCD — 'D' = diagnostic TX, nothing on the HF line
 
 			if (mode == CW)
 			{
@@ -4554,10 +4593,10 @@ void switch_rxtx(uint8_t tx_enable)
 #endif
 			}
 #endif //RIT_ENABLE
-			si5351.SendRegister(SI_CLK_OE, TX1RX0);
+			si5351.SendRegister(SI_CLK_OE, diag_mode ? TX0RX0 : TX1RX0);  // diagnostic mode: TX clock stays off (RX clock off too, as in any TX)
 			OCR1AL = 0x80; // make sure SIDETONE is set at 2.5V
 			if ((!mox) && (mode != CW)) TCCR1A &= ~(1 << COM1A1); // disable SIDETONE, prevent interference during SSB TX
-			TCCR1A |= (1 << COM1B1);  // enable KEY_OUT PWM
+			if (!diag_mode) TCCR1A |= (1 << COM1B1);  // enable KEY_OUT PWM — never in diagnostic mode: KEY_OUT stays a plain LOW output, the PA gets no drive
 #ifdef _SERIAL
 			if (cat_enabled) { DDRC &= ~(1 << 2); } // disable PC2, so that ADC2 can be used as mic input
 #endif
@@ -4941,13 +4980,13 @@ const char* keyer_mode_label[] = { "IambicA", "IambicB","Straight" };  // GW8RDI
 
 #define _N(a) sizeof(a)/sizeof(a[0])
 
-#define N_PARAMS 48  // last visible menu param enum value (BACKL=48 after the AGC_LVL, TOT, CAT_AUTO and CWTUNE enum insertions); update when adding/removing enum entries BEFORE BACKL — getting this wrong makes a blank "hidden" menu slot appear at the wrap and drops the Backlight item
+#define N_PARAMS 49  // last visible menu param enum value (BACKL=49 after the AGC_LVL, TOT, CAT_AUTO, CWTUNE and DIAGMODE enum insertions); update when adding/removing enum entries BEFORE BACKL — getting this wrong makes a blank "hidden" menu slot appear at the wrap and drops the Backlight item
 #ifdef KEEP_BAND_DATA
 #define I_PARAMS 5+9
-enum params_t { _NULL, VOLUME, MODE, FILTER, BAND, STEP, VFOSEL, RIT, AGC, AGC_LVL, NR, ATT, ATT2, SMETER, CWDEC, CWTONE, CWOFF, CWTUNE, KEY_WPM, KEY_MODE, KEY_PIN, TONE_VOL, VOX, VOXGAIN, DRIVE, TOT, TXDELAY, MOX, CWINTERVAL, CWMSG1, CWMSG2, CWMSG3, CWMSG4, CWMSG5, CWMSG6, PWM_MIN, PWM_MAX, SIFXTAL, IQ_ADJ, CAT_ACTIVE, CAT_AUTO, CAT_BAUD, CALIB, SR, CPULOAD, PARAM_A, PARAM_B, PARAM_C, BACKL, FREQA, FREQB, MODEA, MODEB, VERS, BAND_DATA0, BAND_DATA1, BAND_DATA2, BAND_DATA3, BAND_DATA4, BAND_DATA5, BAND_DATA6, BAND_DATA7, BAND_DATA8, ALL = 0xff };
+enum params_t { _NULL, VOLUME, MODE, FILTER, BAND, STEP, VFOSEL, RIT, AGC, AGC_LVL, NR, ATT, ATT2, SMETER, CWDEC, CWTONE, CWOFF, CWTUNE, KEY_WPM, KEY_MODE, KEY_PIN, TONE_VOL, VOX, VOXGAIN, DRIVE, TOT, DIAGMODE, TXDELAY, MOX, CWINTERVAL, CWMSG1, CWMSG2, CWMSG3, CWMSG4, CWMSG5, CWMSG6, PWM_MIN, PWM_MAX, SIFXTAL, IQ_ADJ, CAT_ACTIVE, CAT_AUTO, CAT_BAUD, CALIB, SR, CPULOAD, PARAM_A, PARAM_B, PARAM_C, BACKL, FREQA, FREQB, MODEA, MODEB, VERS, BAND_DATA0, BAND_DATA1, BAND_DATA2, BAND_DATA3, BAND_DATA4, BAND_DATA5, BAND_DATA6, BAND_DATA7, BAND_DATA8, ALL = 0xff };
 #else
 #define I_PARAMS 5
-enum params_t { _NULL, VOLUME, MODE, FILTER, BAND, STEP, VFOSEL, RIT, AGC, AGC_LVL, NR, ATT, ATT2, SMETER, CWDEC, CWTONE, CWOFF, CWTUNE, KEY_WPM, KEY_MODE, KEY_PIN, TONE_VOL, VOX, VOXGAIN, DRIVE, TOT, TXDELAY, MOX, CWINTERVAL, CWMSG1, CWMSG2, CWMSG3, CWMSG4, CWMSG5, CWMSG6, PWM_MIN, PWM_MAX, SIFXTAL, IQ_ADJ, CAT_ACTIVE, CAT_AUTO, CAT_BAUD, CALIB, SR, CPULOAD, PARAM_A, PARAM_B, PARAM_C, BACKL, FREQA, FREQB, MODEA, MODEB, VERS, ALL = 0xff };
+enum params_t { _NULL, VOLUME, MODE, FILTER, BAND, STEP, VFOSEL, RIT, AGC, AGC_LVL, NR, ATT, ATT2, SMETER, CWDEC, CWTONE, CWOFF, CWTUNE, KEY_WPM, KEY_MODE, KEY_PIN, TONE_VOL, VOX, VOXGAIN, DRIVE, TOT, DIAGMODE, TXDELAY, MOX, CWINTERVAL, CWMSG1, CWMSG2, CWMSG3, CWMSG4, CWMSG5, CWMSG6, PWM_MIN, PWM_MAX, SIFXTAL, IQ_ADJ, CAT_ACTIVE, CAT_AUTO, CAT_BAUD, CALIB, SR, CPULOAD, PARAM_A, PARAM_B, PARAM_C, BACKL, FREQA, FREQB, MODEA, MODEB, VERS, ALL = 0xff };
 #endif
 #define N_ALL_PARAMS (N_PARAMS+I_PARAMS)  // number of parameters
 
@@ -5010,7 +5049,10 @@ int8_t paramAction(uint8_t action, uint8_t id = ALL)  // list of parameters
 	case VOXGAIN: paramAction(action, vox_thresh, 0x32, F("Noise Gate"), NULL, 0, 255, false); break; // GW8RDI mod - "Noise Gate" save bytes
 #endif
 	case DRIVE:   paramAction(action, drive, 0x33, F("TX Drive"), NULL, 0, 8, false); break;
-	case TOT:     paramAction(action, tot, 0x34, F("TX Timeout"), NULL, 0, 255, false); break;  // TX time-out timer, seconds; 0 = disabled — force-unkeys the PA if PTT sticks
+	case TOT:     paramAction(action, tot, 0x34, F("TX Timeout"), NULL, 0, 255, false); break;
+#ifdef TX_DIAG
+	case DIAGMODE: if (action <= UPDATE_MENU) paramAction(action, diag_mode, 0x35, F("Diag mode"), offon_label, 0, 1, false); break;  // display/edit only (0 EEPROM bytes, boots OFF) — like CW Tune
+#endif  // TX time-out timer, seconds; 0 = disabled — force-unkeys the PA if PTT sticks
 #ifdef TX_DELAY
 	case TXDELAY: paramAction(action, txdelay, 0x34, F("TX Delay"), NULL, 0, 255, false); break;
 #endif
@@ -5221,6 +5263,14 @@ void analyseCATcmd()    // Supported Kenwood TS-480 protocol CAT commands
 	else if (CMD('B','L',';'))                              Command_BL_GET();
 	else if (CMD2('B','L') && CATcmd[3]==';')               Command_BL_SET(CATcmd[2]-'0');
 	else if (CMD('T','U',';'))                              Command_TU_GET();
+	else if (CMD('C','L',';'))                              Command_CL();
+#ifdef TX_DIAG
+	else if (CMD('D','G',';'))                              Command_DG_GET();
+	else if (CMD2('D','G') && CATcmd[3]==';')               Command_DG_SET(CATcmd[2]-'0');
+#endif
+#ifdef TX_DIAG
+	else if (CMD('T','A',';'))                              Command_TA();
+#endif
 	else if (CMD2('T','U') && CATcmd[3]==';')               Command_TU_SET(CATcmd[2]-'0');
 	else if (CMD('V','O',';'))                              Command_VO_GET();
 	else if (CMD2('V','O') && isValidNumericSet(2))         Command_VO_SET();
@@ -5455,6 +5505,14 @@ void Command_RX()
 	semi_qsk_timeout = 0;  // hack: fix for multiple RX cmds
 #endif
 	Serial.print("RX0;");
+#ifdef TX_DIAG
+	// CAT un-key (the bridge/web app path): send the TX audio report right
+	// behind this RX0;, after switch_rxtx() has fully finished. Pushing it from
+	// catCheckReport() alone was observed to never arrive (4/4 TXs: TA; queried
+	// afterwards had the data, no push came); that path stays as the fallback
+	// for un-keys that don't come over CAT (PTT line, TX time-out).
+	if (txd_report_pending) { txd_report_pending = 0; Command_TA(); }
+#endif //TX_DIAG
 }
 
 void Command_TX0()
@@ -5532,6 +5590,56 @@ void Command_BL_SET(uint8_t val)
 	if (backlight) PORTD |= BACKLIGHT_PIN; else PORTD &= ~BACKLIGHT_PIN;
 	Command_BL_GET();
 }
+
+#ifdef TX_DIAG
+// TA; → TA<mic peak>,<envelope peak>,<clip %>,<envelope avg>,<gated %>; — TX audio diagnostic of the last SSB TX (read-only; also pushed
+// after each SSB TX). All four skip the first ~100 ms after key-down (input settling). mic peak: mic-ADC deviation in counts
+// (~1.07 mV each, ~480 = ADC rail). envelope peak/avg: before the TX drive shift, so full power needs envelope >= 255 >> drive
+// (64 at DR2). clip %: share of samples at the 255 ceiling (100 = full power throughout) — with avg, the honest power indicator.
+// gated %: share of samples with the carrier switched OFF by CARRIER_COMPLETELY_OFF_ON_LOW (envelope <= vox_thresh) — quiet audio
+// doesn't just transmit weakly, it transmits nothing for that share of the time.
+void Command_TA()
+{
+	char buf[32];
+	uint8_t sreg = SREG; cli();  // snapshot: the TX ISR may still be updating these (the key-up push runs before switch_rxtx stops it)
+	uint16_t mic = txd_in_peak, env = txd_amp_peak, clips = txd_clips, gated = txd_gated, n = txd_samples;
+	uint32_t sum = txd_amp_sum;
+	SREG = sreg;
+	sprintf_P(buf, PSTR("TA%u,%u,%u,%u,%u;"), mic, env, n ? (uint16_t)((uint32_t)clips * 100 / n) : 0, n ? (uint16_t)(sum / n) : 0, n ? (uint16_t)((uint32_t)gated * 100 / n) : 0);
+	Serial.print(buf);
+}
+#endif //TX_DIAG
+
+// CL; → CL<cmd>,<cmd>,...; — the read-only queries this build answers, in one reply, so a client (the bridge page's quick
+// commands) needs a single query instead of probing each command. Lists queries only: SETs, TX/RX and SR are never listed.
+#ifdef TX_DIAG
+#define CAT_QUERY_LIST "FA,MD,IF,ID,FV,PS,SM,AI,TQ,AG0,FW,VO,AT,A2,NR,DR,BL,AL,TT,PM,PX,XF,FD,TU,TA,DG,CL"
+#else
+#define CAT_QUERY_LIST "FA,MD,IF,ID,FV,PS,SM,AI,TQ,AG0,FW,VO,AT,A2,NR,DR,BL,AL,TT,PM,PX,XF,FD,TU,CL"
+#endif
+void Command_CL()
+{
+	Serial.print(F("CL" CAT_QUERY_LIST ";"));
+}
+
+#ifdef TX_DIAG
+// DG; → get diagnostic mode, DG0;/DG1; → set it (echo; other values rejected, echo returns the old value). Changing it while
+// keyed un-keys first, so a transmission never switches between real and dry halfway.
+void Command_DG_GET()
+{
+	char buf[5];
+	sprintf(buf, "DG%u;", diag_mode ? 1 : 0);
+	Serial.print(buf);
+}
+void Command_DG_SET(uint8_t val)
+{
+	if (val <= 1 && val != diag_mode) {
+		if (txd_keyed) switch_rxtx(0);
+		diag_mode = val;
+	}
+	Command_DG_GET();
+}
+#endif //TX_DIAG
 
 // TU; → get CW Tune, TU0;/TU1; → set CW Tune (same flag as menu 2.3, never stored); other values are rejected (echo returns the old value)
 void Command_TU_GET()
@@ -5814,15 +5922,36 @@ void catCheckReport()
 {
 	static uint32_t s_freq, s_fxtal;
 	static int8_t s_volume;
-	static uint8_t s_mode, s_filt, s_att, s_att2, s_nr, s_agc, s_agc_lvl, s_drive, s_tot, s_backlight, s_cw_tune, s_pwm_min, s_pwm_max, s_cat_auto;
+	static uint8_t s_mode, s_filt, s_att, s_att2, s_nr, s_agc, s_agc_lvl, s_drive, s_tot, s_backlight, s_cw_tune, s_diag, s_pwm_min, s_pwm_max, s_cat_auto;
 	static int16_t s_dbm;
 	static uint32_t sm_hold_ms;
 	static bool primed = false;
+
+#ifdef TX_DIAG
+	// Diagnostic-mode TX: no RF, so a live TA window every ~0.5 s is safe to send while keyed — fresh counters per window,
+	// so the readout follows trimpot changes on the interface board. (Real TX never sends anything while keyed.)
+	if (diag_mode && txd_keyed && (txd_samples >= TXD_WINDOW_SAMPLES) && cat_enabled && cat_active && Serial.availableForWrite() >= 32) {
+		Command_TA();
+		uint8_t sreg = SREG; cli();
+		txd_in_peak = txd_amp_peak = txd_clips = txd_gated = txd_samples = 0; txd_amp_sum = 0;
+		SREG = sreg;
+	}
+#endif //TX_DIAG
 
 	if (tx) return;  // never interleave reports with TX; pending diffs flush right after RX
 	bool live = primed && cat_enabled && cat_active;  // first pass only snapshots the boot state
 	if (live && Serial.availableForWrite() < 16) return;  // UART busy: defer the whole pass, diffs stay pending
 	primed = true;
+
+#ifdef TX_DIAG
+	// TX audio diagnostic queued at key-up: sent here, from the main loop, once
+	// the whole frame fits in the UART buffer — independent of cat_auto (it is
+	// a one-shot report of the TX that just ended, not a setting diff).
+	if (txd_report_pending && Serial.availableForWrite() >= 32) {
+		txd_report_pending = 0;
+		if (cat_enabled && cat_active) Command_TA();
+	}
+#endif //TX_DIAG
 
 	// The AI announce bypasses the cat_auto gate: turning the feature OFF must
 	// still be reported once, so the client knows to fall back to polling.
@@ -5841,6 +5970,9 @@ void catCheckReport()
 	if (s_tot != tot)               { s_tot = tot;             if (live) Command_TT_GET(); }
 	if (s_backlight != backlight)   { s_backlight = backlight; if (live) Command_BL_GET(); }
 	if (s_cw_tune != cw_tune)       { s_cw_tune = cw_tune;     if (live) Command_TU_GET(); }
+#ifdef TX_DIAG
+	if (s_diag != diag_mode)        { s_diag = diag_mode;      if (live) Command_DG_GET(); }
+#endif
 	if (s_pwm_min != pwm_min)       { s_pwm_min = pwm_min;     if (live) Command_PM_GET(); }
 	if (s_pwm_max != pwm_max)       { s_pwm_max = pwm_max;     if (live) Command_PX_GET(); }
 	if (s_fxtal != si5351.fxtal)    { s_fxtal = si5351.fxtal;  if (live) Command_XF_GET(); }

@@ -10,7 +10,19 @@
 // GET / GET /style.css GET /app.js -> the page's three static files.
 #pragma once
 
+#include <stdbool.h>
+
 // Mounts the "storage" SPIFFS partition and registers the static-file
 // routes on the already-running httpd instance. Call after ws_server_start()
 // (needs the same httpd_handle_t), any order relative to http_control_start().
+// The routes are registered even if the mount fails, so a page restored by
+// POST /ota-storage is served again without a reboot.
 void control_page_start(void);
+
+// Unmount / remount "storage" around POST /ota-storage rewriting it. Both run
+// on the httpd task (as does every page request), so no file read can be in
+// flight between them. control_page_storage_mount() returns true only if the
+// partition mounted AND index.html is present — a mounted but empty or wrong
+// image is still a failed update.
+void control_page_storage_unmount(void);
+bool control_page_storage_mount(void);

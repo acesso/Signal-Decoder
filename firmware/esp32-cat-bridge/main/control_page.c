@@ -50,19 +50,41 @@ static esp_err_t app_js_handler(httpd_req_t *req) {
     return send_file(req, "/spiffs/app.js", "application/javascript");
 }
 
-void control_page_start(void) {
+static bool s_mounted = false;
+
+void control_page_storage_unmount(void) {
+    if (!s_mounted) return;
+    esp_vfs_spiffs_unregister("storage");
+    s_mounted = false;
+    ESP_LOGW(TAG, "\"storage\" SPIFFS unmounted");
+}
+
+bool control_page_storage_mount(void) {
+    if (s_mounted) return true;
     esp_vfs_spiffs_conf_t conf = {
         .base_path = "/spiffs",
         .partition_label = "storage",
         .max_files = 3,
-        .format_if_mount_failed = false,
+        .format_if_mount_failed = false,  // never wipe it: a bad image stays fixable by re-uploading
     };
     esp_err_t ret = esp_vfs_spiffs_register(&conf);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "failed to mount \"storage\" SPIFFS partition (%s) — control page unavailable",
                   esp_err_to_name(ret));
-        return;
+        return false;
     }
+    s_mounted = true;
+    size_t total = 0, used = 0;
+    esp_spiffs_info(conf.partition_label, &total, &used);
+    FILE *f = fopen("/spiffs/index.html", "r");
+    if (f) fclose(f);
+    ESP_LOGI(TAG, "control page storage mounted (SPIFFS: %u/%u bytes used, index.html %s)",
+             (unsigned)used, (unsigned)total, f ? "present" : "MISSING");
+    return f != NULL;
+}
+
+void control_page_start(void) {
+    control_page_storage_mount();  // failure logged inside; routes are registered regardless
 
     httpd_handle_t server = ws_server_get_httpd();
     if (!server) {
@@ -76,8 +98,5 @@ void control_page_start(void) {
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &index_uri));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &style_uri));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &app_js_uri));
-
-    size_t total = 0, used = 0;
-    esp_spiffs_info(conf.partition_label, &total, &used);
-    ESP_LOGI(TAG, "control page ready at GET / (SPIFFS: %u/%u bytes used)", (unsigned)used, (unsigned)total);
+    ESP_LOGI(TAG, "control page routes registered at GET /");
 }

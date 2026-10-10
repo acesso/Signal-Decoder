@@ -247,9 +247,77 @@ button.secondary {
   color: color-mix(in srgb, var(--fg) 45%, transparent);
   flex: 0 0 auto;
 }
-.arrow { font-weight: 700; flex: 0 0 auto; }
-.arrow-in { color: #2e7d32; }   /* radio -> bridge/browser */
-.arrow-out { color: #c0392b; } /* browser/bridge -> radio */
+/* Direction tags: a glyph + who (RADIO / PAGE / APP), sized and coloured to
+   be read at a glance — the old bare 0.78rem arrows were easy to miss. */
+:root { --dir-in: #1f8a3b; --dir-out: #b7791f; --dir-other: #6d5bd0; }
+@media (prefers-color-scheme: dark) { :root { --dir-in: #4cc46a; --dir-out: #e3b341; --dir-other: #a594f9; } }
+.arrow {
+  flex: 0 0 auto;
+  min-width: 4.6rem;
+  font-weight: 800;
+  font-size: 0.85rem;
+  letter-spacing: 0.02em;
+}
+.arrow-in { color: var(--dir-in); }       /* from the radio */
+.arrow-out { color: var(--dir-out); }     /* sent by this page */
+.arrow-other { color: var(--dir-other); } /* sent by another client (web app) */
+.cat-line-in .cat-cmd-prefix { color: var(--dir-in); }
+.cat-line-out .cat-cmd-prefix { color: var(--dir-out); }
+.cat-line-other .cat-cmd-prefix { color: var(--dir-other); }
+.cat-cmd-prefix { font-weight: 700; }
+.cat-cmd-error { color: var(--danger); font-weight: 700; }
+.cat-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.3rem 0.8rem;
+  align-items: baseline;
+  font-size: 0.75rem;
+  margin: 0.4rem 0;
+  color: color-mix(in srgb, var(--fg) 70%, transparent);
+}
+.cat-legend .arrow { min-width: 0; }
+
+/* Chips — toggles and quick commands (CAT filter, quick commands, TX cache). */
+.chip-row { display: inline-flex; flex-wrap: wrap; gap: 0.3rem; align-items: center; }
+.chip {
+  padding: 0.2rem 0.6rem;
+  font-size: 0.75rem;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--fg);
+  cursor: pointer;
+}
+.chip.active { background: var(--accent); border-color: var(--accent); color: #fff; }
+.chip-cmd { font-family: ui-monospace, "SF Mono", Consolas, monospace; }
+.chip-hint { margin: 0; }
+.cat-filter-row, .cat-quick-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  align-items: center;
+  margin: 0.5rem 0;
+}
+.cat-filter-label { font-size: 0.8rem; font-weight: 600; }
+.cat-filter-row select { width: auto; flex: 0 0 auto; }
+.cat-filter-row input { flex: 1; min-width: 8rem; font-family: ui-monospace, "SF Mono", Consolas, monospace; }
+.cat-clear-btn { margin-left: auto; padding: 0.25rem 0.7rem; font-size: 0.75rem; }
+.cat-hidden-count { font-size: 0.75rem; color: color-mix(in srgb, var(--fg) 55%, transparent); }
+
+/* TX audio diagnostic (radio TA frame, evaluated in the browser). */
+.txdiag {
+  margin-top: 0.5rem;
+  padding: 0.5rem 0.65rem;
+  border: 1px solid var(--border);
+  border-radius: 0.35rem;
+}
+.txdiag-head { display: flex; gap: 0.6rem; align-items: baseline; flex-wrap: wrap; }
+.txdiag-badge { font-size: 0.75rem; font-weight: 700; padding: 0.05rem 0.5rem; border-radius: 999px; color: #fff; }
+.txdiag-ok { background: #1f8a3b; }
+.txdiag-warn { background: #b7791f; }
+.txdiag-bad { background: var(--danger); }
+.txdiag-stats { font-family: ui-monospace, "SF Mono", Consolas, monospace; font-size: 0.8rem; margin-top: 0.25rem; }
+.txdiag-hint { margin: 0.25rem 0 0; }
 /* Holds every command from one batch (one WebSocket message/query — see
    appendCatFrame's own comment) as a run of individual .cat-log-cmd
    pills, wrapping onto further lines as needed rather than each command
@@ -268,6 +336,7 @@ button.secondary {
   padding: 0 0.3rem;
 }
 .cat-send-row { margin-top: 0.5rem; }
+.cat-send-row button[type="button"] { flex: 0 0 auto; }
 .cat-send-row input { flex: 1; font-family: ui-monospace, "SF Mono", Consolas, monospace; }
 
 dl#pa-list {
@@ -456,8 +525,22 @@ dl#pa-list {
 .tx-slot-name { font-weight: 600; font-size: 0.8rem; }
 /* Pushed to the row's trailing edge; inherits the base button colours and
    the shared :disabled treatment (used while a slot is playing). */
-.tx-slot-clear {
+.tx-slot-play {
   margin-left: auto;
+  padding: 0.2rem 0.5rem;
+  font-size: 0.7rem;
+}
+.tx-controls { display: flex; flex-wrap: wrap; gap: 0.4rem; align-items: center; margin-top: 0.5rem; }
+.tx-key-label { font-size: 0.75rem; display: inline-flex; align-items: center; gap: 0.25rem; }
+.tx-key-label input { width: 4.5rem; }
+.tx-stop { margin-left: auto; background: var(--danger); padding: 0.25rem 0.7rem; font-size: 0.75rem; }
+.tx-play-status { font-size: 0.8rem; min-height: 1.1rem; margin: 0.4rem 0 0; }
+.tx-play-status[data-kind="tx"] { color: var(--danger); font-weight: 700; }
+.tx-play-status[data-kind="play"] { color: var(--accent); }
+.tx-play-status[data-kind="ok"] { color: var(--dir-in); }
+.tx-play-status[data-kind="error"] { color: var(--danger); }
+.tx-slot-clear {
+  margin-left: 0.3rem;
   padding: 0.2rem 0.5rem;
   font-size: 0.7rem;
   background: var(--danger);
@@ -506,3 +589,68 @@ dl#pa-list {
    elsewhere for anything actively driving the radio. */
 .tone-toggle.tone-on { background: var(--danger); }
 .tone-hint { margin-top: 0.4rem; }
+
+/* Diagnostic mode + live audio test (TX cache card). */
+.diag-banner {
+  margin-top: 0.5rem;
+  padding: 0.45rem 0.65rem;
+  border-radius: 0.35rem;
+  background: color-mix(in srgb, var(--dir-out) 22%, transparent);
+  border: 1px solid var(--dir-out);
+  font-size: 0.8rem;
+}
+.chip.diag-on { background: var(--dir-out); border-color: var(--dir-out); color: #000; }
+.live-now {
+  margin-top: 0.5rem;
+  font-family: ui-monospace, "SF Mono", Consolas, monospace;
+  font-size: 0.8rem;
+}
+
+/* Live test charts — three small multiples on one shared time axis (one unit
+   per chart: %, mV, dBFS — never a dual axis). Series colours: reference
+   palette slots 1–3, validated all-pairs on this page's card surfaces
+   (light #ffffff, dark #22252b); slot 3 is under 3:1 on white, hence the
+   direct end-labels and the data table. */
+.live-charts {
+  --s1: #2a78d6; --s2: #eb6834; --s3: #1baf7a;
+  --viz-grid: color-mix(in srgb, var(--fg) 10%, transparent);
+  --viz-axis: color-mix(in srgb, var(--fg) 55%, transparent);
+  position: relative;
+  margin-top: 0.6rem;
+}
+@media (prefers-color-scheme: dark) {
+  .live-charts { --s1: #3987e5; --s2: #d95926; --s3: #199e70; }
+}
+.viz-legend { display: flex; flex-wrap: wrap; gap: 0.3rem 1rem; font-size: 0.75rem; margin-bottom: 0.3rem; }
+.viz-legend .sw { display: inline-block; width: 0.9rem; height: 2px; vertical-align: middle; margin-right: 0.35rem; border-radius: 1px; }
+.sw-1 { background: var(--s1); } .sw-2 { background: var(--s2); } .sw-3 { background: var(--s3); }
+.viz-block { margin-top: 0.35rem; }
+.viz-title { font-size: 0.72rem; font-weight: 600; color: color-mix(in srgb, var(--fg) 75%, transparent); }
+.viz svg { display: block; width: 100%; overflow: visible; }
+.viz text { fill: var(--viz-axis); font-size: 10px; font-family: system-ui, sans-serif; }
+.viz text.end-label { fill: var(--fg); font-size: 10px; }
+.viz .grid { stroke: var(--viz-grid); stroke-width: 1; }
+.viz .ref { stroke: var(--viz-axis); stroke-width: 1; stroke-dasharray: 3 3; }
+.viz .line { fill: none; stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
+.viz .l1 { stroke: var(--s1); } .viz .l2 { stroke: var(--s2); } .viz .l3 { stroke: var(--s3); }
+.viz .cross { stroke: var(--viz-axis); stroke-width: 1; }
+.viz .dot { stroke: var(--card-bg); stroke-width: 2; }
+.viz .d1 { fill: var(--s1); } .viz .d2 { fill: var(--s2); } .viz .d3 { fill: var(--s3); }
+.viz-tip {
+  position: absolute;
+  pointer-events: none;
+  background: var(--card-bg);
+  border: 1px solid var(--border);
+  border-radius: 0.35rem;
+  padding: 0.35rem 0.5rem;
+  font-size: 0.72rem;
+  line-height: 1.45;
+  white-space: nowrap;
+  box-shadow: 0 2px 8px color-mix(in srgb, #000 18%, transparent);
+  z-index: 2;
+}
+.viz-tip b { font-weight: 600; }
+.viz-tip .sw { display: inline-block; width: 0.6rem; height: 2px; vertical-align: middle; margin-right: 0.3rem; }
+.viz-table-wrap { margin-top: 0.5rem; font-size: 0.75rem; }
+.viz-table { border-collapse: collapse; margin-top: 0.3rem; font-family: ui-monospace, "SF Mono", Consolas, monospace; }
+.viz-table th, .viz-table td { padding: 0.1rem 0.6rem; text-align: right; border-bottom: 1px solid var(--border); }

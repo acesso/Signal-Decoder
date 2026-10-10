@@ -92,12 +92,13 @@ typedef struct {
     uint8_t *data;
     size_t len;
     int fd;
+    httpd_ws_type_t type;  // BINARY = bytes from the radio, TEXT = another client's outgoing frame (see broadcast_excluding_locked)
 } async_send_ctx_t;
 
 static void async_send_frame(void *arg) {
     async_send_ctx_t *ctx = (async_send_ctx_t *)arg;
     httpd_ws_frame_t frame = {
-        .type = HTTPD_WS_TYPE_BINARY,
+        .type = ctx->type,
         .payload = ctx->data,
         .len = ctx->len,
     };
@@ -129,7 +130,16 @@ static void async_send_frame(void *arg) {
 // direction has no "sender" among the browser clients) and the browser->
 // radio handler below (excludes the sender's own fd — see that call site's
 // comment for why). exclude_fd < 0 means "exclude nothing."
-static void broadcast_excluding_locked(int exclude_fd, const uint8_t *data, size_t len) {
+//
+// The WebSocket frame TYPE carries the direction (BRIDGE_FIRMWARE_VERSION
+// 0.8.0, feature "cat_echo_text"): bytes from the radio go out as BINARY,
+// another client's outgoing frame as TEXT. Before this both were BINARY, so
+// a listener couldn't tell "the radio said FA..." from "the web app sent
+// FA..." — the control page's CAT monitor drew both as from-radio, and the
+// web app (which only reads BINARY) took other clients' commands for radio
+// replies. Now the web app simply ignores the TEXT echoes, and the control
+// page labels them as another client's traffic.
+static void broadcast_excluding_locked(int exclude_fd, const uint8_t *data, size_t len, httpd_ws_type_t type) {
     if (!s_server || len == 0) return;
 
     int fds[WS_MAX_CLIENTS];
@@ -155,6 +165,7 @@ static void broadcast_excluding_locked(int exclude_fd, const uint8_t *data, size
         memcpy(ctx->data, data, len);
         ctx->len = len;
         ctx->fd = fds[i];
+        ctx->type = type;
 
         if (httpd_queue_work(s_server, async_send_frame, ctx) != ESP_OK) {
             ESP_LOGW(TAG, "httpd_queue_work failed, dropping %d bytes for fd=%d", (int)len, fds[i]);
@@ -165,7 +176,7 @@ static void broadcast_excluding_locked(int exclude_fd, const uint8_t *data, size
 }
 
 void ws_server_send_to_client(const uint8_t *data, size_t len) {
-    broadcast_excluding_locked(-1, data, len);
+    broadcast_excluding_locked(-1, data, len, HTTPD_WS_TYPE_BINARY);
 }
 
 static esp_err_t cat_ws_handler(httpd_req_t *req) {
@@ -255,7 +266,7 @@ static esp_err_t cat_ws_handler(httpd_req_t *req) {
         // own frame twice, the second time mislabeled as "from radio"
         // (ws.onmessage has no way to tell "my own echo" from "a real
         // reply" apart, since both arrive as an ordinary incoming frame).
-        broadcast_excluding_locked(httpd_req_to_sockfd(req), frame.payload, frame.len);
+        broadcast_excluding_locked(httpd_req_to_sockfd(req), frame.payload, frame.len, HTTPD_WS_TYPE_TEXT);
     }
 
     free(buf);
