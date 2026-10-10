@@ -12,6 +12,26 @@ them into a version section when cutting a release.
 
 ## [Unreleased]
 
+## [0.25.0] - 2026-10-10
+
+### Added
+
+- **The radio updates over the air.** The uSDX now carries a stock Optiboot 8 bootloader (20 MHz, 38400 baud), burned once over ISP. From then on the ESP32 bridge flashes it over the CAT line — page "Radio firmware", or `POST /radio-ota` with the app binary: CAT `UG;` makes the radio jump into its bootloader, every page is written and read back, and the radio restarts and answers `FV;`. About 25 seconds, and **EEPROM is never touched, so the radio keeps its settings** — cable flashes wiped them on the first boot. Refused while the radio is keyed, the external PA reports energized, or a TX slot is playing; recovery from an update that dies mid-write is the ISP cable.
+- **Diagnostic mode on the radio (`DG`, menu "Diag mode").** Every transmission runs the real path but nothing reaches the HF line — no PA drive, no TX clock, external amp never keyed, TX time-out off — and the display shows **D** instead of T. The bridge page's new **Diagnostic** card plays a test tone, keys such a dry transmission and graphs, every half second, what the bridge sends against what the radio's mic input actually receives, so the audio path can be tuned without transmitting.
+- **The radio reports its transmit audio (`TA`).** After every SSB transmission it pushes the mic level, the drive reached against the PA's ceiling, and how much of the time the carrier was gated off by its low-level gate. Evaluated on the bridge page only. It found the cause of weak FT8 output on this station: almost no audio reaches the radio's mic input.
+- **`CL;`** lists every query the radio answers in one reply.
+- **Bridge control page.** CAT monitor: direction tags telling the radio, this page and another client (the web app) apart, a filter (S-meter flood hidden by default), and command-building chips from one `CL;` query. TX cache: play a staged slot, optional Auto-PTT around it, monitor it in the browser, with a countdown.
+- **Bridge: control-page updates over Wi-Fi** (`POST /ota-storage`), no USB and no app update needed.
+
+### Fixed
+
+- The bridge forwarded other clients' CAT commands to the web app as if the radio had sent them. They now travel as text frames, which the web app ignores.
+
+### Changed
+
+- Bridge firmware 0.9.0. The radio firmware keeps reporting 4.02c: its settings layout is unchanged, and a version bump would wipe settings on first boot.
+- The radio app is now 32,200 of 32,256 bytes — the next radio feature needs room made first.
+
 ## [0.24.0] - 2026-10-10
 
 ### Added

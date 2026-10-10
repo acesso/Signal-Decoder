@@ -61,6 +61,21 @@
       <code>192.168.4.1</code> so you can fix it here again.</p>
     </section>
 
+    <section id="radio-fw-card" class="card">
+      <h2>Radio firmware</h2>
+      <dl class="radio-fw-dl"><dt>Running</dt><dd id="radio-fw-version">&mdash;</dd></dl>
+      <input id="radio-fw-file" type="file" accept=".hex">
+      <p id="radio-fw-info" class="hint"></p>
+      <button id="radio-fw-btn" type="button" disabled>Update radio</button>
+      <div class="radio-fw-progress" hidden id="radio-fw-progress"><div id="radio-fw-bar"></div></div>
+      <p id="radio-fw-status" class="tx-play-status" role="status"></p>
+      <p class="hint">Updates the uSDX over the CAT line (Optiboot 8 bootloader, entered with
+      <code>UG;</code>): every page is written, read back and compared, then the radio restarts.
+      EEPROM is not touched &mdash; settings survive. CAT is paused for the ~25 s it takes.
+      Refused while the radio is keyed or the external PA reports energized. If an update
+      fails part-way the radio needs the ISP cable.</p>
+    </section>
+
     <section id="reset-card" class="card">
       <h2>Restart bridge</h2>
       <button id="reset-btn" type="button" class="danger">Restart now</button>

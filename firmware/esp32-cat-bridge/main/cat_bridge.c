@@ -146,10 +146,21 @@ static void feed_cat_snoop(cat_linebuf_t *lb, const uint8_t *data, size_t len, b
     }
 }
 
+// ── Exclusive UART access (radio firmware update) ───────────────────────────
+// radio_ota.c borrows the UART for the radio's bootloader protocol. While
+// exclusive: the reader task parks (and says so — it must not be inside
+// uart_read_bytes() swallowing bootloader replies), client writes and the
+// bridge's own recovery/boot queries are dropped, and the flasher uses the
+// raw calls below.
+static volatile bool s_exclusive = false;
+static volatile bool s_reader_parked = false;
+
 static void uart_reader_task(void *arg) {
     uint8_t buf[UART_READ_CHUNK];
     ESP_LOGI(TAG, "reader task started on core %d", xPortGetCoreID());
     for (;;) {
+        if (s_exclusive) { s_reader_parked = true; vTaskDelay(1); continue; }  // 1 tick (10 ms at CONFIG_FREERTOS_HZ=100 — pdMS_TO_TICKS(<10) rounds to 0 and would busy-spin)
+        s_reader_parked = false;
         int n = uart_read_bytes(CAT_UART_PORT, buf, sizeof(buf), pdMS_TO_TICKS(20));
         if (n > 0) {
             record_radio_bytes((size_t)n);
@@ -224,6 +235,7 @@ static void boot_query_task(void *arg) {
 
         ESP_LOGI(TAG, "boot query -> radio: %s (attempt %d/%d, no clean reply confirmed yet)",
                  BOOT_QUERY, i + 1, BOOT_QUERY_MAX_RETRIES);
+        if (s_exclusive) continue;
         uart_write_bytes(CAT_UART_PORT, BOOT_QUERY, sizeof(BOOT_QUERY) - 1);
     }
     ESP_LOGW(TAG, "boot query: gave up after %d attempts with no clean reply — radio may be off or disconnected",
@@ -250,6 +262,7 @@ static void boot_query_task(void *arg) {
 static int64_t s_last_recovery_us = 0;
 
 static void request_snoop_recovery(bool from_radio) {
+    if (s_exclusive) return;
     int64_t now = esp_timer_get_time();
     if (now - s_last_recovery_us < SNOOP_RECOVERY_MIN_INTERVAL_US) return;
     s_last_recovery_us = now;
@@ -272,6 +285,7 @@ void cat_bridge_start(cat_bridge_rx_cb_t rx_cb) {
 }
 
 int cat_bridge_write(const uint8_t *data, size_t len) {
+    if (s_exclusive) return -1;  // radio firmware update in progress — never mix CAT into the bootloader protocol
     int written = uart_write_bytes(CAT_UART_PORT, (const char *)data, len);
     if (written > 0) {
         record_client_bytes((size_t)written);
@@ -289,4 +303,36 @@ void cat_bridge_set_baud(int baud) {
     // garbage at the new bit timing, indistinguishable from a genuine
     // line-noise problem.
     ESP_ERROR_CHECK(uart_flush_input(CAT_UART_PORT));
+}
+
+bool cat_bridge_acquire_exclusive(void) {
+    if (s_exclusive) return false;
+    s_exclusive = true;
+    for (int i = 0; i < 50 && !s_reader_parked; i++) vTaskDelay(1);  // ~500 ms; the reader leaves uart_read_bytes() within its 20 ms timeout
+    if (!s_reader_parked) { s_exclusive = false; return false; }
+    uart_flush_input(CAT_UART_PORT);
+    ESP_LOGW(TAG, "UART taken exclusively (radio firmware update) — CAT forwarding paused");
+    return true;
+}
+
+void cat_bridge_release_exclusive(void) {
+    uart_flush_input(CAT_UART_PORT);
+    s_exclusive = false;
+    ESP_LOGW(TAG, "UART released — CAT forwarding resumed");
+}
+
+bool cat_bridge_is_exclusive(void) { return s_exclusive; }
+
+int cat_bridge_raw_write(const uint8_t *data, size_t len) {
+    return uart_write_bytes(CAT_UART_PORT, (const char *)data, len);
+}
+
+int cat_bridge_raw_read(uint8_t *buf, size_t len, int timeout_ms) {
+    return uart_read_bytes(CAT_UART_PORT, buf, len, pdMS_TO_TICKS(timeout_ms));
+}
+
+void cat_bridge_raw_set_baud(int baud) {
+    uart_wait_tx_done(CAT_UART_PORT, pdMS_TO_TICKS(100));
+    uart_set_baudrate(CAT_UART_PORT, baud);
+    uart_flush_input(CAT_UART_PORT);
 }

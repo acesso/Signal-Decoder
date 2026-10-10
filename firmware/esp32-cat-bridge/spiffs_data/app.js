@@ -1884,7 +1884,9 @@ function connectCatMonitor() {
     catWs = ws;
     // One query for the radio's diagnostic-mode state; after this the radio
     // pushes every change itself (radios without DG answer ?;, chip stays "?").
-    ws.send('DG;');
+    ws.send('DG;FV;');
+    // One retry if the version reply was lost to the line's occasional byte corruption.
+    setTimeout(() => { if (radioFwVersion.textContent === '—' && catWs === ws) ws.send('FV;'); }, 2500);
   };
   ws.onmessage = (ev) => {
     if (typeof ev.data === 'string') feedCat('other', ev.data);           // TEXT: another client's command
@@ -1924,6 +1926,8 @@ function onRadioFrame(text) {
     if (text === '?;') { const p = catProbe; catProbe = null; p.resolve(false); }
     else if (text.startsWith(catProbe.prefix)) { const p = catProbe; catProbe = null; p.resolve(true); }
   }
+  const fv = text.match(/^FV([^;]+);$/);
+  if (fv) radioFwVersion.textContent = fv[1];
   const dg = text.match(/^DG([01]);$/);
   if (dg) setDiagState(dg[1] === '1');
   const dr = text.match(/^DR(\d);$/);
@@ -2828,3 +2832,105 @@ requestAnimationFrame(qualityTick);
 refreshStatus(true);
 scanNetworks();
 startStatusAutoRefresh();
+
+// ── Radio firmware update (bridge ≥0.9.0, POST /radio-ota) ────────────────
+// The .hex is parsed here into the plain binary the bridge flashes; the
+// bridge does the rest (UG; → Optiboot 8 → write, read back, compare →
+// restart → FV;). Settings live in EEPROM and are never touched.
+const radioFwVersion = document.getElementById('radio-fw-version');
+const radioFwFile = document.getElementById('radio-fw-file');
+const radioFwInfo = document.getElementById('radio-fw-info');
+const radioFwBtn = document.getElementById('radio-fw-btn');
+const radioFwProgress = document.getElementById('radio-fw-progress');
+const radioFwBar = document.getElementById('radio-fw-bar');
+const radioFwStatus = document.getElementById('radio-fw-status');
+const RADIO_APP_MAX = 32256;
+let radioFwImage = null;
+
+// Intel HEX → Uint8Array from address 0 (gaps 0xFF, as erased flash).
+function parseIntelHex(text) {
+  let base = 0;
+  let maxAddr = 0;
+  const chunks = [];
+  for (const raw of text.split(/\r?\n/)) {
+    const line = raw.trim();
+    if (!line) continue;
+    if (line[0] !== ':') throw new Error('not an Intel HEX file');
+    const bytes = line.slice(1).match(/../g).map((h) => parseInt(h, 16));
+    const sum = bytes.reduce((a, b) => (a + b) & 0xFF, 0);
+    if (sum !== 0) throw new Error('checksum error in the .hex');
+    const [len, hi, lo, type] = bytes;
+    const data = bytes.slice(4, 4 + len);
+    if (type === 0x00) {
+      const addr = base + (hi << 8 | lo);
+      chunks.push([addr, data]);
+      maxAddr = Math.max(maxAddr, addr + data.length);
+    } else if (type === 0x01) break;
+    else if (type === 0x02) base = ((data[0] << 8) | data[1]) << 4;
+    else if (type === 0x04) base = ((data[0] << 8) | data[1]) << 16;
+  }
+  const img = new Uint8Array(maxAddr).fill(0xFF);
+  for (const [addr, data] of chunks) img.set(data, addr);
+  return img;
+}
+
+radioFwFile.addEventListener('change', async () => {
+  radioFwImage = null;
+  radioFwBtn.disabled = true;
+  radioFwInfo.textContent = '';
+  const f = radioFwFile.files[0];
+  if (!f) return;
+  try {
+    const img = parseIntelHex(await f.text());
+    if (img.length > RADIO_APP_MAX) throw new Error(`image is ${img.length} bytes — over the ${RADIO_APP_MAX}-byte app area (would hit the bootloader)`);
+    if (img.length < 4 || img[0] !== 0x0C || img[1] !== 0x94) throw new Error('not an ATmega328P app image (reset vector is not a JMP)');
+    if (f.name.includes('with_bootloader')) throw new Error('this is the with_bootloader image — pick usdxBLACKBRICK.ino.hex');
+    radioFwImage = img;
+    radioFwInfo.textContent = `${f.name}: ${img.length} bytes, ${Math.ceil(img.length / 128)} pages`;
+    radioFwBtn.disabled = false;
+  } catch (err) {
+    radioFwInfo.textContent = `Not usable: ${err.message}`;
+  }
+});
+
+function setRadioFwStatus(text, kind) { radioFwStatus.textContent = text; radioFwStatus.dataset.kind = kind || ''; }
+
+radioFwBtn.addEventListener('click', async () => {
+  if (!radioFwImage) return;
+  if (liveActive || txPlayBusy) { setRadioFwStatus('Stop the live test / playback first.', 'error'); return; }
+  if (!confirm(`Update the radio firmware (${radioFwImage.length} bytes)?\n\n` +
+    '• Keep the radio powered and the external PA off during the ~25 s update.\n' +
+    '• CAT is paused meanwhile.\n• If it fails part-way, the radio needs the ISP cable.')) return;
+  radioFwBtn.disabled = true;
+  radioFwProgress.hidden = false;
+  radioFwBar.style.width = '0';
+  setRadioFwStatus('Uploading image to the bridge…', 'play');
+  try {
+    const res = await fetch('/radio-ota', { method: 'POST', body: radioFwImage });
+    if (!res.ok) throw new Error((await res.text()).trim() || `HTTP ${res.status}`);
+  } catch (err) {
+    setRadioFwStatus(`Refused: ${err.message}`, 'error');
+    radioFwBtn.disabled = false;
+    return;
+  }
+  for (;;) {
+    await sleepMs(300);
+    let st = null;
+    try { st = await (await fetch('/radio-ota-status')).json(); } catch { continue; }
+    const frac = st.pages_total ? st.pages_done / st.pages_total : 0;
+    const pct = st.state === 'writing' ? frac * 50 : st.state === 'verifying' ? 50 + frac * 45 : st.state === 'restarting' ? 97 : st.state === 'done' ? 100 : 2;
+    radioFwBar.style.width = `${pct}%`;
+    const label = { entering: 'Asking the radio to enter its bootloader (UG;)…', syncing: 'Syncing with the bootloader…',
+      writing: `Writing page ${st.pages_done}/${st.pages_total}…`, verifying: `Verifying page ${st.pages_done}/${st.pages_total}…`,
+      restarting: 'Restarting the radio, waiting for FV;…' }[st.state];
+    if (label) { setRadioFwStatus(label, 'tx'); continue; }
+    if (st.state === 'done') {
+      setRadioFwStatus(`Done — radio running ${st.version}, every page verified.`, 'ok');
+      radioFwVersion.textContent = st.version;
+    } else if (st.state === 'failed') {
+      setRadioFwStatus(`Failed: ${st.error}`, 'error');
+    }
+    break;
+  }
+  radioFwBtn.disabled = !radioFwImage;
+});

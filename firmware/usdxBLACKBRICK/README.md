@@ -120,29 +120,40 @@ a live reading via `SM;`, so nothing is lost functionally, and `smode` itself
 is left untouched so the LCD resumes updating immediately if `cat_active`
 is ever cleared.
 
-## Parked: firmware updates through the bridge (2026-10-10)
+## Firmware updates through the bridge (2026-10-10)
 
-Today the radio is flashed only over ISP (USBasp): this build is written
-without a bootloader, so nothing on the ATmega can take new firmware over its
-serial port. The ESP32 bridge already updates itself and its page over Wi-Fi
-(`POST /ota`, `POST /ota-storage`); extending that to the radio is parked.
+The radio carries a stock **Optiboot 8** bootloader built for this board
+(`bootloader/`, 20 MHz, **38400 baud**, LED blink off). After a one-time ISP
+burn, the app is updated over the CAT line from the ESP32 bridge — page
+"Radio firmware", or `curl -X POST --data-binary @app.bin http://<bridge>/radio-ota`
+(raw binary: `avr-objcopy -I ihex -O binary usdxBLACKBRICK.ino.hex app.bin`).
 
-**Precondition for picking it up:** the radio must be able to enter its
-bootloader **from firmware** (e.g. a CAT command), not through a hardware reset
-pin — the bridge's header has no free GPIO and the CAT cable carries no RESET
-line. Points to check first:
-
-- A serial bootloader (Optiboot, 512 B) must be burned once over ISP. The
-  sketch has ~950 B free after `TX_DIAG`, so it fits but leaves little room.
-- Stock Optiboot starts the application straight away on a watchdog reset, so
-  "CAT command → watchdog reset" alone won't land in the bootloader. Needs a
-  firmware-side jump into the bootloader (with the reset-cause register set the
-  way the bootloader expects) or an Optiboot build/version that supports a
-  software entry.
-- The bridge then needs an endpoint that triggers that entry over CAT and
-  streams the image over the same UART (STK500 protocol, as avrdude speaks).
-- Recovery when it goes wrong is still ISP, so this replaces routine flashing,
-  not the USBasp.
+- **Entry from firmware, no reset pin:** CAT `UG;` → the app replies `UG1;`,
+  clears `MCUSR` and *jumps* to 0x7E00. Optiboot 8 treats `MCUSR == 0` as an
+  application request and stays in the bootloader; power-on / watchdog resets
+  start the app directly (no boot delay). Refused while keyed (`UG0;`).
+- **Pins during an update** keep the state RX left them in (a jump, not a
+  reset): KEY_OUT LOW, NTX HIGH. The bridge also refuses while its `pa_sense`
+  reports the external PA energized.
+- **The bridge** writes all pages, reads every page back and compares, leaves
+  programming mode (Optiboot restarts the app) and checks `FV;`. ~25 s for the
+  full 252 pages. **EEPROM is never touched — settings survive**, unlike ISP
+  flashing (which wipes them on the post-flash boot).
+- **Fuses:** unchanged (`0xFF / 0xDE / 0xFD` — the high fuse already had the
+  512-byte boot section and BOOTRST). Lock bits `0x0F` (reads `0xCF`): the app
+  can't overwrite the bootloader.
+- **App size limit:** 32,256 bytes (the Uno layout already reserves the 512-byte
+  boot section). Current build: 32,200 bytes — 56 free.
+- **Recovery** if an update dies part-way: ISP (USBasp), the only path by
+  decision. Burning: `avrdude -c usbasp -p m328p -B 4 -e -U flash:w:<app+bootloader>.hex:i`
+  then `-U lock:w:0x0F:m`; the combined image is the app `.hex` (minus its EOF
+  record) followed by `bootloader/optiboot8_atmega328p_20MHz_38400.hex` — **not**
+  arduino-cli's `with_bootloader.hex`, which embeds Optiboot 4.4 (it ignores an
+  application request and can't be entered from firmware).
+- 57600 baud was tried first and failed: the bootloader understood every
+  command but its replies reached the bridge as `00 F8` — this radio→bridge RX
+  line's slow rising edges can't carry 17 µs bits. 38400 (+0.16 %) is the CAT
+  rate the line already carries.
 
 ## Build / flash / test
 

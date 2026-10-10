@@ -25,6 +25,7 @@
 #include "cpu_monitor.h"
 #include "led_status.h"
 #include "pa_watchdog.h"
+#include "radio_ota.h"
 #include "ws_server.h"
 #include "wifi_net.h"
 
@@ -154,7 +155,7 @@ static const char *const BRIDGE_FEATURES[] = {
     "alc_control", "noise_gate_control", "cpu_monitor", "wifi_tx_power_control",
     "adc_hpf_control", "sample_rate_select", "speaker_amp_control", "cat_log",
     "audio_mic_sniff", "input_mode_select", "tx_buffer_playback", "speaker_vol", "tx_slot_select",
-    "ota", "ota_storage", "cat_echo_text",
+    "ota", "ota_storage", "cat_echo_text", "radio_ota",
 };
 
 // The uSDX firmware's own CAT_BAUD menu setting (usdxBLACKBRICK.ino) only
@@ -1848,6 +1849,47 @@ static esp_err_t ota_storage_handler(httpd_req_t *req) {
     return ESP_OK;
 }
 
+// ── Radio firmware update (POST /radio-ota, GET /radio-ota-status) ──────────
+// Body: the radio app as a raw binary (≤ 32256 bytes — the browser page
+// converts the .hex). See radio_ota.h for the sequence and refusals. Returns
+// 202 once the update task has started; progress via GET /radio-ota-status.
+static esp_err_t radio_ota_handler(httpd_req_t *req) {
+    size_t len = req->content_len;
+    if (len == 0 || len > RADIO_OTA_APP_MAX_BYTES) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "body must be the radio app binary, 1..32256 bytes");
+        return ESP_FAIL;
+    }
+    uint8_t *img = heap_caps_malloc(len, MALLOC_CAP_SPIRAM);
+    if (!img) { httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "out of memory"); return ESP_FAIL; }
+    size_t got = 0;
+    while (got < len) {
+        int n = httpd_req_recv(req, (char *)img + got, len - got);
+        if (n == HTTPD_SOCK_ERR_TIMEOUT) continue;
+        if (n <= 0) { free(img); httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "failed to read full body"); return ESP_FAIL; }
+        got += (size_t)n;
+    }
+    const char *refused = radio_ota_start(img, len);  // takes ownership of img either way
+    if (refused) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, refused); return ESP_FAIL; }
+    httpd_resp_set_status(req, "202 Accepted");
+    httpd_resp_set_type(req, "application/json");
+    set_cors(req);
+    char body[64];
+    int n = snprintf(body, sizeof(body), "{\"started\":true,\"bytes\":%u}", (unsigned)len);
+    return httpd_resp_send(req, body, n);
+}
+
+static esp_err_t radio_ota_status_handler(httpd_req_t *req) {
+    radio_ota_status_t st;
+    radio_ota_get_status(&st);
+    char body[256];
+    int n = snprintf(body, sizeof(body),
+                     "{\"state\":\"%s\",\"pages_done\":%u,\"pages_total\":%u,\"bytes\":%u,\"error\":\"%s\",\"version\":\"%s\"}",
+                     radio_ota_state_name(st.state), st.pages_done, st.pages_total, (unsigned)st.image_bytes, st.error, st.version);
+    httpd_resp_set_type(req, "application/json");
+    set_cors(req);
+    return httpd_resp_send(req, body, n);
+}
+
 // GET /ota-status — which slot is running, what state it's in, and whether
 // this build can even be updated over the air. Exists so the uploader can
 // confirm the new image actually took (running partition flips ota_0 <->
@@ -1929,6 +1971,8 @@ void http_control_start(void) {
     httpd_uri_t ota_uri          = { .uri = "/ota",        .method = HTTP_POST, .handler = ota_handler };
     httpd_uri_t ota_status_uri   = { .uri = "/ota-status", .method = HTTP_GET,  .handler = ota_status_handler };
     httpd_uri_t ota_storage_uri  = { .uri = "/ota-storage", .method = HTTP_POST, .handler = ota_storage_handler };
+    httpd_uri_t radio_ota_uri    = { .uri = "/radio-ota",  .method = HTTP_POST, .handler = radio_ota_handler };
+    httpd_uri_t radio_ota_st_uri = { .uri = "/radio-ota-status", .method = HTTP_GET, .handler = radio_ota_status_handler };
     httpd_uri_t options_uri      = { .uri = "/*",           .method = HTTP_OPTIONS, .handler = options_handler };
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &status_uri));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &info_uri));
@@ -1965,6 +2009,8 @@ void http_control_start(void) {
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &ota_uri));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &ota_status_uri));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &ota_storage_uri));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &radio_ota_uri));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &radio_ota_st_uri));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &options_uri));
 
     ESP_LOGI(TAG, "control endpoints ready: GET /status, GET /info, GET /wifi-scan, POST /reset, "

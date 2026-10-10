@@ -30,3 +30,15 @@ int cat_bridge_write(const uint8_t *data, size_t len);
 // used if/when the app adds a runtime baud-change control message. Safe to
 // call at any time after cat_bridge_start().
 void cat_bridge_set_baud(int baud);
+
+// Exclusive UART access for radio_ota.c (radio firmware update over the
+// CAT UART). acquire returns false if already taken or the reader task did
+// not park in time. While held, cat_bridge_write() drops client data.
+#include <stdbool.h>
+bool cat_bridge_acquire_exclusive(void);
+void cat_bridge_release_exclusive(void);
+bool cat_bridge_is_exclusive(void);
+int  cat_bridge_raw_write(const uint8_t *data, size_t len);
+int  cat_bridge_raw_read(uint8_t *buf, size_t len, int timeout_ms);
+void cat_bridge_raw_set_baud(int baud);  // waits for TX to drain, flushes RX
+
