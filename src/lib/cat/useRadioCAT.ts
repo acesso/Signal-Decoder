@@ -6,6 +6,8 @@
 
 import { createSignal, onCleanup } from 'solid-js'
 import { createConfirmErrorTracker } from './confirmError'
+import { parseQueryList, stateQueryCmds, supportsQuery } from './catCapabilities'
+import { TUNE_MAX_MS } from './cwTune'
 
 // Web Serial API ambient types (not yet in lib.dom.d.ts for all TS versions)
 declare global {
@@ -132,6 +134,18 @@ export interface RadioState {
   /** VFO frequency (Hz) of the last successful tune this session — input to
    *  the retune suggestion (cwTune.ts). null = not tuned yet. */
   lastTuneHz: number | null;
+  /** When the running TUNE ends on its own (Date.now() ms; TUNE_MAX_MS after
+   *  the carrier was confirmed). null when not keyed. Web-app limit only —
+   *  the radio's TX time-out stays the hardware backstop. */
+  tuneEndsAt: number | null;
+  /** Read-only queries the radio listed in its capability report (CL;,
+   *  see catCapabilities.ts). null = no list: older firmware answered ?;,
+   *  or the report hasn't answered yet — the legacy fixed queries apply. */
+  catQueries: string[] | null;
+  /** Radio diagnostic mode (DG, TX_DIAG builds): TX runs the whole path but
+   *  nothing reaches the HF line. Read-only here — toggled on the radio or
+   *  the bridge page. Only known when the radio lists DG; null otherwise. */
+  diagMode: boolean | null;
 }
 
 /** 'idle' → 'starting' (MD3, TU1, TX) → 'keyed' → 'stopping' (RX, TU0, mode
@@ -471,7 +485,8 @@ function bridgeHttpBase(wsUrl: string): string | null {
 
 // Used only while CAT auto-report is off/unknown — with auto-report active the
 // radio pushes every change (settings + throttled S-meter) and no poll runs.
-const BLACKBRICK_POLL_CMDS = ['FA;', 'MD;', 'AG0;', 'FW;', 'VO;', 'AT;', 'A2;', 'NR;', 'SM;', 'DR;', 'BL;', 'AL;'];
+// The command list comes from stateQueryCmds() (catCapabilities.ts): the
+// radio's own capability report when it has one, the legacy list otherwise.
 
 const KENWOOD_MODE_MAP: Record<string, CATMode> = {
   '1': 'LSB', '2': 'USB', '3': 'CW', '4': 'FM', '5': 'AM', '6': 'RTTY',
@@ -493,6 +508,9 @@ interface QueueEntry {
   /** Replies collected so far, for entries with prefixes.length > 1 */
   collected: string[];
   isPoll: boolean;
+  /** Resolve with "?;" instead of waiting out the timeout — for capability
+   *  probes, where "unknown command" is itself the answer. */
+  acceptUnknown?: boolean;
   resolve: (resp: string) => void;
   reject:  (err: Error)   => void;
   timer:   ReturnType<typeof setTimeout> | null;
@@ -519,7 +537,8 @@ export function useRadioCAT(): RadioCATControls {
     agc: null, agcLevel: null, filter: null, sMeter: null, drive: null,
     backlight: null, firmwareVersion: null, autoReport: null,
     pttConfirmAlarm: false,
-    cwTune: null, tune: 'idle', lastTuneHz: null,
+    cwTune: null, tune: 'idle', lastTuneHz: null, tuneEndsAt: null,
+    catQueries: null, diagMode: null,
   });
 
   let port:      SerialPort | null = null;
@@ -673,6 +692,14 @@ export function useRadioCAT(): RadioCATControls {
       return;
     }
     const expected = inf.prefixes[inf.collected.length];
+    if (inf.acceptUnknown && msg === '?;') {
+      log('debug', 'response →', msg, '(command unknown to this firmware)');
+      if (inf.timer) clearTimeout(inf.timer);
+      inflight = null;
+      inf.resolve(msg);
+      drainQueue();
+      return;
+    }
     if (msg.substring(0, 2) !== expected) {
       // Not the awaited reply — the radio can interleave an auto-report frame
       // between batch replies (its report pass runs between received chars).
@@ -699,7 +726,7 @@ export function useRadioCAT(): RadioCATControls {
     for (const e of dropped) e.resolve('__dropped__');
   };
 
-  const query = (cmd: string, isPoll = false): Promise<string> => {
+  const query = (cmd: string, isPoll = false, acceptUnknown = false): Promise<string> => {
     // Deduplicate: if an identical command is already queued, skip it
     if (queue.some(e => e.isPoll === isPoll && new TextDecoder().decode(e.bytes) === cmd)) {
       return Promise.resolve('__dedup__');
@@ -709,7 +736,7 @@ export function useRadioCAT(): RadioCATControls {
         bytes:  encoder.encode(cmd),
         prefixes: [cmd.substring(0, 2)],
         collected: [],
-        isPoll, resolve, reject, timer: null,
+        isPoll, acceptUnknown, resolve, reject, timer: null,
       });
       drainQueue();
     });
@@ -1036,7 +1063,15 @@ export function useRadioCAT(): RadioCATControls {
     // TX audio diagnostic (radio TX_DIAG) pushed after every SSB key-up — a
     // bridge-hardware diagnostic evaluated on the bridge's own control page,
     // not here; recognized only so it isn't logged as unexpected.
-    if (/^TA\d+,\d+,\d+;$/.test(msg)) return true;
+    if (/^TA\d+(,\d+)*;$/.test(msg)) return true;
+    if (msg.startsWith('DG')) {
+      // Diagnostic mode, pushed by auto-report when toggled on the radio or
+      // from the bridge page. Never SET by the app, so no grace window.
+      const v = parseIntField(msg, 'DG');
+      if (v === null) return false;
+      setState(prev => ({ ...prev, diagMode: v >= 1 }));
+      return true;
+    }
     if (msg.startsWith('TX')) return true;  // trailing duplicate of a key-up status echo — nothing to apply
     if (msg.startsWith('RX')) {
       // The radio un-keyed and nobody asked within the grace window: its own
@@ -1087,7 +1122,7 @@ export function useRadioCAT(): RadioCATControls {
     // Serialized batch — one round-trip for every polled field instead
     // of one per command, per the firmware's multi-command support.
     let resp = '';
-    try { resp = await queryBatch(BLACKBRICK_POLL_CMDS, isPoll); } catch { resp = ''; }
+    try { resp = await queryBatch(stateQueryCmds(state().catQueries), isPoll); } catch { resp = ''; }
     const frames = resp.split(';').filter(Boolean).map(f => f + ';');
     const byPrefix = new Map<string, string>();
     for (const f of frames) byPrefix.set(f.substring(0, 2), f);
@@ -1111,6 +1146,7 @@ export function useRadioCAT(): RadioCATControls {
     const drive     = byPrefix.has('DR') ? parseIntField(byPrefix.get('DR')!, 'DR') : null;
     const backlight = byPrefix.has('BL') ? parseIntField(byPrefix.get('BL')!, 'BL') : null;
     const agcLevel  = byPrefix.has('AL') ? parseIntField(byPrefix.get('AL')!, 'AL') : null;
+    const diag      = byPrefix.has('DG') ? parseIntField(byPrefix.get('DG')!, 'DG') : null;
 
     log('debug', isPoll ? 'poll(batch)' : 'state refresh', '— freq:', freq, 'mode:', mode, 'agc:', agc, 'agcLvl:', agcLevel, 'filt:', filter,
       'vol:', volume, 'att1:', att1, 'att2:', att2, 'nr:', nr, 'sm:', sMeter, 'drive:', drive, 'bl:', backlight, `[q:${queue.length}]`);
@@ -1135,6 +1171,8 @@ export function useRadioCAT(): RadioCATControls {
       backlight: backlight !== null && (now - ls.backlight > SET_GRACE_MS) ? backlight : prev.backlight,
       // sMeter is read-only telemetry — no grace period needed, always take the latest poll value.
       sMeter:    smRaw !== null ? sMeter : prev.sMeter,
+      // diagMode is read-only (never SET by the app) — no grace period.
+      diagMode:  diag !== null ? diag >= 1 : prev.diagMode,
     }));
   };
 
@@ -1247,13 +1285,14 @@ export function useRadioCAT(): RadioCATControls {
     rxBuf  = '';
     autoReportActive = false;
     tuneActive = false;  // the radio's own TX time-out is the backstop once the link is gone
+    clearTuneLimit();
     tuneRestoreMode = null;
     confirmErrors.forget();
     setState(prev => ({
       ...prev, connected: false, reconnecting: false, frequency: null, mode: null, ptt: false, error: null,
       volume: null, att1: null, att2: null, nr: null, agc: null, agcLevel: null, filter: null, sMeter: null, drive: null,
       backlight: null, firmwareVersion: null, autoReport: null, pttConfirmAlarm: false,
-      cwTune: null, tune: 'idle',
+      cwTune: null, tune: 'idle', tuneEndsAt: null, catQueries: null, diagMode: null,
     }));
   }
 
@@ -1375,6 +1414,34 @@ export function useRadioCAT(): RadioCATControls {
           setState(prev => ({ ...prev, firmwareVersion: m[1] }));
           return true;
         });
+        // Capability report (CL;) — one query, answered with every read-only
+        // query this firmware supports. It is also the version gate: the
+        // releases with and without it both report FV4.02c, so the reply
+        // decides. ?; (older firmware) or no usable answer after a few tries
+        // → catQueries stays null and every query keeps the legacy list.
+        let clAttempts = 0;
+        retryUntilConnected('CL;', async () => {
+          clAttempts++;
+          const list = parseQueryList(await query('CL;', false, true));
+          if (list === 'unsupported' || (list === null && clAttempts >= 6)) {
+            log('info', 'no capability report (CL;) — using the legacy query list');
+            return true;
+          }
+          if (list === null) return false;
+          log('info', 'capability report:', list.join(','));
+          setState(prev => ({ ...prev, catQueries: list }));
+          // Diagnostic mode is read once here; auto-report pushes (or the
+          // poll, with auto-report off) keep it current from then on.
+          if (supportsQuery(list, 'DG')) {
+            retryUntilConnected('DG;', async () => {
+              const v = parseIntField(await query('DG;'), 'DG');
+              if (v === null) return false;
+              setState(prev => ({ ...prev, diagMode: v >= 1 }));
+              return true;
+            });
+          }
+          return true;
+        });
         // One-shot CAT auto-report discovery (AI;). Deliberately queried
         // only here, at connection time: older firmware always answers
         // AI0; (→ keep long-polling), and later toggles at the rig are
@@ -1477,6 +1544,14 @@ export function useRadioCAT(): RadioCATControls {
   // other transmitter: they all key through setPTT() below.
   let tuneActive = false;
   let tuneRestoreMode: CATMode | null = null;
+  // Web-app TUNE limit (TUNE_MAX_MS): ends the carrier through stopTune().
+  // Deliberately not mirrored on the bridge or the radio — the radio's own
+  // TX time-out stays the hardware backstop, and live tuner SWR readings
+  // are planned to replace a fixed duration later.
+  let tuneLimitTimer: ReturnType<typeof setTimeout> | null = null;
+  const clearTuneLimit = () => {
+    if (tuneLimitTimer) { clearTimeout(tuneLimitTimer); tuneLimitTimer = null; }
+  };
 
   // TU0;/TU1; — a PU7FTW extension SET that echoes the effective value.
   // Always awaited (both transports): the echo is the only proof the
@@ -1513,12 +1588,22 @@ export function useRadioCAT(): RadioCATControls {
     }
     if (!tuneActive) return;  // stopTune() ran meanwhile (e.g. disconnect) — don't key
     await keyPTT(true);
-    setState(prev => ({ ...prev, tune: 'keyed', lastTuneHz: prev.frequency }));
+    if (!tuneActive) return;  // stopped while keying
+    clearTuneLimit();
+    tuneLimitTimer = setTimeout(() => {
+      tuneLimitTimer = null;
+      if (tuneActive && state().tune === 'keyed') {
+        log('info', `TUNE limit reached (${TUNE_MAX_MS / 1000} s) — stopping`);
+        void stopTune();
+      }
+    }, TUNE_MAX_MS);
+    setState(prev => ({ ...prev, tune: 'keyed', lastTuneHz: prev.frequency, tuneEndsAt: Date.now() + TUNE_MAX_MS }));
   };
 
   const stopTune = async () => {
     if (!tuneActive || state().tune === 'stopping') return;
-    setState(prev => ({ ...prev, tune: 'stopping' }));
+    clearTuneLimit();
+    setState(prev => ({ ...prev, tune: 'stopping', tuneEndsAt: null }));
     log('info', 'stopTune');
     await keyPTT(false);  // always — confirms RX even if the radio already un-keyed itself
     await setCwTuneFlag(false);

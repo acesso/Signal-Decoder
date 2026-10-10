@@ -12,6 +12,17 @@
 
 import { freqMhzToBand } from '../ft/parser';
 
+/** A one-click TUNE ends on its own after this long (web app only — the
+ *  radio's TX time-out stays the hardware backstop). Long enough for an
+ *  automatic tuner to find a match. */
+export const TUNE_MAX_MS = 5000;
+
+/** Whole seconds left on a running TUNE (rounded up, never negative). */
+export function tuneSecondsLeft(endsAt: number | null, now: number): number | null {
+  if (endsAt === null) return null;
+  return Math.max(0, Math.ceil((endsAt - now) / 1000));
+}
+
 /** Drift window (kHz) = band frequency (MHz) × 3.5 — e.g. ±24.8 kHz at
  *  7.074 MHz, ±49.3 kHz at 14.074 MHz, ±98.3 kHz at 28.074 MHz. */
 export const RETUNE_KHZ_PER_MHZ = 3.5;

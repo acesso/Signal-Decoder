@@ -5,7 +5,7 @@
  * Run with: npm test src/lib/cat/__tests__/cwTune.test.ts
  */
 
-import { retuneWindowHz, retuneSuggestion, RETUNE_KHZ_PER_MHZ } from '../cwTune';
+import { retuneWindowHz, retuneSuggestion, tuneSecondsLeft, RETUNE_KHZ_PER_MHZ, TUNE_MAX_MS } from '../cwTune';
 
 describe('retuneWindowHz — MHz × 3.5 kHz', () => {
   test('formula constant', () => {
@@ -55,5 +55,20 @@ describe('retuneSuggestion', () => {
 
   test('unknown current frequency (0) → no suggestion', () => {
     expect(retuneSuggestion(0, 7_074_000).suggest).toBe(false);
+  });
+});
+
+describe('TUNE limit', () => {
+  test('5 s', () => {
+    expect(TUNE_MAX_MS).toBe(5000);
+  });
+
+  test('countdown rounds up and stops at 0', () => {
+    expect(tuneSecondsLeft(null, 1000)).toBeNull();
+    expect(tuneSecondsLeft(6000, 1000)).toBe(5);
+    expect(tuneSecondsLeft(6000, 1001)).toBe(5);
+    expect(tuneSecondsLeft(6000, 5001)).toBe(1);
+    expect(tuneSecondsLeft(6000, 6000)).toBe(0);
+    expect(tuneSecondsLeft(6000, 9000)).toBe(0);
   });
 });
