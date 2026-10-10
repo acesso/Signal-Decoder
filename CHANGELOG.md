@@ -12,6 +12,21 @@ them into a version section when cutting a release.
 
 ## [Unreleased]
 
+## [0.26.0] - 2026-10-10
+
+### Added
+
+- **The web app reads the radio's capability report.** On connect it sends one `CL;` and, from then on, queries only what the radio lists, plus diagnostic mode (`DG`) when listed. Firmware without the report answers `?;` and the app keeps the fixed query list it always used. The reply is the version check, because both firmware builds report `FV4.02c;`.
+- **PTT and TUNE turn blue while the radio is in diagnostic mode.** The app follows `DG` from the radio and the bridge page (read once at connect, then by auto-report or the poll) and never sets it. The red "TX not confirmed off" alarm stays red.
+
+### Changed
+
+- **TUNE stops on its own after 5 seconds**, with a countdown on the button. The limit lives only in the web app; the radio's TX time-out stays the hardware backstop.
+
+### Fixed
+
+- The radio's 5-value `TA` report after an SSB transmission is recognized again instead of being logged as an unexpected frame.
+
 ## [0.25.0] - 2026-10-10
 
 ### Added

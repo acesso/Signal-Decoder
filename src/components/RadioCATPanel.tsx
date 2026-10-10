@@ -12,7 +12,7 @@ import {
   type BridgeInfo,
   type TuneState,
 } from '../lib/cat/useRadioCAT'
-import { retuneSuggestion, type RetuneSuggestion } from '../lib/cat/cwTune'
+import { retuneSuggestion, tuneSecondsLeft, TUNE_MAX_MS, type RetuneSuggestion } from '../lib/cat/cwTune'
 import type { AudioBridge } from '../lib/cat/useAudioBridge'
 import type { IQBridge } from '../lib/cat/useIQBridge'
 import CalibrationWizard from './CalibrationWizard'
@@ -203,7 +203,12 @@ function ModeSelector(props: { mode: CATMode | null; onChange: (m: CATMode) => v
 
 // ── PTTButton ─────────────────────────────────────────────────────────────────
 
-function PTTButton(props: { ptt: boolean; onToggle: () => void; confirmAlarm?: boolean }) {
+// Blue instead of red/grey while the radio is in diagnostic mode (DG1): a TX
+// runs the whole path but nothing reaches the HF line. The unconfirmed-RX
+// alarm stays red regardless — it's about the CAT link, not RF.
+const DIAG_TITLE = ' Radio is in diagnostic mode — no RF reaches the antenna.'
+
+function PTTButton(props: { ptt: boolean; onToggle: () => void; confirmAlarm?: boolean; diag?: boolean }) {
   return (
     <div class="flex flex-col items-center gap-1 shrink-0">
       <button
@@ -211,14 +216,16 @@ function PTTButton(props: { ptt: boolean; onToggle: () => void; confirmAlarm?: b
         title={
           props.confirmAlarm
             ? 'RADIO DID NOT CONFIRM RX — it may still be transmitting. Bridge is retrying automatically.'
-            : props.ptt ? 'Transmitting — click to go back to RX' : 'Push to Talk — click to transmit'
+            : (props.ptt ? 'Transmitting — click to go back to RX' : 'Push to Talk — click to transmit') + (props.diag ? DIAG_TITLE : '')
         }
         class={`flex items-center justify-center gap-1.5 text-xs font-bold w-16 py-1.5 rounded-md transition-colors border
           ${props.confirmAlarm
             ? 'bg-[#f85149] border-[#f85149] text-white animate-pulse ring-2 ring-[#f85149] ring-offset-2 ring-offset-[#0d1117]'
             : props.ptt
-              ? 'bg-[#f85149] border-[#f85149] text-white'
-              : 'bg-[#21262d] border-[#30363d] text-[#8b949e] hover:text-[#c9d1d9] hover:border-[#8b949e]'
+              ? (props.diag ? 'bg-[#388bfd] border-[#388bfd] text-white' : 'bg-[#f85149] border-[#f85149] text-white')
+              : props.diag
+                ? 'bg-[#21262d] border-[#388bfd] text-[#388bfd] hover:text-[#58a6ff] hover:border-[#58a6ff]'
+                : 'bg-[#21262d] border-[#30363d] text-[#8b949e] hover:text-[#c9d1d9] hover:border-[#8b949e]'
           }`}
       >
         <Show
@@ -251,7 +258,7 @@ function PTTButton(props: { ptt: boolean; onToggle: () => void; confirmAlarm?: b
 
 const TUNE_HELP =
   'Tune — keys an unmodulated CW carrier on the dial frequency for the antenna tuner, at the uSDX\'s own power ' +
-  '(the external PA stays unkeyed). Click again to stop; the radio\'s TX time-out also ends it. ' +
+  `(the external PA stays unkeyed). Stops on its own after ${TUNE_MAX_MS / 1000} s, or click again to stop; the radio\'s TX time-out also ends it. ` +
   'Re-tune after a band change or a large VFO move (more than ±MHz×3.5 kHz) — the tuner\'s SWR match depends on frequency.'
 
 function TuneButton(props: {
@@ -259,12 +266,24 @@ function TuneButton(props: {
   disabled: boolean
   suggestion: RetuneSuggestion
   lastTuneHz: number | null
+  /** When the running tune stops on its own (ms epoch), for the countdown. */
+  tuneEndsAt: number | null
+  diag?: boolean
   onToggle: () => void
 }) {
   const busy = () => props.tune === 'starting' || props.tune === 'stopping'
+  // Countdown tick — runs only while keyed.
+  const [now, setNow] = createSignal(Date.now())
+  createEffect(() => {
+    if (props.tune !== 'keyed') return
+    setNow(Date.now())
+    const id = setInterval(() => setNow(Date.now()), 200)
+    onCleanup(() => clearInterval(id))
+  })
+  const secondsLeft = () => props.tune === 'keyed' ? tuneSecondsLeft(props.tuneEndsAt, now()) : null
   const hint = () => props.tune === 'idle' && props.suggestion.suggest && props.suggestion.reason !== 'never'
   const title = () => {
-    if (props.tune === 'keyed') return 'Tuning — carrier on air. Click to stop.'
+    if (props.tune === 'keyed') return (props.diag ? 'Tuning in diagnostic mode — no RF on air.' : 'Tuning — carrier on air.') + ' Click to stop.'
     if (busy()) return props.tune === 'starting' ? 'Starting tune…' : 'Stopping tune…'
     if (props.disabled) return 'Tune is unavailable while transmitting.'
     const last = props.lastTuneHz !== null ? ` Last tuned at ${(props.lastTuneHz / 1e6).toFixed(3)} MHz.` : ' Not tuned yet this session.'
@@ -273,7 +292,7 @@ function TuneButton(props: {
       : props.suggestion.reason === 'drift' && props.suggestion.windowHz !== null
         ? ` The VFO moved more than ±${(props.suggestion.windowHz / 1000).toFixed(1)} kHz from the last tune — re-tune suggested.`
       : ''
-    return TUNE_HELP + last + why
+    return TUNE_HELP + last + why + (props.diag ? DIAG_TITLE : '')
   }
   return (
     <div class="flex flex-col items-center gap-1 shrink-0">
@@ -283,15 +302,17 @@ function TuneButton(props: {
         title={title()}
         class={`flex items-center justify-center gap-1.5 text-xs font-bold w-16 py-1.5 rounded-md transition-colors border disabled:opacity-50
           ${props.tune === 'keyed'
-            ? 'bg-[#f85149] border-[#f85149] text-white animate-pulse'
+            ? (props.diag ? 'bg-[#388bfd] border-[#388bfd] text-white animate-pulse' : 'bg-[#f85149] border-[#f85149] text-white animate-pulse')
             : busy()
               ? 'bg-[#21262d] border-[#d29922] text-[#d29922]'
+              : props.diag
+                ? 'bg-[#21262d] border-[#388bfd] text-[#388bfd] hover:text-[#58a6ff] hover:border-[#58a6ff]'
               : hint()
                 ? 'bg-[#21262d] border-[#d29922] text-[#d29922] hover:text-[#e3b341]'
                 : 'bg-[#21262d] border-[#30363d] text-[#8b949e] hover:text-[#c9d1d9] hover:border-[#8b949e]'
           }`}
       >
-        TUNE
+        TUNE<Show when={secondsLeft() !== null}> {secondsLeft()}</Show>
       </button>
       <Show when={hint()}>
         <span class="text-[9px] font-bold text-[#d29922] whitespace-nowrap">↻ retune?</span>
@@ -2084,15 +2105,19 @@ export default function RadioCATPanel(props: {
           <div class="w-px h-6 bg-[#30363d] shrink-0" />
 
           {/* PTT */}
-          <PTTButton ptt={state().ptt} onToggle={handlePTTToggle} confirmAlarm={state().pttConfirmAlarm} />
+          <PTTButton ptt={state().ptt} onToggle={handlePTTToggle} confirmAlarm={state().pttConfirmAlarm} diag={state().diagMode === true} />
 
-          {/* CW Tune (uSDX BLACK_BRICK TU command) */}
-          <Show when={config().rigProfile === 'usdx-blackbrick' && state().firmwareVersion !== null}>
+          {/* CW Tune (uSDX BLACK_BRICK TU command) — hidden when the radio's
+              capability report (CL;) exists and doesn't list TU */}
+          <Show when={config().rigProfile === 'usdx-blackbrick' && state().firmwareVersion !== null
+            && (state().catQueries === null || state().catQueries!.includes('TU'))}>
             <TuneButton
               tune={state().tune}
               disabled={state().tune === 'idle' && (state().ptt || state().pttConfirmAlarm)}
               suggestion={retuneSuggestion(state().frequency ?? 0, state().lastTuneHz)}
               lastTuneHz={state().lastTuneHz}
+              tuneEndsAt={state().tuneEndsAt}
+              diag={state().diagMode === true}
               onToggle={handleTuneToggle}
             />
           </Show>

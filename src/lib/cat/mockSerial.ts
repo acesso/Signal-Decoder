@@ -27,6 +27,11 @@ export interface MockSerialOptions {
   initialFrequency?: number;
   /** Kenwood mode digit, 2 = USB */
   modeDigit?: number;
+  /** Simulate firmware from before the capability report: CL; and DG;
+   *  answer ?; like any unknown command (default false). */
+  legacyFirmware?: boolean;
+  /** Initial diagnostic mode (DG), default off. */
+  diagMode?: boolean;
 }
 
 interface MockStats {
@@ -50,6 +55,7 @@ export function createMockSerialPort(opts: MockSerialOptions = {}) {
     sMeter: 7,
     backlight: 1,
     cwTune: 0,                // CW Tune (TU, menu 2.3) — never stored, boots OFF
+    diag: opts.diagMode ? 1 : 0,  // diagnostic mode (DG, TX_DIAG builds)
     pwmMin: 10, pwmMax: 130,  // PA bias endpoints (firmware defaults)
     fxtal: 25_000_000,        // reference oscillator (XF, menu "Ref frq")
     tx: false,
@@ -75,6 +81,14 @@ export function createMockSerialPort(opts: MockSerialOptions = {}) {
   let rxBuffer = '';
 
   function respond(cmd: string): string {
+    if (opts.legacyFirmware && /^(CL|DG)/.test(cmd)) return '?;';
+    // Diagnostic mode SET (DG0/DG1) — 3 chars; echoes the effective value.
+    const dgSet = cmd.match(/^DG(\d)$/);
+    if (dgSet) {
+      const v = parseInt(dgSet[1], 10);
+      if (v <= 1) rig.diag = v;
+      return `DG${rig.diag};`;
+    }
     // AGC level SET — handled before the generic set path because single-digit
     // sets ("AL5") are only 3 chars and the generic path requires length > 3.
     // Validated echo like the firmware: 1..14, out-of-range keeps the old value.
@@ -164,7 +178,10 @@ export function createMockSerialPort(opts: MockSerialOptions = {}) {
       case 'AI': return `AI${rig.autoReport ? 1 : 0};`;  // CAT auto-report state
       case 'BL': return `BL${rig.backlight};`;
       case 'TU': return `TU${rig.cwTune};`;
-      case 'TA': return 'TA0,0,0;';  // TX audio diagnostic — the mock never transmits audio
+      case 'TA': return 'TA0,0,0,0,0;';  // TX audio diagnostic — the mock never transmits audio
+      case 'DG': return `DG${rig.diag};`;
+      // Capability report — the firmware's CAT_QUERY_LIST (TX_DIAG build).
+      case 'CL': return 'CLFA,MD,IF,ID,FV,PS,SM,AI,TQ,AG0,FW,VO,AT,A2,NR,DR,BL,AL,TT,PM,PX,XF,FD,TU,TA,DG,CL;';
       case 'PM': return `PM${rig.pwmMin};`;
       case 'PX': return `PX${rig.pwmMax};`;
       // Soft restart: real firmware acks SR1; then watchdog-reboots (offline
