@@ -21,6 +21,7 @@
 #include "bridge_state.h"
 #include "cat_bridge.h"
 #include "cat_log.h"
+#include "control_page.h"
 #include "cpu_monitor.h"
 #include "led_status.h"
 #include "pa_watchdog.h"
@@ -153,7 +154,7 @@ static const char *const BRIDGE_FEATURES[] = {
     "alc_control", "noise_gate_control", "cpu_monitor", "wifi_tx_power_control",
     "adc_hpf_control", "sample_rate_select", "speaker_amp_control", "cat_log",
     "audio_mic_sniff", "input_mode_select", "tx_buffer_playback", "speaker_vol", "tx_slot_select",
-    "ota",
+    "ota", "ota_storage", "cat_echo_text",
 };
 
 // The uSDX firmware's own CAT_BAUD menu setting (usdxBLACKBRICK.ino) only
@@ -1754,6 +1755,99 @@ static esp_err_t ota_handler(httpd_req_t *req) {
     return ESP_OK;
 }
 
+// ── Control-page storage update (POST /ota-storage) ─────────────────────────
+// POST /ota covers only the app slots; the control page lives on the separate
+// "storage" SPIFFS partition (partitions.csv), which before this could only
+// be rewritten over USB-UART. This pushes the SPIFFS image idf.py builds from
+// spiffs_data/ (build/storage.bin) over WiFi, so page-only changes need no
+// app update at all:
+//   curl -X POST --data-binary @build/storage.bin http://usdx-bridge.local/ota-storage
+//
+// The body must be EXACTLY the partition size — spiffs_create_partition_image
+// always emits a full-partition image, and the strict check stops an app .bin
+// (≈1.1MB) or a truncated upload from landing here. The partition is unmounted
+// first, then erased and written one 4K sector at a time as the body streams
+// in, then remounted and checked for index.html. No reboot.
+//
+// There is no A/B slot for storage: a failure mid-write leaves the page
+// unavailable until a good image is uploaded again. Every JSON endpoint,
+// /cat, /ota and this route itself live in the app and keep working, so that
+// is always recoverable over WiFi — control_page_start() registers its routes
+// even when the mount fails, so a restored page is served without a reboot.
+#define STORAGE_SECTOR_BYTES 4096
+
+static esp_err_t ota_storage_handler(httpd_req_t *req) {
+    audio_monitor_tx_status_t tx_status;
+    audio_monitor_tx_get_status(&tx_status);
+    if (tx_status.playing) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "a TX slot is playing — wait for it to finish before updating the control page");
+        return ESP_FAIL;
+    }
+
+    const esp_partition_t *part = esp_partition_find_first(ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_SPIFFS, "storage");
+    if (!part) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "no \"storage\" SPIFFS partition in this partition table");
+        return ESP_FAIL;
+    }
+    size_t content_len = req->content_len;
+    if (content_len != part->size) {
+        char err_msg[160];
+        snprintf(err_msg, sizeof(err_msg), "image is %u bytes, the storage partition is %u — POST build/storage.bin (a full-partition SPIFFS image)",
+                 (unsigned)content_len, (unsigned)part->size);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, err_msg);
+        return ESP_FAIL;
+    }
+
+    char *buf = malloc(STORAGE_SECTOR_BYTES);
+    if (!buf) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "failed to allocate receive buffer");
+        return ESP_FAIL;
+    }
+
+    ESP_LOGW(TAG, "storage update starting: %u bytes -> partition '%s'", (unsigned)content_len, part->label);
+    control_page_storage_unmount();
+
+    size_t offset = 0;
+    esp_err_t err = ESP_OK;
+    while (offset < content_len) {
+        size_t fill = 0;  // fill one whole sector before erasing+writing it
+        while (fill < STORAGE_SECTOR_BYTES) {
+            int received = httpd_req_recv(req, buf + fill, STORAGE_SECTOR_BYTES - fill);
+            if (received == HTTPD_SOCK_ERR_TIMEOUT) continue;  // same retry as ota_handler's
+            if (received <= 0) { err = ESP_FAIL; break; }
+            fill += (size_t)received;
+        }
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "storage body recv failed at %u/%u bytes", (unsigned)offset, (unsigned)content_len);
+            break;
+        }
+        err = esp_partition_erase_range(part, offset, STORAGE_SECTOR_BYTES);
+        if (err == ESP_OK) err = esp_partition_write(part, offset, buf, STORAGE_SECTOR_BYTES);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "storage write failed at %u bytes: %s", (unsigned)offset, esp_err_to_name(err));
+            break;
+        }
+        offset += STORAGE_SECTOR_BYTES;
+    }
+    free(buf);
+
+    bool page_ok = control_page_storage_mount();
+    if (err != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
+                            "storage update failed part-way — the control page is unavailable until a good image is uploaded again");
+        return ESP_FAIL;
+    }
+
+    ESP_LOGW(TAG, "storage update complete (%u bytes), page %s", (unsigned)offset, page_ok ? "ok" : "MISSING index.html");
+    httpd_resp_set_type(req, "application/json");
+    set_cors(req);
+    char body[96];
+    int n = snprintf(body, sizeof(body), "{\"ok\":%s,\"bytes\":%u,\"page_ok\":%s}",
+                     page_ok ? "true" : "false", (unsigned)offset, page_ok ? "true" : "false");
+    httpd_resp_send(req, body, n);
+    return ESP_OK;
+}
+
 // GET /ota-status — which slot is running, what state it's in, and whether
 // this build can even be updated over the air. Exists so the uploader can
 // confirm the new image actually took (running partition flips ota_0 <->
@@ -1834,6 +1928,7 @@ void http_control_start(void) {
     httpd_uri_t tone_status_uri  = { .uri = "/tone",       .method = HTTP_GET,  .handler = tone_status_handler };
     httpd_uri_t ota_uri          = { .uri = "/ota",        .method = HTTP_POST, .handler = ota_handler };
     httpd_uri_t ota_status_uri   = { .uri = "/ota-status", .method = HTTP_GET,  .handler = ota_status_handler };
+    httpd_uri_t ota_storage_uri  = { .uri = "/ota-storage", .method = HTTP_POST, .handler = ota_storage_handler };
     httpd_uri_t options_uri      = { .uri = "/*",           .method = HTTP_OPTIONS, .handler = options_handler };
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &status_uri));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &info_uri));
@@ -1869,6 +1964,7 @@ void http_control_start(void) {
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &tone_status_uri));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &ota_uri));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &ota_status_uri));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &ota_storage_uri));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &options_uri));
 
     ESP_LOGI(TAG, "control endpoints ready: GET /status, GET /info, GET /wifi-scan, POST /reset, "

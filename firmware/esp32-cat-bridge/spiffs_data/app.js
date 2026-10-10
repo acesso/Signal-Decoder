@@ -740,6 +740,17 @@ function renderTxCache(status) {
     head.append(name, role);
 
     if (slot.ready) {
+      const play = document.createElement('button');
+      play.className = 'tx-slot-play';
+      play.type = 'button';
+      play.textContent = '▶ Play';
+      play.disabled = txPlayBusy || status.playing || liveActive;
+      play.title = txAutoPtt
+        ? `Key the radio and transmit slot ${slot.slot}`
+        : `Play slot ${slot.slot} on the bridge DAC (radio mic input) — not keyed, nothing goes on air`;
+      play.addEventListener('click', () => void playTxSlot(slot.slot));
+      head.append(play);
+
       const clear = document.createElement('button');
       clear.className = 'tx-slot-clear';
       clear.type = 'button';
@@ -826,6 +837,396 @@ async function refreshTxCache() {
 const TX_CACHE_REFRESH_MS = 5000;
 refreshTxCache();
 setInterval(refreshTxCache, TX_CACHE_REFRESH_MS);
+
+// ── TX cache playback ────────────────────────────────────────────────────
+// ▶ Play runs a staged slot through POST /tx-play, i.e. out of the bridge
+// DAC into the radio's mic input. On its own that never transmits (the uSDX
+// has no VOX); with Auto-PTT the page keys the radio around it the same way
+// the web app does: TX; → pre-key → play → wait for the end → post-key → RX;.
+// "Monitor in browser" listens to the playback through the mic sniffer
+// (/audio-mic-sniff taps the same DAC write), so what you hear is exactly what
+// the radio was fed.
+const txAutoPttChip = document.getElementById('tx-autoptt-chip');
+const txMonitorChip = document.getElementById('tx-monitor-chip');
+const txPreKey = document.getElementById('tx-prekey');
+const txPostKey = document.getElementById('tx-postkey');
+const txStopBtn = document.getElementById('tx-stop-btn');
+const txPlayStatus = document.getElementById('tx-play-status');
+
+let txAutoPtt = loadJson('txAutoPtt', false);
+let txMonitor = loadJson('txMonitor', false);
+let txPlayBusy = false;
+let txKeyed = false;
+let txStopRequested = false;
+txPreKey.value = loadJson('txPreKeyMs', 150);
+txPostKey.value = loadJson('txPostKeyMs', 0);
+
+function renderTxChips() {
+  txAutoPttChip.classList.toggle('active', txAutoPtt);
+  txAutoPttChip.title = txAutoPtt ? 'Auto-PTT on: Play keys the radio (TX;) around the slot' : 'Auto-PTT off: Play only feeds the radio mic input — nothing goes on air';
+  txMonitorChip.classList.toggle('active', txMonitor);
+}
+txAutoPttChip.addEventListener('click', () => { txAutoPtt = !txAutoPtt; saveJson('txAutoPtt', txAutoPtt); renderTxChips(); refreshTxCache(); });
+txMonitorChip.addEventListener('click', () => { txMonitor = !txMonitor; saveJson('txMonitor', txMonitor); renderTxChips(); });
+txPreKey.addEventListener('change', () => saveJson('txPreKeyMs', Math.max(0, Number(txPreKey.value) || 0)));
+txPostKey.addEventListener('change', () => saveJson('txPostKeyMs', Math.max(0, Number(txPostKey.value) || 0)));
+
+const sleepMs = (ms) => new Promise((r) => setTimeout(r, ms));
+
+function setTxPlayStatus(text, kind) {
+  txPlayStatus.textContent = text;
+  txPlayStatus.dataset.kind = kind || '';
+}
+
+// Ask the radio for its mode right before keying: TX; in CW with CW Tune ON
+// would send the tune carrier instead of the staged message, and AM/FM/CW
+// refuse TX anyway — only LSB/USB make sense here.
+async function radioModeForTx() {
+  let mode = null;
+  const prev = catProbe;
+  if (prev) return null;  // a Query radio run is in flight — don't interleave
+  const ok = await new Promise((resolve) => {
+    const timer = setTimeout(() => { catProbe = null; resolve(false); }, 800);
+    catProbe = { prefix: 'MD', resolve: (r) => { clearTimeout(timer); resolve(r); } };
+    if (!sendCat('MD;')) { clearTimeout(timer); catProbe = null; resolve(false); }
+  });
+  if (ok) {
+    const last = [...catFrames].reverse().find((f) => f.dir === 'in' && /^MD\d;$/.test(f.text));
+    if (last) mode = Number(last.text[2]);
+  }
+  return mode;
+}
+
+async function unkey() {
+  if (!txKeyed) return;
+  sendCat('RX;');
+  txKeyed = false;
+}
+
+async function playTxSlot(slot) {
+  if (txPlayBusy || liveActive) return;
+  txPlayBusy = true;
+  txStopRequested = false;
+  txStopBtn.disabled = false;
+  refreshTxCache();
+  let startedSniff = false;
+  try {
+    if (txAutoPtt) {
+      const mode = await radioModeForTx();
+      if (mode !== 1 && mode !== 2) {
+        throw new Error(mode === null ? 'could not read the radio mode (MD;) — not keying' : `radio is in ${['', 'LSB', 'USB', 'CW', 'FM', 'AM'][mode] || 'mode ' + mode}, not LSB/USB — not keying`);
+      }
+    }
+    if (txMonitor && !sniffActive) {
+      micSniffPlayCheckbox.checked = true;
+      await startSniff();
+      startedSniff = true;
+    }
+    if (txAutoPtt) {
+      if (!sendCat('TX;')) throw new Error('CAT not connected — not keying');
+      txKeyed = true;
+      setTxPlayStatus(`Slot ${slot}: keyed, pre-key ${txPreKey.value} ms…`, 'tx');
+      await sleepMs(Math.max(0, Number(txPreKey.value) || 0));
+      if (txStopRequested) throw new Error('stopped');
+    }
+    const res = await fetch(`/tx-play?slot=${slot}`, { method: 'POST' });
+    if (!res.ok) throw new Error(`/tx-play: ${(await res.text()).trim() || 'HTTP ' + res.status}`);
+    const { duration_ms: durationMs } = await res.json();
+    const what = txAutoPtt ? 'transmitting' : 'playing (not keyed)';
+    const startedAt = Date.now();
+    const deadline = startedAt + (durationMs || 0) + 3000;
+    for (;;) {
+      // Countdown from the slot's own duration; the /tx-status poll below is
+      // what actually decides the end.
+      const left = Math.max(0, (durationMs || 0) - (Date.now() - startedAt));
+      setTxPlayStatus(`Slot ${slot}: ${what} — ${(left / 1000).toFixed(1)} s left of ${fmtTxDuration(durationMs)}`, txAutoPtt ? 'tx' : 'play');
+      await sleepMs(250);
+      if (txStopRequested) break;
+      let st = null;
+      try { st = await (await fetch('/tx-status')).json(); } catch { /* one dropped poll — keep waiting until the deadline */ }
+      if (st && !st.playing) break;
+      if (Date.now() > deadline) throw new Error('playback did not finish in time');
+    }
+    if (txKeyed && !txStopRequested) await sleepMs(Math.max(0, Number(txPostKey.value) || 0));
+    setTxPlayStatus(txStopRequested ? `Slot ${slot}: stopped` : `Slot ${slot}: done`, 'ok');
+  } catch (err) {
+    setTxPlayStatus(`Slot ${slot}: ${err.message}`, 'error');
+  } finally {
+    await unkey();  // every exit path un-keys — the radio's own TX time-out is only the backstop
+    if (startedSniff) stopSniff();
+    txPlayBusy = false;
+    txStopBtn.disabled = true;
+    refreshTxCache();
+  }
+}
+
+txStopBtn.addEventListener('click', async () => {
+  txStopRequested = true;
+  try { await fetch('/tx-stop', { method: 'POST' }); } catch { /* the finally in playTxSlot still un-keys */ }
+  await unkey();
+});
+
+renderTxChips();
+
+// ── Diagnostic mode + live audio test ─────────────────────────────────────
+// Radio diagnostic mode (CAT DG, radio firmware TX_DIAG): every TX runs the
+// real path but nothing reaches the HF line, and while keyed the radio pushes
+// a TA window every ~0.5 s. The live test keys such a dry TX with the bridge's
+// test tone so the interface board can be tuned against what the radio's mic
+// ADC actually receives — never a real transmission: Start is refused unless
+// the radio itself has confirmed DG1.
+const diagChip = document.getElementById('diag-chip');
+const diagBanner = document.getElementById('diag-banner');
+const liveBtn = document.getElementById('live-btn');
+const liveHz = document.getElementById('live-hz');
+const liveAmp = document.getElementById('live-amp');
+const liveAmpVal = document.getElementById('live-amp-val');
+const liveNow = document.getElementById('live-now');
+const liveCharts = document.getElementById('live-charts');
+const liveReadout = document.getElementById('live-readout');
+const vizPct = document.getElementById('viz-pct');
+const vizMic = document.getElementById('viz-mic');
+const vizDac = document.getElementById('viz-dac');
+const vizTip = document.getElementById('viz-tip');
+const vizTbody = document.getElementById('viz-tbody');
+
+let diagOn = null;        // null = unknown (radio hasn't answered DG)
+let liveActive = false;
+let liveSniffWs = null;
+let liveSniffSum = 0;
+let liveSniffN = 0;
+let liveSniffTimer = null;
+let liveDacDb = null;      // latest bridge DAC level (dBFS RMS), attached to each radio window
+let liveT0 = 0;
+let liveData = [];         // this run only: { t, drive, ceil, gated, mic, dac } per ~0.5 s radio window
+
+function setDiagState(on) {
+  diagOn = on;
+  diagChip.textContent = `Diag mode: ${on ? 'ON' : 'OFF'}`;
+  diagChip.classList.toggle('diag-on', on);
+  diagBanner.hidden = !on;
+  liveBtn.disabled = !on && !liveActive;
+  // The radio un-keys on any DG change while keyed — a live test can't survive it.
+  if (!on && liveActive) void stopLiveTest('diagnostic mode turned off');
+}
+
+diagChip.addEventListener('click', () => {
+  if (diagOn === null) { sendCat('DG;'); return; }
+  sendCat(diagOn ? 'DG0;' : 'DG1;');
+});
+
+liveAmp.addEventListener('input', () => {
+  liveAmpVal.textContent = `${liveAmp.value}%`;
+  if (liveActive) void postTone({ amp: Number(liveAmp.value) / 100 });
+});
+liveHz.addEventListener('change', () => { if (liveActive) void postTone({ hz: Number(liveHz.value) }); });
+
+function startLiveSniff() {
+  const url = new URL('/audio-mic-sniff', location.href);
+  url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
+  const ws = new WebSocket(url.toString());
+  ws.binaryType = 'arraybuffer';
+  ws.onmessage = (ev) => {
+    if (!(ev.data instanceof ArrayBuffer)) return;
+    const pcm = new Int16Array(ev.data);
+    for (let i = 0; i < pcm.length; i++) liveSniffSum += pcm[i] * pcm[i];
+    liveSniffN += pcm.length;
+  };
+  liveSniffWs = ws;
+  liveSniffTimer = setInterval(() => {
+    if (!liveSniffN) { liveDacDb = null; return; }
+    const rms = Math.sqrt(liveSniffSum / liveSniffN) / 32768;
+    liveDacDb = rms > 0 ? Math.max(-90, 20 * Math.log10(rms)) : -90;
+    liveSniffSum = 0; liveSniffN = 0;
+  }, 500);
+}
+
+function onLiveWindow(mic, avg, clip, gated) {
+  const drive = catRadioDrive ?? 2;
+  const pct = avg === null ? 0 : drive >= 8 ? 100 : Math.min(100, Math.round(((avg << drive) * 100) / 255));
+  const point = { t: (Date.now() - liveT0) / 1000, drive: pct, ceil: clip, gated: gated ?? 0, mic: Math.round(mic * 1.07), dac: liveDacDb };
+  liveData.push(point);
+  liveNow.hidden = false;
+  liveNow.textContent = `now: drive ${point.drive}% of ceiling · at ceiling ${point.ceil}% · gated off ${point.gated}% · mic ≈${point.mic} mV · DAC ${point.dac === null ? '—' : point.dac.toFixed(1) + ' dBFS'}`;
+  liveReadout.textContent = `running · ${liveData.length} windows`;
+  const tr = document.createElement('tr');
+  for (const v of [point.t.toFixed(1), point.drive, point.ceil, point.gated, point.mic, point.dac === null ? '—' : point.dac.toFixed(1)]) {
+    const td = document.createElement('td'); td.textContent = v; tr.append(td);
+  }
+  vizTbody.append(tr);
+  renderLiveCharts();
+}
+
+// ── Live charts: three small multiples on one shared time axis ──
+// One unit per chart (%, mV, dBFS) — never a dual axis. Thin 2px lines,
+// recessive grid, end labels on the % chart, crosshair + tooltip across all
+// three. The full-power mic reference is derived from the radio's TX drive:
+// envelope ≈ 2 × mic counts, full power at envelope >= 255 >> drive.
+const SVGNS = 'http://www.w3.org/2000/svg';
+const VIZ_PAD = { l: 34, r: 74, t: 6, b: 16 };
+let vizHoverIdx = null;
+
+function svgEl(tag, attrs, text) {
+  const e = document.createElementNS(SVGNS, tag);
+  for (const k in attrs) e.setAttribute(k, attrs[k]);
+  if (text !== undefined) e.textContent = text;
+  return e;
+}
+
+function vizX(t, w, tMax) { return VIZ_PAD.l + (tMax > 0 ? (t / tMax) : 0) * (w - VIZ_PAD.l - VIZ_PAD.r); }
+
+function drawChart(host, { height, yMin, yMax, ticks, fmt, series, ref, endLabels }) {
+  const w = Math.max(280, host.clientWidth || 600);
+  const tMax = Math.max(5, liveData.length ? liveData[liveData.length - 1].t : 5);
+  const y = (v) => VIZ_PAD.t + (1 - (v - yMin) / (yMax - yMin)) * (height - VIZ_PAD.t - VIZ_PAD.b);
+  const svg = svgEl('svg', { viewBox: `0 0 ${w} ${height}`, height, role: 'img' });
+  for (const v of ticks) {
+    svg.append(svgEl('line', { class: 'grid', x1: VIZ_PAD.l, x2: w - VIZ_PAD.r, y1: y(v), y2: y(v) }));
+    svg.append(svgEl('text', { x: VIZ_PAD.l - 5, y: y(v) + 3, 'text-anchor': 'end' }, fmt(v)));
+  }
+  // x ticks: whole seconds, ~6 labels
+  const step = Math.max(1, Math.ceil(tMax / 6));
+  for (let t = 0; t <= tMax; t += step) svg.append(svgEl('text', { x: vizX(t, w, tMax), y: height - 3, 'text-anchor': 'middle' }, `${t}s`));
+  if (ref) {
+    svg.append(svgEl('line', { class: 'ref', x1: VIZ_PAD.l, x2: w - VIZ_PAD.r, y1: y(ref.v), y2: y(ref.v) }));
+    svg.append(svgEl('text', { class: 'end-label', x: w - VIZ_PAD.r + 4, y: y(ref.v) + 3 }, ref.label));
+  }
+  const labels = [];
+  for (const sr of series) {
+    const pts = liveData.filter((d) => d[sr.key] !== null && d[sr.key] !== undefined);
+    if (!pts.length) continue;
+    const clamp = (v) => Math.min(yMax, Math.max(yMin, v));
+    const dAttr = pts.map((d, i) => `${i ? 'L' : 'M'}${vizX(d.t, w, tMax).toFixed(1)},${y(clamp(d[sr.key])).toFixed(1)}`).join('');
+    svg.append(svgEl('path', { class: `line ${sr.cls}`, d: dAttr }));
+    if (endLabels) {
+      const last = pts[pts.length - 1];
+      labels.push({ y: y(clamp(last[sr.key])) + 3, text: `${sr.label} ${fmt(last[sr.key])}` });
+    }
+  }
+  // End labels: keep their natural order, then push apart so none overlap
+  // (two series both at 100% used to print on top of each other).
+  labels.sort((a, b) => a.y - b.y);
+  for (let i = 1; i < labels.length; i++) labels[i].y = Math.max(labels[i].y, labels[i - 1].y + 11);
+  const over = labels.length ? labels[labels.length - 1].y - (height - 2) : 0;
+  if (over > 0) for (const l of labels) l.y -= over;
+  for (const l of labels) svg.append(svgEl('text', { class: 'end-label', x: w - VIZ_PAD.r + 4, y: l.y }, l.text));
+  if (vizHoverIdx !== null && liveData[vizHoverIdx]) {
+    const d = liveData[vizHoverIdx];
+    const x = vizX(d.t, w, tMax);
+    svg.append(svgEl('line', { class: 'cross', x1: x, x2: x, y1: VIZ_PAD.t, y2: height - VIZ_PAD.b }));
+    for (const sr of series) {
+      if (d[sr.key] === null || d[sr.key] === undefined) continue;
+      svg.append(svgEl('circle', { class: `dot ${sr.dot}`, cx: x, cy: y(Math.min(yMax, Math.max(yMin, d[sr.key]))), r: 4 }));
+    }
+  }
+  host.replaceChildren(svg);
+}
+
+function renderLiveCharts() {
+  liveCharts.hidden = !liveData.length;
+  if (!liveData.length) return;
+  drawChart(vizPct, {
+    height: 150, yMin: 0, yMax: 100, ticks: [0, 50, 100], fmt: (v) => `${Math.round(v)}%`, endLabels: true,
+    series: [
+      { key: 'drive', cls: 'l1', dot: 'd1', label: 'drive' },
+      { key: 'ceil', cls: 'l2', dot: 'd2', label: 'ceiling' },
+      { key: 'gated', cls: 'l3', dot: 'd3', label: 'gated' },
+    ],
+  });
+  const drive = catRadioDrive ?? 2;
+  const fullMv = drive >= 8 ? 0 : Math.round(((255 >> drive) / 2) * 1.07);
+  const micMax = Math.max(fullMv * 1.4, ...liveData.map((d) => d.mic), 10);
+  drawChart(vizMic, {
+    height: 110, yMin: 0, yMax: micMax, ticks: [0, Math.round(micMax / 2), Math.round(micMax)], fmt: (v) => `${Math.round(v)}`,
+    series: [{ key: 'mic', cls: 'l1', dot: 'd1' }],
+    ref: fullMv ? { v: fullMv, label: `full @DR${drive}` } : null,
+  });
+  drawChart(vizDac, {
+    height: 110, yMin: -60, yMax: 0, ticks: [-60, -30, 0], fmt: (v) => `${Math.round(v)}`,
+    series: [{ key: 'dac', cls: 'l1', dot: 'd1' }],
+  });
+}
+
+// Crosshair: nearest window to the pointer, drawn on all three charts, one tooltip.
+function vizPointer(ev) {
+  if (!liveData.length) return;
+  const host = ev.currentTarget;
+  const rect = host.getBoundingClientRect();
+  const w = Math.max(280, host.clientWidth || 600);
+  const tMax = Math.max(5, liveData[liveData.length - 1].t);
+  const t = ((ev.clientX - rect.left) * (w / rect.width) - VIZ_PAD.l) / (w - VIZ_PAD.l - VIZ_PAD.r) * tMax;
+  let best = 0;
+  for (let i = 1; i < liveData.length; i++) if (Math.abs(liveData[i].t - t) < Math.abs(liveData[best].t - t)) best = i;
+  vizHoverIdx = best;
+  renderLiveCharts();
+  const d = liveData[best];
+  vizTip.hidden = false;
+  vizTip.innerHTML = '';
+  const add = (html) => { const div = document.createElement('div'); div.innerHTML = html; vizTip.append(div); };
+  add(`<b>t = ${d.t.toFixed(1)} s</b>`);
+  add(`<i class="sw sw-1"></i>drive <b>${d.drive}%</b> of ceiling`);
+  add(`<i class="sw sw-2"></i>at ceiling <b>${d.ceil}%</b>`);
+  add(`<i class="sw sw-3"></i>gated off <b>${d.gated}%</b>`);
+  add(`mic ≈ <b>${d.mic} mV</b> · DAC <b>${d.dac === null ? '—' : d.dac.toFixed(1) + ' dBFS'}</b>`);
+  const box = liveCharts.getBoundingClientRect();
+  const left = Math.min(ev.clientX - box.left + 12, box.width - vizTip.offsetWidth - 4);
+  vizTip.style.left = `${Math.max(0, left)}px`;
+  vizTip.style.top = `${ev.clientY - box.top + 12}px`;
+}
+function vizLeave() { vizHoverIdx = null; vizTip.hidden = true; renderLiveCharts(); }
+for (const host of [vizPct, vizMic, vizDac]) {
+  host.addEventListener('pointermove', vizPointer);
+  host.addEventListener('pointerleave', vizLeave);
+}
+window.addEventListener('resize', () => { if (liveData.length) renderLiveCharts(); });
+
+async function startLiveTest() {
+  if (liveActive || txPlayBusy) return;
+  if (diagOn !== true) { showMsg('Diagnostic mode is not confirmed ON by the radio — not keying.', 'error'); return; }
+  const mode = await radioModeForTx();
+  if (mode !== 1 && mode !== 2) { showMsg('Radio must be in LSB/USB for the live test (the SSB audio chain is what gets measured).', 'error'); return; }
+  if (diagOn !== true) return;  // re-check: a DG0 could have arrived meanwhile
+  liveActive = true;
+  liveBtn.textContent = 'Stop live test';
+  liveBtn.disabled = false;
+  // This run's data only — Start clears the previous run.
+  liveData = [];
+  liveT0 = Date.now();
+  liveDacDb = null;
+  vizTbody.replaceChildren();
+  renderLiveCharts();
+  liveNow.hidden = false;
+  liveNow.textContent = 'waiting for the first window…';
+  liveReadout.textContent = 'running';
+  refreshTxCache();
+  await postTone({ on: true, hz: Number(liveHz.value), amp: Number(liveAmp.value) / 100 });
+  startLiveSniff();
+  sendCat('TX;');
+}
+
+async function stopLiveTest(reason) {
+  if (!liveActive) return;
+  liveActive = false;
+  sendCat('RX;');
+  await postTone({ on: false });
+  if (liveSniffWs) { liveSniffWs.close(); liveSniffWs = null; }
+  clearInterval(liveSniffTimer);
+  liveBtn.textContent = 'Start live test';
+  liveBtn.disabled = diagOn !== true;
+  liveReadout.textContent = liveData.length ? `stopped · ${liveData.length} windows (kept until the next Start)` : 'idle';
+  if (reason) showMsg(`Live test stopped: ${reason}.`, 'ok');
+  refreshTxCache();
+}
+
+liveBtn.addEventListener('click', () => { if (liveActive) void stopLiveTest(); else void startLiveTest(); });
+
+// Closing the tab mid-test: un-key (no RF in diagnostic mode, but the radio
+// would otherwise stay keyed with its receiver muted) and stop the tone.
+window.addEventListener('beforeunload', () => {
+  if (!liveActive) return;
+  try { catWs?.send('RX;'); } catch { /* best effort */ }
+  try { fetch('/tone', { method: 'POST', keepalive: true, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ on: false }) }); } catch { /* best effort */ }
+});
 
 // ── Continuous test tone (POST/GET /tone) ────────────────────────────────
 // Drives the same mic-send path the sniffer above taps, so the tone shows
@@ -1288,6 +1689,10 @@ micSniffPlayCheckbox.addEventListener('change', () => {
 // README's note on why persistence wasn't worth the added firmware
 // complexity for what's meant to stay a live debug view).
 const CAT_LOG_MAX_LINES = 200;
+// Raw frames kept independently of what's on screen, so changing a filter
+// (or un-pausing) re-renders from history instead of only affecting what
+// arrives next.
+const CAT_FRAME_HISTORY = 600;
 
 const catLog = document.getElementById('cat-log');
 const catLogPause = document.getElementById('cat-log-pause');
@@ -1295,89 +1700,179 @@ const catSendForm = document.getElementById('cat-send-form');
 const catSendInput = document.getElementById('cat-send-input');
 const catBaudSelect = document.getElementById('cat-baud-select');
 const catBaudApplyBtn = document.getElementById('cat-baud-apply-btn');
+const catHideChips = document.getElementById('cat-hide-chips');
+const catFilterText = document.getElementById('cat-filter-text');
+const catFilterMode = document.getElementById('cat-filter-mode');
+const catHiddenCount = document.getElementById('cat-hidden-count');
+const catQuickChips = document.getElementById('cat-quick-chips');
+const catQueryBtn = document.getElementById('cat-query-btn');
+const catTxDiag = document.getElementById('cat-txdiag');
 
 let catWs = null;
-let catRadioBuf = '';
 
-// Commands arriving together in the SAME WebSocket message (e.g. the web
-// app's batched poll "FA;MD;AG0;...;AL;", sent as one query) share a
-// single log LINE — one timestamp/arrow, each command as its own small
-// pill within that line — rather than one DOM row per command; a 12-
-// command batch used to read as 12 stacked lines, which buried the "these
-// all went out together" fact the batching itself is trying to show.
-// catCurrentBatchLine/Arrow track the line currently being appended to;
-// null whenever the next frame should start a fresh line (a genuinely new
-// batch, or the very first frame ever).
-let catCurrentBatchLine = null;
-let catCurrentBatchArrow = null;
+// Direction of a frame on the /cat socket (bridge ≥0.8.0, feature
+// "cat_echo_text"): bytes FROM THE RADIO arrive as BINARY frames, another
+// client's outgoing command (e.g. the web app's poll) as TEXT. Frames this
+// page sends itself are drawn locally at send time (the bridge never echoes
+// them back to their sender). An older bridge sends everything as BINARY, so
+// other clients' commands show as from-radio there, as they always did.
+const CAT_DIR = {
+  in:    { glyph: '◀', tag: 'RADIO', title: 'from the radio' },
+  out:   { glyph: '▶', tag: 'BRIDGE', title: 'sent to the radio from this bridge page' },
+  other: { glyph: '▶', tag: 'APP',   title: 'sent to the radio by another client (e.g. the web app)' },
+};
 
-function appendCatFrame(direction, frame, isBatchStart) {
-  if (catLogPause.checked) return;
+function makeArrow(dir) {
+  const d = CAT_DIR[dir];
+  const arrow = document.createElement('span');
+  arrow.className = `arrow arrow-${dir}`;
+  arrow.title = d.title;
+  arrow.textContent = `${d.glyph} ${d.tag}`;
+  return arrow;
+}
 
-  if (isBatchStart || !catCurrentBatchLine) {
-    const line = document.createElement('div');
-    line.className = 'cat-log-line';
-
-    const time = document.createElement('span');
-    time.className = 'cat-log-time';
-    time.textContent = new Date().toLocaleTimeString(undefined, { hour12: false });
-
-    const arrow = document.createElement('span');
-    arrow.className = `arrow arrow-${direction}`;
-    arrow.textContent = direction === 'in' ? '←' : '→';
-    arrow.title = direction === 'in' ? 'from radio' : 'to radio';
-
-    const commands = document.createElement('span');
-    commands.className = 'cat-log-frame';
-
-    line.append(time, arrow, commands);
-    catLog.appendChild(line);
-    catCurrentBatchLine = commands;
-    catCurrentBatchArrow = direction;
-  }
-
-  // A direction change without an explicit new batch shouldn't happen in
-  // practice (feedCatBuf is only ever called with one direction per
-  // call), but if it ever did, starting a fresh line is safer than
-  // silently mislabeling a command with the wrong arrow.
-  if (catCurrentBatchArrow !== direction) {
-    catCurrentBatchLine = null;
-    appendCatFrame(direction, frame, true);
-    return;
-  }
-
+// Colours the command prefix apart from its payload — "FA" vs "00021074000"
+// reads far faster than one undifferentiated monospace run. Error replies
+// ("?;") get their own colour.
+function makeCmd(frame) {
   const cmd = document.createElement('span');
   cmd.className = 'cat-log-cmd';
-  cmd.textContent = frame;
-  catCurrentBatchLine.appendChild(cmd);
-
-  while (catLog.childElementCount > CAT_LOG_MAX_LINES) {
-    catLog.removeChild(catLog.firstChild);
+  if (frame === '?;') {
+    cmd.classList.add('cat-cmd-error');
+    cmd.textContent = frame;
+    return cmd;
   }
+  const prefix = document.createElement('span');
+  prefix.className = 'cat-cmd-prefix';
+  const rest = document.createElement('span');
+  rest.className = 'cat-cmd-payload';
+  const plen = frame.startsWith('AG0') ? 3 : /^[A-Z][A-Z0-9]/.test(frame) ? 2 : 0;  // AG0 is the one 3-char command name
+  prefix.textContent = frame.slice(0, plen);
+  rest.textContent = frame.slice(plen);
+  cmd.append(prefix, rest);
+  return cmd;
+}
+
+// ── Filter ──
+// Prefix chips hide whole command families (SM is the usual flood — the radio
+// pushes S-meter telemetry several times a second); the text box narrows
+// further, either showing only matching frames or hiding them.
+const CAT_HIDE_PREFIXES = [
+  { key: 'SM', label: 'SM', title: 'S-meter telemetry' },
+  { key: 'TXRX', label: 'TX/RX', title: 'TX0;/RX0; key status echoes' },
+  { key: 'AI', label: 'AI', title: 'auto-report announces' },
+  { key: 'FA', label: 'FA', title: 'frequency' },
+  { key: 'IF', label: 'IF', title: 'status frames' },
+];
+const catHidden = new Set(loadJson('catHidePrefixes', ['SM']));
+let catHiddenSeen = 0;
+
+function loadJson(key, fallback) {
+  try { const v = localStorage.getItem(key); return v ? JSON.parse(v) : fallback; } catch { return fallback; }
+}
+function saveJson(key, value) {
+  try { localStorage.setItem(key, JSON.stringify(value)); } catch { /* private window — non-essential */ }
+}
+
+function catFrameVisible(f) {
+  const p2 = f.text.slice(0, 2);
+  if (catHidden.has(p2)) return false;
+  if (catHidden.has('TXRX') && (p2 === 'TX' || p2 === 'RX')) return false;
+  const q = catFilterText.value.trim().toUpperCase();
+  if (q) {
+    const hit = f.text.toUpperCase().includes(q);
+    if (catFilterMode.value === 'only' ? !hit : hit) return false;
+  }
+  return true;
+}
+
+function renderHideChips() {
+  catHideChips.replaceChildren();
+  for (const p of CAT_HIDE_PREFIXES) {
+    const chip = document.createElement('button');
+    chip.type = 'button';
+    chip.className = 'chip';
+    chip.classList.toggle('active', catHidden.has(p.key));
+    chip.textContent = p.label;
+    chip.title = `${catHidden.has(p.key) ? 'Hidden' : 'Shown'}: ${p.title} — click to toggle`;
+    chip.addEventListener('click', () => {
+      if (catHidden.has(p.key)) catHidden.delete(p.key); else catHidden.add(p.key);
+      saveJson('catHidePrefixes', [...catHidden]);
+      renderHideChips();
+      rerenderCatLog();
+    });
+    catHideChips.append(chip);
+  }
+}
+
+// ── Frame history + rendering ──
+// Frames arriving in the same WebSocket message (e.g. the web app's batched
+// poll) share one batch id and render as one log line of pills.
+const catFrames = [];
+let catBatchSeq = 0;
+let catLastLine = null;   // { batch, dir, frameEl } of the last rendered line
+
+function renderCatFrame(f) {
+  if (!catFrameVisible(f)) {
+    catHiddenSeen++;
+    catHiddenCount.textContent = catHiddenSeen ? `${catHiddenSeen} hidden` : '';
+    return;
+  }
+  if (!catLastLine || catLastLine.batch !== f.batch || catLastLine.dir !== f.dir) {
+    const line = document.createElement('div');
+    line.className = `cat-log-line cat-line-${f.dir}`;
+    const time = document.createElement('span');
+    time.className = 'cat-log-time';
+    time.textContent = f.time;
+    const frameEl = document.createElement('span');
+    frameEl.className = 'cat-log-frame';
+    line.append(time, makeArrow(f.dir), frameEl);
+    catLog.appendChild(line);
+    catLastLine = { batch: f.batch, dir: f.dir, frameEl };
+    while (catLog.childElementCount > CAT_LOG_MAX_LINES) catLog.removeChild(catLog.firstChild);
+  }
+  catLastLine.frameEl.appendChild(makeCmd(f.text));
+}
+
+function rerenderCatLog() {
+  catLog.replaceChildren();
+  catLastLine = null;
+  catHiddenSeen = 0;
+  catHiddenCount.textContent = '';
+  for (const f of catFrames) renderCatFrame(f);
   catLog.scrollTop = catLog.scrollHeight;
 }
 
-// Splits one WebSocket message's raw bytes on ';' into complete frames,
-// carrying any partial trailing frame over in `buf` for the NEXT message
-// (a CAT frame doesn't always align with a message boundary — see the
-// LCD/UART pin-share quirk in the firmware README, which can split a
-// frame's bytes across two separate reads). Only the first complete frame
-// actually starting within THIS call is marked as a batch start — a
-// frame that's the leftover tail of a previous call's partial buffer
-// belongs to that earlier batch, not a new one.
-function feedCatBuf(buf, chunk, direction) {
-  const startedEmpty = buf.length === 0;
-  buf += chunk;
+function recordCatFrame(dir, text, batch) {
+  const f = { dir, text, batch, time: new Date().toLocaleTimeString(undefined, { hour12: false }) };
+  catFrames.push(f);
+  if (catFrames.length > CAT_FRAME_HISTORY) catFrames.shift();
+  if (dir === 'in') onRadioFrame(text);
+  if (catLogPause.checked) return;  // kept in history; shown again on un-pause
+  renderCatFrame(f);
+  catLog.scrollTop = catLog.scrollHeight;
+}
+
+// Splits one WebSocket message on ';' into complete frames, carrying a
+// partial trailing frame over to the next message of the SAME direction (a
+// frame can straddle two reads — see the LCD/UART pin-share quirk in the
+// radio firmware README). Each direction has its own carry-over buffer.
+const catPartial = { in: '', out: '', other: '' };
+function feedCat(dir, chunk) {
+  const batch = ++catBatchSeq;
+  let buf = catPartial[dir] + chunk;
   let start = 0;
-  let first = true;
   for (let i = 0; i < buf.length; i++) {
-    if (buf[i] === ';') {
-      appendCatFrame(direction, buf.slice(start, i + 1), first && startedEmpty);
-      first = false;
-      start = i + 1;
-    }
+    if (buf[i] === ';') { recordCatFrame(dir, buf.slice(start, i + 1), batch); start = i + 1; }
   }
-  return buf.slice(start);
+  catPartial[dir] = buf.slice(start);
+}
+
+function sendCat(text) {
+  if (!catWs || catWs.readyState !== WebSocket.OPEN) { showMsg('CAT monitor is not connected.', 'error'); return false; }
+  catWs.send(text);
+  feedCat('out', text.endsWith(';') ? text : text + ';');
+  return true;
 }
 
 function connectCatMonitor() {
@@ -1385,18 +1880,20 @@ function connectCatMonitor() {
   url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
   const ws = new WebSocket(url.toString());
   ws.binaryType = 'arraybuffer';
-
-  ws.onopen = () => { catWs = ws; };
+  ws.onopen = () => {
+    catWs = ws;
+    // One query for the radio's diagnostic-mode state; after this the radio
+    // pushes every change itself (radios without DG answer ?;, chip stays "?").
+    ws.send('DG;');
+  };
   ws.onmessage = (ev) => {
-    const text = typeof ev.data === 'string' ? ev.data : new TextDecoder().decode(ev.data);
-    catRadioBuf = feedCatBuf(catRadioBuf, text, 'in');
+    if (typeof ev.data === 'string') feedCat('other', ev.data);           // TEXT: another client's command
+    else feedCat('in', new TextDecoder().decode(ev.data));               // BINARY: the radio
   };
   ws.onclose = () => {
     if (catWs === ws) catWs = null;
-    // Reconnect after a short delay — the CAT monitor is meant to stay
-    // open indefinitely as a debug view, so a dropped connection (bridge
-    // reboot, brief Wi-Fi hiccup) should recover on its own rather than
-    // leaving the log silently dead until a manual page reload.
+    // Reconnect — the monitor is meant to stay open indefinitely, so a
+    // bridge reboot or Wi-Fi hiccup recovers on its own.
     setTimeout(connectCatMonitor, 2000);
   };
 }
@@ -1404,31 +1901,202 @@ function connectCatMonitor() {
 catSendForm.addEventListener('submit', (ev) => {
   ev.preventDefault();
   const raw = catSendInput.value.trim();
-  if (!raw || !catWs || catWs.readyState !== WebSocket.OPEN) return;
-  // Frames sent from here go out exactly as typed — the operator is
-  // responsible for the trailing ';' and correct casing, same as typing
-  // into a terminal talking to the radio directly. A missing ';' just
-  // means the radio (and this page's own frame splitter) won't see it as
-  // complete until the next character arrives.
-  catWs.send(raw);
-  // Routed through feedCatBuf (starting from an always-empty buffer, since
-  // a manual send is always one fresh, complete batch) rather than a
-  // direct appendCatFrame call — so typing e.g. "FA;SM;" here splits into
-  // two lines under one batch-start marker, consistent with how the same
-  // two commands would render if the radio (or another client) had sent
-  // them together in one message.
-  feedCatBuf('', raw.endsWith(';') ? raw : raw + ';', 'out');
-  catSendInput.value = '';
+  if (!raw) return;
+  // Sent exactly as typed — the operator owns the trailing ';' and casing,
+  // as in a terminal talking to the radio directly.
+  if (sendCat(raw)) catSendInput.value = '';
 });
 
 document.getElementById('cat-log-clear-btn').addEventListener('click', () => {
-  catLog.innerHTML = '';
-  // Otherwise the next frame would silently append into a batch line that
-  // no longer exists in the DOM (removed by innerHTML above) instead of
-  // starting a fresh one.
-  catCurrentBatchLine = null;
-  catCurrentBatchArrow = null;
+  catFrames.length = 0;
+  rerenderCatLog();
 });
+catLogPause.addEventListener('change', () => { if (!catLogPause.checked) rerenderCatLog(); });
+catFilterText.addEventListener('input', rerenderCatLog);
+catFilterMode.addEventListener('change', rerenderCatLog);
+
+// ── Radio frame watchers: probe replies, TX drive, TX audio diagnostic ──
+let catProbe = null;   // { prefix, resolve } while "Query radio" waits for one reply
+let catRadioDrive = null;
+
+function onRadioFrame(text) {
+  if (catProbe) {
+    if (text === '?;') { const p = catProbe; catProbe = null; p.resolve(false); }
+    else if (text.startsWith(catProbe.prefix)) { const p = catProbe; catProbe = null; p.resolve(true); }
+  }
+  const dg = text.match(/^DG([01]);$/);
+  if (dg) setDiagState(dg[1] === '1');
+  const dr = text.match(/^DR(\d);$/);
+  if (dr) catRadioDrive = Number(dr[1]);
+  // 5 fields on current radio firmware (avg envelope, then gated %); older builds send 3 or 4.
+  const ta = text.match(/^TA(\d+),(\d+),(\d+)(?:,(\d+))?(?:,(\d+))?;$/);
+  if (ta) renderTxDiag(Number(ta[1]), Number(ta[2]), Number(ta[3]), ta[4] === undefined ? null : Number(ta[4]), ta[5] === undefined ? null : Number(ta[5]));
+}
+
+// ── Quick-command chips ──
+// Read-only queries only — never TX;/RX;/SR;/SR2; or any SET — so a misclick
+// can't key the transmitter or wipe the radio's settings. Built by "Query
+// radio": each candidate is sent once; it becomes a chip only if the radio
+// answers with its own prefix (?; or silence = not supported by this
+// firmware). The result is remembered in this browser until queried again.
+const CAT_QUERY_CANDIDATES = [
+  'FA;', 'MD;', 'IF;', 'ID;', 'FV;', 'PS;', 'SM;', 'AI;', 'TQ;', 'AG0;', 'FW;', 'VO;', 'AT;', 'A2;',
+  'NR;', 'DR;', 'BL;', 'AL;', 'TT;', 'PM;', 'PX;', 'XF;', 'FD;', 'TU;', 'TA;',
+];
+let catChips = loadJson('catQuickChips', []);
+
+function renderQuickChips() {
+  catQuickChips.replaceChildren();
+  if (!catChips.length) {
+    const hint = document.createElement('span');
+    hint.className = 'hint chip-hint';
+    hint.textContent = 'Run “Query radio” to find the commands this radio answers.';
+    catQuickChips.append(hint);
+    return;
+  }
+  for (const c of catChips) {
+    const chip = document.createElement('button');
+    chip.type = 'button';
+    chip.className = 'chip chip-cmd';
+    chip.textContent = c;
+    chip.title = `Add ${c} to the command line (Send when ready — several can be combined into one batch)`;
+    chip.addEventListener('click', () => insertIntoCatInput(c));
+    catQuickChips.append(chip);
+  }
+}
+
+// Chips are command-building shortcuts, not senders: insert at the cursor so
+// several can be chained into one batch (e.g. "FA;MD;SM;") or edited into a
+// SET before pressing Send.
+function insertIntoCatInput(text) {
+  const el = catSendInput;
+  const start = el.selectionStart ?? el.value.length;
+  const end = el.selectionEnd ?? el.value.length;
+  el.setRangeText(text, start, end, 'end');
+  el.focus();
+}
+
+document.getElementById('cat-send-clear').addEventListener('click', () => { catSendInput.value = ''; catSendInput.focus(); });
+
+function probeOnce(cmd, timeoutMs = 700) {
+  const prefix = cmd.replace(/;$/, '');
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => { if (catProbe && catProbe.prefix === prefix) catProbe = null; resolve(false); }, timeoutMs);
+    catProbe = { prefix, resolve: (ok) => { clearTimeout(timer); resolve(ok); } };
+    if (!sendCat(cmd)) { clearTimeout(timer); catProbe = null; resolve(false); }
+  });
+}
+
+catQueryBtn.addEventListener('click', async () => {
+  if (!catWs) { showMsg('CAT monitor is not connected.', 'error'); return; }
+  catQueryBtn.disabled = true;
+  // One query first: CL; (radio firmware ≥ this release) answers with every
+  // read-only query it supports. Older firmware answers ?; — fall back to
+  // probing each known query one by one.
+  catQueryBtn.textContent = 'Querying…';
+  // The LCD/UART pin share can drop a byte from a long reply (seen once:
+  // "CLFAMD,..."), so a reply with any malformed entry is asked for again.
+  let list = [];
+  for (let attempt = 0; attempt < 3; attempt++) {
+    // A lost reply (timeout) is retried too; only a firmware that answers ?;
+    // three times — i.e. has no CL — falls through to per-command probing.
+    // 2 s: right after the page loads, the bridge's single httpd task is busy
+    // serving the page's own startup requests and relays /cat late (seen as a
+    // ~2 s round trip; ~60 ms once settled).
+    if (!(await probeOnce('CL;', 2000))) continue;
+    const reply = [...catFrames].reverse().find((f) => f.dir === 'in' && f.text.startsWith('CL'));
+    const tokens = reply ? reply.text.slice(2, -1).split(',') : [];
+    const valid = tokens.filter((c) => /^[A-Z][A-Z0-9]{1,2}$/.test(c));
+    if (valid.length > list.length) list = valid;
+    if (valid.length && valid.length === tokens.length) break;
+  }
+  {
+    if (list.length) {
+      catChips = list.map((c) => `${c};`);
+      saveJson('catQuickChips', catChips);
+      renderQuickChips();
+      catQueryBtn.textContent = 'Query radio';
+      catQueryBtn.disabled = false;
+      showMsg(`Radio lists ${list.length} queries (CL;).`, 'ok');
+      return;
+    }
+  }
+  const found = [];
+  for (let i = 0; i < CAT_QUERY_CANDIDATES.length; i++) {
+    const c = CAT_QUERY_CANDIDATES[i];
+    catQueryBtn.textContent = `Querying ${i + 1}/${CAT_QUERY_CANDIDATES.length}…`;
+    if (await probeOnce(c)) found.push(c);
+  }
+  catChips = found;
+  saveJson('catQuickChips', catChips);
+  renderQuickChips();
+  catQueryBtn.textContent = 'Query radio';
+  catQueryBtn.disabled = false;
+  showMsg(`Radio answered ${found.length} of ${CAT_QUERY_CANDIDATES.length} queries.`, 'ok');
+});
+
+// ── TX audio diagnostic (radio firmware TX_DIAG, frame TA<mic>,<env>,<clip%>;) ──
+// Evaluated here in the browser only, for the operator's diagnostic session —
+// the bridge firmware never parses it. The radio pushes the frame after every
+// SSB key-up (also answers TA;), all measured after a ~100 ms settling window:
+//   mic  — peak mic-ADC deviation, counts (~1.07 mV each, 1.1 V ref; ~480 = rail)
+//   env  — peak envelope before the TX-drive shift; full output needs
+//          env >= 255 >> drive (64 at DR2)
+//   clip — share of samples at the 255 ceiling (100 = full power throughout)
+//   avg  — average envelope. Peaks alone mislead (one transient reads as
+//          "loud"); clip % and avg say where the transmission actually sat.
+//   gated — share of the transmission with the carrier switched OFF by the
+//          radio's low-level gate (CARRIER_COMPLETELY_OFF_ON_LOW): quiet audio
+//          doesn't just transmit weakly, it transmits nothing for that share.
+const TXD_SILENT = 5;
+const TXD_RAIL = 470;
+const TXD_VERDICT = {
+  'no-audio':   { text: 'no audio at the radio', cls: 'bad',  hint: 'Nothing reaches the uSDX mic ADC — check the DAC → interface board → mic jack path.' },
+  low:          { text: 'below full power',      cls: 'warn', hint: 'Audio arrives but mostly below the full-power knee — raise the level reaching the mic input (interface board / speaker vol) or TX drive. A high peak with a low ceiling share means one transient, not real level.' },
+  full:         { text: 'full power',            cls: 'ok',   hint: 'The envelope sat at the ceiling for most of the transmission — the radio is getting enough audio.' },
+  overdriven:   { text: 'overdriven',            cls: 'bad',  hint: 'Mic ADC near its rail — lower the level; clipping the ADC distorts the signal.' },
+};
+
+async function renderTxDiag(mic, env, clip, avg, gated) {
+  if (liveActive) onLiveWindow(mic, avg, clip, gated);
+  if (catRadioDrive === null) {
+    // Need the drive to place the knee: ask once, then wait briefly for DRn;.
+    sendCat('DR;');
+    for (let i = 0; i < 10 && catRadioDrive === null; i++) await new Promise((r) => setTimeout(r, 100));
+  }
+  const drive = catRadioDrive ?? 2;
+  const knee = drive >= 8 ? 0 : 255 >> drive;
+  // clip % decides "full" — a peak over the knee can be one transient.
+  const silent = avg !== null ? avg < 2 && mic < TXD_SILENT : mic < TXD_SILENT;
+  const verdict = mic >= TXD_RAIL ? 'overdriven' : silent ? 'no-audio' : clip >= 90 ? 'full' : 'low';
+  // Average drive as a share of the PA ceiling (envelope << drive, capped at 255).
+  const drivePct = avg === null ? null : drive >= 8 ? 100 : Math.min(100, Math.round(((avg << drive) * 100) / 255));
+  const v = TXD_VERDICT[verdict];
+  catTxDiag.hidden = false;
+  catTxDiag.replaceChildren();
+  const head = document.createElement('div');
+  head.className = 'txdiag-head';
+  const title = document.createElement('strong');
+  title.textContent = 'Last SSB TX audio';
+  const badge = document.createElement('span');
+  badge.className = `txdiag-badge txdiag-${v.cls}`;
+  badge.textContent = v.text;
+  const when = document.createElement('span');
+  when.className = 'cat-log-time';
+  when.textContent = new Date().toLocaleTimeString(undefined, { hour12: false });
+  head.append(title, badge, when);
+  const stats = document.createElement('div');
+  stats.className = 'txdiag-stats';
+  stats.textContent = (gated !== null ? `carrier gated off ${gated}% · ` : '') + `at ceiling ${clip}%` + (drivePct !== null ? ` · average drive ${drivePct}% of ceiling (envelope avg ${avg} / knee ${knee}, DR${drive})` : ` · knee ${knee} (DR${drive})`)
+    + ` · peaks: mic ${mic} counts (≈${Math.round(mic * 1.07)} mV), envelope ${env}`;
+  const hint = document.createElement('div');
+  hint.className = 'hint txdiag-hint';
+  hint.textContent = v.hint;
+  catTxDiag.append(head, stats, hint);
+}
+
+renderHideChips();
+renderQuickChips();
 
 // ── Persisted CAT log ────────────────────────────────────────────────────
 // Distinct from the live in-memory log above: fetched on demand from
@@ -1449,11 +2117,9 @@ function renderPersistedCatEntry(entry) {
   time.textContent = `+${h}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
   time.title = 'uptime at log time, that boot — not a wall-clock timestamp';
 
-  const arrow = document.createElement('span');
-  const direction = entry.from_radio ? 'in' : 'out';
-  arrow.className = `arrow arrow-${direction}`;
-  arrow.textContent = direction === 'in' ? '←' : '→';
-  arrow.title = direction === 'in' ? 'from radio' : 'to radio';
+  // The persisted log only knows radio vs not-radio, not which client sent it.
+  const arrow = makeArrow(entry.from_radio ? 'in' : 'other');
+  if (!entry.from_radio) { arrow.textContent = '▶ SENT'; arrow.title = 'sent to the radio by a client'; }
 
   const text = document.createElement('span');
   text.className = 'cat-log-frame';

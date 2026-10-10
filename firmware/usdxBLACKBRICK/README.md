@@ -37,6 +37,8 @@ Enabled by default: startup diagnostics (DIAG), CW keyer (straight/iambic-A/B + 
 | `XF` ref-frequency calibration over CAT | PU7FTW | drives the web app's receive-only calibration wizard |
 | `SR`/`SR2` soft restart / factory reset over CAT | PU7FTW | SR2 realigns EEPROM after param-layout changes |
 | **AGC level (`AL`, menu 1.8)** | PU7FTW 2026-07-06 | target window for the M0PUB AGC, 1–14 (default 4 = the algorithm's original 1024…1536 window) |
+| **TX audio diagnostic (`TX_DIAG`, CAT `TA`)** | PU7FTW 2026-10-10 | SSB TX records, after a ~100 ms key-down settling window, the mic-ADC peak (from mid-scale: the +32 `AF_BIAS` offset removed), the envelope peak and average before the drive shift, the share of samples at the power ceiling, and the share with the carrier gated off; pushed as `TA<mic>,<env>,<clip%>,<avg>,<gated%>;` after every SSB key-up and answered on `TA;`. The settling window matters: PC2 is driven LOW during RX and released at TX, and the input's swing back to its bias otherwise reads as a huge peak (the first build reported envelope peak 456 with 0 % at the ceiling). The report keeps its own keyed flag: `tx` does not mean "keyed" in this firmware — with `CARRIER_COMPLETELY_OFF_ON_LOW`, `_vox()` reuses `tx` as the low-level carrier gate's ~58 ms hang timer, so with quiet audio it sits at 0 for most of a transmission (an earlier build keyed the report on `tx` and missed most of them). A CAT un-key sends the report right after its `RX0;`; other un-keys (PTT line, TX time-out) send it from the auto-report pass. Evaluated on the bridge's control page. `CL;` lists every query the build answers in one reply. Compile guard on by default: +718 B flash, +14 B RAM, ~1.5 % CPU during TX only; with the guard off the build is the same size as before |
+| **Diagnostic mode (`TX_DIAG`, CAT `DG`, menu "Diag mode")** | PU7FTW 2026-10-10 | every TX runs the real path — key-up timing, relay, ADC/mic switch-over, reports — but nothing reaches the HF line: the Si5351 TX clock stays off (also in the low-level carrier gate), KEY_OUT PWM is never enabled and the envelope is forced to 0, NTX/PTX are not asserted. TX time-out is not armed (the `TT` value is kept). LCD shows `D` instead of `T`. While keyed, a live `TA` window is pushed every ~0.5 s (2400 samples, counters reset per window). Never stored, boots OFF; changing it while keyed un-keys first. Lets the interface board be tuned against what the mic ADC really receives without transmitting. Flash after this: 32,060 B (196 B free) |
 | **TX gate: only LSB/USB can key the PA** | PU7FTW 2026-07-06 | `switch_rxtx()` refuses TX in CW/AM/FM from PTT and CAT alike — can't transmit over a station you're listening to. Since 2026-10-10 CW is allowed only with CW Tune ON (see below) |
 | **CW Tune carrier (menu 2.3, CAT `TU`)** | PU7FTW 2026-10-10 | for an external antenna tuner: with `CW Tune` ON, PTT or CAT `TX;` in CW mode keys an unmodulated carrier at the dial frequency (`dsp_tx_tune`, constant envelope at PA bias max). **NTX stays in its RX state during the carrier**, so the external miniPA70 is never keyed — the tuner sees only the uSDX's own power through the amp's bypass. Never stored — always boots OFF, 0 EEPROM bytes so the layout is unchanged. `TU0;`/`TU1;` sets it over CAT (echo), changes are auto-reported; `TU0` mid-carrier un-keys. TX time-out guard still applies. `TX0;`/`RX0;` status is now sent in CW too. +338 B flash total |
 | Baud-rate correction for the 20 MHz crystal | fork/PU7FTW | `Serial.begin(16000000ULL * baud / F_MCU)` |
@@ -117,6 +119,30 @@ the LCD S-meter/dBm field while a CAT session is active — CAT already delivers
 a live reading via `SM;`, so nothing is lost functionally, and `smode` itself
 is left untouched so the LCD resumes updating immediately if `cat_active`
 is ever cleared.
+
+## Parked: firmware updates through the bridge (2026-10-10)
+
+Today the radio is flashed only over ISP (USBasp): this build is written
+without a bootloader, so nothing on the ATmega can take new firmware over its
+serial port. The ESP32 bridge already updates itself and its page over Wi-Fi
+(`POST /ota`, `POST /ota-storage`); extending that to the radio is parked.
+
+**Precondition for picking it up:** the radio must be able to enter its
+bootloader **from firmware** (e.g. a CAT command), not through a hardware reset
+pin — the bridge's header has no free GPIO and the CAT cable carries no RESET
+line. Points to check first:
+
+- A serial bootloader (Optiboot, 512 B) must be burned once over ISP. The
+  sketch has ~950 B free after `TX_DIAG`, so it fits but leaves little room.
+- Stock Optiboot starts the application straight away on a watchdog reset, so
+  "CAT command → watchdog reset" alone won't land in the bootloader. Needs a
+  firmware-side jump into the bootloader (with the reset-cause register set the
+  way the bootloader expects) or an Optiboot build/version that supports a
+  software entry.
+- The bridge then needs an endpoint that triggers that entry over CAT and
+  streams the image over the same UART (STK500 protocol, as avrdude speaks).
+- Recovery when it goes wrong is still ISP, so this replaces routine flashing,
+  not the USBasp.
 
 ## Build / flash / test
 

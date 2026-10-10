@@ -164,6 +164,7 @@ export function createMockSerialPort(opts: MockSerialOptions = {}) {
       case 'AI': return `AI${rig.autoReport ? 1 : 0};`;  // CAT auto-report state
       case 'BL': return `BL${rig.backlight};`;
       case 'TU': return `TU${rig.cwTune};`;
+      case 'TA': return 'TA0,0,0;';  // TX audio diagnostic — the mock never transmits audio
       case 'PM': return `PM${rig.pwmMin};`;
       case 'PX': return `PX${rig.pwmMax};`;
       // Soft restart: real firmware acks SR1; then watchdog-reboots (offline

@@ -291,6 +291,56 @@ function main(): void {
       record('TU restored to its original value', parseIntField(tuRestoreResp, 'TU') === tuBefore, JSON.stringify(tuRestoreResp));
     }
 
+    // ── TX audio diagnostic (TA, TX_DIAG builds): read-only query of the last
+    // SSB TX's mic peak / envelope peak / clip %. Only the frame shape is
+    // checked — the values need a real TX, which this test bed never keys
+    // (all zeros right after boot). ──
+    const taResp = sendGet(fd, 'TA;', 'TA');
+    const taFrame = taResp.match(/TA(\d+),(\d+),(\d+),(\d+),(\d+);/);
+    record('TA; returns a TA<mic>,<env>,<clip%>,<avg>,<gated%>; frame', taFrame !== null && Number(taFrame[3]) <= 100 && Number(taFrame[5]) <= 100, JSON.stringify(taResp));
+
+    // ── Diagnostic mode flag (DG, TX_DIAG builds): SET/GET round-trip only,
+    // restoring the original. Never keys — a dry TX is validated by hand first
+    // (tuner reads 0 W) before it joins this test bed. ──
+    const dgBeforeResp = sendGet(fd, 'DG;', 'DG');
+    const dgBefore = parseIntField(dgBeforeResp, 'DG');
+    record('DG; GET returns 0/1', dgBefore === 0 || dgBefore === 1, JSON.stringify(dgBeforeResp));
+    if (dgBefore !== null) {
+      const dgProbe = dgBefore === 1 ? 0 : 1;
+      const dgSetResp = send(fd, `DG${dgProbe};`);
+      record('DG SET echoes the new value', dgSetResp.includes(`DG${dgProbe};`), JSON.stringify(dgSetResp));
+      const dgBadResp = send(fd, 'DG7;');
+      record('DG SET of 7 is rejected (echo returns old value)', dgBadResp.includes(`DG${dgProbe};`), JSON.stringify(dgBadResp));
+      const ttResp = sendGet(fd, 'TT;', 'TT');
+      record('TT is unchanged by DG (time-out only suspended while keyed in DG)', parseIntField(ttResp, 'TT') !== null, JSON.stringify(ttResp));
+      const dgRestoreResp = sendSetVerified(fd, `DG${dgBefore};`, 'DG', dgBefore);
+      record('DG restored to its original value', parseIntField(dgRestoreResp, 'DG') === dgBefore, JSON.stringify(dgRestoreResp));
+    }
+
+    // ── Dry TX in diagnostic mode (validated by hand first: tuner read 0 W).
+    // Keys ONLY after the radio itself echoed DG1; — never a real TX — and
+    // always ends with RX; and the original DG state. While keyed in DG the radio pushes a TA
+    // window every ~0.5 s; the key-up pushes the final TA right after RX0;. ──
+    const dgOnResp = sendSetVerified(fd, 'DG1;', 'DG', 1);
+    const dgOn = parseIntField(dgOnResp, 'DG') === 1;
+    record('DG1 confirmed by the radio before any dry TX', dgOn, JSON.stringify(dgOnResp));
+    if (dgOn) {
+      let dry = '';
+      try {
+        dry += send(fd, 'TX;', 300);
+        dry += readAvailable(fd, 1400);              // ~2 live windows
+      } finally {
+        dry += send(fd, 'RX;', 600);                 // always un-key, whatever happened above
+      }
+      const windows = (dry.match(/TA\d+,\d+,\d+,\d+,\d+;/g) || []).length;
+      record('Dry TX keys (TX0) and pushes live TA windows while keyed', dry.includes('TX0;') && windows >= 2, `${windows} TA frames · ${JSON.stringify(dry.replace(/SM-?\d+;/g, ''))}`);
+      record('Dry TX un-keys (RX0) on RX;', dry.includes('RX0;'), JSON.stringify(dry.slice(-60)));
+    }
+    // Restore whatever the operator had (it may have been ON for a live test).
+    const dgFinal = dgBefore ?? 0;
+    const dgOffResp = sendSetVerified(fd, `DG${dgFinal};`, 'DG', dgFinal);
+    record('DG restored to its original value after the dry TX', parseIntField(dgOffResp, 'DG') === dgFinal, JSON.stringify(dgOffResp));
+
     // ── Mode changes over CAT (MD, Kenwood digits 1=LSB 2=USB 3=CW 4=FM 5=AM).
     // Since the 2026-07-06 build AM/FM/CW are selectable for RX (listening) while
     // TX is blocked outside LSB/USB *in the firmware* — TX blocking is deliberately

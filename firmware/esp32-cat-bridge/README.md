@@ -380,13 +380,65 @@ by hand to match:
 The standalone control page's CAT monitor card connects to the same `/cat`
 WebSocket the Signal-Decoder web app uses — a plain observer (plus an
 optional manual send box), not a separate protocol or firmware endpoint.
-Frames are split client-side on `;` and logged with a direction arrow
-(green/left = radio → bridge, red/right = bridge/browser → radio) — useful
-for confirming what's actually crossing the wire without needing the full
-web app open. Client-side only: the firmware doesn't buffer or replay
-history, so the log starts empty on every page load (a small in-firmware
-ring buffer was considered and explicitly skipped — this is meant to stay a
-live debug view, not a persistent log).
+Frames are split client-side on `;` and logged with a direction tag:
+**◀ RADIO** (green) from the radio, **▶ BRIDGE** (amber) sent from this bridge page,
+**▶ APP** (violet) sent by another client such as the web app. The bridge
+tells the last two apart by WebSocket frame type (0.8.0, feature
+`cat_echo_text`): radio bytes are BINARY, another client's forwarded
+command is TEXT — the web app only reads BINARY, so it no longer mistakes
+other clients' commands for radio replies. Command prefixes are coloured
+apart from their payload. Client-side only: the firmware doesn't buffer or
+replay history, so the log starts empty on every page load.
+
+- **Filter** — chips hide whole command families (`SM` hidden by default:
+  the radio pushes S-meter telemetry several times a second; also `TX/RX`
+  echoes, `AI`, `FA`, `IF`), plus a show-only/hide text filter. The page
+  keeps the last 600 frames, so a filter change re-renders history, and an
+  "N hidden" counter says what's suppressed.
+- **Quick commands** — "Query radio" sends one `CL;`, which the radio
+  answers with every read-only query it supports, and turns the list into
+  chips (remembered in the browser; older radio firmware without `CL` is
+  probed command by command instead). Chips are command-building shortcuts:
+  a click inserts the command at the cursor, so several can be chained into
+  one batch or edited into a SET, then sent with Send. Read-only only:
+  never `TX;`, `SR;`/`SR2;` or any SET. "Clear log" sits next to the filter;
+  ✕ clears the command line.
+- **TX audio diagnostic** — the radio (firmware `TX_DIAG`) pushes
+  `TA<mic>,<env>,<clip%>,<avg>,<gated%>;` after every SSB transmission; the
+  page evaluates it into a panel (share with the carrier gated off, share
+  at the power ceiling, average drive, peaks, verdict). Evaluated in the browser only —
+  the bridge firmware never parses it.
+
+### Diagnostic mode and live audio test (control page)
+
+A dedicated **Diagnostic — live audio test** card (above the TX cache) carries a **Diag mode** chip mirroring the radio's `DG`
+flag (one `DG;` query on connect, then the radio's own pushes) and a banner
+while it's on. **Start live test** is refused unless the radio has confirmed
+`DG1`: it checks LSB/USB, starts the bridge test tone (frequency/level
+adjustable live), keys a dry TX and shows, every ~0.5 s, the bridge DAC level
+(from the mic sniffer — what the bridge sends) next to what the radio's mic
+ADC received (`TA` windows: mic mV, drive % of the PA ceiling, share at the
+ceiling, share gated off). Every window of the run is plotted on three small
+charts sharing one time axis — % (drive / at ceiling / gated off, with end
+labels), mic mV (with a dashed full-power reference derived from the radio's
+TX drive) and bridge DAC dBFS — never a dual axis; a crosshair reads all three
+at once, and a data table lists every window. The graph holds the current run
+only: Start clears it, Stop keeps it until the next Start. Stop (or closing the tab)
+sends `RX;` and stops the tone. Play/Auto-PTT are locked meanwhile. Nothing
+is transmitted: in diagnostic mode the radio never drives the PA, the TX
+clock or the external amp.
+
+### TX cache playback (control page)
+
+The TX cache card sits above the CAT monitor. **▶ Play** runs a staged slot
+through `POST /tx-play`, i.e. out of the DAC into the radio's mic input —
+never on air by itself (the uSDX has no VOX). **Auto-PTT** keys the radio
+around it the way the web app does: checks `MD;` is LSB/USB (TX in CW with
+CW Tune ON would send the tune carrier instead), `TX;`, pre-key, play,
+wait for `/tx-status` to report the end (a countdown shows the time left), post-key, `RX;` — **■ Stop** and
+any error always send `RX;`. **Monitor in browser** listens through the mic
+sniffer (`/audio-mic-sniff` taps the same DAC write), so what you hear is
+exactly what the radio was fed.
 
 ### PA safety watchdog
 
@@ -596,6 +648,31 @@ Two constraints worth knowing:
 credentials and settings survive it. `storage` and `catlog` move: SPIFFS is
 rewritten from `spiffs_data/` by the same flash, and the CAT log ring (a
 debug feature, off by default) is lost.
+
+### Control-page updates (over Wi-Fi, no app update)
+
+`POST /ota` writes only the app slots; the control page lives on the
+separate `storage` SPIFFS partition. `POST /ota-storage` (0.8.0, feature
+`ota_storage`) rewrites that partition from the image `idf.py build` makes
+from `spiffs_data/`, so page-only changes need no app update and no reboot:
+
+```bash
+idf.py build
+curl -X POST --data-binary @build/storage.bin http://usdx-bridge.local/ota-storage
+# -> {"ok":true,"bytes":262144,"page_ok":true}     (~2 s)
+```
+
+- The body must be **exactly** the partition size (a full-partition SPIFFS
+  image) — an app `.bin` or a truncated file is rejected before anything is
+  touched.
+- Refused while a TX slot is playing, like `POST /ota`.
+- The partition is unmounted, erased and written sector by sector, then
+  remounted; `page_ok` reports that `index.html` is present.
+- There is no A/B slot for storage: a failure part-way leaves the page
+  unavailable until a good image is uploaded again. Everything else — the
+  JSON endpoints, `/cat`, `/ota` and this route — lives in the app and keeps
+  working, and the page routes stay registered even when the mount fails,
+  so a restored page is served again without a reboot.
 
 ## Known limitations (first pass — fine for now, worth revisiting later)
 
