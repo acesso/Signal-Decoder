@@ -649,6 +649,29 @@ credentials and settings survive it. `storage` and `catlog` move: SPIFFS is
 rewritten from `spiffs_data/` by the same flash, and the CAT log ring (a
 debug feature, off by default) is lost.
 
+### Radio firmware updates (`POST /radio-ota`, 0.9.0)
+
+Flashes the uSDX app over the CAT UART: the radio carries an Optiboot 8
+bootloader (radio firmware `bootloader/`) entered with CAT `UG;`. The
+bridge borrows the UART exclusively (CAT forwarding paused, `/cat`
+clients get nothing meanwhile), switches to 38400 for the bootloader,
+checks the chip signature, writes every 128-byte page, reads every page
+back and compares, leaves programming mode and confirms `FV;` at the CAT
+baud. ~25 s; EEPROM untouched, so the radio keeps its settings.
+
+```bash
+avr-objcopy -I ihex -O binary usdxBLACKBRICK.ino.hex app.bin
+curl -X POST --data-binary @app.bin http://usdx-bridge.local/radio-ota   # 202 {"started":true,...}
+curl http://usdx-bridge.local/radio-ota-status                          # state, pages_done/total, error, version
+```
+
+Refused while a TX slot plays, while `pa_sense` reports the external PA
+energized, if the image isn't an ATmega328P app (≤ 32256 bytes, JMP reset
+vector), or if the radio doesn't answer `UG1;` (keyed, or older firmware). A
+failure before any page is written leaves the old app running; one after
+needs the ISP cable. The control page's "Radio firmware" card does the same
+from a `.hex` file.
+
 ### Control-page updates (over Wi-Fi, no app update)
 
 `POST /ota` writes only the app slots; the control page lives on the

@@ -654,3 +654,10 @@ dl#pa-list {
 .viz-table-wrap { margin-top: 0.5rem; font-size: 0.75rem; }
 .viz-table { border-collapse: collapse; margin-top: 0.3rem; font-family: ui-monospace, "SF Mono", Consolas, monospace; }
 .viz-table th, .viz-table td { padding: 0.1rem 0.6rem; text-align: right; border-bottom: 1px solid var(--border); }
+
+/* Radio firmware update card. */
+.radio-fw-dl { display: grid; grid-template-columns: auto 1fr; gap: 0.25rem 0.75rem; margin: 0 0 0.5rem; }
+.radio-fw-dl dt { font-weight: 600; }
+#radio-fw-file { width: 100%; font-size: 0.8rem; margin-bottom: 0.4rem; }
+.radio-fw-progress { height: 0.5rem; border-radius: 999px; background: var(--bg); border: 1px solid var(--border); overflow: hidden; margin-top: 0.5rem; }
+#radio-fw-bar { height: 100%; width: 0; background: var(--accent); transition: width 0.25s; }

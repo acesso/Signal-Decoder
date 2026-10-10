@@ -5264,6 +5264,7 @@ void analyseCATcmd()    // Supported Kenwood TS-480 protocol CAT commands
 	else if (CMD2('B','L') && CATcmd[3]==';')               Command_BL_SET(CATcmd[2]-'0');
 	else if (CMD('T','U',';'))                              Command_TU_GET();
 	else if (CMD('C','L',';'))                              Command_CL();
+	else if (CMD('U','G',';'))                              Command_UG();
 #ifdef TX_DIAG
 	else if (CMD('D','G',';'))                              Command_DG_GET();
 	else if (CMD2('D','G') && CATcmd[3]==';')               Command_DG_SET(CATcmd[2]-'0');
@@ -5609,6 +5610,29 @@ void Command_TA()
 	Serial.print(buf);
 }
 #endif //TX_DIAG
+
+// UG; → enter the Optiboot 8 bootloader for a firmware update over this same UART (see bootloader/README.md). Refused while
+// keyed (reply UG0;). Otherwise replies UG1;, waits for it to leave the UART, then JUMPS (not resets) to the bootloader with
+// MCUSR cleared — Optiboot 8 treats MCUSR == 0 as an application request and stays in the bootloader. Jumping keeps every pin
+// as RX left it (KEY_OUT LOW, NTX HIGH: external PA unkeyed); only the interrupt sources are silenced, the bootloader polls the
+// UART itself. With no programmer talking within ~1 s, the bootloader's watchdog restarts the app. Never listed by CL;.
+void Command_UG()
+{
+#ifdef TX_DIAG
+	if (tx || txd_keyed) { Serial.print(F("UG0;")); return; }
+#else
+	if (tx) { Serial.print(F("UG0;")); return; }
+#endif
+	Serial.print(F("UG1;"));
+	Serial.flush();
+	cli();
+	TIMSK0 = 0; TIMSK1 = 0; TIMSK2 = 0; PCICR = 0; EIMSK = 0;  // no app ISR may fire inside the bootloader
+	ADCSRA = 0;
+	UCSR0B = 0;          // the bootloader re-initialises UART0 at its own baud
+	wdt_disable();
+	MCUSR = 0;           // the Optiboot 8 "application request" marker
+	((void (*)(void))(0x7E00 / 2))();  // bootloader start (byte 0x7E00, word address 0x3F00)
+}
 
 // CL; → CL<cmd>,<cmd>,...; — the read-only queries this build answers, in one reply, so a client (the bridge page's quick
 // commands) needs a single query instead of probing each command. Lists queries only: SETs, TX/RX and SR are never listed.

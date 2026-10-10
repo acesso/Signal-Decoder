@@ -16,6 +16,7 @@ idf_component_register(
         "pa_watchdog.c"
         "cpu_monitor.c"
         "cat_log.c"
+        "radio_ota.c"
     INCLUDE_DIRS "."
     REQUIRES
         esp_wifi
