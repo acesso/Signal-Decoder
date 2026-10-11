@@ -17,6 +17,7 @@ idf_component_register(
         "cpu_monitor.c"
         "cat_log.c"
         "radio_ota.c"
+        "mem_bench.c"
     INCLUDE_DIRS "."
     REQUIRES
         esp_wifi

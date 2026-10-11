@@ -12,6 +12,16 @@ them into a version section when cutting a release.
 
 ## [Unreleased]
 
+## [0.27.0] - 2026-10-11
+
+### Changed
+
+- **The A1S bridge runs its flash and PSRAM twice as fast or more (bridge firmware 0.10.0).** Flash moved from DIO at 40 MHz to QIO at 80 MHz, PSRAM from 40 to 80 MHz, and the build targets chip revision 3 or later, which drops a PSRAM workaround only early chips need. Measured on the bridge: PSRAM to internal RAM 13 → 25 MB/s, random PSRAM reads 1860 → 985 ns, program reads from flash 7.5 → 24.6 MB/s, and a 56 KB smaller app. Several minutes under load (I/Q stream, CAT polling, repeated measurements) gave no resets. **Flash mode and speed live in the bootloader, which an OTA update never rewrites:** a bridge moves over with one USB flash (`idf.py -p <port> flash`), keeping its settings and CAT log.
+
+### Added
+
+- **`GET /bench` on the bridge** measures RAM copy speeds, random PSRAM reads, flash reads through the cache, and how long the other core stalls while a flash sector is written. It writes only to a blank sector of the inactive OTA slot. Listed as `mem_bench` in `/info`.
+
 ## [0.26.0] - 2026-10-10
 
 ### Added
