@@ -649,6 +649,24 @@ credentials and settings survive it. `storage` and `catlog` move: SPIFFS is
 rewritten from `spiffs_data/` by the same flash, and the CAT log ring (a
 debug feature, off by default) is lost.
 
+### Flash and PSRAM speed (`GET /bench`, experimental)
+
+The A1S runs its flash in QIO at 80 MHz and PSRAM at 80 MHz, and is built for chip revision 3 or later, which drops the PSRAM cache workaround. Measured on this board (ESP32-D0WD-V3 rev 3.1, Zbit flash):
+
+| Setting | PSRAM → internal | Random PSRAM read | Flash read via cache |
+|---|---|---|---|
+| DIO 40 MHz, PSRAM 40 MHz (before) | 13 MB/s | 1860 ns | 7.5 MB/s |
+| QIO 80 MHz, PSRAM 80 MHz | 25 MB/s | 985 ns | 24.6 MB/s |
+
+- **Flash mode and clock are applied by the bootloader, which OTA never rewrites.** Moving a board to these settings takes one USB flash (`idf.py -p <port> flash`); NVS settings and the CAT log are kept.
+- **A chip below revision 3** refuses an image built this way, and the bootloader keeps the previous one.
+
+`GET /bench` runs the measurement in 1–2 s and returns JSON:
+- RAM copy speeds, random PSRAM read time and cached flash read speed.
+- How long a task on the other core stalls while one flash sector is erased and written. It writes only to the inactive OTA slot's last sector, and only when that sector is blank; otherwise `other_core_stall_us` is negative.
+- `?steps=0..4` stops after a given stage.
+- While it runs, the web server is busy, so streams pause briefly.
+
 ### Radio firmware updates (`POST /radio-ota`, 0.9.0)
 
 Flashes the uSDX app over the CAT UART: the radio carries an Optiboot 8

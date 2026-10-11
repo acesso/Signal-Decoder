@@ -25,6 +25,7 @@
 #include "cpu_monitor.h"
 #include "led_status.h"
 #include "pa_watchdog.h"
+#include "mem_bench.h"
 #include "radio_ota.h"
 #include "ws_server.h"
 #include "wifi_net.h"
@@ -149,13 +150,15 @@ static const char *TAG = "http_control";
 // reports ota_supported:false from GET /ota-status and rejects POST /ota,
 // since the very first OTA-capable image necessarily has to arrive over
 // UART.
+// "mem_bench" means: GET /bench exists — a 1–2 s memory/flash speed measurement (mem_bench.h),
+// used to compare flash/PSRAM/cache settings on real hardware.
 static const char *const BRIDGE_FEATURES[] = {
     "cat", "wifi_config", "wifi_scan", "reset", "audio", "cat_baud", "pa_watchdog",
     "audio_input_select", "mic_gain", "rx_slot_select", "led_enable",
     "alc_control", "noise_gate_control", "cpu_monitor", "wifi_tx_power_control",
     "adc_hpf_control", "sample_rate_select", "speaker_amp_control", "cat_log",
     "audio_mic_sniff", "input_mode_select", "tx_buffer_playback", "speaker_vol", "tx_slot_select",
-    "ota", "ota_storage", "cat_echo_text", "radio_ota",
+    "ota", "ota_storage", "cat_echo_text", "radio_ota", "mem_bench",
 };
 
 // The uSDX firmware's own CAT_BAUD menu setting (usdxBLACKBRICK.ino) only
@@ -224,6 +227,20 @@ static void json_escape(char *out, size_t out_sz, const char *in) {
 
 static void set_cors(httpd_req_t *req) {
     httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+}
+
+// GET /bench — memory/flash benchmark (experimental, exp/a1s-memory-tuning). Takes 1–2 s.
+static esp_err_t bench_handler(httpd_req_t *req) {
+    char q[16], v[4];
+    int steps = 4;
+    if (httpd_req_get_url_query_str(req, q, sizeof(q)) == ESP_OK &&
+        httpd_query_key_value(q, "steps", v, sizeof(v)) == ESP_OK) steps = atoi(v);
+    char body[900];
+    size_t n = mem_bench_run_json(steps, body, sizeof(body));
+    set_cors(req);
+    httpd_resp_set_type(req, "application/json");
+    if (!n) return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "bench output too long");
+    return httpd_resp_send(req, body, n);
 }
 
 static esp_err_t status_handler(httpd_req_t *req) {
@@ -1937,6 +1954,7 @@ void http_control_start(void) {
     }
 
     httpd_uri_t status_uri       = { .uri = "/status",      .method = HTTP_GET,     .handler = status_handler };
+    httpd_uri_t bench_uri        = { .uri = "/bench",       .method = HTTP_GET,     .handler = bench_handler };
     httpd_uri_t info_uri         = { .uri = "/info",        .method = HTTP_GET,     .handler = info_handler };
     httpd_uri_t wifi_scan_uri    = { .uri = "/wifi-scan",   .method = HTTP_GET,     .handler = wifi_scan_handler };
     httpd_uri_t reset_uri        = { .uri = "/reset",       .method = HTTP_POST,    .handler = reset_handler };
@@ -1975,6 +1993,7 @@ void http_control_start(void) {
     httpd_uri_t radio_ota_st_uri = { .uri = "/radio-ota-status", .method = HTTP_GET, .handler = radio_ota_status_handler };
     httpd_uri_t options_uri      = { .uri = "/*",           .method = HTTP_OPTIONS, .handler = options_handler };
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &status_uri));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &bench_uri));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &info_uri));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &wifi_scan_uri));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &reset_uri));
