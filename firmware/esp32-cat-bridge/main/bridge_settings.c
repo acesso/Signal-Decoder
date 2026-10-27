@@ -25,6 +25,7 @@ static const char *TAG = "bridge_settings";
 #define NVS_KEY_TX_SLOT "tx_slot"
 #define NVS_KEY_MIC_GAIN_DB "mic_gain_db"
 #define NVS_KEY_SPEAKER_VOL "speaker_vol"
+#define NVS_KEY_DAC_LEVEL_DB "dac_level_db"
 #define NVS_KEY_WIFI_TX_POWER "wifi_tx_pwr"
 // 78, not 84 — 84 (21.0dBm) was never a real driver step. Confirmed by
 // sweeping POST /wifi-tx-power against real hardware (esp_wifi.h's own
@@ -265,6 +266,25 @@ bool bridge_settings_set_speaker_vol(int8_t vol_value) {
     return ok;
 }
 
+int8_t bridge_settings_get_dac_level_db(void) {
+    nvs_handle_t h;
+    int8_t v = 0;
+    if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &h) == ESP_OK) {
+        nvs_get_i8(h, NVS_KEY_DAC_LEVEL_DB, &v);
+        nvs_close(h);
+    }
+    return v < -60 ? -60 : v > 0 ? 0 : v;
+}
+
+bool bridge_settings_set_dac_level_db(int8_t db) {
+    nvs_handle_t h;
+    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h) != ESP_OK) return false;
+    esp_err_t e1 = nvs_set_i8(h, NVS_KEY_DAC_LEVEL_DB, db);
+    esp_err_t e2 = nvs_commit(h);
+    nvs_close(h);
+    return e1 == ESP_OK && e2 == ESP_OK;
+}
+
 int8_t bridge_settings_get_wifi_tx_power_quarter_dbm(void) {
     nvs_handle_t h;
     int8_t v = DEFAULT_WIFI_TX_POWER_QUARTER_DBM;
@@ -348,5 +368,27 @@ bool bridge_settings_set_cat_log_enabled(bool enabled) {
     nvs_close(h);
     bool ok = e1 == ESP_OK && e2 == ESP_OK;
     ESP_LOGI(TAG, "saved persistent CAT log enabled=%s to NVS: %s", enabled ? "true" : "false", ok ? "ok" : "FAILED");
+    return ok;
+}
+
+bool bridge_settings_get_str(const char *key, char *out, size_t out_sz) {
+    if (out_sz) out[0] = 0;
+    nvs_handle_t h;
+    if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &h) != ESP_OK) return false;
+    size_t len = out_sz;
+    esp_err_t e = nvs_get_str(h, key, out, &len);
+    nvs_close(h);
+    if (e != ESP_OK && out_sz) out[0] = 0;
+    return e == ESP_OK;
+}
+
+bool bridge_settings_set_str(const char *key, const char *value) {
+    nvs_handle_t h;
+    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h) != ESP_OK) return false;
+    esp_err_t e1 = nvs_set_str(h, key, value);
+    esp_err_t e2 = nvs_commit(h);
+    nvs_close(h);
+    bool ok = e1 == ESP_OK && e2 == ESP_OK;
+    ESP_LOGI(TAG, "saved %s=%s to NVS: %s", key, value, ok ? "ok" : "FAILED");
     return ok;
 }

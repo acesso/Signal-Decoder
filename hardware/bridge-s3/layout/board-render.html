@@ -1,0 +1,703 @@
+<title>S3 Bridge Board</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=IBM+Plex+Sans:wght@400;600&family=Saira+Condensed:wght@600;700&display=swap">
+<style>
+/* Layout: a bench sheet — title strip, filter chips, the two faces of the board side by side (stacked on a phone), then the key and the parts. The board art keeps fixed PCB colours; the page around it follows the viewer's theme. */
+:root {
+  --bg: #eef1ec;
+  --panel: #ffffff;
+  --fg: #18211b;
+  --muted: #59665d;
+  --line: #cfd8d1;
+  --accent: #1b7a43;
+  --chip: #e3ebe5;
+  --tip-bg: #18211b;
+  --tip-fg: #f1f6f2;
+  --font-display: "Saira Condensed", "Arial Narrow", sans-serif;
+  --font-body: "IBM Plex Sans", system-ui, sans-serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #101512; --panel: #18201b; --fg: #e3ebe5; --muted: #95a59a; --line: #2c3a31; --accent: #4cc27f;
+    --chip: #222d26; --tip-bg: #e3ebe5; --tip-fg: #101512;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #101512; --panel: #18201b; --fg: #e3ebe5; --muted: #95a59a; --line: #2c3a31; --accent: #4cc27f;
+  --chip: #222d26; --tip-bg: #e3ebe5; --tip-fg: #101512;
+  color-scheme: dark;
+}
+body { background: var(--bg); color: var(--fg); font-family: var(--font-body); font-size: 15px; line-height: 1.5; }
+.wrap { max-width: 1240px; margin: 0 auto; padding-inline: 16px; padding-block: 28px 48px; display: grid; gap: 24px; }
+header { display: grid; gap: 6px; }
+.eyebrow { font-family: var(--font-mono); font-size: 12px; letter-spacing: .08em; text-transform: uppercase; color: var(--accent); }
+h1 { font-family: var(--font-display); font-weight: 700; font-size: clamp(34px, 6vw, 56px); line-height: 1; margin: 0; text-wrap: balance; letter-spacing: .01em; }
+.lede { margin: 0; color: var(--muted); max-width: 70ch; }
+.specs { display: flex; flex-wrap: wrap; gap: 8px 20px; font-family: var(--font-mono); font-size: 12.5px; color: var(--muted); }
+.specs b { color: var(--fg); font-weight: 600; }
+.filters { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.filters span.lbl { font-family: var(--font-mono); font-size: 12px; letter-spacing: .06em; text-transform: uppercase; color: var(--muted); margin-right: 4px; }
+.chipbtn { font: 600 13px var(--font-body); border: 1px solid var(--line); background: var(--chip); color: var(--fg); border-radius: 999px; padding: 5px 12px; cursor: pointer; }
+.chipbtn[aria-pressed="true"] { background: var(--accent); border-color: var(--accent); color: #ffffff; }
+.chipbtn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.views { display: grid; grid-template-columns: 1fr; gap: 20px; max-width: 1100px; }
+figure { margin: 0; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px; display: grid; gap: 10px; min-width: 0; }
+figcaption { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; flex-wrap: wrap; }
+figcaption h2 { font-family: var(--font-display); font-weight: 600; font-size: 24px; margin: 0; letter-spacing: .02em; }
+figcaption span { font-size: 13px; color: var(--muted); }
+.art { overflow-x: auto; }
+.art svg { display: block; width: 100%; min-width: 360px; height: auto; }
+.wire { transition: opacity .12s ease; }
+svg.focused .wire:not(.on) { opacity: .12; }
+svg.focused .wire.on .stroke { stroke-width: 1.15; }
+@media (prefers-reduced-motion: reduce) { .wire { transition: none; } }
+#tip { position: fixed; z-index: 10; pointer-events: none; background: var(--tip-bg); color: var(--tip-fg); border-radius: 8px; padding: 8px 10px; font-size: 12.5px; line-height: 1.35; max-width: 280px; box-shadow: 0 6px 18px rgba(0,0,0,.25); }
+#tip b { display: block; font-size: 13px; }
+#tip .route { font-family: var(--font-mono); font-size: 12px; }
+#tip .face { opacity: .75; font-size: 11.5px; }
+.key { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 230px), 1fr)); gap: 10px 22px; padding: 0; margin: 0; list-style: none; }
+.key li { display: grid; grid-template-columns: 34px 1fr; gap: 10px; align-items: start; font-size: 13.5px; }
+.sw { height: 6px; border-radius: 3px; margin-top: 8px; outline: 1px solid var(--line); }
+.sw.dash { background: repeating-linear-gradient(90deg, #0b0f0c 0 6px, transparent 6px 10px); outline: 1px solid #6d7d72; outline-offset: 1px; }
+.sw.jmp { height: 9px; margin-top: 6px; border-radius: 5px; }
+.key b { display: block; font-weight: 600; }
+.key small { color: var(--muted); font-size: 12.5px; }
+section h2 { font-family: var(--font-display); font-weight: 600; font-size: 26px; margin: 0 0 10px; letter-spacing: .02em; }
+.tablewrap { overflow-x: auto; }
+table { border-collapse: collapse; width: 100%; font-size: 13.5px; }
+th, td { text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--line); vertical-align: top; }
+th { font-family: var(--font-mono); font-size: 11.5px; letter-spacing: .06em; text-transform: uppercase; color: var(--muted); font-weight: 600; }
+td code { font-family: var(--font-mono); font-size: 12.5px; }
+.micros { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 270px), 1fr)); gap: 16px; }
+.micros figcaption h3 { font-family: var(--font-display); font-weight: 600; font-size: 19px; margin: 0; letter-spacing: .02em; }
+.micros .art svg { min-width: 0; max-width: 460px; margin-inline: auto; }
+.micros ul { margin: 0; padding-left: 18px; font-size: 13px; display: grid; gap: 3px; }
+.micros li b { font-weight: 600; }
+.note { font-size: 13px; color: var(--muted); max-width: 84ch; margin: 0; }
+</style>
+
+<div class="wrap">
+  <header>
+    <div class="eyebrow">uSDX CAT bridge · v2 hardware · draft 5</div>
+    <h1>S3 Bridge Board</h1>
+    <p class="lede">The new floor of the bridge stack: an ESP32-S3 with a WM8782 for 96 kHz I/Q, a PCM1808 for RX audio and a PCM5102A for TX audio, all clocked from one 24.576 MHz crystal. Hover or tap a wire to see where it goes; pick a part to see only its wires.</p>
+    <div class="specs">
+      <span><b>80 × 120 mm</b> double-sided perfboard</span>
+      <span><b>2.54 mm</b> grid</span>
+      <span><b>AWG22</b> wiring</span>
+      <span>I/Q <b>96 kHz</b> · audio <b>48 kHz</b></span>
+    </div>
+  </header>
+
+  <div class="filters" id="filters" role="group" aria-label="Show the wires of one part"><span class="lbl">Show wires of</span></div>
+
+  <div class="views">
+    <figure>
+      <figcaption><h2>Top side</h2><span>Parts as mounted, plus the short wires on this face around the two adapters.</span></figcaption>
+      <div class="art" id="top"></div>
+    </figure>
+    <figure>
+      <figcaption><h2>Bottom side</h2><span>Mirrored, as seen with the board flipped over. Most of the wiring lives here.</span></figcaption>
+      <div class="art" id="bottom"></div>
+    </figure>
+  </div>
+  <div id="tip" hidden></div>
+
+  <section>
+    <h2>The two adapter boards</h2>
+    <p class="note" style="margin-bottom:12px">Both are the same double-sided board: a SOT-23-6 footprint on side A and a SOT-363 footprint on side B. <b>Each side numbers the holes differently</b> (side-A hole n is side-B hole 7 − n; the square hole is A1 = B6). The LP5907 is mounted side A up and the 74LVC1G157 side B (chip) up, as in the board drawing. The face that points down is drawn as seen through the board from above, so the square hole and every other hole sit in the same place on both panels of an adapter, and in the board drawing.</p>
+    <div class="micros">
+      <figure>
+        <figcaption><h3>Clock buffer · side B, top</h3><span>the chip face up: a '1G14-type inverter clone (marked C14)</span></figcaption>
+        <div class="art" id="m-buf-b"></div>
+        <ul><li>Pads: 1 NC, 2 A (input), 3 GND, 4 Y (inverted out), 5 NC, 6 VCC</li><li><b>On the perfboard:</b> pads 5–6 bridged (3.3 V), a 104 from pad 6 to pad 3 on the bottom, pads 1–2 bridged: the 24.576 MHz oscillator (3.3 V) feeds pad 2 and, through pad 1, the WM8782 CLK (J6 open). Y drives the two 47 Ω branches</li><li>Verify first: pad 2 low → Y high, pad 2 high → Y low, chip cold</li></ul>
+      </figure>
+      <figure>
+        <figcaption><h3>Clock buffer · side A, bottom</h3><span>faces the perfboard; seen through from above, holes where they are in the top view</span></figcaption>
+        <div class="art" id="m-buf-a"></div>
+        <ul><li>Bare: the old 157 bridges and C3 are removed</li><li>All bridges and the 104 are made on the perfboard instead</li></ul>
+      </figure>
+      <figure>
+        <figcaption><h3>LP5907 · side A, top</h3><span>the chip, both caps and the EN wire</span></figcaption>
+        <div class="art" id="m-lp-a"></div>
+        <ul><li><b>C1</b> 10 µF across holes 1–2 (IN to GND); <b>C2</b> 10 µF across holes 6–5 (OUT to the grounded spare)</li><li><b>Red wire:</b> hole 1 to hole 3 (EN to IN), around hole 2</li><li>The SOT-23-5 leaves pad 5 empty. Tested: 3.30 V out, 3.33 V at ~9 mA</li></ul>
+      </figure>
+      <figure>
+        <figcaption><h3>LP5907 · side B, bottom</h3><span>empty footprint; seen through from above, holes where they are in the side-A (top) view</span></figcaption>
+        <div class="art" id="m-lp-b"></div>
+        <ul><li><b>Red wire:</b> hole B2 to hole B5. It grounds the spare pad (A5), so C2 has ground right beside OUT</li><li><b>B1 is OUT,</b> right next to B2: keep solder off it</li></ul>
+      </figure>
+      <figure>
+        <figcaption><h3>AMS1117-5.0 · top</h3><span>SOT-223 adapter as in the photo: pads 3 2 1 (IN OUT GND) along the top</span></figcaption>
+        <div class="art" id="m-ams"></div>
+        <ul><li><b>Check the marking:</b> AMS1117-<b>5.0</b>, not 3.3 or ADJ</li><li><b>C out MLCC</b> 10 µF (harvested) between the OUT and GND leads, right on the adapter (fitted). The 10 µF electrolytic on the board adds bulk; the MLCC keeps the ESR under the datasheet's 0.5 Ω</li><li><b>C in</b> 10 µF electrolytic on the board. Solder the tab well: it is OUT and the heatsink</li><li>Tested 2026-10-20: 7.5 V in, 4.99 V out with a red LED on 330 Ω, MLCC only</li></ul>
+      </figure>
+    </div>
+  </section>
+
+  <section>
+    <h2>Wire key</h2>
+    <ul class="key" id="key"></ul>
+  </section>
+
+  <section>
+    <h2>Parts, as built</h2>
+    <div class="tablewrap">
+      <table>
+        <thead><tr><th>Part</th><th>Qty</th><th>Job</th><th>Power and connections</th></tr></thead>
+        <tbody>
+          <tr><th colspan="4">Modules</th></tr>
+          <tr><td>ESP32-S3-N16R8 dev board (XH-S3E module)</td><td>1</td><td>The bridge: Wi-Fi, CAT, PA watchdog, I/Q processing, audio I2S</td><td>5 V over its USB-C from the main board's LM7805. GND by the black wire along the edge row to the TPS7A4701's GND. Pins: see each part below</td></tr>
+          <tr><td>2.4 GHz antenna on the S3's IPEX socket</td><td>1</td><td>Wi-Fi under the stack (the module's PCB antenna is not used)</td><td>—</td></tr>
+          <tr><td>WM8782 module</td><td>1</td><td>I/Q ADC, I2S master at 48, 96 or 192 kHz (DIP lever 3: −, +, 0; the bridge measures it)</td><td>Quiet 5 V from the TPS7A4701 through a 2-pin JST plug on <code>J5</code>. <code>B LR D</code> → GPIO4 5 6. <code>CLK</code> from the oscillator, <code>J6</code> open. DIP <code>+ 0 + 0</code> at 96 kHz, <code>J1</code> = 24, <code>J2</code> open. I/Q in on <code>J4</code> (Rin, G, Lin)</td></tr>
+          <tr><td>PCM1808 module</td><td>1</td><td>Radio audio ADC, 48 kHz slave: LIN = RX audio, RIN = audio loop</td><td>5 V lane (AMS1117) and 3.3 V from the LP5907. BCK 16, LRC 18, OUT → 17, SCK from the 47 Ω branch B. Bridge <code>PMT–MD1–MD0–GND</code></td></tr>
+          <tr><td>PCM5102A module</td><td>1</td><td>TX audio DAC, out through its own 3.5 mm jack</td><td>5 V by a wire on the top face. DIN 15, BCK 16 and LCK 18 (shared with the PCM1808), XSMT (mute) from GPIO8 over the top face. On the module: <code>SCK</code> bridged to ground; <code>H1L H2L H4L</code> = L, <code>H3L</code> open</td></tr>
+          <tr><td>TPS7A4701 module</td><td>1</td><td>Low-noise 5.0 V for the WM8782 (pads 3.2 + .4), upside down with a heatsink</td><td>7.5 V from the JST XH into <code>EN</code>, bridged to <code>Vin</code>. GND to the S3's ground and to the ground hole beside the WM8782's lead</td></tr>
+          <tr><td>24.576 MHz oscillator (<code>GP08-5</code>, half-size DIP-8 can)</td><td>1</td><td>Master clock for the WM8782, the S3's GPIO7 and the PCM1808's SCK</td><td>3.3 V from the LP5907 (pin 8), GND (pin 4), OUT (pin 5) by a short red wire to the clock junction; 104 across pins 8–4</td></tr>
+          <tr><td>Retired clock buffer adapter (SOT-363, pins cut)</td><td>1</td><td>Its holes are the clock junction: the oscillator's OUT and both 47 Ω branches meet there</td><td>—</td></tr>
+          <tr><td>LP5907MFX-3.3 on a SOT-23-5 adapter</td><td>1</td><td>Clean 3.3 V for the PCM1808 and the oscillator</td><td>5 V by a red wire from the PCM1808's +5V bar into <code>EN</code> (tied to <code>IN</code> on the adapter). OUT beside the PCM1808's 3.3V</td></tr>
+          <tr><td>AMS1117-5.0 on a SOT-223 adapter</td><td>1</td><td>The board's 5 V lane from the 7.5 V; about 200 mA spare</td><td>Pins IN, OUT, GND in one column. 7.5 V by a red diagonal wire into IN. OUT by a solder bridge one hole right, then a red wire straight up to the PCM1808's +5V</td></tr>
+          <tr><th colspan="4">Passives</th></tr>
+          <tr><td>47 Ω 1/4 W metal film</td><td>2</td><td>Clock branches: A → S3 GPIO7, B → PCM1808 SCK</td><td>Top face, from the clock junction</td></tr>
+          <tr><td>1 kΩ 1/4 W</td><td>1</td><td>CAT RX pull-up, so the radio's replies rise fast enough through the level shifter</td><td>Across data header pins 2 (RX) and 3 (3.3 V), bottom face</td></tr>
+          <tr><td>10 µF 50 V electrolytic</td><td>2</td><td>AMS1117 input and output (Cin, Cout)</td><td>7.5 V and 5 V lanes to GND</td></tr>
+          <tr><td>10 µF 0805 MLCC (harvested)</td><td>3</td><td>LP5907 IN and OUT, AMS1117 OUT (its stability needs low ESR)</td><td>On the adapters</td></tr>
+          <tr><td>100 nF (104) ceramic</td><td>1</td><td>Oscillator supply decoupling</td><td>Bottom face, pins 8–4</td></tr>
+          <tr><th colspan="4">Connectors and wiring</th></tr>
+          <tr><td>2-pin JST XH, white (housing over 3 × 3 holes)</td><td>1</td><td>7.5 V and GND (the ground star)</td><td>From the main board's 7805 input, after its 100 µH choke and 330 µF</td></tr>
+          <tr><td>1×6 pin header</td><td>1</td><td>Data cable to the main board's level shifter, in its LV order so the cable runs straight</td><td>Pin 1 by S3 pin 9: CAT TX 9, CAT RX 10, 3.3 V (red top-face wire to the S3's 3V3), GND (black, to the WM8782 ground hole), PA emergency 11, PA sense 14</td></tr>
+          <tr><td>6-wire cable (orange, yellow, green, blue, violet, gray)</td><td>1</td><td>The data cable</td><td>LV1 TX, LV2 RX, LV 3.3 V, GND, LV3 PA emergency, LV4 PA sense</td></tr>
+          <tr><td>P2 (3.5 mm) stereo jack</td><td>2</td><td>I/Q in (tip I, ring Q); RX audio and loop (tip RX, ring loop)</td><td>I/Q to the WM8782's <code>J4</code> (red, black, red); RX to the PCM1808's LIN, GND, RIN (yellow, black, orange)</td></tr>
+          <tr><td>2-pin JST plug with flying leads</td><td>1</td><td>Quiet 5 V and GND to the WM8782's <code>J5</code></td><td>From the holes beside the TPS7A4701's Vo and GND</td></tr>
+          <tr><td>Round female sockets (1×2 to 1×6), two 1×22 female headers</td><td>—</td><td>Module sockets; the S3 sits on both 1×22 rows for support</td><td>—</td></tr>
+          <tr><td>Double-sided perfboard, 30 × 42 holes</td><td>1</td><td>The board, mounted at floor −1 of the stack on 2 cm spacers</td><td>—</td></tr>
+          <tr><td>AWG22 solid wire</td><td>—</td><td>Bottom-face lanes and top-face links</td><td>Colours as drawn (hover a wire)</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+  <p class="note"><b>Bottom face checked against the build photo (2026-10-26):</b> the board is 30 × 42 holes; the I/Q, audio, analog-input, ground and 5 V wires sit where they were soldered, in their real colours (hover for the colour). The PCM5102A's 5 V and its mute (XSMT) wire run on the top face; the mute path is drawn approximately and the 5 V one not at all. Not yet checked against the build: the AMS1117 and LP5907 pin positions, the clock area and the rest of the top face. Drawn from the third placement mock-up. Module outlines and pin positions are approximate; the authoritative pin map is <code>firmware/esp32-cat-bridge/main/bridge_config.h</code> and the build notes are in <code>hardware/bridge-s3/wiring.md</code>. Where a wire changes face it goes through a free hole, drawn as a ring on both views.</p>
+</div>
+
+<script>
+(() => {
+  const W = 80, H = 116, BX0 = 2.54;   // the board starts one row in (the real perfboard is 30 x 42 holes)
+  const PAD = { l: 8, r: 9, t: 4, b: 4 };
+  const NET = {
+    iq:   { c: '#5aa9ff', name: 'I/Q I2S', sub: 'WM8782 B, LR, D to GPIO4, 5, 6' },
+    clk:  { c: '#ff8a3d', name: '24.576 MHz clock', sub: 'CLK into the buffer, then 47 Ω to GPIO7 and to PCM1808 SCK' },
+    aud:  { c: '#c98cff', name: 'Audio I2S', sub: 'GPIO15–18 to the PCM1808 and PCM5102A, mute on GPIO8' },
+    sig:  { c: '#7fe0a0', name: 'Analog in', sub: 'I/Q jack to the WM8782, RX jack to the PCM1808' },
+    data: { c: '#2ee6c4', name: 'Data cable', sub: 'CAT and PA lines, header to the S3, one to one' },
+    v75:  { c: '#ff4d4d', name: '7.5 V', sub: 'JST XH in, to the TPS7A4701 and the AMS1117' },
+    v5:   { c: '#ffb000', name: '5 V lane', sub: 'From the AMS1117 to the PCM1808, PCM5102A and LP5907 (the S3 takes 5 V over USB from the main board)' },
+    v5q:  { c: '#ff7eb6', name: 'Quiet 5 V', sub: 'TPS7A4701 output to the WM8782 only' },
+    v33:  { c: '#d9ef4a', name: '3.3 V', sub: 'LP5907 to the PCM1808 and the buffer' },
+    gnd:  { c: '#0b0f0c', name: 'Ground', sub: 'Every return ends at the JST XH ground pin (the star)', dash: true },
+    jmp:  { c: '#c9d1d8', name: 'Solder jumper', sub: 'A bridge between neighbouring pins or pads, no wire', jmp: true },
+  };
+  const PARTS = ['ESP32-S3', 'WM8782', 'PCM1808', 'PCM5102A', 'TPS7A4701', '74LVC1G157', 'LP5907', 'Oscillator', 'AMS1117', 'Data header', 'Power header', 'Jacks'];
+
+  // ── Geometry (top-side coordinates, mm) ──
+  // The hole grid, measured on the user's board photo: holes at X(i), Y(j).
+  // Pins sit on holes; long wires run between hole rows (half steps) where they pass other pins.
+  // The S3 and TPS7A4701 sit one column right of draft 5 (the S3's USB end over the right edge). The WM8782 is two columns left of draft 5,
+  // so the I/Q wires jog three columns on the way up. The buffer is two rows lower, its I1 beside the WM8782's CLK; the LP5907 sits
+  // beside the PCM1808's 3.3V pin, straddling the 5 V and ground lanes.
+  const GX0 = 2.0, GY0 = 0.86, P = 2.54;
+  const X = i => +(GX0 + P * i).toFixed(2), Y = j => +(GY0 + P * j).toFixed(2);
+  const SX = k => X(9 + k);                 // S3 header pin k (0 = 3V3 at the antenna end)
+  const S3_BOTTOM = ['3V3','3V3','RST','4','5','6','7','15','16','17','18','8','3','46','9','10','11','12','13','14','5V','GND'];
+  const S3_TOP = ['GND','TX','RX','1','2','42','41','40','39','38','37','36','35','0','45','48','47','21','20','19','GND','GND'];
+  const g = n => SX(S3_BOTTOM.indexOf(n));
+  const S3Y = Y(14), S3TY = Y(4);
+
+  const modules = [
+    { id: 'ESP32-S3', x: 17.34, y: 8.9, w: 67.2, h: 29, fill: '#141414', stroke: '#3a3a3a', label: 'ESP32-S3-N16R8', lx: 52, ly: 21.6 },
+    { id: 'WM8782', x: 8.32, y: 40.9, w: 51, h: 32.1, fill: '#1f9d48', stroke: '#126b30', label: 'WM8782', lx: 50, ly: 63.5 },
+    { id: 'TPS7A4701', x: 67.74, y: 50, w: 19, h: 28, fill: '#22a24e', stroke: '#126b30', label: 'TPS7A4701', lx: 84.6, ly: 64 },
+    { id: 'PCM5102A', x: 2.14, y: 71.36, w: 18.6, h: 32.5, fill: '#6a2c91', stroke: '#45195f', label: 'PCM5102A', lx: 9.94, ly: 92.46, vertical: true },
+    { id: 'PCM1808', x: 32.98, y: 71.8, w: 33.4, h: 30.3, fill: '#6a2c91', stroke: '#45195f', label: 'PCM1808', lx: 49.7, ly: 87 },
+  ];
+  const jacks = [
+    { x: -3.2, y: 52.82, w: 14.6, h: 7.8, label: 'I/Q in' },
+    { x: -0.66, y: 93.3, w: 7, h: 7.8, label: 'TX' },
+    { x: -3.2, y: 101.2, w: 14.6, h: 8.4, label: 'RX / loop' },
+  ];
+  // On short pin headers like a DIP-6 (rows 7.62 mm apart), side A (the SOT-23-6 face) up, soldered into the board and trimmed.
+  const adapters = [
+    { x: 33.53, y: 59.34, w: 10.6, h: 10.0, label: '74LVC1G157' },
+    { x: 55.12, y: 73.18, w: 10.6, h: 10.3, label: 'LP5907' },
+    { x: 72.6, y: 100.9, w: 7.3, h: 11.2, label: 'AMS1117' },
+  ];
+  // Radial electrolytics standing on the board (top view): + and − hole, label
+  // 24.576 MHz oscillator, half-size DIP-8 metal can (pins 1 NC, 4 GND, 5 OUT, 8 VCC; pin 1 = sharp corner), run at 3.3 V
+  const oscs = [ { x: 19.53, y: 46.33, w: 13.2, h: 13.2, label: '24.576 MHz' } ];
+  // Through-hole 104 soldered across the buffer's pin stubs on the bottom face (pad 6 VCC to pad 3 GND)
+  const capsBottom = [ { a: [X(11), Y(19)], b: [X(8), Y(22)], label: '104' } ];
+  const caps = [
+    { p: [X(29), Y(36)], m: [X(30), Y(36)], label: 'Cin' },
+    { p: [X(29), Y(38)], m: [X(30), Y(38)], label: 'Cout' },
+  ];
+  const headers = [
+    { pins: ['TX','RX','3V3','GND','EMG','SNS'], xs: [X(23),X(24),X(25),X(26),X(27),X(28)], y: Y(17), label: 'data' },
+    { pins: ['7V5','GND'], xs: [X(29),X(30)], y: Y(32), label: 'JST XH', body: { i0: 28, i1: 30, j0: 31, j1: 33 } },   // white 2-pin housing over 3 x 3 holes
+  ];
+  const row = (names, i0, y, side, extra = {}) => names.map((n, k) => ({ n, x: X(i0 + k), y, side, ...extra }));
+  const col = (names, x, j0, side, extra = {}) => names.map((n, k) => ({ n, x, y: Y(j0 + k), side, ...extra }));
+  const modPins = [
+    ...row(['B','LR','D','CLK'], 9, Y(26), 'below'),
+    ...col(['Rin','G','Lin'], X(3), 18, 'right'),
+    ...[['5V', X(28), Y(19)], ['G', X(27), Y(19)]].map(([n, x, y]) => ({ n, x, y, side: 'below', small: true })),
+    ...row(['GND','Vo','NC','GND'], 27, Y(20), 'below'),
+    ...row(['GND','Vin','EN','GND'], 27, Y(30), 'above'),
+    ...row(['VIN','GND','LCK','DIN','BCK','SCK'], 1, Y(29), 'below', { small: true }),
+    ...col(['1','2','3','4','G','R','G','L'], X(7), 30, 'left', { small: true }),
+    ...row(['BCK','OUT','LRC','SCK','GND','3.3V'], 16, Y(29), 'below'),
+    ...row(['PMT','MD1','MD0','GND','3.3V','+5V'], 16, Y(39), 'above'),
+    ...col(['LIN','GND','RIN'], X(13), 33, 'right'),
+    // adapter pins, labelled with the side-A hole numbers (side A faces up)
+    // Retired clock buffer (a '1G14-type clone): its adapter pins are cut, so these holes are now just junctions
+    ...col(['1 NC','2 A in','3 GND'], X(13), 24, 'left', { small: true, adapter: true }),
+    ...col(['6 VCC','5 NC','4 Y'], X(16), 24, 'right', { small: true, adapter: true }),
+    // oscillator pins, seen from above (pin 1, the sharp corner, top-left)
+    ...[['1 NC', X(8), Y(19), 'left'], ['8 VCC', X(11), Y(19), 'right'], ['4 GND', X(8), Y(22), 'left'], ['5 OUT', X(11), Y(22), 'right']].map(([n, x, y, side]) => ({ n, x, y, side, small: true, adapter: true })),
+    // LP5907 turned 90° clockwise: OUT, spare, NC on top; IN, GND, EN below
+    ...row(['6 OUT','5 GND*','4 NC'], 22, Y(29), 'above', { small: true, adapter: true }),
+    ...row(['1 IN','2 GND','3 EN'], 22, Y(32), 'below', { small: true, adapter: true }),
+    // AMS1117-5.0 on its SOT-223 adapter, lying along the top edge: GND, OUT, IN from the edge in
+    ...row(['IN','OUT','GND'], 28, Y(40), 'below', { small: true, adapter: true }),
+  ];
+
+  // Handy named points
+  const half = j => +(Y(j) + P / 2).toFixed(2);   // between row j and j+1
+  const halfX = i => +(X(i) + P / 2).toFixed(2);
+  const V2 = [X(15), Y(15)], V3 = [X(20), Y(28)];
+
+  // ── Wires: n = net, f = face (b bottom / t top / m on a module), p = points, a → b = ends, c = parts ──
+  const w = (n, f, p, a, b, c, extra) => ({ n, f, p, a, b, c, ...extra });
+  // Wire colours as built (from the bottom-face photo, 2026-10-26); a wire without one is drawn in its net's colour.
+  const WC = { blue: '#3f6dff', violet: '#9b5de5', green: '#1fb57f', red: '#f0435f', black: '#101410', yellow: '#f5d214', orange: '#ff7f50', gray: '#a0a6ad' };
+  const as = col => ({ col });
+  const wires = [
+    // I/Q I2S: three straight, parallel wires (as built)
+    w('iq','b',[[X(9),Y(26)],[X(9),Y(25)],[X(12),Y(15)],[X(12),S3Y]],'WM8782 B','S3 GPIO4 (I/Q bit clock)',['WM8782','ESP32-S3'],as('blue')),
+    w('iq','b',[[X(10),Y(26)],[X(10),Y(25)],[X(13),Y(15)],[X(13),S3Y]],'WM8782 LR','S3 GPIO5 (I/Q word clock)',['WM8782','ESP32-S3'],as('violet')),
+    w('iq','b',[[X(11),Y(26)],[X(11),Y(25)],[X(14),Y(15)],[X(14),S3Y]],'WM8782 D','S3 GPIO6 (I/Q data)',['WM8782','ESP32-S3'],as('green')),
+    // clock
+    w('clk','b',[[X(12),Y(26)],[X(16),Y(26)]],'WM8782 CLK (J6 open: the module takes our clock here)','pad 4 (Y) hole, by the old wire bridge (drawn straight)',['WM8782','Oscillator']),
+    w('clk','b',[[X(11),Y(22)],[X(16),Y(26)]],'oscillator pin 5 OUT (short red wire)','pad 4 (Y) hole, where both 47 Ω branches start',['Oscillator','ESP32-S3','PCM1808'],as('red')),
+    w('v33','t',[[X(16),Y(24)],[X(11),Y(19)]],'pad 6 hole (3.3 V from the LP5907)','oscillator pin 8 VCC, a red diagonal wire',['LP5907','Oscillator']),
+    w('gnd','b',[[X(8),Y(22)],[X(2),Y(28)]],'oscillator pin 4 GND (black wire)','the solder bar on the PCM5102A GND pin',['Oscillator','PCM5102A']),
+    w('jmp','b',[[X(2),Y(28)],[X(2),Y(30)]],'solder bar','PCM5102A GND, and the black ground wire beside it',['PCM5102A']),
+    w('clk','t',[[X(16),Y(26)],[X(15),Y(26)],V2],'buffer Y (pad 4)','hole to S3 GPIO7 (branch A), under the adapter and up',['74LVC1G157','ESP32-S3'],{ r: [X(15),58.4], via: V2 }),
+    w('clk','b',[V2,[V2[0],S3Y]],'branch A (hole)','S3 GPIO7 (master clock in)',['74LVC1G157','ESP32-S3']),
+    w('clk','t',[[X(16),Y(26)],[V3[0],Y(26)],V3],'buffer Y (pad 4)','hole by PCM1808 SCK (branch B)',['74LVC1G157','PCM1808'],{ r: [V3[0],69.5], via: V3 }),
+    w('clk','b',[V3,[X(19),Y(29)]],'branch B (hole)','PCM1808 SCK',['74LVC1G157','PCM1808']),
+    // audio I2S (GPIO15 DAC data, 16 BCK, 17 ADC data, 18 LRC), as built: the PCM5102A wires run straight down to the PCM1808's pins
+    w('aud','b',[[g('15'),S3Y],[X(17),Y(15)],[X(17),Y(27)],[X(4),Y(27)],[X(4),Y(29)]],'S3 GPIO15','PCM5102A DIN',['ESP32-S3','PCM5102A'],as('green')),
+    w('aud','b',[[g('16'),S3Y],[X(18),Y(16)],[X(18),Y(27)],[X(17),Y(28)],[X(16),Y(29)]],'S3 GPIO16 (bit clock)','PCM1808 BCK',['ESP32-S3','PCM1808'],as('blue')),
+    w('aud','b',[[X(5),Y(29)],[X(5),Y(28)],[X(16),Y(28)],[X(16),Y(29)]],'PCM5102A BCK','PCM1808 BCK (shared bit clock)',['PCM1808','PCM5102A'],as('blue')),
+    w('aud','b',[[g('17'),S3Y],[X(19),Y(16)],[X(19),Y(26)],[X(18),Y(28)],[X(17),Y(29)]],'PCM1808 OUT','S3 GPIO17 (ADC data in)',['PCM1808','ESP32-S3'],as('green')),
+    w('aud','b',[[g('18'),S3Y],[X(20),Y(16)],[X(20),Y(26)],[X(19),Y(28)],[X(18),Y(29)]],'S3 GPIO18 (word clock)','PCM1808 LRC',['ESP32-S3','PCM1808'],as('violet')),
+    w('aud','b',[[X(3),Y(29)],[X(3),Y(30)],[X(17),Y(30)],[X(18),Y(29)]],'PCM5102A LCK','PCM1808 LRC (shared word clock)',['PCM1808','PCM5102A'],as('violet')),
+    w('aud','b',[[g('8'),S3Y],[X(20),Y(13)]],'S3 GPIO8 (mute)','hole beside it, to the top face',['ESP32-S3','PCM5102A'],{ via: [X(20),Y(13)] }),
+    w('aud','t',[[X(20),Y(13)],[halfX(4),Y(13)],[halfX(4),Y(31)],[X(7),Y(32)]],'GPIO8 hole (mute)','PCM5102A pad 3 (XSMT): under the S3, behind the I/Q jack, under the PCM5102A (path approximate)',['ESP32-S3','PCM5102A']),
+    w('gnd','b',[[X(2),Y(30)],[X(2),Y(31)],[X(19),Y(31)],[X(20),Y(29)]],'PCM5102A GND (black wire)','PCM1808 GND',['PCM5102A','PCM1808']),
+    w('gnd','b',[[X(20),Y(29)],[X(21),Y(30)],[X(24),Y(31)],[X(27),Y(31)],[X(27),Y(30)]],'PCM1808 GND (black wire)','TPS7A4701 GND (Vin side)',['PCM1808','TPS7A4701']),
+    // analog inputs
+    w('sig','b',[[X(1),Y(21)],[X(3),Y(18)]],'I/Q jack, ring (Q)','WM8782 Rin',['Jacks','WM8782'],as('red')),
+    w('gnd','b',[[X(1),Y(23)],[X(2),Y(22)],[X(3),Y(19)]],'I/Q jack, sleeve (black wire)','WM8782 J4 ground',['Jacks','WM8782']),
+    w('sig','b',[[X(4),Y(23)],[X(3),Y(20)]],'I/Q jack, tip (I)','WM8782 Lin',['Jacks','WM8782'],as('red')),
+    w('sig','b',[[X(4),Y(42)],[X(12),Y(42)],[X(14),Y(40)],[X(14),Y(33)],[X(13),Y(33)]],'RX jack, tip (RX audio)','PCM1808 LIN',['Jacks','PCM1808'],as('yellow')),
+    w('gnd','b',[[X(1),Y(42)],[halfX(1),Y(41)],[halfX(11),Y(41)],[halfX(13),Y(39)],[halfX(13),Y(34)],[X(13),Y(34)]],'RX jack, sleeve (black wire)','PCM1808 input ground',['Jacks','PCM1808']),
+    w('sig','b',[[X(2),Y(40)],[X(11),Y(40)],[X(13),Y(38)],[X(13),Y(35)]],'RX jack, ring (audio loop)','PCM1808 RIN',['Jacks','PCM1808'],as('orange')),
+    // data header, in the level shifter's LV order (LV1 LV2 LV GND LV3 LV4), so the cable runs straight; pin 1 (LV1) by S3 pin 9
+    w('data','b',[[X(23),Y(17)],[g('9'),S3Y]],'data header pin 1, LV1 (CAT TX), orange','S3 GPIO9 (CAT TX)',['Data header','ESP32-S3'],as('orange')),
+    w('data','b',[[X(24),Y(17)],[g('10'),S3Y]],'data header pin 2, LV2 (CAT RX), yellow','S3 GPIO10 (CAT RX)',['Data header','ESP32-S3'],as('yellow')),
+    w('data','t',[[X(25),Y(17)],[X(25),half(14)],[SX(0),half(14)],[SX(0),S3Y]],'data header pin 3, LV (3.3 V)','S3 3V3: a red wire on the top face, between the WM8782 and the S3',['Data header','ESP32-S3'],as('red')),
+    w('gnd','b',[[X(26),Y(17)],[X(26),Y(18)],[X(27),Y(18)],[X(27),Y(19)]],'data header pin 4, GND','the WM8782 ground hole by the TPS7A4701 (bridged to its GND), a black wire',['Data header','TPS7A4701']),
+    w('data','b',[[X(27),Y(17)],[X(27),Y(16)],[g('11'),Y(16)],[g('11'),S3Y]],'data header pin 5, LV3 (PA emergency), violet','S3 GPIO11 (PA emergency)',['Data header','ESP32-S3'],as('violet')),
+    w('data','b',[[X(24),Y(17)],[X(25),Y(17)]],'data header pin 2 (CAT RX)','pin 3 (3.3 V): 1 kΩ pull-up, so the radio replies rise fast enough',['Data header'],{ r: [halfX(24),Y(17)], rAcross: true, rLabel: '1kΩ' }),
+    w('data','b',[[X(28),Y(17)],[g('14'),S3Y]],'data header pin 6, LV4 (PA sense), gray','S3 GPIO14 (PA sense)',['Data header','ESP32-S3'],as('gray')),
+    // power (the S3 takes its 5 V over USB from the main board's LM7805; its ground also joins the star here)
+    w('gnd','b',[[g('GND'),S3Y],[X(30),Y(20)]],'S3 GND (black wire along the edge row)','TPS7A4701 GND (bottom pin)',['ESP32-S3','TPS7A4701']),
+    w('v75','b',[[X(29),Y(32)],[X(29),Y(30)]],'JST XH 7.5 V','TPS7A4701 EN (bridged to Vin)',['Power header','TPS7A4701'],as('red')),
+    w('gnd','b',[[X(30),Y(30)],[X(30),Y(32)]],'TPS7A4701 GND','the ground run by the JST XH GND (star)',['TPS7A4701','Power header']),
+    w('v75','b',[[X(29),Y(32)],[X(29),Y(36)]],'JST XH 7.5 V','C in +',['Power header','AMS1117'],as('red')),
+    w('v75','b',[[X(29),Y(36)],[X(28),Y(40)]],'7.5 V row (C in +)','AMS1117 IN, a diagonal red wire',['AMS1117'],as('red')),
+    w('jmp','b',[[X(29),Y(40)],[X(29),Y(41)]],'AMS1117 OUT (middle pin)','a solder bridge one hole right',['AMS1117']),
+    w('gnd','b',[[X(30),Y(40)],[X(30),Y(32)]],'AMS1117 GND, C out −, C in − (the edge row)','the ground star by the JST XH',['AMS1117','Power header']),
+    w('v5q','b',[[X(28),Y(20)],[X(28),Y(19)]],'TPS7A4701 Vo (quiet 5 V)','hole beside it: flying wire to a 2-pin JST plug, into the WM8782 +5V',['TPS7A4701','WM8782']),
+    w('gnd','b',[[X(27),Y(20)],[X(27),Y(19)]],'TPS7A4701 GND','hole beside it: flying wire to the same JST plug, WM8782 GND',['TPS7A4701','WM8782']),
+    w('v5','b',[[X(29),Y(41)],[X(21),Y(41)]],'AMS1117 OUT (through the solder bridge)','straight up to the PCM1808 +5V solder bar',['AMS1117','PCM1808'],as('red')),
+    w('jmp','b',[[X(21),Y(38)],[X(21),Y(41)]],'solder bar on the PCM1808 +5V pin','both red 5 V wires',['PCM1808']),
+    w('v5','b',[[X(21),Y(38)],[X(24),Y(32)]],'PCM1808 +5V (solder bar)','LP5907 EN (tied to IN on the adapter)',['PCM1808','LP5907'],as('red')),
+    // 3.3 V and the adapters' ground
+    w('gnd','b',[[X(23),Y(32)],[X(24),Y(31)]],'LP5907 GND (side-A hole 2)','the black ground wire beside it (not checked against the build)',['PCM1808','LP5907']),
+    w('v33','b',[[X(22),Y(29)],[X(21),Y(29)]],'LP5907 OUT (side-A hole 6)','PCM1808 3.3V, the neighbouring pin',['LP5907','PCM1808']),
+    w('v33','t',[[X(22),Y(29)],[X(16),Y(25)]],'LP5907 OUT (side-A hole 6)','pad 5 hole, bridged to pad 6 on the bottom (a red diagonal wire)',['LP5907','74LVC1G157']),
+    // solder jumpers
+    w('jmp','b',[[X(16),Y(39)],[X(19),Y(39)]],'PCM1808 PMT, MD1, MD0','PCM1808 GND (one bridge across the four pins)',['PCM1808']),
+    w('jmp','b',[[X(28),Y(30)],[X(29),Y(30)]],'TPS7A4701 EN','TPS7A4701 Vin',['TPS7A4701']),
+    w('jmp','b',[[X(16),Y(24)],[X(16),Y(25)]],'buffer pad 6 (VCC)','pad 5 (the 3.3 V wire): bridged on the perfboard',['74LVC1G157']),
+        w('jmp','m',[[15.94,76.06],[17.94,76.06]],'PCM5102A SCK','module ground pad (the bridge next to SCK)',['PCM5102A']),
+    w('jmp','m',[[18.14,Y(30)],[18.14,Y(33)]],'PCM5102A H1L, H2L, H4L','L side (FLT, DEMP, FMT low; H3L stays open)',['PCM5102A']),
+  ];
+
+  const NS = 'http://www.w3.org/2000/svg';
+  const el = (tag, attrs, parent) => { const e = document.createElementNS(NS, tag); for (const k in attrs) e.setAttribute(k, attrs[k]); parent && parent.appendChild(e); return e; };
+  const views = [];
+
+  function board(target, mirror) {
+    const svg = el('svg', { viewBox: `${-PAD.l} ${-PAD.t} ${W + PAD.l + PAD.r} ${H + PAD.t + PAD.b}`, role: 'img',
+      'aria-label': mirror ? 'Bottom side of the S3 bridge board with colour-coded wiring' : 'Top side of the S3 bridge board with every part in place' });
+    const MX = x => mirror ? W - x : x;
+    const id = mirror ? 'b' : 't';
+    const defs = el('defs', {}, svg);
+    const pat = el('pattern', { id: id + 'holes', width: 2.54, height: 2.54, patternUnits: 'userSpaceOnUse', x: MX(GX0) - 1.27, y: GY0 - 1.27 }, defs);
+    el('rect', { width: 2.54, height: 2.54, fill: '#1f6b3c' }, pat);
+    el('circle', { cx: 1.27, cy: 1.27, r: 0.78, fill: '#c9a24e' }, pat);
+    el('circle', { cx: 1.27, cy: 1.27, r: 0.38, fill: '#0e2f1b' }, pat);
+    el('rect', { x: mirror ? 0 : BX0, y: 0, width: W - BX0, height: H, rx: 1.4, fill: '#1f6b3c', stroke: '#164f2c', 'stroke-width': 0.5 }, svg);
+    el('rect', { x: MX(X(30)) - 1.27 - (mirror ? 0 : P * 29), y: Y(2) - 1.27, width: P * 30, height: P * 42, fill: `url(#${id}holes)` }, svg);
+    for (const sy of [0.6, H - 3.6]) for (let x = BX0 + 5; x < W - 5; x += 2.54) el('rect', { x: MX(x) - 0.75, y: sy, width: 1.5, height: 3, rx: 0.3, fill: '#d6b25c' }, svg);
+    for (const [x, y] of [[BX0 + 2.4, 2.4], [W - 2.4, 2.4], [BX0 + 2.4, H - 2.4], [W - 2.4, H - 2.4]]) {
+      el('circle', { cx: MX(x), cy: y, r: 1.6, fill: '#c9a24e' }, svg);
+      el('circle', { cx: MX(x), cy: y, r: 0.9, fill: '#0b130e' }, svg);
+    }
+    const label = (txt, x, y, o = {}) => {
+      const t = el('text', { x: MX(x), y, fill: o.fill || '#f2f2f2', 'font-size': o.size || 2.2, 'font-family': 'IBM Plex Mono, monospace',
+        'font-weight': o.weight || 600, 'text-anchor': o.anchor || 'middle', 'dominant-baseline': 'middle', 'pointer-events': 'none' }, svg);
+      if (o.rotate) t.setAttribute('transform', `rotate(${mirror ? 90 : -90} ${MX(x)} ${y})`);
+      t.textContent = txt;
+      return t;
+    };
+    const rectM = (r, attrs, parent = svg) => el('rect', { x: mirror ? W - r.x - r.w : r.x, y: r.y, width: r.w, height: r.h, ...attrs }, parent);
+
+    if (!mirror) {
+      for (const m of modules) rectM(m, { rx: 1.2, fill: m.fill, stroke: m.stroke, 'stroke-width': 0.5 });
+      for (const j of jacks) {
+        rectM(j, { rx: 0.8, fill: '#181818', stroke: '#5a5a5a', 'stroke-width': 0.3 });
+        el('circle', { cx: MX(j.x + 2.2), cy: j.y + j.h / 2, r: 1.5, fill: '#060606', stroke: '#9a9a9a', 'stroke-width': 0.3 }, svg);
+        if (j.w > 8) label(j.label, j.x + j.w / 2 + 1.6, j.y + j.h / 2, { size: 1.9, fill: '#d0d0d0' });
+        else label(j.label, j.x + j.w + 1.4, j.y + j.h / 2, { size: 1.6, fill: '#f0e6ff', anchor: 'start' });
+      }
+      // S3 details
+      el('rect', { x: 17.34, y: 9.6, width: 6.7, height: 27.6, fill: '#2a2a2a' }, svg);
+      el('rect', { x: 24.54, y: 10.6, width: 20.1, height: 21.4, rx: 0.8, fill: '#c8c8c3', stroke: '#8f8f8a', 'stroke-width': 0.3 }, svg);
+      el('circle', { cx: 27.14, cy: 12.9, r: 1, fill: '#d8b864', stroke: '#7a6630', 'stroke-width': 0.25 }, svg);
+      label('IPEX', 29.94, 12.9, { size: 1.5, fill: '#5a5a55' });
+      label('XH-S3E N16R8', 34.54, 21.5, { size: 1.9, fill: '#55554f' });
+      for (const y of [11.6, 25.1]) el('rect', { x: 75.74, y, width: 8.8, height: 7.7, rx: 1.4, fill: '#b9bcc0', stroke: '#6f7377', 'stroke-width': 0.3 }, svg);
+      el('rect', { x: 64.74, y: 25.4, width: 3.4, height: 3.4, fill: '#f1f1f1' }, svg);
+      label('RGB', 66.44, 30.5, { size: 1.3, fill: '#bbbbbb' });
+      // WM8782 details, kept clear of the adapter area
+      for (const [x, y] of [[44.42, 44.2], [44.42, 51.8]]) el('rect', { x, y, width: 5.5, height: 3.6, rx: 0.4, fill: '#c9cbcc', stroke: '#7d7f80', 'stroke-width': 0.25 }, svg);
+      el('rect', { x: 10.92, y: 61.5, width: 10.6, height: 8.4, rx: 0.6, fill: '#121212' }, svg);
+      label('S1', 16.22, 65.7, { size: 1.8, fill: '#e8e8e8' });
+      for (const y of [44.4, 50.4]) el('circle', { cx: 19.02, cy: y + 1.6, r: 2.1, fill: '#d8d8d8', stroke: '#8c8c8c', 'stroke-width': 0.25 }, svg);
+      // adapters (on the board, under the WM8782)
+      for (const a of adapters) {
+        rectM(a, { rx: 0.6, fill: '#164f2c', stroke: '#f5d76e', 'stroke-width': 0.35, 'stroke-dasharray': '1 0.7' });
+      }
+      for (const c of caps) {
+        const cx = (c.p[0] + c.m[0]) / 2, cy = (c.p[1] + c.m[1]) / 2;
+        el('circle', { cx: MX(cx), cy, r: 2.5, fill: '#23324f', stroke: '#9fb3d6', 'stroke-width': 0.25 }, svg);
+        el('path', { d: `M ${MX(c.m[0])} ${cy - 2.2} A 2.5 2.5 0 0 ${mirror ? 1 : 0} ${MX(c.m[0])} ${cy + 2.2}`, fill: 'none', stroke: '#dfe7f2', 'stroke-width': 0.7, opacity: 0.8 }, svg);
+        label('+', c.p[0], cy - 3.2, { size: 1.4, fill: '#ffffff' });
+        label(c.label, c.p[0] > c.m[0] ? cx - 2.9 : cx + 2.9, cy + 3.3, { size: 1.05, fill: '#dfe7f2', weight: 400, anchor: (c.p[0] > c.m[0]) !== mirror ? 'end' : 'start' });
+      }
+      label('AMS1117', 76.2, 113.8, { size: 1.4, fill: '#f5d76e' });
+      for (const o of oscs) {
+        rectM(o, { rx: 1.2, fill: '#b9bcc0', stroke: '#6f7377', 'stroke-width': 0.35 });
+        el('path', { d: `M ${MX(o.x)} ${o.y + 1.6} L ${MX(o.x + 1.6)} ${o.y}`, stroke: '#5a5e62', 'stroke-width': 0.3 }, svg);
+        label(o.label, o.x + o.w / 2 + 1.3, o.y + o.h / 2, { size: 1.5, fill: '#2b2e31' });
+        label('3.3 V, from the LP5907', o.x + o.w / 2 - 1.4, o.y + o.h / 2, { size: 1.0, fill: '#3a3e42', weight: 400 });
+      }
+      label('old buffer: pins cut', 38.83, 70.76, { size: 1.3, fill: '#f5d76e' });
+      label('LP5907', 66.9, 78.32, { size: 1.4, fill: '#f5d76e' });
+      if (false) label('', 38.8, 54.6, { size: 1.3, fill: '#f5d76e', weight: 400 });
+      // PCM parts
+      for (const [x, y] of [[34.2, 82], [34.2, 92.5], [42.5, 93.2], [52.5, 82], [52.5, 92.5]]) el('circle', { cx: x + 2.8, cy: y + 2.8, r: 2.6, fill: '#dcdcdc', stroke: '#8a8a8a', 'stroke-width': 0.25 }, svg);
+      el('rect', { x: 42.5, y: 88, width: 4.4, height: 4, fill: '#151515' }, svg);
+      el('rect', { x: 3, y: 81, width: 7.6, height: 5.6, fill: '#151515' }, svg);
+      // TPS heatsink (its back faces up)
+      el('rect', { x: 71.54, y: 58, width: 11.4, height: 12, rx: 0.6, fill: '#9aa3a8', stroke: '#5f676b', 'stroke-width': 0.3 }, svg);
+      for (let i = 0; i < 6; i++) el('line', { x1: 72.54 + i * 1.9, y1: 58.6, x2: 72.54 + i * 1.9, y2: 69.4, stroke: '#6f777b', 'stroke-width': 0.35 }, svg);
+      label('heatsink', 77.24, 72.3, { size: 1.4, fill: '#dfe7df', weight: 400 });
+      for (const m of modules) label(m.label, m.lx, m.ly, { size: m.id === 'TPS7A4701' ? 1.6 : m.id === 'ESP32-S3' ? 1.9 : 2.3, rotate: m.vertical });
+    } else {
+      for (const c of capsBottom) {
+        const mx = (c.a[0] + c.b[0]) / 2, my = (c.a[1] + c.b[1]) / 2;
+        el('line', { x1: MX(c.a[0]), y1: c.a[1], x2: MX(c.b[0]), y2: c.b[1], stroke: '#cfd3d6', 'stroke-width': 0.35 }, svg);
+        el('rect', { x: MX(mx) - 1.2, y: my - 0.8, width: 2.4, height: 1.6, rx: 0.5, fill: '#e2a33b', stroke: '#8a5a12', 'stroke-width': 0.15 }, svg);
+        label(c.label, mx, my + 1.9, { size: 1.0, fill: '#ffe9a8', weight: 400 });
+      }
+      for (const o of oscs) rectM(o, { rx: 1.2, fill: 'none', stroke: '#c9cdd1', 'stroke-width': 0.3, 'stroke-dasharray': '1.2 1', opacity: 0.7 });
+      for (const m of [...modules, ...jacks]) rectM(m, { rx: 1, fill: 'none', stroke: '#9fd3b1', 'stroke-width': 0.3, 'stroke-dasharray': '1.2 1', opacity: 0.55 });
+      for (const m of modules) label(m.label, m.lx, m.id === 'ESP32-S3' ? 23.5 : m.ly, { size: 2, fill: '#bfe3cb', weight: 400, rotate: m.vertical });
+      for (const j of jacks) label(j.label, j.x + j.w / 2, j.y + j.h / 2, { size: 1.7, fill: '#bfe3cb', weight: 400 });
+    }
+
+    // header pins and labels
+    S3_BOTTOM.forEach((n, i) => {
+      el('rect', { x: MX(SX(i)) - 0.9, y: S3Y - 0.9, width: 1.8, height: 1.8, fill: '#d9b85e', stroke: '#8c6f2a', 'stroke-width': 0.2 }, svg);
+      label(n, SX(i), S3Y - 2.3, { size: 1.25, anchor: 'end', rotate: true });
+    });
+    S3_TOP.forEach((n, i) => el('rect', { x: MX(SX(i)) - 0.9, y: S3TY - 0.9, width: 1.8, height: 1.8, fill: '#d9b85e', stroke: '#8c6f2a', 'stroke-width': 0.2 }, svg));
+    for (const p of modPins) {
+      el('circle', { cx: MX(p.x), cy: p.y, r: 0.75, fill: '#e6c46a', stroke: '#7c6224', 'stroke-width': 0.2 }, svg);
+      const s = p.small ? 1.1 : 1.3;
+      const off = { below: [0, 1.9], above: [0, -1.9], right: [2.2, 0], left: [-2.2, 0] }[p.side];
+      let anchor = 'middle';
+      if (p.side === 'right') anchor = mirror ? 'end' : 'start';
+      if (p.side === 'left') anchor = mirror ? 'start' : 'end';
+      label(p.n, p.x + off[0], p.y + off[1], { size: s, fill: p.adapter ? '#ffe9a8' : '#fff6d8', anchor });
+    }
+    for (const h of headers) {
+      if (h.body) {
+        const x0 = X(h.body.i0) - 1.2, x1 = X(h.body.i1) + 1.2, y0 = Y(h.body.j0) - 1.2, y1 = Y(h.body.j1) + 1.2;
+        const r = { x: x0, y: y0, w: x1 - x0, h: y1 - y0 };
+        if (mirror) rectM(r, { rx: 0.6, fill: 'none', stroke: '#e8e8e8', 'stroke-width': 0.3, 'stroke-dasharray': '1 0.8', opacity: 0.7 });
+        else rectM(r, { rx: 0.6, fill: '#f2f0ea', stroke: '#b9b5aa', 'stroke-width': 0.35 });
+      }
+      h.pins.forEach((n, i) => {
+        const x = h.vertical ? h.x : h.xs[i], y = h.vertical ? h.ys[i] : h.y;
+        el('rect', { x: MX(x) - 1.1, y: y - 1.1, width: 2.2, height: 2.2, rx: 0.3, fill: '#111', stroke: '#e6c46a', 'stroke-width': 0.3 }, svg);
+        el('circle', { cx: MX(x), cy: y, r: 0.55, fill: '#e6c46a' }, svg);
+        if (h.vertical) label(n, x + 2, y, { size: 1.15, fill: '#fff6d8', anchor: mirror ? 'end' : 'start' });
+        else label(n, x, y + 2.2, { size: 1.1, fill: h.body && !mirror ? '#2b2b2b' : '#fff6d8' });
+      });
+      if (h.vertical) label(h.label, h.x, h.ys[0] - 2.4, { size: 1.3, fill: '#bfe3cb', weight: 400 });
+      else if (h.body) label(h.label, X(h.body.i0), h.y, { size: 1.2, fill: mirror ? '#e8e8e8' : '#2b2b2b', weight: 600 });
+      else label(h.label, h.xs[0] - 2.6, h.y, { size: 1.3, fill: '#bfe3cb', weight: 400, anchor: mirror ? 'start' : 'end' });
+    }
+
+    // wires on this face (top view also shows the bridges made on the modules themselves)
+    const faces = mirror ? ['b'] : ['t', 'm'];
+    const order = ['gnd', 'v5', 'v75', 'v5q', 'v33', 'data', 'sig', 'aud', 'iq', 'clk', 'jmp'];
+    const layer = el('g', {}, svg);
+    for (const key of order) for (const wr of wires.filter(x => x.n === key && faces.includes(x.f))) {
+      const net = NET[wr.n];
+      const pts = wr.p.map(([x, y]) => `${MX(x)},${y}`).join(' ');
+      const gw = el('g', { class: 'wire', tabindex: 0, 'data-parts': wr.c.join('|') }, layer);
+      gw._wire = wr;
+      if (net.jmp) {
+        el('polyline', { points: pts, fill: 'none', stroke: '#4a5560', 'stroke-width': 1.7, 'stroke-linecap': 'round', 'stroke-linejoin': 'round' }, gw);
+        el('polyline', { class: 'stroke', points: pts, fill: 'none', stroke: net.c, 'stroke-width': 1.25, 'stroke-linecap': 'round', 'stroke-linejoin': 'round' }, gw);
+      } else if (net.dash) {
+        el('polyline', { points: pts, fill: 'none', stroke: '#6d7d72', 'stroke-width': 0.95, 'stroke-linejoin': 'round', 'stroke-linecap': 'round' }, gw);
+        el('polyline', { class: 'stroke', points: pts, fill: 'none', stroke: wr.col ? WC[wr.col] : net.c, 'stroke-width': 0.6, 'stroke-dasharray': '1.4 0.9', 'stroke-linejoin': 'round' }, gw);
+      } else {
+        el('polyline', { points: pts, fill: 'none', stroke: '#0b1a10', 'stroke-width': 1.15, 'stroke-linejoin': 'round', 'stroke-linecap': 'round', opacity: 0.6 }, gw);
+        el('polyline', { class: 'stroke', points: pts, fill: 'none', stroke: wr.col ? WC[wr.col] : net.c, 'stroke-width': 0.7, 'stroke-linejoin': 'round', 'stroke-linecap': 'round' }, gw);
+      }
+      el('polyline', { points: pts, fill: 'none', stroke: 'transparent', 'stroke-width': 3, 'pointer-events': 'stroke' }, gw);
+      if (wr.hop) {
+        el('circle', { cx: MX(wr.hop[0]), cy: wr.hop[1], r: 0.9, fill: '#1f6b3c', stroke: net.c, 'stroke-width': 0.45 }, gw);
+      }
+      if (wr.r) {
+        const rw = wr.rAcross ? 4 : 1.8, rh = wr.rAcross ? 1.8 : 4;   // rAcross: the body lies along the rows
+        el('rect', { x: MX(wr.r[0]) - rw / 2, y: wr.r[1] - rh / 2, width: rw, height: rh, rx: 0.5, fill: '#d6c3a0', stroke: '#5b4a2c', 'stroke-width': 0.2 }, gw);
+        const t = el('text', { x: MX(wr.r[0]) + (mirror ? -1.6 : 1.6), y: wr.r[1], fill: '#ffd3ad', 'font-size': 1.3, 'font-family': 'IBM Plex Mono, monospace', 'font-weight': 600, 'text-anchor': mirror ? 'end' : 'start', 'dominant-baseline': 'middle', 'pointer-events': 'none' }, gw);
+        t.textContent = wr.rLabel || '47Ω';
+      }
+    }
+    // holes where a wire changes face: drawn on both views
+    for (const wr of wires.filter(x => x.via)) {
+      el('circle', { cx: MX(wr.via[0]), cy: wr.via[1], r: 1.05, fill: 'none', stroke: '#ffffff', 'stroke-width': 0.35, 'pointer-events': 'none' }, svg);
+    }
+    if (mirror) {
+      el('circle', { cx: MX(X(30)), cy: Y(32), r: 1.7, fill: 'none', stroke: '#ffffff', 'stroke-width': 0.35 }, svg);
+      label('ground star', X(30), Y(32) + 3.2, { size: 1.2, fill: '#ffffff', weight: 400 });
+    }
+    // Turned 90° counter-clockwise to match the board as it sits on the bench; every label stays upright.
+    const g = el('g', { transform: `matrix(0 -1 1 0 0 ${W})` }, null);
+    for (const n of [...svg.childNodes]) if (n.tagName !== 'defs') g.appendChild(n);
+    svg.appendChild(g);
+    svg.setAttribute('viewBox', `${-PAD.t} ${-PAD.r} ${H + PAD.t + PAD.b} ${W + PAD.l + PAD.r}`);
+    for (const t of g.querySelectorAll('text')) t.setAttribute('transform', `rotate(90 ${t.getAttribute('x')} ${t.getAttribute('y')})`);
+    target.appendChild(svg);
+    views.push(svg);
+  }
+
+  // ── Adapter close-ups (mm, board 11.4 × 11.1) ──
+  function micro(target, v) {
+    const svg = el('svg', { viewBox: '-9.5 -2.2 30.4 15.6', role: 'img', 'aria-label': v.aria }, null);
+    target.appendChild(svg);
+    const t = (txt, x, y, o = {}) => { const e = el('text', { x, y, fill: o.fill || '#f2f2f2', 'font-size': o.size || 1.05, 'font-family': 'IBM Plex Mono, monospace', 'font-weight': o.weight || 600, 'text-anchor': o.anchor || 'middle', 'dominant-baseline': 'middle' }, svg); e.textContent = txt; return e; };
+    const HX = { L: 1.9, R: 9.52 }, HY = [3.01, 5.55, 8.09], CX = 5.7, CY = 5.55;
+    el('rect', { x: 0, y: 0, width: 11.4, height: 11.1, rx: 0.3, fill: '#1c8a3e', stroke: '#126b30', 'stroke-width': 0.15 }, svg);
+    const big = v.fp === 'sot23';
+    const pdx = big ? 1.25 : 0.95, pp = big ? 0.95 : 0.65, pw = big ? 1.0 : 0.7, ph = big ? 0.6 : 0.4;
+    const pad = (c, r) => [c === 'L' ? CX - pdx : CX + pdx, CY + (r - 1) * pp];
+    // traces, then pads
+    for (const c of ['L', 'R']) for (let r = 0; r < 3; r++) {
+      const [px, py] = pad(c, r);
+      el('polyline', { points: `${px},${py} ${c === 'L' ? px - 0.9 : px + 0.9},${py} ${HX[c]},${HY[r]}`, fill: 'none', stroke: '#3fb565', 'stroke-width': 0.28 }, svg);
+    }
+    for (const c of ['L', 'R']) for (let r = 0; r < 3; r++) {
+      const [px, py] = pad(c, r);
+      el('rect', { x: px - pw / 2, y: py - ph / 2, width: pw, height: ph, fill: '#d9d9d6', stroke: '#8f8f8a', 'stroke-width': 0.06 }, svg);
+    }
+    if (v.headers) for (const c of ['L', 'R']) for (const y of HY) el('rect', { x: HX[c] - 1.2, y: y - 1.2, width: 2.4, height: 2.4, rx: 0.2, fill: '#141414', opacity: 0.85 }, svg);
+    // holes and labels
+    for (const h of v.holes) {
+      const x = HX[h.c], y = HY[h.r];
+      if (h.sq) el('rect', { x: x - 0.8, y: y - 0.8, width: 1.6, height: 1.6, fill: '#e3e3e0' }, svg);
+      else el('circle', { cx: x, cy: y, r: 0.8, fill: '#e3e3e0' }, svg);
+      el('circle', { cx: x, cy: y, r: 0.42, fill: '#0b130e' }, svg);
+      t(String(h.n), h.c === 'L' ? x + 1.35 : x - 1.35, y - 0.95, { size: 0.85, fill: '#ffffff' });
+      const warn = h.warn;
+      t(h.f, h.c === 'L' ? -0.6 : 12.0, y, { anchor: h.c === 'L' ? 'end' : 'start', fill: warn ? '#ffb347' : '#e8f2ea', size: 1.0 });
+    }
+    for (const d of v.draw) d(svg, { pad, HX, HY, CX, CY, t });
+  }
+  const chip = (w, h, leads) => (svg, k) => {
+    for (const [c, r] of leads) { const [px, py] = k.pad(c, r); el('rect', { x: px - 0.45, y: py - 0.18, width: 0.9, height: 0.36, fill: '#bfbfbf' }, svg); }
+    el('rect', { x: k.CX - w / 2, y: k.CY - h / 2, width: w, height: h, rx: 0.12, fill: '#1b1b1b', stroke: '#444', 'stroke-width': 0.06 }, svg);
+  };
+  const dot = (dx, dy) => (svg, k) => el('circle', { cx: k.CX + dx, cy: k.CY + dy, r: 0.16, fill: '#eeeeee' }, svg);
+  const cap = (x1, y1, x2, y2, txt, tx, ty) => (svg, k) => {
+    const vert = x1 === x2, len = Math.hypot(x2 - x1, y2 - y1), body = Math.min(len, 2.0), th = 1.15;
+    const mx = (x1 + x2) / 2, my = (y1 + y2) / 2;
+    const r = vert ? { x: mx - th / 2, y: my - body / 2, width: th, height: body } : { x: mx - body / 2, y: my - th / 2, width: body, height: th };
+    el('rect', { ...r, rx: 0.12, fill: '#c9a87a', stroke: '#8a6e44', 'stroke-width': 0.06 }, svg);
+    for (const s of [-1, 1]) el('rect', vert ? { x: mx - th / 2, y: my + s * body / 2 - (s > 0 ? 0.35 : 0), width: th, height: 0.35, fill: '#d8d8d4' } : { x: mx + s * body / 2 - (s > 0 ? 0.35 : 0), y: my - th / 2, width: 0.35, height: th, fill: '#d8d8d4' }, svg);
+    k.t(txt, tx, ty, { size: 0.85, fill: '#ffe9a8' });
+  };
+  const bridge = (c, r1, r2) => (svg, k) => {
+    const [x, y1] = k.pad(c, r1), [, y2] = k.pad(c, r2);
+    el('rect', { x: x - 0.55, y: y1 - 0.4, width: 1.1, height: y2 - y1 + 0.8, rx: 0.4, fill: '#cfd3d6', stroke: '#8d9296', 'stroke-width': 0.08 }, svg);
+  };
+  const redwire = d => svg => { el('path', { d, fill: 'none', stroke: '#7a1010', 'stroke-width': 0.75, 'stroke-linecap': 'round' }, svg); el('path', { d, fill: 'none', stroke: '#d23a3a', 'stroke-width': 0.5, 'stroke-linecap': 'round' }, svg); };
+  const note = (txt, x, y, fill) => (svg, k) => k.t(txt, x, y, { size: 0.85, fill: fill || '#ffe9a8', weight: 400 });
+  const sideA = f => [['L',0,4],['L',1,5],['L',2,6],['R',0,3],['R',1,2],['R',2,1]].map(([c, r, n]) => ({ c, r, n, f: f[n], sq: n === 1, warn: f.warn === n }));
+  // Seen through the board from the other face: same physical hole positions as the face drawn on top.
+  const sideAThru = f => [['L',0,6],['L',1,5],['L',2,4],['R',0,1],['R',1,2],['R',2,3]].map(([c, r, n]) => ({ c, r, n, f: f[n], sq: n === 1, warn: f.warn === n }));
+  const sideBThru = f => [['L',0,3],['L',1,2],['L',2,1],['R',0,4],['R',1,5],['R',2,6]].map(([c, r, n]) => ({ c, r, n, f: f[n], sq: n === 6, warn: f.warn === n }));
+  const sideB = f => [['L',0,1],['L',1,2],['L',2,3],['R',0,6],['R',1,5],['R',2,4]].map(([c, r, n]) => ({ c, r, n, f: f[n], sq: n === 6, warn: f.warn === n }));
+  micro(document.getElementById('m-buf-a'), { aria: 'clock buffer adapter, side A', fp: 'sot23', headers: true,
+    holes: sideAThru({ 6: 'NC', 5: 'A in', 4: 'GND', 1: 'VCC', 2: 'NC', 3: 'Y', warn: 3 }),
+    draw: [note('bare: no bridges, no C3', 5.7, 12.3)] });
+  micro(document.getElementById('m-buf-b'), { aria: 'clock buffer adapter, side B', fp: 'sot363',
+    holes: sideB({ 1: 'NC (junction)', 2: 'A ← osc (via 1)', 3: 'GND', 6: 'VCC 3.3 V', 5: 'NC → 6', 4: 'Y → out', warn: 4 }),
+    draw: [chip(1.25, 2.0, [['L',0],['L',1],['L',2],['R',0],['R',1],['R',2]]), dot(-0.35, -0.7), note('pad 1', 3.4, 1.4, '#e8f2ea')] });
+  micro(document.getElementById('m-lp-a'), { aria: 'LP5907 adapter, side A', fp: 'sot23',
+    holes: sideA({ 4: 'NC', 5: 'spare = GND', 6: 'OUT 3.3 V', 3: 'EN', 2: 'GND', 1: 'IN 5 V' }),
+    draw: [chip(1.6, 2.9, [['L',0],['L',2],['R',0],['R',1],['R',2]]), dot(0.45, 1.05), cap(1.9, 5.55, 1.9, 8.09, 'C2 10 µF', 1.9, 10.3), cap(9.52, 5.55, 9.52, 8.09, 'C1 10 µF', 9.52, 10.3), redwire('M 9.9 8.5 C 11.9 8.6, 11.9 2.6, 9.9 2.7')] });
+  micro(document.getElementById('m-lp-b'), { aria: 'LP5907 adapter, side B', fp: 'sot363', headers: true,
+    holes: sideBThru({ 1: 'OUT', 2: 'spare → GND', 3: 'NC', 6: 'IN', 5: 'GND', 4: 'EN', warn: 1 }),
+    draw: [redwire('M 1.9 5.55 C 4 4.2, 7.4 4.2, 9.52 5.55'), note('B1 = OUT: no solder', 5.7, 10.2, '#ffb347')] });
+
+  (() => {
+    const target = document.getElementById('m-ams');
+    const svg = el('svg', { viewBox: '-4 -2.6 23 15', role: 'img', 'aria-label': 'AMS1117 adapter, top' }, null);
+    target.appendChild(svg);
+    const t = (txt, x, y, o = {}) => { const e = el('text', { x, y, fill: o.fill || '#e8f2ea', 'font-size': o.size || 1.0, 'font-family': 'IBM Plex Mono, monospace', 'font-weight': o.weight || 600, 'text-anchor': o.anchor || 'middle', 'dominant-baseline': 'middle' }, svg); e.textContent = txt; return e; };
+    el('rect', { x: 0, y: 0, width: 11.4, height: 11.4, rx: 0.3, fill: '#1c8a3e', stroke: '#126b30', 'stroke-width': 0.15 }, svg);
+    // as in the photo: three solder pads along the top edge (3 2 1), the chip below, its tab pad at the bottom
+    const PX = [2.6, 5.7, 8.8], LX = [3.4, 5.7, 8.0];
+    ['3', '2', '1'].forEach((n, i) => {
+      el('polyline', { points: `${PX[i]},1.6 ${PX[i]},3.0 ${LX[i]},3.6 ${LX[i]},4.6`, fill: 'none', stroke: '#3fb565', 'stroke-width': 0.35 }, svg);
+      el('rect', { x: PX[i] - 1.0, y: 0.5, width: 2.0, height: 1.9, rx: 0.2, fill: '#d9d9d6', stroke: '#8f8f8a', 'stroke-width': 0.06 }, svg);
+      el('rect', { x: LX[i] - 0.35, y: 3.9, width: 0.7, height: 1.2, fill: '#bfbfbf' }, svg);
+      t(n, PX[i], 2.95, { size: 0.8, fill: '#ffffff' });
+    });
+    el('rect', { x: 2.45, y: 5.0, width: 6.5, height: 3.4, rx: 0.15, fill: '#1b1b1b', stroke: '#444', 'stroke-width': 0.06 }, svg);
+    t('1117 5.0', 5.7, 6.7, { size: 0.85, fill: '#cfcfcf', weight: 400 });
+    el('rect', { x: 3.2, y: 8.4, width: 5.0, height: 2.4, rx: 0.2, fill: '#d9d9d6', stroke: '#8f8f8a', 'stroke-width': 0.06 }, svg);
+    // MLCC between the OUT (2) and GND (1) leads, just under the pads
+    el('rect', { x: 5.95, y: 2.75, width: 1.9, height: 1.0, rx: 0.12, fill: '#c9a87a', stroke: '#8a6e44', 'stroke-width': 0.06 }, svg);
+    for (const x of [5.95, 7.55]) el('rect', { x, y: 2.75, width: 0.3, height: 1.0, fill: '#d8d8d4' }, svg);
+    t('IN', PX[0], -1.0, { size: 0.9 });
+    t('OUT', PX[1], -1.0, { size: 0.9 });
+    t('GND', PX[2], -1.0, { size: 0.9 });
+    t('MLCC 10 µF', 12.0, 3.25, { anchor: 'start', size: 0.85, fill: '#ffe9a8', weight: 400 });
+    t('tab = OUT', 12.0, 9.6, { anchor: 'start', size: 0.85, fill: '#ffe9a8', weight: 400 });
+  })();
+
+  board(document.getElementById('top'), false);
+  board(document.getElementById('bottom'), true);
+
+  // ── Hover / tap tooltip ──
+  const tip = document.getElementById('tip');
+  const FACE = { b: 'bottom face', t: 'top face', m: 'on the module' };
+  function showTip(gw, x, y) {
+    const wr = gw._wire, net = NET[wr.n];
+    tip.innerHTML = '';
+    const b = document.createElement('b'); b.textContent = wr.col ? `${net.name} · ${wr.col} wire` : net.name;
+    const r = document.createElement('div'); r.className = 'route'; r.textContent = `${wr.a} → ${wr.b}`;
+    const f = document.createElement('div'); f.className = 'face'; f.textContent = FACE[wr.f];
+    tip.append(b, r, f);
+    tip.hidden = false;
+    const pad = 14, tw = tip.offsetWidth, th = tip.offsetHeight;
+    tip.style.left = Math.min(window.innerWidth - tw - 8, x + pad) + 'px';
+    tip.style.top = Math.max(8, Math.min(window.innerHeight - th - 8, y + pad)) + 'px';
+  }
+  function hilite(gw, on) {
+    for (const svg of views) {
+      svg.classList.toggle('focused', on || !!filter);
+      for (const other of svg.querySelectorAll('.wire')) {
+        const match = on ? other._wire === gw._wire : partMatch(other);
+        other.classList.toggle('on', match);
+      }
+    }
+  }
+  for (const svg of views) {
+    for (const gw of svg.querySelectorAll('.wire')) {
+      gw.addEventListener('pointerenter', e => { hilite(gw, true); showTip(gw, e.clientX, e.clientY); });
+      gw.addEventListener('pointermove', e => showTip(gw, e.clientX, e.clientY));
+      gw.addEventListener('pointerleave', () => { tip.hidden = true; hilite(gw, false); });
+      gw.addEventListener('focus', () => { const r = gw.getBoundingClientRect(); hilite(gw, true); showTip(gw, r.right, r.top); });
+      gw.addEventListener('blur', () => { tip.hidden = true; hilite(gw, false); });
+    }
+  }
+
+  // ── Filter by part ──
+  let filter = null;
+  const partMatch = gw => !filter || gw._wire.c.includes(filter);
+  const bar = document.getElementById('filters');
+  const buttons = [];
+  for (const name of ['All', ...PARTS]) {
+    const btn = document.createElement('button');
+    btn.type = 'button'; btn.className = 'chipbtn'; btn.textContent = name;
+    btn.setAttribute('aria-pressed', name === 'All' ? 'true' : 'false');
+    btn.addEventListener('click', () => {
+      filter = name === 'All' ? null : (filter === name ? null : name);
+      for (const b of buttons) b.setAttribute('aria-pressed', String(b.textContent === (filter || 'All')));
+      for (const svg of views) {
+        svg.classList.toggle('focused', !!filter);
+        for (const gw of svg.querySelectorAll('.wire')) gw.classList.toggle('on', partMatch(gw));
+      }
+      try { localStorage.setItem('s3board.filter', filter || ''); } catch (e) { /* storage unavailable */ }
+    });
+    buttons.push(btn);
+    bar.append(btn);
+  }
+  try {
+    const saved = localStorage.getItem('s3board.filter');
+    if (saved && PARTS.includes(saved)) buttons.find(b => b.textContent === saved).click();
+  } catch (e) { /* storage unavailable */ }
+
+  // ── Key ──
+  const key = document.getElementById('key');
+  for (const k in NET) {
+    const n = NET[k];
+    const li = document.createElement('li');
+    const sw = document.createElement('span');
+    sw.className = 'sw' + (n.dash ? ' dash' : '') + (n.jmp ? ' jmp' : '');
+    if (!n.dash) sw.style.background = n.c;
+    const txt = document.createElement('div');
+    const b = document.createElement('b'); b.textContent = n.name;
+    const s = document.createElement('small'); s.textContent = n.sub;
+    txt.append(b, s);
+    li.append(sw, txt);
+    key.append(li);
+  }
+})();
+</script>

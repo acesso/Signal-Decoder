@@ -20,7 +20,7 @@
 body {
   margin: 0;
   padding: 1.25rem;
-  max-width: 74rem;
+  max-width: 140rem;
   margin-inline: auto;
   font-family: system-ui, -apple-system, sans-serif;
   color: var(--fg);
@@ -51,6 +51,39 @@ h2 { font-size: 1rem; margin: 0 0 0.75rem; }
   .col-side { flex: 0 0 22rem; }
   .col-main { flex: 1; min-width: 0; }
 }
+/* Desktop: the main column becomes a fluid grid of cards; wide cards (the
+   audio tools, CAT monitor) span the whole row. */
+@media (min-width: 90rem) {
+  .col-main {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(34rem, 1fr));
+    gap: 0 1rem;
+    align-items: start;
+  }
+  .col-main > .card-wide, .col-main > #cat-card { grid-column: 1 / -1; }
+}
+
+/* Hover explanations */
+.info { color: var(--muted, #8b949e); font-size: 1em; cursor: pointer; }
+[title] { cursor: pointer; }
+
+/* Hardware settings: Inputs / Outputs, then one block per device */
+.hw-group {
+  margin: 1rem 0 0.4rem;
+  font-size: 0.75rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--muted, #8b949e);
+}
+.hw-device {
+  border: 1px solid var(--border, #30363d);
+  border-radius: 6px;
+  padding: 0.5rem 0.75rem 0.25rem;
+  margin-bottom: 0.5rem;
+}
+.hw-device-head { display: flex; align-items: baseline; gap: 0.6rem; margin-bottom: 0.3rem; }
+.hw-chip { font-family: ui-monospace, monospace; font-weight: 600; }
+.hw-sub { font-size: 0.8rem; color: var(--muted, #8b949e); }
 dl#status-list, dl#cpu-stats-list {
   display: grid;
   grid-template-columns: auto 1fr;
@@ -661,3 +694,44 @@ dl#pa-list {
 #radio-fw-file { width: 100%; font-size: 0.8rem; margin-bottom: 0.4rem; }
 .radio-fw-progress { height: 0.5rem; border-radius: 999px; background: var(--bg); border: 1px solid var(--border); overflow: hidden; margin-top: 0.5rem; }
 #radio-fw-bar { height: 100%; width: 0; background: var(--accent); transition: width 0.25s; }
+
+/* Board name: a badge next to the page title and a highlighted row in the
+   Status card, so it is obvious which bridge this page belongs to. */
+.board-badge {
+  display: inline-block;
+  margin-left: 0.4em;
+  padding: 0.1em 0.55em;
+  border-radius: 999px;
+  font-size: 0.55em;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  vertical-align: middle;
+  border: 1px solid currentColor;
+}
+:root { --board-a1s: #1a7f37; --board-s3: #0969da; }
+@media (prefers-color-scheme: dark) { :root { --board-a1s: #3fb950; --board-s3: #58a6ff; } }
+.board-badge[data-board="a1s"], .board-name[data-board="a1s"] { color: var(--board-a1s); }
+.board-badge[data-board="s3"], .board-name[data-board="s3"] { color: var(--board-s3); }
+.board-name { font-weight: 700; }
+.board-detail { display: block; font-weight: 400; font-size: 0.8em; color: var(--fg); opacity: 0.7; }
+[hidden] { display: none !important; }
+/* Until GET /info says what this bridge has, nothing feature-gated shows. */
+.features-pending [data-feature] { display: none !important; }
+
+/* System card: history graphs, storage bars, sortable task table */
+.sys-graph { margin: 0.75rem 0 0.25rem; }
+.sys-graph-head { display: flex; justify-content: space-between; font-size: 0.8rem; font-weight: 600; }
+.sys-graph-now { font-family: ui-monospace, monospace; font-weight: 400; color: var(--muted, #8b949e); }
+.sys-graph canvas { width: 100%; height: 64px; display: block; border: 1px solid var(--border); border-radius: 4px; }
+.sys-legend { font-size: 0.7rem; color: var(--muted, #8b949e); display: flex; align-items: center; gap: 0.3rem; margin-top: 0.15rem; }
+.sw { display: inline-block; width: 0.8rem; height: 0.18rem; border-radius: 2px; margin-left: 0.4rem; }
+.sw-a { background: #3fb950; } .sw-b { background: #58a6ff; }
+.sys-storage { margin: 0.6rem 0 0.75rem; display: grid; gap: 0.3rem; }
+.sys-bar-row { display: grid; grid-template-columns: 1fr; font-size: 0.75rem; }
+.sys-bar-name { color: var(--muted, #8b949e); }
+.sys-bar { height: 0.45rem; border-radius: 3px; background: color-mix(in srgb, var(--fg) 12%, transparent); overflow: hidden; }
+.sys-bar-fill { height: 100%; background: #58a6ff; }
+.sys-bar-fill.hot { background: #d29922; }
+.sys-bar-val { font-family: ui-monospace, monospace; font-size: 0.7rem; justify-self: end; }
+#cpu-task-table th[data-sort] { cursor: pointer; user-select: none; }
+#cpu-task-table th.sorted { text-decoration: underline; }

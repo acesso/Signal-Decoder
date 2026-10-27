@@ -103,10 +103,52 @@ async function refreshStatus(silent) {
   try {
     const info = await (await fetch('/info')).json();
     document.getElementById('s-fw').textContent = info.firmware_version;
+    applyBoardInfo(info);
   } catch (err) {
     if (!silent) showMsg(`Failed to load firmware info: ${err.message}`, 'error');
+    document.documentElement.classList.remove('features-pending');  // unknown bridge: show everything
   }
 }
+
+// ── Board ─────────────────────────────────────────────────────────────────
+// GET /info names the board ("a1s" / "s3") and lists what it can do. Every
+// control that needs a capability carries data-feature="<name>" in
+// index.html; anything the running bridge doesn't list is hidden, so the S3
+// board never shows ES8388-only controls (and shows no audio cards until its
+// converters are brought up). A bridge too old to report features shows
+// everything, as before.
+const BOARD_NAMES = {
+  a1s: { name: 'ESP32-A1S', detail: 'AI-Thinker audio kit, ES8388 codec' },
+  s3: { name: 'ESP32-S3-N16R8', detail: 'WM8782 · PCM1808 · PCM5102' },
+};
+const BOARD_SHORT = { a1s: 'A1S', s3: 'S3' };
+
+function applyBoardInfo(info) {
+  const board = typeof info.board === 'string' ? info.board : 'a1s';  // firmware before 0.11.0 is always the A1S
+  const boardEl = document.getElementById('s-board');
+  const known = BOARD_NAMES[board] || { name: board, detail: '' };
+  boardEl.textContent = known.name;
+  if (known.detail) {
+    const detail = document.createElement('span');
+    detail.className = 'board-detail';
+    detail.textContent = known.detail;
+    boardEl.append(detail);
+  }
+  boardEl.dataset.board = board;
+  const badge = document.getElementById('board-badge');
+  badge.textContent = BOARD_SHORT[board] || board;
+  badge.dataset.board = board;
+  badge.hidden = false;
+  document.title = `uSDX CAT bridge (${BOARD_SHORT[board] || board})`;
+  bridgeFeatures = Array.isArray(info.features) ? new Set(info.features) : null;
+  document.documentElement.classList.remove('features-pending');
+  if (!bridgeFeatures) return;
+  // data-feature="a|b" shows the element when the bridge lists either.
+  for (const el of document.querySelectorAll('[data-feature]')) {
+    el.hidden = !el.dataset.feature.split('|').some((f) => bridgeFeatures.has(f));
+  }
+}
+let bridgeFeatures = null;
 
 // ── PA safety watchdog ────────────────────────────────────────────────────
 // Purely a status readout + manual clear — the actual watchdog (sensing,
@@ -348,6 +390,145 @@ async function setTxSlot(slot) {
 txSlotBtns.forEach((btn) => {
   btn.addEventListener('click', () => void setTxSlot(btn.dataset.txSlot));
 });
+
+// ── Routing (GET/POST /routing, both boards since 0.11.0) ─────────────────
+// Which input feeds the I/Q and the audio streams. The web app sets the same
+// state, so this polls it and keeps the buttons in step. Bridges that list
+// "routing" in /info; the ADC buttons only appear on two-ADC boards.
+const iqSourceBtns = document.querySelectorAll('[data-iq-source]');
+const audioSourceBtns = document.querySelectorAll('[data-audio-source]');
+const ROUTING_REFRESH_MS = 3000;
+
+function markActive(btns, key, value) {
+  btns.forEach((btn) => btn.classList.toggle('active', btn.dataset[key] === value));
+}
+
+async function refreshRouting() {
+  try {
+    const res = await fetch('/routing');
+    if (!res.ok) return;
+    const r = await res.json();
+    markActive(iqSourceBtns, 'iqSource', r.iq && r.iq.input);
+    markActive(audioSourceBtns, 'audioSource', r.audio && r.audio.input);
+    // The RX channel buttons are left to the status refresh: it knows the
+    // A1S's I/Q mode lights both channels, which /routing can't express.
+    if (r.tx && typeof r.tx.channel === 'string') updateTxSlotButtons(r.tx.channel);
+  } catch { /* older firmware without /routing */ }
+}
+
+async function postRouting(patch, what) {
+  try {
+    const res = await fetch('/routing', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(patch) });
+    if (!res.ok) throw new Error(await res.text() || `HTTP ${res.status}`);
+    const r = await res.json();
+    showMsg(r.reboot_required ? `${what} saved; the bridge is restarting to apply it.` : `${what} applied and saved.`, 'ok');
+  } catch (err) {
+    showMsg(`Failed to change ${what}: ${err.message}`, 'error');
+  }
+  void refreshRouting();
+}
+
+iqSourceBtns.forEach((btn) => btn.addEventListener('click', () => void postRouting({ iq: { input: btn.dataset.iqSource } }, 'I/Q source')));
+audioSourceBtns.forEach((btn) => btn.addEventListener('click', () => void postRouting({ audio: { input: btn.dataset.audioSource } }, 'Audio source')));
+void refreshRouting();
+setInterval(refreshRouting, ROUTING_REFRESH_MS);
+
+// ── I/Q processing on the bridge (S3, GET/POST /iq-config) ────────────────
+const iqFftBtns = document.querySelectorAll('[data-iq-fft]');
+const iqRowsBtns = document.querySelectorAll('[data-iq-rows]');
+const iqLoadEl = document.getElementById('iq-proc-load');
+
+async function refreshIqProcessing() {
+  if (!iqFftBtns.length) return;
+  try {
+    const res = await fetch('/iq-config');
+    if (!res.ok) return;
+    const c = await res.json();
+    markActive(iqFftBtns, 'iqFft', String(c.fft_size));
+    markActive(iqRowsBtns, 'iqRows', String(c.rows_per_s));
+    if (iqLoadEl) iqLoadEl.textContent = `${(c.fs / 1000).toFixed(0)} kHz in, DSP ${c.dsp_load_pct}%`;
+  } catch { /* not this board */ }
+  // The WM8782's rate is set by its DIP switch; the bridge measures it.
+  if (wm8782RateEl) {
+    try {
+      const caps = await (await fetch('/capabilities')).json();
+      const wm = (caps.inputs || []).find((i) => i.id === 'wm8782');
+      if (wm && wm.rate_hz) wm8782RateEl.textContent = `${wm.rate_hz / 1000} kHz`;
+    } catch { /* older firmware */ }
+  }
+}
+const wm8782RateEl = document.getElementById('wm8782-rate');
+
+async function postIqConfig(patch, what) {
+  try {
+    const res = await fetch('/iq-config', { method: 'POST', body: JSON.stringify(patch) });
+    if (!res.ok) throw new Error(await res.text() || `HTTP ${res.status}`);
+    showMsg(`${what} applied.`, 'ok');
+  } catch (err) {
+    showMsg(`Failed to change ${what}: ${err.message}`, 'error');
+  }
+  void refreshIqProcessing();
+}
+
+iqFftBtns.forEach((btn) => btn.addEventListener('click', () => void postIqConfig({ fft_size: Number(btn.dataset.iqFft) }, 'FFT size')));
+iqRowsBtns.forEach((btn) => btn.addEventListener('click', () => void postIqConfig({ rows_per_s: Number(btn.dataset.iqRows) }, 'Rows per second')));
+void refreshIqProcessing();
+setInterval(refreshIqProcessing, ROUTING_REFRESH_MS);
+
+// ── PCM5102A output level and mute (S3, GET/POST /dac-level) ─────────────
+const dacSlider = document.getElementById('dac-level-slider');
+const dacReadout = document.getElementById('dac-level-readout');
+const dacMuteBtns = document.querySelectorAll('[data-dac-muted]');
+
+function showDac(d) {
+  if (typeof d.db === 'number') { dacSlider.value = d.db; dacReadout.textContent = `${d.db} dB`; }
+  markActive(dacMuteBtns, 'dacMuted', String(!!d.muted));
+}
+
+async function postDac(patch, what) {
+  try {
+    const res = await fetch('/dac-level', { method: 'POST', body: JSON.stringify(patch) });
+    if (!res.ok) throw new Error(await res.text() || `HTTP ${res.status}`);
+    showDac(await res.json());
+    showMsg(`${what} applied.`, 'ok');
+  } catch (err) {
+    showMsg(`Failed to change ${what}: ${err.message}`, 'error');
+  }
+}
+
+if (dacSlider) {
+  fetch('/dac-level').then((r) => (r.ok ? r.json() : null)).then((d) => d && showDac(d)).catch(() => {});
+  dacSlider.addEventListener('input', () => { dacReadout.textContent = `${dacSlider.value} dB`; });
+  dacSlider.addEventListener('change', () => void postDac({ db: Number(dacSlider.value) }, 'DAC level'));
+  dacMuteBtns.forEach((btn) => btn.addEventListener('click', () => void postDac({ muted: btn.dataset.dacMuted === 'true' }, 'DAC mute')));
+}
+
+// ── Explanations as hover tooltips ───────────────────────────────────────
+// Every explanatory paragraph (p.hint) becomes the tooltip of the control it
+// follows, marked with an ⓘ, so the page shows controls rather than prose.
+// A hint the scripts fill in live (it has an id) stays as text.
+(function hintsToTooltips() {
+  for (const p of document.querySelectorAll('p.hint')) {
+    if (p.id) continue;
+    const text = p.textContent.replace(/\s+/g, ' ').trim();
+    let target = p.previousElementSibling;
+    while (target && (target.matches('p.hint') || target.tagName === 'SCRIPT')) target = target.previousElementSibling;
+    // The control's own label when it has one; otherwise the card's title, so
+    // an ⓘ never lands on a blank spot after a table or a log box.
+    const card = p.closest('section') || p.parentElement;
+    let label = target && (target.matches('.audio-input-label, label, h2, h3')
+      ? target : target.querySelector('.audio-input-label, label, h2, h3'));
+    if (!label) label = card.querySelector('h2') || card;
+    label.title = label.title ? `${label.title}\n\n${text}` : text;
+    if (!label.querySelector(':scope > .info')) {
+      const i = document.createElement('span');
+      i.className = 'info';
+      i.textContent = ' ⓘ';
+      label.append(i);
+    }
+    p.remove();
+  }
+})();
 
 // ── Status LED kill-switch ────────────────────────────────────────────────
 // One-time reversible test: does the LEDs' own PWM switching (GPIO22/19,
@@ -663,6 +844,90 @@ function fmtBytes(n) {
 
 const cpuTaskBody = document.getElementById('cpu-task-body');
 
+// ── System graphs, storage bars, sortable task table ─────────────────────
+const SYS_HISTORY = 60;  // 3 minutes at one sample per refresh
+const sysHist = { core0: [], core1: [], internal: [], psram: [] };
+function pushSystemHistory(stats) {
+  const idle = (n) => (stats.tasks || []).find((t) => t.name === n);
+  const push = (arr, v) => { arr.push(v); if (arr.length > SYS_HISTORY) arr.shift(); };
+  const i0 = idle('IDLE0'), i1 = idle('IDLE1');
+  push(sysHist.core0, i0 ? Math.max(0, 100 - i0.cpu_pct) : null);
+  push(sysHist.core1, i1 ? Math.max(0, 100 - i1.cpu_pct) : null);
+  push(sysHist.internal, stats.internal_total ? (100 * stats.internal_free) / stats.internal_total : null);
+  push(sysHist.psram, stats.psram_total ? (100 * stats.psram_free) / stats.psram_total : null);
+  const last = (a) => a[a.length - 1];
+  const pct = (v) => (v === null || v === undefined ? '—' : `${v.toFixed(0)}%`);
+  document.getElementById('sys-cpu-now').textContent = `${pct(last(sysHist.core0))} · ${pct(last(sysHist.core1))}`;
+  document.getElementById('sys-mem-now').textContent = `${pct(last(sysHist.internal))} · ${pct(last(sysHist.psram))}`;
+}
+function drawGraph(canvas, a, b) {
+  const ctx = canvas.getContext('2d');
+  const cs = getComputedStyle(document.documentElement);
+  const w = canvas.width, h = canvas.height;
+  ctx.clearRect(0, 0, w, h);
+  ctx.strokeStyle = cs.getPropertyValue('--border') || '#888';
+  ctx.lineWidth = 1;
+  for (const f of [0.25, 0.5, 0.75]) { ctx.beginPath(); ctx.moveTo(0, h * f); ctx.lineTo(w, h * f); ctx.stroke(); }
+  const line = (arr, color) => {
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 1.6;
+    ctx.beginPath();
+    let started = false;
+    arr.forEach((v, i) => {
+      if (v === null) return;
+      const x = (w * (SYS_HISTORY - arr.length + i)) / (SYS_HISTORY - 1);
+      const y = h - (h * Math.min(100, v)) / 100;
+      if (started) ctx.lineTo(x, y); else { ctx.moveTo(x, y); started = true; }
+    });
+    ctx.stroke();
+  };
+  line(a, '#3fb950');
+  line(b, '#58a6ff');
+}
+function drawSystemGraphs() {
+  drawGraph(document.getElementById('sys-cpu-graph'), sysHist.core0, sysHist.core1);
+  drawGraph(document.getElementById('sys-mem-graph'), sysHist.internal, sysHist.psram);
+}
+function renderStorage(list) {
+  const el = document.getElementById('sys-storage');
+  if (!Array.isArray(list)) { el.hidden = true; return; }
+  el.hidden = false;
+  el.innerHTML = '';
+  for (const s of list) {
+    const pct = s.total ? Math.min(100, (100 * s.used) / s.total) : 0;
+    const entries = /entries/.test(s.name);
+    const row = document.createElement('div');
+    row.className = 'sys-bar-row';
+    row.innerHTML = `<span class="sys-bar-name"></span><div class="sys-bar"><div class="sys-bar-fill${pct > 85 ? ' hot' : ''}"></div></div><span class="sys-bar-val"></span>`;
+    row.querySelector('.sys-bar-name').textContent = s.name;
+    row.querySelector('.sys-bar-fill').style.width = `${pct}%`;
+    row.querySelector('.sys-bar-val').textContent = entries ? `${s.used} / ${s.total}` : `${fmtBytes(s.used)} / ${fmtBytes(s.total)}`;
+    el.append(row);
+  }
+}
+// Task table: sorted by name until a column header is clicked (then by that
+// column; click again to reverse), so rows don't jump around every refresh.
+let taskSort = { key: 'name', dir: 1 };
+try { const saved = JSON.parse(localStorage.getItem('taskSort') || 'null'); if (saved && saved.key) taskSort = saved; } catch { /* default */ }
+function sortedTasks(tasks) {
+  const k = taskSort.key;
+  return [...tasks].sort((x, y) => {
+    const a = x[k], b = y[k];
+    const c = typeof a === 'string' ? a.localeCompare(b) : (a ?? -1) - (b ?? -1);
+    return c * taskSort.dir || x.name.localeCompare(y.name);
+  });
+}
+document.querySelectorAll('#cpu-task-table th[data-sort]').forEach((th) => {
+  th.addEventListener('click', () => {
+    const k = th.dataset.sort;
+    taskSort = { key: k, dir: taskSort.key === k ? -taskSort.dir : (k === 'name' ? 1 : -1) };
+    try { localStorage.setItem('taskSort', JSON.stringify(taskSort)); } catch { /* fine */ }
+    document.querySelectorAll('#cpu-task-table th[data-sort]').forEach((h) => h.classList.toggle('sorted', h === th));
+    void refreshSystemStats();
+  });
+  if (th.dataset.sort === taskSort.key) th.classList.add('sorted');
+});
+
 async function refreshSystemStats() {
   try {
     const res = await fetch('/system-stats');
@@ -677,8 +942,12 @@ async function refreshSystemStats() {
     document.getElementById('cpu-dma-free').textContent = fmtBytes(stats.dma_free);
     document.getElementById('cpu-dma-largest').textContent = fmtBytes(stats.dma_largest_free_block);
 
+    pushSystemHistory(stats);
+    drawSystemGraphs();
+    renderStorage(stats.storage);
+
     cpuTaskBody.innerHTML = '';
-    for (const task of stats.tasks || []) {
+    for (const task of sortedTasks(stats.tasks || [])) {
       const tr = document.createElement('tr');
       const core = task.core === 0 || task.core === 1 ? String(task.core) : '—';
       tr.innerHTML = `<td>${task.name}</td><td>${task.cpu_pct.toFixed(1)}%</td><td>${core}</td><td>${fmtBytes(task.stack_free)}</td>`;
@@ -1421,6 +1690,18 @@ document.getElementById('reset-btn').addEventListener('click', async () => {
 // Falls back to 8000 if the fetch fails for any reason — better than
 // silently assuming a rate that's actively wrong.
 let bridgeSampleRate = 8000;
+// The I/Q input's rate where it differs from the audio's (the S3's WM8782
+// runs at 96 kHz while /audio is 48 kHz); null = same as the audio.
+let iqSampleRate = null;
+const iqRate = () => iqSampleRate ?? bridgeSampleRate;
+
+// A context at the stream's own rate: chunks scheduled back to back then join
+// sample-exactly. At the device rate (often 44.1 kHz) each 8 ms chunk was
+// resampled on its own, leaving a step at every boundary — a steady
+// broadband comb under a clean test tone.
+function audioContextAt(rate) {
+  try { return new AudioContext({ sampleRate: rate }); } catch { return new AudioContext(); }
+}
 
 async function fetchBridgeSampleRate() {
   try {
@@ -1556,7 +1837,8 @@ function stopPlayback() {
 }
 
 async function connectAudio() {
-  playCtx = new AudioContext();
+  await fetchBridgeSampleRate();
+  playCtx = audioContextAt(bridgeSampleRate);
   nextPlayTime = 0;
   playAnalyserNode = playCtx.createAnalyser();
   playAnalyserNode.fftSize = SCOPE_FFT_SIZE;
@@ -1634,7 +1916,7 @@ function stopSniff() {
 
 async function startSniff() {
   await fetchBridgeSampleRate(); // same reasoning as ensureAudioSocket() — read fresh in case /sample-rate changed since last use
-  sniffPlayCtx = new AudioContext();
+  sniffPlayCtx = audioContextAt(bridgeSampleRate);
   sniffNextPlayTime = 0;
   sniffAnalyserNode = sniffPlayCtx.createAnalyser();
   sniffAnalyserNode.fftSize = SCOPE_FFT_SIZE;
@@ -2296,6 +2578,8 @@ iqCorrectionBtns.forEach((btn) => {
   btn.addEventListener('click', () => {
     iqCorrection = btn.dataset.iqCorrection;
     iqCorrectionBtns.forEach((b) => b.classList.toggle('active', b === btn));
+    // A bridge with its own DSP applies the correction before its spectrum.
+    if (bridgeDoesSpectrum()) void fetch('/iq-config', { method: 'POST', body: JSON.stringify({ iq_correction: iqCorrection }) });
   });
 });
 
@@ -2321,7 +2605,7 @@ let iqMagBytes = new Uint8Array(IQ_FFT_SIZE);
 let iqLastPeakDb = -Infinity;
 
 function updateIqZoomLabel() {
-  const nyquist = bridgeSampleRate / 2;
+  const nyquist = iqRate() / 2;
   const zoomFrac = Number(iqFreqZoomInput.value) / 100;
   // 100 = full ±Nyquist span; smaller values zoom into the center (0Hz) —
   // exponential mapping so the low end of the slider still gives a usable
@@ -2334,8 +2618,8 @@ function updateIqZoomLabel() {
   iqFreqMid2El.textContent = fmt(halfSpanHz / 2);
   iqFreqMaxEl.textContent = `${fmt(halfSpanHz)} Hz`;
   iqFftSizeEl.textContent = String(IQ_FFT_SIZE);
-  iqBinWidthEl.textContent = `${(bridgeSampleRate / IQ_FFT_SIZE).toFixed(1)} Hz`;
-  iqSampleRateEl.textContent = `${bridgeSampleRate} Hz`;
+  iqBinWidthEl.textContent = `${(iqRate() / IQ_FFT_SIZE).toFixed(1)} Hz`;
+  iqSampleRateEl.textContent = `${iqRate()} Hz`;
 }
 iqFreqZoomInput.addEventListener('input', updateIqZoomLabel);
 updateIqZoomLabel();
@@ -2407,6 +2691,33 @@ function feedIqSamples(int16) {
   }
 }
 
+// S3: the bridge computes the spectrum itself (/iq-spectrum, "IQS1" rows:
+// seq, fs, bins, dB floor, dB span, then one byte per bin, lowest frequency
+// first). Rows are mapped onto this page's dB scale and bin count, so the
+// same bars and waterfall draw them.
+const bridgeDoesSpectrum = () => !!bridgeFeatures && bridgeFeatures.has('iq_spectrum');
+function feedSpectrumRow(buf) {
+  if (buf.byteLength < 20) return;
+  const dv = new DataView(buf);
+  if (dv.getUint32(0, false) !== 0x49515331) return;  // "IQS1"
+  const fs = dv.getUint32(8, true), bins = dv.getUint16(12, true);
+  const floor = dv.getInt16(14, true), span = dv.getUint16(16, true);
+  if (!bins || buf.byteLength < 20 + bins) return;
+  const row = new Uint8Array(buf, 20, bins);
+  if (fs && fs !== iqRate()) { iqSampleRate = fs; updateIqZoomLabel(); }
+  let peakDb = -Infinity;
+  for (let i = 0; i < IQ_FFT_SIZE; i++) {
+    const db = floor + (row[Math.floor((i * bins) / IQ_FFT_SIZE)] * span) / 255;
+    if (db > peakDb) peakDb = db;
+    const frac = (db - IQ_MIN_DB) / (IQ_MAX_DB - IQ_MIN_DB);
+    iqMagBytes[i] = Math.max(0, Math.min(255, Math.round(frac * 255)));
+  }
+  iqLastPeakDb = peakDb;
+  iqPeakEl.textContent = `${peakDb.toFixed(1)} dB`;
+  iqFftSizeEl.textContent = String(bins);
+  iqBinWidthEl.textContent = `${(fs / bins).toFixed(1)} Hz`;
+}
+
 function stopIqSpectrum() {
   if (iqWs) { iqWs.close(); iqWs = null; }
   iqActive = false;
@@ -2417,11 +2728,23 @@ function stopIqSpectrum() {
 }
 
 async function startIqSpectrum() {
-  await fetchBridgeSampleRate(); // fresh — the configured rate may have changed since this page loaded
+  const onBridge = bridgeDoesSpectrum();
+  if (onBridge) {
+    try {
+      const c = await (await fetch('/iq-config')).json();
+      iqSampleRate = c.fs || iqSampleRate;
+      if (c.iq_correction) {
+        iqCorrection = c.iq_correction;
+        iqCorrectionBtns.forEach((b) => b.classList.toggle('active', b.dataset.iqCorrection === iqCorrection));
+      }
+    } catch { /* keep */ }
+  } else {
+    await fetchBridgeSampleRate(); // fresh — the configured rate may have changed since this page loaded
+  }
   updateIqZoomLabel();
   iqAccumCount = 0;
 
-  const url = new URL('/iq-data', location.href);
+  const url = new URL(onBridge ? '/iq-spectrum' : '/iq-data', location.href);
   url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
   const ws = new WebSocket(url.toString());
   ws.binaryType = 'arraybuffer';
@@ -2434,7 +2757,8 @@ async function startIqSpectrum() {
   };
   ws.onmessage = (ev) => {
     if (!(ev.data instanceof ArrayBuffer)) return;
-    feedIqSamples(new Int16Array(ev.data));
+    if (onBridge) feedSpectrumRow(ev.data);
+    else feedIqSamples(new Int16Array(ev.data));
   };
   ws.onerror = () => {
     showMsg('I/Q spectrum connection failed.', 'error');
@@ -2452,13 +2776,13 @@ iqSpectrumBtn.addEventListener('click', () => {
 
 function iqSpectrumTick() {
   if (!iqActive) return;
-  const nyquist = bridgeSampleRate / 2;
+  const nyquist = iqRate() / 2;
   const zoomFrac = Number(iqFreqZoomInput.value) / 100;
   const halfSpanHz = Math.max(nyquist * 0.01, nyquist * Math.pow(zoomFrac, 2));
   // Crop the shifted (0Hz-centered) magnitude array to ±halfSpanHz around
   // the center bin — same idea as the other channels' Max-freq slider,
   // just symmetric around the center instead of cropping from an edge.
-  const binHz = bridgeSampleRate / IQ_FFT_SIZE;
+  const binHz = iqRate() / IQ_FFT_SIZE;
   const halfBins = Math.max(1, Math.round(halfSpanHz / binHz));
   const center = IQ_FFT_SIZE / 2;
   const lo = Math.max(0, center - halfBins);

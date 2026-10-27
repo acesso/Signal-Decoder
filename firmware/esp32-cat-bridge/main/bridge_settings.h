@@ -115,6 +115,11 @@ bool bridge_settings_set_mic_gain_db(float db_value);
 int8_t bridge_settings_get_speaker_vol(void);
 bool bridge_settings_set_speaker_vol(int8_t vol_value);
 
+// S3: PCM5102A output level, a digital gain in dB (-60..0) on everything sent
+// to the DAC. Default 0 (unity).
+int8_t bridge_settings_get_dac_level_db(void);
+bool bridge_settings_set_dac_level_db(int8_t db);
+
 // WiFi max TX power in quarter-dBm units (see wifi_net_set_tx_power_quarter_dbm()
 // for the full range/units explanation). Defaults to 78 (~19.5 dBm, the
 // driver's own real maximum on this board — 84 was never an actual
@@ -167,3 +172,9 @@ bool bridge_settings_set_input_mode_name(const char *name);
 // pattern as sample_rate_hz above.
 bool bridge_settings_get_cat_log_enabled(void);
 bool bridge_settings_set_cat_log_enabled(bool enabled);
+
+// Generic short strings (routing choices: "iq_src", "audio_src"). get returns
+// false, leaving out empty, when the key was never saved. Keys are NVS keys
+// (15 characters at most).
+bool bridge_settings_get_str(const char *key, char *out, size_t out_sz);
+bool bridge_settings_set_str(const char *key, const char *value);

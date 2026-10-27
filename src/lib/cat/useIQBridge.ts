@@ -18,6 +18,7 @@
 // Gated on the bridge's GET /info reporting the "input_mode_select"
 // feature — see hasFeature('input_mode_select') in RadioCATPanel.tsx's
 // BridgeStatusPanel.
+import { fetchBridgeDescription, postRouting, type BridgeCapabilities, type BridgeRouting, type RoutingPatch } from './bridgeCapabilities'
 import { createSignal, onCleanup } from 'solid-js'
 import type { CATMode } from './useRadioCAT'
 
@@ -324,22 +325,66 @@ export type InputMode = 'audio' | 'iq'
 // useAudioBridge.ts's fetchBridgeSampleRate(): this hook needs
 // input_mode/sample_rate_hz, which aren't (and per that file's own
 // precedent, shouldn't be) part of the generic CAT-bridge status type.
-async function fetchBridgeIQInfo(catWsUrl: string): Promise<{ inputMode: InputMode; sampleRateHz: number }> {
-  const fallback = { inputMode: 'audio' as InputMode, sampleRateHz: FALLBACK_SAMPLE_RATE }
+// ws://host/cat -> http(s)://host — base for the bridge's HTTP endpoints.
+function bridgeHttpBase(catWsUrl: string): string | null {
   try {
     const u = new URL(catWsUrl)
-    if (u.protocol !== 'ws:' && u.protocol !== 'wss:') return fallback
-    u.protocol = u.protocol === 'wss:' ? 'https:' : 'http:'
-    u.pathname = '/status'
-    const res = await fetch(u.toString())
+    if (u.protocol !== 'ws:' && u.protocol !== 'wss:') return null
+    return `${u.protocol === 'wss:' ? 'https:' : 'http:'}//${u.host}`
+  } catch {
+    return null
+  }
+}
+
+// ws://host/cat -> ws://host/<path>
+function bridgeWsUrl(catWsUrl: string, path: string): string | null {
+  try {
+    const u = new URL(catWsUrl)
+    if (u.protocol !== 'ws:' && u.protocol !== 'wss:') return null
+    u.pathname = path
+    u.search = ''
+    return u.toString()
+  } catch {
+    return null
+  }
+}
+
+interface BridgeIQInfo {
+  inputMode: InputMode
+  sampleRateHz: number
+  /** The bridge computes the spectrum and the passband itself (GET /info
+   *  lists iq_spectrum + iq_passband — the S3 board), see IQBridgeState.bridgeDsp. */
+  bridgeDsp: boolean
+}
+
+
+async function fetchBridgeIQInfo(catWsUrl: string): Promise<BridgeIQInfo> {
+  const fallback: BridgeIQInfo = { inputMode: 'audio', sampleRateHz: FALLBACK_SAMPLE_RATE, bridgeDsp: false }
+  const base = bridgeHttpBase(catWsUrl)
+  if (!base) return fallback
+  try {
+    const info = await fetch(`${base}/info`).then((r) => (r.ok ? r.json() : null)).catch(() => null) as { features?: unknown } | null
+    const features = Array.isArray(info?.features) ? (info!.features as unknown[]).map(String) : []
+    if (features.includes('iq_spectrum') && features.includes('iq_passband')) {
+      const cfg = await fetch(`${base}/iq-config`).then((r) => (r.ok ? r.json() : null)).catch(() => null) as { fs?: unknown } | null
+      const fs = typeof cfg?.fs === 'number' ? cfg.fs : FALLBACK_SAMPLE_RATE
+      return { inputMode: 'iq', sampleRateHz: fs, bridgeDsp: true }
+    }
+    const res = await fetch(`${base}/status`)
     if (!res.ok) return fallback
     const data = (await res.json()) as { input_mode?: unknown; sample_rate_hz?: unknown }
     const inputMode = data.input_mode === 'iq' ? 'iq' : 'audio'
     const sampleRateHz = typeof data.sample_rate_hz === 'number' ? data.sample_rate_hz : FALLBACK_SAMPLE_RATE
-    return { inputMode, sampleRateHz }
+    return { inputMode, sampleRateHz, bridgeDsp: false }
   } catch {
     return fallback
   }
+}
+
+// Passband stream rate for a demodulator bandwidth: the bridge's decimation
+// filter is flat to 0.4 x the output rate on each side of 0 Hz.
+function bridgePassbandRateFor(bandwidthHz: number): number {
+  return bandwidthHz <= 9600 ? 12000 : 24000
 }
 
 export interface IQBridgeState {
@@ -366,6 +411,18 @@ export interface IQBridgeState {
   usbDeviceName: string
   inputMode: InputMode
   sampleRateHz: number
+  /** True while connected to a bridge that computes the spectrum and the
+   *  passband itself (the S3 board): the app reads /iq-passband (the
+   *  passband already shifted to 0 Hz and decimated) and /iq-spectrum
+   *  instead of raw /iq-data, and sends the passband center, I/Q correction
+   *  and DC removal to the bridge. sampleRateHz stays the wideband rate the
+   *  spectrum spans. Imbalance correction is not available in this mode. */
+  bridgeDsp: boolean
+  /** What the connected bridge can do and how it's routed (GET
+   *  /capabilities, /routing; derived from /info + /status on older
+   *  firmware). null until a bridge has been read. */
+  capabilities: BridgeCapabilities | null
+  routing: BridgeRouting | null
   // Count of interleaved I/Q sample PAIRS received in the most recent
   // frame — 0 while inactive. Not a running total: this is a liveness
   // signal (see feedIQSamples()'s comment on why there's no
@@ -607,6 +664,31 @@ export class IQSpectrumComputer {
       if (db > peakDb) peakDb = db
       const frac = (db - IQ_MIN_DB) / (IQ_MAX_DB - IQ_MIN_DB)
       this.magBytes[dstIdx] = Math.max(0, Math.min(255, Math.round(frac * 255)))
+    }
+    this.peakDb = peakDb
+    this.hasFreshWindow = true
+  }
+
+  // A row computed by the bridge (/iq-spectrum, iq_dsp.h): 20-byte header
+  // ("IQS1", seq, fs, bins, db_floor, db_span) then `bins` bytes, lowest
+  // frequency first. Rescaled onto this class's own dB mapping
+  // (IQ_MIN_DB..IQ_MAX_DB) so consumers can't tell the two sources apart.
+  setBridgeRow(buf: ArrayBuffer): void {
+    if (buf.byteLength < 20) return
+    const dv = new DataView(buf)
+    if (dv.getUint32(0, false) !== 0x49515331) return // "IQS1"
+    const bins = dv.getUint16(12, true)
+    const floor = dv.getInt16(14, true)
+    const span = dv.getUint16(16, true)
+    if (bins === 0 || buf.byteLength < 20 + bins) return
+    const row = new Uint8Array(buf, 20, bins)
+    const n = IQ_FFT_SIZE
+    let peakDb = -Infinity
+    for (let i = 0; i < n; i++) {
+      const db = floor + (row[Math.floor((i * bins) / n)] * span) / 255
+      if (db > peakDb) peakDb = db
+      const frac = (db - IQ_MIN_DB) / (IQ_MAX_DB - IQ_MIN_DB)
+      this.magBytes[i] = Math.max(0, Math.min(255, Math.round(frac * 255)))
     }
     this.peakDb = peakDb
     this.hasFreshWindow = true
@@ -1843,6 +1925,9 @@ export function useIQBridge() {
     usbDeviceName: '',
     inputMode: 'audio',
     sampleRateHz: FALLBACK_SAMPLE_RATE,
+    bridgeDsp: false,
+    capabilities: null,
+    routing: null,
     lastFramePairs: 0,
     passbandCenterHz: loadPassbandCenterHz() ?? 0,
     passbandBandwidthHz: loadPassbandBandwidthHz() ?? 2700,
@@ -1883,6 +1968,7 @@ export function useIQBridge() {
     iqCorrection = mode
     saveIQCorrection(mode)
     setState((s) => ({ ...s, iqCorrection: mode }))
+    pushBridgeConfig()
   }
 
   // Independent of iqCorrection and of each other — an operator might
@@ -1894,6 +1980,7 @@ export function useIQBridge() {
     dcRemovalEnabled = enabled
     saveDCRemoval(enabled)
     setState((s) => ({ ...s, dcRemovalEnabled: enabled }))
+    pushBridgeConfig()
   }
   let imbalanceCorrectionEnabled = loadImbalanceCorrection()
   function setImbalanceCorrection(enabled: boolean) {
@@ -1962,10 +2049,118 @@ export function useIQBridge() {
   // overwritten by setPassband's own default-300 rebuild.
   demod.setHighpassHz(loadHighpassHz())
   function setPassband(centerHz: number, bandwidthHz: number) {
-    demod.setPassband(centerHz, bandwidthHz, state().sampleRateHz)
     savePassbandCenterHz(centerHz)
     savePassbandBandwidthHz(bandwidthHz)
     setState((s) => ({ ...s, passbandCenterHz: centerHz, passbandBandwidthHz: bandwidthHz }))
+    if (bridgeDsp) applyBridgeDemod()
+    else demod.setPassband(centerHz, bandwidthHz, state().sampleRateHz)
+  }
+
+  // ── Bridge-side processing (IQBridgeState.bridgeDsp) ──────────────────────
+  // The bridge shifts the passband center to 0 Hz and decimates, so the
+  // demodulator runs centered at 0 Hz on the passband stream's rate; the
+  // center, rate, I/Q correction and DC removal go to the bridge instead.
+  let bridgeDsp = false
+  let bridgeBase: string | null = null
+  let bridgePbRate = 12000
+  let specWs: WebSocket | null = null
+  let bridgeCfgTimer: ReturnType<typeof setTimeout> | null = null
+  function applyBridgeDemod() {
+    bridgePbRate = bridgePassbandRateFor(state().passbandBandwidthHz)
+    demod.setPassband(0, state().passbandBandwidthHz, bridgePbRate)
+    pushBridgeConfig()
+  }
+  // Debounced: a dragged passband marker would otherwise POST on every step.
+  function pushBridgeConfig() {
+    if (!bridgeDsp || !bridgeBase) return
+    if (bridgeCfgTimer !== null) clearTimeout(bridgeCfgTimer)
+    const base = bridgeBase
+    bridgeCfgTimer = setTimeout(() => {
+      bridgeCfgTimer = null
+      const body = JSON.stringify({
+        center_hz: Math.round(state().passbandCenterHz),
+        pb_rate: bridgePbRate,
+        iq_correction: iqCorrection,
+        dc_removal: dcRemovalEnabled,
+      })
+      fetch(`${base}/iq-config`, { method: 'POST', body }).catch((err) => log('warn', 'POST /iq-config failed:', err))
+    }, 120)
+  }
+  // Bridge description and routing: read on every (re)connect, so switching
+  // to a different bridge picks up its own capabilities.
+  let describedBase: string | null = null  // the bridge the description was read from
+  async function refreshBridgeDescription(catWsUrl: string) {
+    const base = bridgeHttpBase(catWsUrl)
+    if (!base) return
+    if (describedBase !== base) setState((s) => ({ ...s, capabilities: null, routing: null }))  // a different bridge: forget the old one now
+    describedBase = base
+    const generation = connectGeneration
+    const d = await fetchBridgeDescription(base)
+    if (generation !== connectGeneration) return
+    setState((s) => ({ ...s, capabilities: d?.capabilities ?? null, routing: d?.routing ?? null }))
+  }
+  /** Changes the bridge's routing (saved on the bridge). Picking a different
+   *  I/Q input can change the wideband rate, which the state follows. */
+  async function updateRouting(patch: RoutingPatch): Promise<BridgeRouting | null> {
+    const base = describedBase
+    if (!base) return null
+    try {
+      const routing = await postRouting(base, patch)
+      setState((s) => ({
+        ...s,
+        routing,
+        sampleRateHz: bridgeDsp && routing.iq.rateHz > 0 ? routing.iq.rateHz : s.sampleRateHz,
+        error: null,
+      }))
+      if (patch.iq?.input) pushBridgeConfig()  // the passband center is checked against the new rate
+      return routing
+    } catch (err) {
+      log('warn', 'routing change refused:', err)
+      setState((s) => ({ ...s, error: err instanceof Error ? err.message : String(err) }))
+      return null
+    }
+  }
+
+  // One passband frame: 16-byte header ("IQP1", seq, fs, center_hz), then
+  // int16 I,Q pairs — see firmware/esp32-cat-bridge/main/iq_dsp.h.
+  function feedBridgePassband(buf: ArrayBuffer) {
+    if (buf.byteLength < 16) return
+    const dv = new DataView(buf)
+    if (dv.getUint32(0, false) !== 0x49515031) return // "IQP1"
+    const fs = dv.getUint32(8, true)
+    const int16 = new Int16Array(buf, 16, (buf.byteLength - 16) >> 1)
+    const iq = new Float64Array(int16.length)
+    for (let n = 0; n < int16.length; n++) iq[n] = int16[n] / 32768
+    if (fs > 0 && fs !== bridgePbRate) {
+      bridgePbRate = fs
+      demod.setPassband(0, state().passbandBandwidthHz, fs)
+    }
+    playDemodulatedFrame(iq, bridgePbRate)
+    setState((s) => ({ ...s, lastFramePairs: iq.length >> 1 }))
+  }
+  function openSpectrumSocket(catWsUrl: string, generation: number) {
+    const url = bridgeWsUrl(catWsUrl, '/iq-spectrum')
+    if (!url) return
+    const sock = new WebSocket(url)
+    sock.binaryType = 'arraybuffer'
+    specWs = sock
+    sock.onmessage = (ev: MessageEvent<ArrayBuffer>) => {
+      if (generation !== connectGeneration) return
+      if (!(ev.data instanceof ArrayBuffer)) return
+      // Each row carries the input rate; it changes when the bridge switches ADC.
+      if (ev.data.byteLength >= 12) {
+        const fs = new DataView(ev.data).getUint32(8, true)
+        if (fs > 0 && fs !== state().sampleRateHz) setState((s) => ({ ...s, sampleRateHz: fs }))
+      }
+      spectrum.setBridgeRow(ev.data)
+    }
+    sock.onclose = () => {
+      if (specWs === sock) specWs = null
+      if (!wantConnected || !bridgeDsp || generation !== connectGeneration) return
+      setTimeout(() => {
+        if (wantConnected && bridgeDsp && !specWs && generation === connectGeneration) openSpectrumSocket(catWsUrl, generation)
+      }, RECONNECT_BASE_DELAY_MS)
+    }
   }
 
   // Demodulated-audio playback graph — mirrors useAudioBridge.ts's
@@ -2176,11 +2371,18 @@ export function useIQBridge() {
     clearSilenceTimer()
     ws?.close()
     ws = null
+    specWs?.close()
+    specWs = null
+    if (bridgeCfgTimer !== null) { clearTimeout(bridgeCfgTimer); bridgeCfgTimer = null }
+    if (bridgeDsp) {
+      bridgeDsp = false
+      demod.setPassband(state().passbandCenterHz, state().passbandBandwidthHz, state().sampleRateHz)
+    }
     stopSoundcard()
     void stopUSB()
     teardownPlayback()
     meterPeakRms = 0
-    setState((s) => ({ ...s, connected: false, reconnecting: false, lastFramePairs: 0, iqSignalDbfs: null, source: 'bridge' }))
+    setState((s) => ({ ...s, connected: false, reconnecting: false, lastFramePairs: 0, iqSignalDbfs: null, source: 'bridge', bridgeDsp: false }))
   }
 
   // True once this connect() session's socket has opened successfully at
@@ -2192,23 +2394,40 @@ export function useIQBridge() {
   // socket just closed) without this flag.
   let hasConnectedOnce = false
 
+  // Asks the bridge what it can do first: a bridge that computes the spectrum
+  // and passband itself (bridgeDsp) gets /iq-passband + /iq-spectrum, any
+  // other bridge raw /iq-data, exactly as before.
   function openSocket(iqUrl: string, catWsUrl: string, generation: number, resolveFirstAttempt?: (ok: boolean) => void) {
-    void fetchBridgeIQInfo(catWsUrl).then(({ inputMode, sampleRateHz }) => {
-      if (generation === connectGeneration) {
-        setState((s) => ({
-          ...s,
-          inputMode: s.forceIQMode ? 'iq' : inputMode,
-          sampleRateHz: s.forceSampleRateHz ?? sampleRateHz,
-        }))
+    void fetchBridgeIQInfo(catWsUrl).then((info) => {
+      if (generation !== connectGeneration) return
+      bridgeDsp = info.bridgeDsp
+      setState((s) => ({
+        ...s,
+        inputMode: s.forceIQMode ? 'iq' : info.inputMode,
+        sampleRateHz: info.bridgeDsp ? info.sampleRateHz : (s.forceSampleRateHz ?? info.sampleRateHz),
+        bridgeDsp: info.bridgeDsp,
+      }))
+      if (bridgeDsp) {
+        bridgeBase = bridgeHttpBase(catWsUrl)
+        log('info', 'bridge computes the spectrum and passband — using /iq-passband + /iq-spectrum')
+        applyBridgeDemod()
+        void refreshBridgeDescription(catWsUrl)
+        if (!specWs) openSpectrumSocket(catWsUrl, generation)
+      } else {
+        demod.setPassband(state().passbandCenterHz, state().passbandBandwidthHz, state().sampleRateHz)
       }
+      const streamUrl = bridgeDsp ? (bridgeWsUrl(catWsUrl, '/iq-passband') ?? iqUrl) : iqUrl
+      openStreamSocket(streamUrl, iqUrl, catWsUrl, generation, resolveFirstAttempt)
     })
+  }
 
-    const socket = new WebSocket(iqUrl)
+  function openStreamSocket(streamUrl: string, iqUrl: string, catWsUrl: string, generation: number, resolveFirstAttempt?: (ok: boolean) => void) {
+    const socket = new WebSocket(streamUrl)
     socket.binaryType = 'arraybuffer'
 
     socket.onopen = () => {
       if (generation !== connectGeneration) return
-      log('info', `connected — ${iqUrl}`)
+      log('info', `connected — ${streamUrl}`)
       reconnectAttempt = 0
       hasConnectedOnce = true
       ws = socket
@@ -2228,15 +2447,15 @@ export function useIQBridge() {
     }
     socket.onerror = () => {
       if (generation !== connectGeneration) return
-      log('warn', `connection error — ${iqUrl}`)
-      setState((s) => ({ ...s, error: `Failed to connect to ${iqUrl}` }))
+      log('warn', `connection error — ${streamUrl}`)
+      setState((s) => ({ ...s, error: `Failed to connect to ${streamUrl}` }))
       resolveFirstAttempt?.(false)
     }
     socket.onclose = () => {
       if (generation !== connectGeneration) return
       clearSilenceTimer()
       const delay = Math.min(RECONNECT_BASE_DELAY_MS * 2 ** reconnectAttempt, RECONNECT_MAX_DELAY_MS)
-      log('info', `closed — ${iqUrl}${wantConnected ? `, retrying in ${delay}ms (attempt ${reconnectAttempt + 1})` : ''}`)
+      log('info', `closed — ${streamUrl}${wantConnected ? `, retrying in ${delay}ms (attempt ${reconnectAttempt + 1})` : ''}`)
       ws = null
       // See IQBridgeState.reconnecting's comment — only true once this
       // session has actually connected before; a still-failing FIRST
@@ -2258,6 +2477,10 @@ export function useIQBridge() {
       if (generation !== connectGeneration) return
       armSilenceTimer(socket)
       if (!(ev.data instanceof ArrayBuffer)) return
+      if (bridgeDsp) {
+        feedBridgePassband(ev.data)
+        return
+      }
       const int16 = new Int16Array(ev.data)
       // Convert to float once, here, then hand off to the shared pipeline
       // (see feedIQSamples) that the soundcard path also uses.
@@ -2665,6 +2888,7 @@ export function useIQBridge() {
   // clobber a newer connection's own state.
   async function refreshInfo(catWsUrl: string): Promise<void> {
     const generation = connectGeneration
+    void refreshBridgeDescription(catWsUrl)
     const { inputMode, sampleRateHz } = await fetchBridgeIQInfo(catWsUrl)
     if (generation === connectGeneration) {
       setState((s) => ({
@@ -2734,6 +2958,7 @@ export function useIQBridge() {
     requestUSBDevice, connectUSB, isUSBSupported,
     setPlayThroughSpeakers, setIQCorrection, setDCRemoval, setImbalanceCorrection, setForceIQMode,
     setForceSampleRateHz, setAGCEnabled, setAGCLevel, setHighpassEnabled, setHighpassHz, setNoiseReducerEnabled,
+    updateRouting, refreshBridgeDescription,
   }
 }
 

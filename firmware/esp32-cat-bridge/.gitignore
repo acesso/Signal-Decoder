@@ -3,3 +3,6 @@ sdkconfig
 sdkconfig.old
 managed_components/
 dependencies.lock
+build-s3/
+sdkconfig.s3
+sdkconfig.s3.old

@@ -468,3 +468,13 @@ typedef struct {
     uint32_t loop_count;               // how many iterations contributed to the above since the last call
 } audio_monitor_rx_timing_t;
 void audio_monitor_get_rx_timing(audio_monitor_rx_timing_t *out);
+
+#include "sdkconfig.h"
+#if CONFIG_BRIDGE_BOARD_S3
+// S3 only: which ADC feeds /audio. Saved, so it survives reboots.
+typedef enum { AUDIO_SRC_PCM1808 = 0, AUDIO_SRC_WM8782 = 1 } audio_source_t;
+audio_source_t audio_monitor_get_audio_source(void);
+const char *audio_monitor_audio_source_name(audio_source_t src);
+bool audio_monitor_parse_audio_source(const char *name, audio_source_t *out);
+bool audio_monitor_set_audio_source(audio_source_t src);
+#endif

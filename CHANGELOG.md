@@ -12,6 +12,42 @@ them into a version section when cutting a release.
 
 ## [Unreleased]
 
+## [0.28.0] - 2026-10-27
+
+### Added
+
+- **Second bridge board, the ESP32-S3 (bridge firmware 0.12.0), working on air.** One firmware builds for the AI-Thinker A1S or an ESP32-S3-N16R8 board with separate converters. On air at 7074: FT8 decodes over I/Q, the radio's audio, and both at once, and FT8 transmissions were spotted worldwide on PSKReporter. Slot uploads no longer cause connection drops. Build notes and the board drawing are in `hardware/bridge-s3/`.
+  - **Converters:** a WM8782 for I/Q, a PCM1808 for the radio's audio and a PCM5102A for TX audio. Both ADCs stream at once, and either can feed either stream.
+  - **I/Q rate:** the WM8782 runs at 48, 96 or 192 kHz, set by its DIP switch. The bridge measures the rate and follows. At 192 kHz, FT8 decoded 84 kHz away from the VFO.
+  - **Bridge-side DSP:** the bridge computes the I/Q spectrum and passband itself, sending about 94 KB/s instead of 375 KB/s of raw I/Q.
+  - **Two serial lines** for an antenna tuner and a frequency-sensing module (`/serial?line=tuner|freq`).
+  - **Wiring:** CAT runs at 19200 baud with a 1 kΩ pull-up on the RX line.
+- **One model for every bridge's inputs, outputs and routing:** `GET /capabilities` and `GET/POST /routing`, with older firmware described from `/info` and `/status`. The app picks the I/Q source and the decode audio separately.
+- **Probe**, in the CAT connection settings, for both the bridge and USB serial. It reports the bridge's model, firmware, inputs, outputs, DSP and features, and the radio's model, firmware and capability list. The bridge address no longer needs `/cat`.
+- **PCM5102A output level and soft mute** (`/dac-level`, S3). While TX goes to a bridge that has it, the app's **TX Level** slider sets that level instead of each mode's own gain, and the modes send at full scale.
+- **"Last TX" chip** next to TUNE, from the radio's TX audio report: full power, below full power, carrier gated off, close to clipping or clipping, with the mic peak as a share of the ADC rail. It shows live while keyed in diagnostic mode.
+- **Bridge control page:**
+  - Audio tools and Hardware settings cards, grouped by device.
+  - Hover tooltips instead of long hints, and a wider desktop layout.
+  - System card: CPU and memory graphs, storage bars and a sortable task list.
+
+### Changed
+
+- **RX source changes apply to a running decode**, and **Stop closes the bridge streams that Start opened**, so the audio stops too.
+- **The radio's audio controls lock by the RX source in use**, not by the bridge's mode. On the S3 they stayed locked in audio mode.
+- **S3 network buffers:** the TCP send buffer and window are 16 segments, so a lost Wi-Fi frame is resent at once.
+
+### Fixed
+
+- **S3 I/Q passband:** short reads from the input buffer were dropped, losing 5 ms chunks. The audio sounded metallic, with cuts, and FT8 didn't decode from the I/Q.
+- **Bridge page playback** (Listen and the mic sniffer):
+  - **Chunk resampling:** each chunk was resampled on its own when the browser ran at 44.1 kHz, which showed as a broadband comb under a clean tone.
+  - **Sample rate:** the I/Q card could overwrite the audio sample rate.
+- **Bridge page:**
+  - The I/Q spectrum card disappeared on the S3.
+  - The A1S's RX channel buttons flipped every few seconds.
+- **CORS:** POST `/iq-config` and `/audio-source` sent two CORS headers, so browsers rejected them.
+
 ## [0.27.0] - 2026-10-11
 
 ### Changed

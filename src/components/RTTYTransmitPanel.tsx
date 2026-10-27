@@ -7,6 +7,7 @@ import { encodeBaudotChars, encodeAsciiChars, CARRIER_SHIFTS } from '../lib/rtty
 import type { RTTYConfig } from '$decoder-lib/rtty/decoder'
 import { loadBoolean, saveBoolean } from '$decoder-lib/storage'
 import NumberField from './NumberField'
+import { bridgeTxLevel } from '../lib/audio/bridgeTxLevel'
 
 const BAUD_RATES = [45, 45.45, 50, 65, 75, 100, 110, 150, 200, 300]
 
@@ -94,6 +95,10 @@ export default function RTTYTransmitPanel(props: Props): JSX.Element {
     const g = tx.state().txGain
     return g <= 0 ? -60 : Math.round(20 * Math.log10(g))
   })
+
+  // While the TX output is the bridge, the slider is the bridge's DAC level (bridgeTxLevel.ts).
+  const levelDb = () => (bridgeTxLevel.active() ? bridgeTxLevel.db() : txDb())
+  const setLevelDb = (db: number) => (bridgeTxLevel.active() ? bridgeTxLevel.set(db) : tx.setTxGain(dbToGain(db)))
   const dbToGain = (db: number) => (db <= -60 ? 0 : Math.pow(10, db / 20))
 
   const isPlaying = createMemo(() => tx.state().phase === 'playing')
@@ -208,7 +213,7 @@ export default function RTTYTransmitPanel(props: Props): JSX.Element {
                 !onBridge() ? 'bg-[#238636] text-white' : 'bg-[#0d1117] text-[#8b949e] hover:text-[#c9d1d9]'
               }`}
             >
-              Local speaker
+              Local sound card (live)
             </button>
             <button
               onClick={() => tx.setAudioSink('bridge')}
@@ -216,7 +221,7 @@ export default function RTTYTransmitPanel(props: Props): JSX.Element {
                 onBridge() ? 'bg-[#238636] text-white' : 'bg-[#0d1117] text-[#8b949e] hover:text-[#c9d1d9]'
               }`}
             >
-              ESP32 Bridge
+              Bridge (slotted)
             </button>
           </div>
           <Show when={onBridge()}>
@@ -441,15 +446,15 @@ export default function RTTYTransmitPanel(props: Props): JSX.Element {
 
         <div class="flex flex-col gap-1">
           <label class="text-[10px] text-[#8b949e]">
-            TX Level <span class="ml-1 font-mono text-[#c9d1d9]">{txDb() === 0 ? '0 dB' : `${txDb()} dB`}</span>
+            TX Level <span class="ml-1 font-mono text-[#c9d1d9]">{levelDb() === 0 ? '0 dB' : `${levelDb()} dB`}{bridgeTxLevel.active() ? ' · bridge DAC' : ''}</span>
           </label>
           <input
             type="range"
             min={-60}
             max={0}
             step={1}
-            value={txDb()}
-            onInput={(e) => tx.setTxGain(dbToGain(Number(e.currentTarget.value)))}
+            value={levelDb()}
+            onInput={e => setLevelDb(Number(e.currentTarget.value))}
             class="w-28 accent-[#2ea043] cursor-pointer"
           />
         </div>

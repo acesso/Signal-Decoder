@@ -15,4 +15,18 @@ dependencies:
   #   # All dependencies of `main` are public by default.
   #   public: true
   espressif/mdns: ^1.2
-  espressif/esp_codec_dev: ^1.3
+  # A1S only: ES8388 driver.
+  espressif/esp_codec_dev:
+    version: ^1.3
+    rules:
+      - if: "target == esp32"
+  # S3 only: FFT and FIR for the bridge-side I/Q spectrum and passband (iq_dsp.c).
+  espressif/esp-dsp:
+    version: ^1.5.0
+    rules:
+      - if: "target == esp32s3"
+  # S3 only: the onboard WS2812 RGB status LED.
+  espressif/led_strip:
+    version: ^2.5.5
+    rules:
+      - if: "target == esp32s3"

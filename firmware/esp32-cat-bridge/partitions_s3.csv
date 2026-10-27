@@ -1,0 +1,18 @@
+# Name,     Type, SubType,  Offset,   Size
+# ESP32-S3-N16R8 bridge (16 MB flash). Same partitions, by label, as the A1S's
+# partitions.csv (the code finds them by name), sized for 16 MB:
+#   ota_0/ota_1  4 MB each: the A1S app is ~1.1 MB; the S3 adds the converter
+#                and I/Q DSP code, and 4 MB keeps room for years of growth.
+#   storage      1 MB SPIFFS for the control page (256 KB on the A1S).
+#   catlog       2 MB CAT-traffic ring (512 KB on the A1S): wear spread 4x thinner.
+#   coredump     64 KB: the last crash's core dump, so a crash on a unit out
+#                of USB reach can still be diagnosed.
+# About 4.9 MB at the end stays unallocated for later.
+nvs,        data, nvs,      0x9000,   0x6000,
+phy_init,   data, phy,      0xf000,   0x1000,
+otadata,    data, ota,      0x10000,  0x2000,
+ota_0,      app,  ota_0,    0x20000,  4M,
+ota_1,      app,  ota_1,    ,         4M,
+storage,    data, spiffs,   ,         1M,
+catlog,     data, 0x40,     ,         2M,
+coredump,   data, coredump, ,         64K,

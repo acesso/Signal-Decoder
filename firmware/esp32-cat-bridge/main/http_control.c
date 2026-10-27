@@ -11,6 +11,9 @@
 #include "esp_system.h"
 #include "esp_ota_ops.h"
 #include "esp_partition.h"
+#include "esp_spiffs.h"
+#include "esp_image_format.h"
+#include "nvs.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -152,14 +155,34 @@ static const char *TAG = "http_control";
 // UART.
 // "mem_bench" means: GET /bench exists — a 1–2 s memory/flash speed measurement (mem_bench.h),
 // used to compare flash/PSRAM/cache settings on real hardware.
+//
+// Per board: "additive, never removed" holds within a board. The S3 board
+// lists only what it actually has: none of the ES8388 controls.
+// "adc_source_select" (S3) means: GET/POST /audio-source picks which ADC feeds
+// /audio ("pcm1808" or "wm8782"), and /iq-config "source" which one feeds the
+// I/Q streams ("wm8782" or "pcm1808") — see audio_monitor_s3.c.
+// "dac_level" (S3) means: GET/POST /dac-level sets the PCM5102A output level
+// (a digital gain, dB, saved) and its soft mute (XSMT, not saved).
+// "capabilities" / "routing" (both boards) mean: GET /capabilities describes
+// the bridge, GET/POST /routing selects and saves its stream routing (io_routing.h).
+// GET /info also reports "board" ("a1s" or "s3").
+#if CONFIG_BRIDGE_BOARD_S3
+static const char *const BRIDGE_FEATURES[] = {
+    "cat", "wifi_config", "wifi_scan", "reset", "audio", "cat_baud", "pa_watchdog", "rx_slot_select", "led_enable",
+    "cpu_monitor", "wifi_tx_power_control", "cat_log", "audio_mic_sniff", "tx_buffer_playback", "tx_slot_select",
+    "ota", "ota_storage", "cat_echo_text", "radio_ota", "mem_bench", "aux_serial",
+    "iq_spectrum", "iq_passband", "adc_source_select", "capabilities", "routing", "dac_level",
+};
+#else
 static const char *const BRIDGE_FEATURES[] = {
     "cat", "wifi_config", "wifi_scan", "reset", "audio", "cat_baud", "pa_watchdog",
     "audio_input_select", "mic_gain", "rx_slot_select", "led_enable",
     "alc_control", "noise_gate_control", "cpu_monitor", "wifi_tx_power_control",
     "adc_hpf_control", "sample_rate_select", "speaker_amp_control", "cat_log",
     "audio_mic_sniff", "input_mode_select", "tx_buffer_playback", "speaker_vol", "tx_slot_select",
-    "ota", "ota_storage", "cat_echo_text", "radio_ota", "mem_bench",
+    "ota", "ota_storage", "cat_echo_text", "radio_ota", "mem_bench", "capabilities", "routing",
 };
+#endif
 
 // The uSDX firmware's own CAT_BAUD menu setting (usdxBLACKBRICK.ino) only
 // offers these four — validated against on POST /cat-baud so a typo/garbage
@@ -331,7 +354,7 @@ static esp_err_t info_handler(httpd_req_t *req) {
     // second time.
     char body[512];
     size_t o = (size_t)snprintf(body, sizeof(body),
-        "{\"firmware_version\":\"%s\",\"features\":[", BRIDGE_FIRMWARE_VERSION);
+        "{\"firmware_version\":\"%s\",\"board\":\"%s\",\"features\":[", BRIDGE_FIRMWARE_VERSION, BRIDGE_BOARD_NAME);
     for (size_t i = 0; i < BRIDGE_FEATURES_COUNT && o < sizeof(body); i++) {
         int n = snprintf(body + o, sizeof(body) - o, "%s\"%s\"", i ? "," : "", BRIDGE_FEATURES[i]);
         if (n < 0 || (size_t)n >= sizeof(body) - o) {
@@ -401,7 +424,7 @@ static esp_err_t reset_handler(httpd_req_t *req) {
     httpd_resp_set_type(req, "text/plain");
     set_cors(req);
     httpd_resp_sendstr(req, "restarting");
-    xTaskCreate(restart_task, "bridge_restart", 2048, NULL, tskIDLE_PRIORITY + 1, NULL);
+    xTaskCreate(restart_task, "bridge_restart", 3072, NULL, tskIDLE_PRIORITY + 1, NULL);
     return ESP_OK;
 }
 
@@ -555,7 +578,7 @@ static esp_err_t wifi_config_handler(httpd_req_t *req) {
     httpd_resp_set_type(req, "text/plain");
     set_cors(req);
     httpd_resp_sendstr(req, "saved, restarting");
-    xTaskCreate(restart_task, "bridge_restart", 2048, NULL, tskIDLE_PRIORITY + 1, NULL);
+    xTaskCreate(restart_task, "bridge_restart", 3072, NULL, tskIDLE_PRIORITY + 1, NULL);
     return ESP_OK;
 }
 
@@ -1039,6 +1062,10 @@ static bool is_supported_sample_rate_for_mode(int hz, audio_input_mode_t mode) {
     return false;
 }
 
+bool http_control_rate_ok_for_mode(uint32_t hz, audio_input_mode_t mode) {
+    return is_supported_sample_rate_for_mode((int)hz, mode);
+}
+
 // POST /sample-rate — body: {"hz":48000}; one of SUPPORTED_SAMPLE_RATES_HZ
 // (or SUPPORTED_IQ_SAMPLE_RATES_HZ if the bridge is currently in
 // AUDIO_INPUT_MODE_IQ — see audio_monitor_get_input_mode()). Persists to
@@ -1073,7 +1100,7 @@ static esp_err_t sample_rate_handler(httpd_req_t *req) {
     httpd_resp_set_type(req, "text/plain");
     set_cors(req);
     httpd_resp_sendstr(req, "saved, restarting");
-    xTaskCreate(restart_task, "bridge_restart", 2048, NULL, tskIDLE_PRIORITY + 1, NULL);
+    xTaskCreate(restart_task, "bridge_restart", 3072, NULL, tskIDLE_PRIORITY + 1, NULL);
     return ESP_OK;
 }
 
@@ -1128,7 +1155,7 @@ static esp_err_t input_mode_handler(httpd_req_t *req) {
     httpd_resp_set_type(req, "text/plain");
     set_cors(req);
     httpd_resp_sendstr(req, "saved, restarting");
-    xTaskCreate(restart_task, "bridge_restart", 2048, NULL, tskIDLE_PRIORITY + 1, NULL);
+    xTaskCreate(restart_task, "bridge_restart", 3072, NULL, tskIDLE_PRIORITY + 1, NULL);
     return ESP_OK;
 }
 
@@ -1161,7 +1188,7 @@ static esp_err_t cat_log_enable_handler(httpd_req_t *req) {
     httpd_resp_set_type(req, "text/plain");
     set_cors(req);
     httpd_resp_sendstr(req, "saved, restarting");
-    xTaskCreate(restart_task, "bridge_restart", 2048, NULL, tskIDLE_PRIORITY + 1, NULL);
+    xTaskCreate(restart_task, "bridge_restart", 3072, NULL, tskIDLE_PRIORITY + 1, NULL);
     return ESP_OK;
 }
 
@@ -1595,9 +1622,29 @@ static esp_err_t tx_stop_handler(httpd_req_t *req) {
 // as its own endpoint (not folded into GET /status) since it's meaningfully
 // larger and meant to be polled on its own cadence by a live-refreshing
 // diagnostics panel, not fetched every time any other status field is needed.
+// Size of the running app image, measured once (it never changes while running).
+static uint32_t running_image_bytes(void) {
+    static uint32_t cached;
+    if (cached) return cached;
+    const esp_partition_t *part = esp_ota_get_running_partition();
+    esp_partition_pos_t pos = { .offset = part->address, .size = part->size };
+    esp_image_metadata_t meta;
+    if (esp_image_get_metadata(&pos, &meta) == ESP_OK) cached = meta.image_len;
+    return cached;
+}
+
 static esp_err_t system_stats_handler(httpd_req_t *req) {
     cpu_monitor_heap_t heap;
     cpu_monitor_get_heap(&heap);
+
+    // Memory by kind, and the storage areas, for the System card's graphs and bars.
+    size_t int_free = heap_caps_get_free_size(MALLOC_CAP_INTERNAL), int_total = heap_caps_get_total_size(MALLOC_CAP_INTERNAL);
+    size_t ps_free = heap_caps_get_free_size(MALLOC_CAP_SPIRAM), ps_total = heap_caps_get_total_size(MALLOC_CAP_SPIRAM);
+    size_t page_total = 0, page_used = 0;
+    esp_spiffs_info("storage", &page_total, &page_used);
+    nvs_stats_t nvs = { 0 };
+    nvs_get_stats(NULL, &nvs);
+    const esp_partition_t *app = esp_ota_get_running_partition();
 
     // RX-loop timing — see audio_monitor_get_rx_timing()'s own comment;
     // read-and-reset, so each GET reports the max seen since the LAST GET.
@@ -1611,12 +1658,15 @@ static esp_err_t system_stats_handler(httpd_req_t *req) {
         return ESP_FAIL;
     }
 
-    char body[1850];
+    char body[2200];
     int n = snprintf(body, sizeof(body),
         "{\"cpu_freq_mhz\":%d,\"heap_free\":%u,\"heap_min_free\":%u,\"heap_total\":%u,"
         "\"heap_largest_free_block\":%u,\"dma_free\":%u,\"dma_largest_free_block\":%u,"
         "\"rx_max_loop_interval_us\":%lld,\"rx_max_read_duration_us\":%lld,"
         "\"rx_max_broadcast_duration_us\":%lld,\"rx_loop_count\":%u,"
+        "\"internal_free\":%u,\"internal_total\":%u,\"psram_free\":%u,\"psram_total\":%u,"
+        "\"storage\":[{\"name\":\"App (%s)\",\"used\":%u,\"total\":%u},{\"name\":\"Control page\",\"used\":%u,\"total\":%u},"
+        "{\"name\":\"Settings (NVS entries)\",\"used\":%u,\"total\":%u}],"
         "\"tasks\":%s}",
         cpu_monitor_get_freq_mhz(),
         (unsigned)heap.free_bytes, (unsigned)heap.min_free_bytes, (unsigned)heap.total_bytes,
@@ -1624,6 +1674,9 @@ static esp_err_t system_stats_handler(httpd_req_t *req) {
         (unsigned)heap.dma_free_bytes, (unsigned)heap.dma_largest_free_block_bytes,
         (long long)rx_timing.max_loop_interval_us, (long long)rx_timing.max_read_duration_us,
         (long long)rx_timing.max_broadcast_duration_us, (unsigned)rx_timing.loop_count,
+        (unsigned)int_free, (unsigned)int_total, (unsigned)ps_free, (unsigned)ps_total,
+        app->label, (unsigned)running_image_bytes(), (unsigned)app->size, (unsigned)page_used, (unsigned)page_total,
+        (unsigned)nvs.used_entries, (unsigned)nvs.total_entries,
         tasks_json);
     if (n < 0 || (size_t)n >= sizeof(body)) {
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "system-stats body truncated");
@@ -1769,7 +1822,7 @@ static esp_err_t ota_handler(httpd_req_t *req) {
     httpd_resp_send(req, body, n);
     // Same deferred-restart pattern as reset_handler() — let the response
     // reach the client before the reboot tears the socket down.
-    xTaskCreate(restart_task, "bridge_restart", 2048, NULL, tskIDLE_PRIORITY + 1, NULL);
+    xTaskCreate(restart_task, "bridge_restart", 3072, NULL, tskIDLE_PRIORITY + 1, NULL);
     return ESP_OK;
 }
 

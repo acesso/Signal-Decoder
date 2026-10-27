@@ -1,7 +1,8 @@
 // Port of src/app/page.tsx (Next.js app) — the top-level shell wiring all 5
 // decoder modes, the RadioCAT panel (lifted here so VFO frequency flows to
 // every decoder), the FT transmit panel, and the memory/resource debug bar.
-import { createEffect, createMemo, createSignal, For, onCleanup, onMount, Show, type JSX } from 'solid-js'
+import { createEffect, createMemo, createSignal, For, onCleanup, onMount, Show, type JSX, on } from 'solid-js'
+import { bridgeTxLevel } from './lib/audio/bridgeTxLevel'
 import RTTYDecoder from './components/RTTYDecoder'
 import RTTYTransmitPanel, { type RTTYTxStatus } from './components/RTTYTransmitPanel'
 import SSTVDecoder from './components/SSTVDecoder'
@@ -27,7 +28,10 @@ import type { CapturedImage } from '$decoder-lib/sstv/audioProcessor'
 import { trackEvent } from '$decoder-lib/analytics'
 import { loadObject, saveObject, loadString, saveString } from '$decoder-lib/storage'
 import { effectiveVfoForIQ } from '$decoder-lib/ft/iqFreq'
-import { type AudioSourceOverride, resolveAudioSource } from '$decoder-lib/audio/audioSource'
+import {
+  type AudioSourceOverride, resolveAudioSource, deriveAudioSourceOverride, splitAudioSourceOverride,
+  RX_IQ_SOURCES, RX_AUDIO_SOURCES, type RxIQSource, type RxAudioSource,
+} from '$decoder-lib/audio/audioSource'
 
 type DecoderMode = 'rtty' | 'sstv' | 'cw' | 'ft' | 'mfsk'
 
@@ -63,6 +67,18 @@ const LS_AUDIO_SOURCE_OVERRIDE = 'audio_source_override'
 const VALID_AUDIO_SOURCE_OVERRIDES: AudioSourceOverride[] = ['auto', 'microphone', 'bridge-audio', 'bridge-iq', 'soundcard-iq', 'usb-iq']
 function loadAudioSourceOverride(): AudioSourceOverride {
   return loadString(LS_AUDIO_SOURCE_OVERRIDE, 'auto', VALID_AUDIO_SOURCE_OVERRIDES)
+}
+// The two RX selections (see RxIQSource/RxAudioSource in audioSource.ts).
+// First run after the split: seeded from the older single override.
+const LS_RX_IQ_SOURCE = 'rx_iq_source'
+const LS_RX_AUDIO_SOURCE = 'rx_audio_source'
+function loadRxSources(): { iq: RxIQSource; audio: RxAudioSource } {
+  const legacy = splitAudioSourceOverride(loadAudioSourceOverride())
+  const has = (k: string) => typeof window !== 'undefined' && localStorage.getItem(k) !== null
+  return {
+    iq: has(LS_RX_IQ_SOURCE) ? loadString(LS_RX_IQ_SOURCE, 'auto', RX_IQ_SOURCES) : legacy.iq,
+    audio: has(LS_RX_AUDIO_SOURCE) ? loadString(LS_RX_AUDIO_SOURCE, 'auto', RX_AUDIO_SOURCES) : legacy.audio,
+  }
 }
 
 // ── I/Q passband width, per decoder mode ─────────────────────────────────
@@ -233,7 +249,9 @@ function TopBar(props: {
   onFTModeChange: (m: FTMode) => void
   audioSource: AudioSourceDisplay | null
   audioSourceOverride: AudioSourceOverride
-  onAudioSourceOverrideChange: (v: AudioSourceOverride) => void
+  rxIQSource: RxIQSource
+  rxAudioSource: RxAudioSource
+  onRxSourcesChange: (iq: RxIQSource, audio: RxAudioSource) => void
   // True while the bridge audio source currently feeding decode (whichever
   // of iqBridge/audioBridge audioSource above reflects) has dropped and is
   // retrying automatically — see useIQBridge.ts's/useAudioBridge.ts's
@@ -390,21 +408,32 @@ function TopBar(props: {
 
         <div class="ml-auto flex flex-col items-end gap-0.5 text-[10px] text-[#8b949e] whitespace-nowrap">
           <div class="flex items-center gap-1.5">
-            <span class="shrink-0">Audio source</span>
+            <span class="shrink-0">I/Q</span>
             <select
-              value={props.audioSourceOverride}
-              onChange={(e) => props.onAudioSourceOverrideChange(e.currentTarget.value as AudioSourceOverride)}
-              title="Force which source decoders read from — Auto keeps the existing bridge/microphone auto-detection. Forcing a bridge choice reads from that socket only if it's actually connected right now; it does not switch the bridge's own firmware mode."
+              value={props.rxIQSource}
+              onChange={(e) => props.onRxSourcesChange(e.currentTarget.value as RxIQSource, props.rxAudioSource)}
+              title="Where the I/Q (waterfall and I/Q demodulation) comes from. Auto uses the bridge when it's set to carry I/Q."
               class="cursor-pointer rounded border border-[#30363d] bg-[#0d1117] px-1.5 py-0.5 font-mono text-[#c9d1d9] focus:border-[#2ea043] focus:outline-none"
             >
               <option value="auto">Auto</option>
-              <option value="microphone">Microphone</option>
-              <option value="bridge-audio">Bridge (radio audio)</option>
-              <option value="bridge-iq">Bridge (I/Q)</option>
-              <option value="soundcard-iq">Soundcard (I/Q)</option>
+              <option value="off">Off</option>
+              <option value="bridge">Bridge</option>
+              <option value="soundcard">Sound card</option>
               <Show when={props.usbSupported}>
-                <option value="usb-iq">USB SDR (I/Q, experimental)</option>
+                <option value="usb">USB SDR (experimental)</option>
               </Show>
+            </select>
+            <span class="shrink-0">Decode audio</span>
+            <select
+              value={props.rxAudioSource}
+              onChange={(e) => props.onRxSourcesChange(props.rxIQSource, e.currentTarget.value as RxAudioSource)}
+              title="What the decoders listen to. Auto: the demodulated I/Q when I/Q is running, else the bridge's audio, else the sound card."
+              class="cursor-pointer rounded border border-[#30363d] bg-[#0d1117] px-1.5 py-0.5 font-mono text-[#c9d1d9] focus:border-[#2ea043] focus:outline-none"
+            >
+              <option value="auto">Auto</option>
+              <option value="iq">Demodulated I/Q</option>
+              <option value="bridge">Bridge audio</option>
+              <option value="soundcard">Sound card / mic</option>
             </select>
           </div>
           {/* Only meaningful in Auto — a forced choice already says exactly
@@ -757,7 +786,12 @@ function RTTYTxSummaryChip(props: { s: RTTYTxStatus | null }): JSX.Element {
 function App(): JSX.Element {
   const [mode, setMode] = createSignal<DecoderMode>(loadMode())
   const [ftMode, setFTMode] = createSignal<FTMode>(loadFTMode())
-  const [audioSourceOverride, setAudioSourceOverride] = createSignal<AudioSourceOverride>(loadAudioSourceOverride())
+  const initialRx = loadRxSources()
+  const [rxIQSource, setRxIQSource] = createSignal<RxIQSource>(initialRx.iq)
+  const [rxAudioSource, setRxAudioSource] = createSignal<RxAudioSource>(initialRx.audio)
+  // What the decoders resolve their input from — derived, so they keep
+  // working unchanged (see deriveAudioSourceOverride()).
+  const audioSourceOverride = createMemo<AudioSourceOverride>(() => deriveAudioSourceOverride(rxIQSource(), rxAudioSource()))
   // Which input device the 'soundcard-iq' source opens. Empty = the
   // browser's default input. Persisted so an operator with a dedicated I/Q
   // interface doesn't re-pick it every session.
@@ -836,22 +870,36 @@ function App(): JSX.Element {
   // than recomputed in each, so there is one definition of "the dial".
   const effectiveVfoHz = createMemo(() => effectiveVfoForIQ(vfoFrequency(), iqBridge.state()))
 
-  function handleAudioSourceOverrideChange(v: AudioSourceOverride) {
-    setAudioSourceOverride(v)
-    saveString(LS_AUDIO_SOURCE_OVERRIDE, v)
-    // Forcing "Microphone" is the one override value that also touches the
-    // bridge's actual connection (not just which source decoders read
-    // from) — per the operator's own explicit choice, disconnect any open
-    // bridge audio/I/Q socket rather than leaving it connected-but-unused.
-    // The two bridge-specific override values deliberately do NOT trigger
-    // any connect/disconnect/mode-switch here — see AudioSourceOverride's
-    // own comment in audioSource.ts for why: the operator's forced choice
-    // is authoritative, not another layer of automatic correction.
-    if (v === 'microphone') {
-      if (iqBridge.state().connected) iqBridge.disconnect()
+  function handleRxSourcesChange(iq: RxIQSource, audio: RxAudioSource) {
+    setRxIQSource(iq)
+    setRxAudioSource(audio)
+    saveString(LS_RX_IQ_SOURCE, iq)
+    saveString(LS_RX_AUDIO_SOURCE, audio)
+    // Close whatever the new choice no longer uses. Bridge sockets the operator
+    // opened from the Bridge panel stay while they're still wanted.
+    if (iq !== 'bridge' && iq !== 'auto' && iqBridge.state().connected && iqBridge.state().source === 'bridge') iqBridge.disconnect()
+    if (audio === 'soundcard' || audio === 'iq') {
       if (audioBridge.state().connected || audioBridge.state().playbackActive) audioBridge.disconnect()
     }
+    if (iq === 'off' && iqBridge.state().connected) iqBridge.disconnect()
+    // A running decode switches over now, instead of on the next Start.
+    if (isRecording()) {
+      handleStop()
+      void handleStart()
+    }
   }
+
+  // The radio's own audio controls (volume, filter, AGC…) only shape what the
+  // app hears when it decodes the radio's demodulated audio. Decided by the
+  // RX source, not the bridge's mode: a bridge with separate ADCs (the S3)
+  // always reports I/Q while also streaming the radio's audio.
+  const decodingFromIQ = createMemo(() => {
+    const o = audioSourceOverride()
+    if (o === 'bridge-iq' || o === 'soundcard-iq' || o === 'usb-iq') return true
+    if (o === 'auto') return iqBridge.state().connected
+    return false
+  })
+
 
   // See IQ_PASSBAND_DEFAULTS' own comment. Loaded once; applied to
   // iqBridge on mount (for whatever mode() already restored from its own
@@ -904,6 +952,20 @@ function App(): JSX.Element {
   // decide whether "Start Decoding" can auto-connect the bridge instead of
   // always prompting for a local mic.
   const [bridgeWsUrl, setBridgeWsUrl] = createSignal<string | undefined>(undefined)
+  // The bridge's DAC level is the TX level while TX goes to the bridge
+  // (bridgeTxLevel.ts): follow the bridge in use, and re-read it now and then
+  // so a change on the bridge's own page shows here too.
+  createEffect(() => bridgeTxLevel.attach(bridgeWsUrl()))
+  const dacLevelTimer = setInterval(() => { if (bridgeWsUrl()) void bridgeTxLevel.refresh() }, 15000)
+  onCleanup(() => clearInterval(dacLevelTimer))
+  // Pointed at a different bridge: sockets still attached to the previous one
+  // would keep streaming from it (or go silently dead), so drop them; the next
+  // Start Decoding opens them against the new bridge.
+  createEffect(on(bridgeWsUrl, (url, prev) => {
+    if (prev === undefined || url === prev) return
+    if (iqBridge.state().connected && iqBridge.state().source === 'bridge') iqBridge.disconnect()
+    if (audioBridge.state().connected || audioBridge.state().playbackActive) audioBridge.disconnect()
+  }))
   // Set by handleStart() below when the bridge's audio WebSocket fails to
   // connect during the "Start Decoding" auto-connect and it falls back to
   // the local microphone — otherwise that fallback was silent (no console
@@ -950,132 +1012,90 @@ function App(): JSX.Element {
 
   // ── Unified start / stop ─────────────────────────────────────────────────
 
+  // Which bridge streams handleStart() itself opened (handleStop closes those).
+  const startOpened = { iq: false, audio: false }
+
   async function handleStart() {
     setBridgeAudioFallbackWarning(null)
-
-    // A forced override (see audioSourceOverride's own comment) skips ALL
-    // of the auto-detect query/connect/disconnect machinery below — the
-    // operator's explicit choice is authoritative. 'microphone' also
-    // doesn't need bridgeWsUrl()/refreshInfo() at all since it never
-    // touches the bridge. The two forced bridge values deliberately read
-    // whatever's ALREADY connected via resolveAudioSource() rather than
-    // connecting/switching anything themselves — if nothing is connected
-    // on the forced socket, that's the operator's own call to fix (open
-    // the Bridge panel / flip its input mode), not something this
-    // function should silently paper over.
-    const override = audioSourceOverride()
-    if (override !== 'auto') {
-      // 'soundcard-iq' is the one forced value that has to CONNECT
-      // something here. The two bridge values read a socket the operator
-      // opens from the Bridge panel, and 'microphone' is opened by
-      // globalAudio itself — but a soundcard I/Q device has no panel of its
-      // own to connect from, so "Start Decoding" is the moment to open it.
-      // Idempotent: if a soundcard capture is already running (the operator
-      // stopped and restarted decoding), this leaves it alone rather than
-      // re-prompting for the device.
-      if (override === 'soundcard-iq' && !(iqBridge.state().connected && iqBridge.state().source === 'soundcard')) {
-        const ok = await iqBridge.connectSoundcard(soundcardIQDeviceId() || undefined)
-        if (!ok) {
-          setBridgeAudioFallbackWarning(
-            `Could not open the soundcard I/Q input (${iqBridge.state().error ?? 'unknown error'}) — pick a device in the gear panel, or choose a different audio source.`,
-          )
-          return
-        }
-      }
-      // Same shape as the soundcard branch above: a source with no panel of
-      // its own, so Start Decoding is where it gets opened.
-      //
-      // requestUSBDevice() prompts the browser's device chooser, which needs
-      // transient user activation — this runs inside the Start click, which
-      // satisfies it. Doing it anywhere non-interactive would be rejected.
-      if (override === 'usb-iq' && !(iqBridge.state().connected && iqBridge.state().source === 'usb')) {
-        const picked = await iqBridge.requestUSBDevice()
-        if (!picked) {
-          setBridgeAudioFallbackWarning(
-            `No USB SDR selected (${iqBridge.state().error ?? 'chooser dismissed'}) — WebUSB needs Chrome/Edge/Opera, and on Linux a udev rule granting access to the device.`,
-          )
-          return
-        }
-        const ok = await iqBridge.connectUSB()
-        if (!ok) {
-          setBridgeAudioFallbackWarning(
-            `Could not open the USB SDR (${iqBridge.state().error ?? 'unknown error'}) — this input is experimental and untested against real hardware.`,
-          )
-          return
-        }
-      }
-      const { kind, bridge } = resolveAudioSource(override, iqBridge, audioBridge)
-      globalAudio.configureSource(kind, bridge)
-      setDecodingFromBridgeMode(null)
-      const node = await globalAudio.start()
-      if (node) {
-        await activeHandle().current?.start()
-        trackEvent('decode_start', mode() === 'ft' ? { mode: mode(), ft_mode: ftMode() } : { mode: mode() })
-      }
-      return
-    }
-    // If the CAT connection is over the ESP32 bridge, decode from the
-    // bridge's own live radio audio instead of always prompting for a
-    // local mic — auto-opening the /audio connection here (same as
-    // clicking "Listen to Radio" in the Bridge panel) rather than making
-    // that a separate required step; connecting the bridge at all should
-    // be enough for decoding to just work.
+    const iqSel = rxIQSource()
+    const audioSel = rxAudioSource()
     const wsUrl = bridgeWsUrl()
+    const warnings: string[] = []
 
-    // Which physical path the bridge is currently sampling — "audio"
-    // (already-demodulated) or "iq" (raw, demodulated client-side by
-    // useIQBridge.ts; see that file's header comment on why this is a
-    // superset, not a separate/incompatible mode). A quick refreshInfo()
-    // here (one /status fetch) rather than trusting iqBridge's last-known
-    // state, since the operator may not have opened the Bridge panel at
-    // all this session — the RadioCATPanel-driven refresh isn't guaranteed
-    // to have run yet.
-    let bridgeInIQMode = false
+    // What the bridge (if CAT runs over one) is routed to carry right now.
+    // refreshInfo() also re-reads its /capabilities and /routing, so a
+    // different bridge than last time is picked up here.
+    let bridgeCarriesIQ = false
+    let bridgeCarriesAudio = false
     if (wsUrl) {
       await iqBridge.refreshInfo(wsUrl)
-      bridgeInIQMode = iqBridge.state().inputMode === 'iq'
+      await iqBridge.refreshBridgeDescription(wsUrl)
+      const routing = iqBridge.state().routing
+      bridgeCarriesIQ = routing ? routing.iq.input !== null : iqBridge.state().inputMode === 'iq'
+      bridgeCarriesAudio = routing ? routing.audio.input !== null : iqBridge.state().inputMode === 'audio'
     }
 
-    if (wsUrl && bridgeInIQMode) {
-      // The bridge just reported I/Q mode — if audioBridge still has a
-      // /audio socket open (e.g. this session started in audio mode and
-      // the bridge switched since), drop it: audio_iq.c and audio_ws.c are
-      // mutually exclusive on the firmware side, so a stale /audio
-      // connection left open here would never receive anything either,
-      // same class of "connected but silently dead" bug this whole
-      // recovery path exists to fix.
-      if (audioBridge.state().connected || audioBridge.state().playbackActive) audioBridge.disconnect()
-      iqBridge.setCatMode(cat.state().mode)
-      if (!iqBridge.state().connected) await iqBridge.connect(wsUrl)
-      if (!iqBridge.state().connected) {
-        setBridgeAudioFallbackWarning(
-          `Could not connect to the bridge's I/Q stream (${iqBridge.state().error ?? 'unknown error'}) — falling back to the microphone.`
-        )
-      }
-    } else if (wsUrl && !audioBridge.state().playbackActive) {
-      // Mirror of the I/Q-side cleanup above — dropping a now-stale
-      // iqBridge connection when the bridge has switched to audio mode.
+    // ── I/Q ──
+    // Sound card and USB have no panel of their own, so Start is where they
+    // open. Idempotent: an already-running capture is left alone.
+    if (iqSel === 'soundcard' && !(iqBridge.state().connected && iqBridge.state().source === 'soundcard')) {
       if (iqBridge.state().connected) iqBridge.disconnect()
-      await audioBridge.connect(wsUrl)
-      // connect() failing used to fall through to the microphone with no
-      // visible sign anything had gone wrong — a bridge/network hiccup on
-      // JUST the /audio socket (the CAT /cat connection can be perfectly
-      // healthy at the same time, they're independent sockets) silently
-      // turned into an unexplained mic permission prompt. Surface it.
-      if (!audioBridge.state().playbackActive) {
-        setBridgeAudioFallbackWarning(
-          `Could not connect to the bridge's audio (${audioBridge.state().error ?? 'unknown error'}) — falling back to the microphone.`
-        )
-      }
+      const ok = await iqBridge.connectSoundcard(soundcardIQDeviceId() || undefined)
+      if (!ok) warnings.push(`Could not open the sound card I/Q input (${iqBridge.state().error ?? 'unknown error'}) — pick a device in the gear panel.`)
     }
-    const useIQ = wsUrl && bridgeInIQMode && iqBridge.state().connected
-    const useAudio = wsUrl && !bridgeInIQMode && audioBridge.state().playbackActive
-    globalAudio.configureSource(useIQ ? 'bridge' : useAudio ? 'bridge' : 'microphone', useIQ ? iqBridge : useAudio ? audioBridge : undefined)
-    // Remembers which bridge (if any) THIS decode session actually locked
-    // onto, so the mismatch-recovery effect below can tell "the bridge
-    // switched mode out from under an active decode" apart from "the
-    // operator hasn't started decoding, or is intentionally on the mic."
-    setDecodingFromBridgeMode(useIQ ? 'iq' : useAudio ? 'audio' : null)
+    // requestUSBDevice() needs the user activation of the Start click itself.
+    if (iqSel === 'usb' && !(iqBridge.state().connected && iqBridge.state().source === 'usb')) {
+      if (iqBridge.state().connected) iqBridge.disconnect()
+      const picked = await iqBridge.requestUSBDevice()
+      const ok = picked && (await iqBridge.connectUSB())
+      if (!ok) warnings.push(`Could not open the USB SDR (${iqBridge.state().error ?? 'chooser dismissed'}) — WebUSB needs Chrome/Edge/Opera, and on Linux a udev rule.`)
+    }
+    const wantBridgeIQ = !!wsUrl && (iqSel === 'bridge' || (iqSel === 'auto' && bridgeCarriesIQ))
+    if (wantBridgeIQ) {
+      if (!bridgeCarriesIQ) {
+        warnings.push('The bridge is routed to carry audio, not I/Q — switch its input in the Bridge panel, or pick another I/Q source.')
+      } else {
+        iqBridge.setCatMode(cat.state().mode)
+        if (iqBridge.state().connected && iqBridge.state().source !== 'bridge') iqBridge.disconnect()
+        if (!iqBridge.state().connected) {
+          await iqBridge.connect(wsUrl)
+          startOpened.iq = iqBridge.state().connected
+        }
+        if (!iqBridge.state().connected) warnings.push(`Could not connect to the bridge's I/Q stream (${iqBridge.state().error ?? 'unknown error'}).`)
+      }
+    } else if (iqBridge.state().connected && iqBridge.state().source === 'bridge' && (iqSel !== 'auto' || !bridgeCarriesIQ)) {
+      // A bridge I/Q socket that's no longer wanted, or that the bridge stopped
+      // feeding (a single-codec bridge switched to audio).
+      iqBridge.disconnect()
+    }
+    const iqRunning = iqBridge.state().connected
+
+    // ── Decode audio ──
+    const wantBridgeAudio = !!wsUrl && (audioSel === 'bridge' || (audioSel === 'auto' && !iqRunning && bridgeCarriesAudio))
+    if (wantBridgeAudio) {
+      if (!bridgeCarriesAudio) {
+        warnings.push(iqBridge.state().capabilities?.concurrentInputs
+          ? 'The bridge has no input routed to audio — pick one in the Bridge panel.'
+          : 'This bridge carries audio OR I/Q, and is set to I/Q — switch its input in the Bridge panel to decode its audio.')
+      } else if (!audioBridge.state().playbackActive) {
+        await audioBridge.connect(wsUrl)
+        startOpened.audio = audioBridge.state().playbackActive
+        if (!audioBridge.state().playbackActive) warnings.push(`Could not connect to the bridge's audio (${audioBridge.state().error ?? 'unknown error'}).`)
+      }
+    } else if ((audioBridge.state().connected || audioBridge.state().playbackActive) && !bridgeCarriesAudio) {
+      audioBridge.disconnect()  // the bridge stopped feeding /audio
+    }
+    if (audioSel === 'iq' && !iqRunning) warnings.push('Decode audio is set to the demodulated I/Q, but no I/Q source is running.')
+
+    const { kind, bridge } = resolveAudioSource(audioSourceOverride(), iqBridge, audioBridge)
+    globalAudio.configureSource(kind, bridge)
+    // Which bridge stream (if any) THIS session decodes from — the recovery
+    // effect below watches it on single-codec bridges.
+    setDecodingFromBridgeMode(
+      bridge === iqBridge && iqBridge.state().source === 'bridge' && iqRunning ? 'iq'
+        : bridge === audioBridge && audioBridge.state().playbackActive ? 'audio' : null,
+    )
+    if (warnings.length) setBridgeAudioFallbackWarning(warnings.join(' '))
 
     const node = await globalAudio.start()
     if (node) {
@@ -1087,6 +1107,11 @@ function App(): JSX.Element {
     setDecodingFromBridgeMode(null)
     activeHandle().current?.stop()
     globalAudio.stop()
+    // Bridge streams that Start opened close with Stop, so the audio stops
+    // too; ones the operator opened from the Bridge panel keep running.
+    if (startOpened.iq && iqBridge.state().connected && iqBridge.state().source === 'bridge') iqBridge.disconnect()
+    if (startOpened.audio && (audioBridge.state().connected || audioBridge.state().playbackActive)) audioBridge.disconnect()
+    startOpened.iq = startOpened.audio = false
     // Release the soundcard I/Q capture too. Unlike the bridge sources —
     // which the operator opens and closes deliberately from the Bridge
     // panel, and may well want to keep running (spectrum, speaker
@@ -1125,6 +1150,10 @@ function App(): JSX.Element {
   createEffect(() => {
     const lockedMode = decodingFromBridgeMode()
     if (lockedMode === null) return
+    // Only single-codec bridges switch kind under a running session; a
+    // bridge with separate inputs streams both, so "iq" there says nothing
+    // about its audio stream.
+    if (iqBridge.state().capabilities?.concurrentInputs) return
     const liveMode = iqBridge.state().inputMode
     if (lockedMode === liveMode) return
     console.info(`[bridge-mode] decode was using "${lockedMode}" but the bridge is now in "${liveMode}" mode — restarting decode against the correct source`)
@@ -1262,7 +1291,9 @@ function App(): JSX.Element {
           onIQHighpassEnabledChange={iqBridge.setHighpassEnabled}
           iqHighpassHz={iqBridge.state().highpassHz}
           onIQHighpassHzChange={iqBridge.setHighpassHz}
-          onAudioSourceOverrideChange={handleAudioSourceOverrideChange}
+          rxIQSource={rxIQSource()}
+          rxAudioSource={rxAudioSource()}
+          onRxSourcesChange={handleRxSourcesChange}
           bridgeReconnecting={bridgeReconnecting()}
         />
       </div>
@@ -1290,6 +1321,7 @@ function App(): JSX.Element {
             collapsed={catCollapsed()}
             onWsUrlChange={setBridgeWsUrl}
             onSubpanelOpenChange={setCatSubpanelOpen}
+            decodingFromIQ={decodingFromIQ()}
           />
         </div>
 
@@ -1351,6 +1383,7 @@ function App(): JSX.Element {
                   onReplyConsumed={() => setReplyRequest(null)}
                   onSetPTT={cat.state().connected ? cat.setPTT : undefined}
                   onStatusChange={setSstvTxStatus}
+                  bridgeWsUrl={bridgeWsUrl()}
                 />
               </div>
             </details>

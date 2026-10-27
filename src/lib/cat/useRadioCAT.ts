@@ -8,6 +8,7 @@ import { createSignal, onCleanup } from 'solid-js'
 import { createConfirmErrorTracker } from './confirmError'
 import { parseQueryList, stateQueryCmds, supportsQuery } from './catCapabilities'
 import { TUNE_MAX_MS } from './cwTune'
+import { parseTxReport, type TxReport } from './txReport'
 
 // Web Serial API ambient types (not yet in lib.dom.d.ts for all TS versions)
 declare global {
@@ -146,6 +147,10 @@ export interface RadioState {
    *  nothing reaches the HF line. Read-only here — toggled on the radio or
    *  the bridge page. Only known when the radio lists DG; null otherwise. */
   diagMode: boolean | null;
+  /** The radio's last TX audio report (TA, TX_DIAG builds): pushed after each
+   *  SSB key-up, and live while keyed in diagnostic mode. `at` is when it
+   *  arrived; `live` = arrived while still keyed. null until the first one. */
+  txReport: (TxReport & { at: number; live: boolean }) | null;
 }
 
 /** 'idle' → 'starting' (MD3, TU1, TX) → 'keyed' → 'stopping' (RX, TU0, mode
@@ -528,6 +533,15 @@ const SILENCE_RECHECK_MS = 15_000;
 
 // ── Factory ──────────────────────────────────────────────────────────────────
 
+
+// Set by the connection settings' Probe button (radioProbe.ts): the serial
+// port it just opened, closed and left granted, so the next connect uses it
+// without asking the browser for a port a second time.
+let preselectedSerialPort: SerialPort | null = null;
+export function preselectSerialPort(port: SerialPort | null): void {
+  preselectedSerialPort = port;
+}
+
 export function useRadioCAT(): RadioCATControls {
   const [state, setState] = createSignal<RadioState>({
     connected: false, reconnecting: false, frequency: null, mode: null,
@@ -538,7 +552,7 @@ export function useRadioCAT(): RadioCATControls {
     backlight: null, firmwareVersion: null, autoReport: null,
     pttConfirmAlarm: false,
     cwTune: null, tune: 'idle', lastTuneHz: null, tuneEndsAt: null,
-    catQueries: null, diagMode: null,
+    catQueries: null, diagMode: null, txReport: null,
   });
 
   let port:      SerialPort | null = null;
@@ -1060,10 +1074,13 @@ export function useRadioCAT(): RadioCATControls {
       if (graceOver('cwTune')) setState(prev => ({ ...prev, cwTune: v }));
       return true;
     }
-    // TX audio diagnostic (radio TX_DIAG) pushed after every SSB key-up — a
-    // bridge-hardware diagnostic evaluated on the bridge's own control page,
-    // not here; recognized only so it isn't logged as unexpected.
-    if (/^TA\d+(,\d+)*;$/.test(msg)) return true;
+    // TX audio diagnostic (radio TX_DIAG): pushed after every SSB key-up, and
+    // live every ~0.5 s while keyed in diagnostic mode. Shown as the "last TX" chip.
+    if (/^TA\d+(,\d+)*;$/.test(msg)) {
+      const r = parseTxReport(msg)
+      if (r) setState(prev => ({ ...prev, txReport: { ...r, at: Date.now(), live: prev.ptt } }))
+      return true
+    }
     if (msg.startsWith('DG')) {
       // Diagnostic mode, pushed by auto-report when toggled on the radio or
       // from the bridge page. Never SET by the app, so no grace window.
@@ -1345,8 +1362,12 @@ export function useRadioCAT(): RadioCATControls {
           const { createMockSerialPort } = await import('$decoder-lib/cat/mockSerial');
           p = createMockSerialPort() as unknown as SerialPort;
         } else {
+          // A port the Probe button just picked is used as-is (it's already
+          // granted); otherwise ask the browser for one.
+          const picked = preselectedSerialPort;
+          preselectedSerialPort = null;
           const serial = (navigator as Navigator & { serial: { requestPort(): Promise<SerialPort> } }).serial;
-          p = await serial.requestPort();
+          p = picked ?? await serial.requestPort();
         }
         await p.open({
           baudRate: config.baudRate, dataBits: config.dataBits,

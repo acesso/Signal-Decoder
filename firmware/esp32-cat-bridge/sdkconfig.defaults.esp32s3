@@ -1,0 +1,50 @@
+# ESP32-S3-N16R8 bridge board — read after sdkconfig.defaults. The board itself
+# is selected by the target (CONFIG_BRIDGE_BOARD_S3 follows
+# CONFIG_IDF_TARGET_ESP32S3, see main/Kconfig.projbuild). Every value here was
+# measured on the board with firmware/esp32s3-probe; see main/doc/S3_PORT_PLAN.md.
+
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+# The flash is an XMC XM25QH128A; the bootloader cannot set its quad-enable
+# bit, so DIO. (bootloader_components/xmc_a_flash lets it boot at all.)
+CONFIG_ESPTOOLPY_FLASHMODE_DIO=y
+CONFIG_ESPTOOLPY_FLASHFREQ_80M=y
+
+# 8 MB in-package octal PSRAM. 120 MHz exists but ESP-IDF marks it
+# experimental and temperature-sensitive.
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_SPEED_80M=y
+
+# Largest caches with 64-byte data lines, and code + read-only data run from
+# PSRAM: PSRAM->internal 61 -> 88 MB/s, and a flash erase/write stalls the
+# other core for ~0.06 ms instead of ~25 ms (OTA, NVS and CAT-log writes can't
+# glitch audio). PSRAM also beats this board's DIO-only flash.
+CONFIG_ESP32S3_INSTRUCTION_CACHE_32KB=y
+CONFIG_ESP32S3_DATA_CACHE_64KB=y
+CONFIG_ESP32S3_DATA_CACHE_LINE_64B=y
+CONFIG_SPIRAM_XIP_FROM_PSRAM=y
+
+# Console on the native USB port (USB-Serial/JTAG): flashing and logs need no
+# BOOT/RST presses, and UART0 stays free for a peripheral.
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+
+# 16 MB layout: see partitions_s3.csv.
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions_s3.csv"
+
+# Keep the last crash in the "coredump" partition (ELF format) so it can be
+# read back later without a cable.
+CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH=y
+CONFIG_ESP_COREDUMP_DATA_FORMAT_ELF=y
+
+# 16 (shared default) + room for the aux serial lines' and the I/Q streams'
+# WebSocket clients (ws_server.c max_open_sockets).
+CONFIG_LWIP_MAX_SOCKETS=28
+
+# Streaming over Wi-Fi: with the default 4-segment TCP send buffer/window a
+# single lost Wi-Fi frame can't trigger a fast retransmit, so each stream
+# stalls until the retransmit timer fires (~300 ms cuts in /audio and the
+# I/Q streams, both at once). 16 segments lets lost frames be resent at once.
+# lwIP buffers go to PSRAM (SPIRAM_TRY_ALLOCATE_WIFI_LWIP).
+CONFIG_LWIP_TCP_SND_BUF_DEFAULT=23040
+CONFIG_LWIP_TCP_WND_DEFAULT=23040
+CONFIG_LWIP_TCP_RECVMBOX_SIZE=16
+CONFIG_ESP_WIFI_TX_BA_WIN=16

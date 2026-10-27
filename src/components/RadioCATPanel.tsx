@@ -1,5 +1,5 @@
 // Port of src/components/RadioCATPanel.tsx (Next.js app).
-import { createSignal, createEffect, onCleanup, For, Show, type JSX } from 'solid-js'
+import { createSignal, createEffect, on, onCleanup, For, Show, type JSX } from 'solid-js'
 import {
   useRadioCAT,
   type CATMode,
@@ -11,10 +11,16 @@ import {
   type BridgeStatus,
   type BridgeInfo,
   type TuneState,
+  preselectSerialPort,
 } from '../lib/cat/useRadioCAT'
 import { retuneSuggestion, tuneSecondsLeft, TUNE_MAX_MS, type RetuneSuggestion } from '../lib/cat/cwTune'
 import type { AudioBridge } from '../lib/cat/useAudioBridge'
 import type { IQBridge } from '../lib/cat/useIQBridge'
+import { fetchBridgeDescription, inputsFor, type BridgeInput } from '../lib/cat/bridgeCapabilities'
+import { normalizeBridgeAddress, bridgeCatUrl } from '../lib/cat/bridgeUrl'
+import { probeRadioOverSerial, probeRadioOverWebSocket } from '../lib/cat/radioProbe'
+import { ProbeCard, type ProbeResult } from './ProbeCard'
+import { assessTxReport, TX_MIC_RAIL, type TxReport } from '../lib/cat/txReport'
 import CalibrationWizard from './CalibrationWizard'
 import NumberField from './NumberField'
 import { loadObject, saveObject } from '../lib/storage'
@@ -208,6 +214,37 @@ function ModeSelector(props: { mode: CATMode | null; onChange: (m: CATMode) => v
 // alarm stays red regardless — it's about the CAT link, not RF.
 const DIAG_TITLE = ' Radio is in diagnostic mode — no RF reaches the antenna.'
 
+const TX_REPORT_COLORS = { ok: '#3fb950', warn: '#d29922', bad: '#f85149' } as const
+
+// The radio's report on the last transmission (TA): a dot and a few words,
+// details and what to change on hover. Live while keyed in diagnostic mode.
+function TxReportChip(props: { report: TxReport & { at: number; live: boolean }; drive: number | null }) {
+  const a = () => assessTxReport(props.report, props.drive)
+  const time = () => new Date(props.report.at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })
+  const title = () => {
+    const r = props.report
+    const need = 255 >> Math.max(0, Math.min(8, props.drive ?? 2))
+    return [
+      `${props.report.live ? 'Live (keyed, diagnostic mode)' : `Last TX, ${time()}`}: ${a().summary}`,
+      `Mic input peak: ${r.micPeak} of ~${TX_MIC_RAIL} (${a().micPct}% of the rail)`,
+      `Envelope peak: ${r.envPeak} (full power needs ${need} at drive ${props.drive ?? '?'})`,
+      `At full power: ${r.clipPct}% of the time · carrier gated off: ${r.gatedPct}%`,
+      a().advice ?? 'Level is right: full power with headroom on the mic input.',
+    ].join('\n')
+  }
+  return (
+    <span
+      title={title()}
+      class="flex shrink-0 cursor-pointer items-center gap-1.5 rounded border border-[#30363d] px-2 py-1 font-mono text-[10px] text-[#c9d1d9]"
+    >
+      <span class={`h-2 w-2 rounded-full ${props.report.live ? 'animate-pulse' : ''}`} style={{ background: TX_REPORT_COLORS[a().level] }} />
+      <span class="text-[#8b949e]">{props.report.live ? 'TX live' : 'Last TX'}</span>
+      <span style={{ color: TX_REPORT_COLORS[a().level] }}>{a().summary}</span>
+      <span class="text-[#8b949e]">· mic {a().micPct}%</span>
+    </span>
+  )
+}
+
 function PTTButton(props: { ptt: boolean; onToggle: () => void; confirmAlarm?: boolean; diag?: boolean }) {
   return (
     <div class="flex flex-col items-center gap-1 shrink-0">
@@ -330,12 +367,10 @@ function TuneButton(props: {
 // CAT itself could still connect (some browsers tolerate the wrong scheme
 // there), while bridge audio failed outright with "could not derive
 // /audio URL", with no obvious link back to this field.
-function normalizeBridgeWsUrl(raw: string): string {
-  const trimmed = raw.trim()
-  if (trimmed.startsWith('https://')) return 'wss://' + trimmed.slice('https://'.length)
-  if (trimmed.startsWith('http://')) return 'ws://' + trimmed.slice('http://'.length)
-  return trimmed
-}
+//
+// The /cat path is filled in too: a bare host ("192.168.0.13",
+// "usdx-bridge.local:80"), http(s)://host or ws://host all become
+// ws(s)://host/cat. An explicit other path is left alone.
 
 // Only ws://... or wss://... is ever valid here — anything else (a bare
 // hostname with no scheme, a typo'd scheme, etc.) would silently break
@@ -357,6 +392,45 @@ function SettingsPanel(props: {
   onConnect: () => void
 }) {
   const preset = () => RADIO_PRESETS[props.config.presetIdx]
+  // Probe: reach the setup without connecting the app. Over a bridge: its
+  // capabilities, routing and features, plus the radio behind it through the
+  // CAT socket. Over USB serial: the radio itself, on the port picked here
+  // (left granted, so Connect reuses it).
+  const [probe, setProbe] = createSignal<{ busy: boolean; result?: ProbeResult }>({ busy: false })
+  async function runProbe() {
+    setProbe({ busy: true })
+    if (props.config.transport === 'websocket') {
+      const catUrl = bridgeCatUrl(props.config.wsUrl)
+      if (!catUrl) { setProbe({ busy: false }); return }
+      const base = catUrl.replace(/^ws/, 'http').replace(/^(https?:\/\/[^/]+).*$/, '$1')
+      const timeout = <T,>(p: Promise<T>) => Promise.race([p, new Promise<null>((r) => setTimeout(() => r(null), 5000))])
+      const [desc, info, radio] = await Promise.all([
+        timeout(fetchBridgeDescription(base)),
+        timeout(fetch(`${base}/info`).then((r) => (r.ok ? r.json() : null)).catch(() => null) as Promise<{ features?: string[] } | null>),
+        probeRadioOverWebSocket(catUrl),
+      ])
+      setProbe({
+        busy: false,
+        result: desc
+          ? { target: normalizeBridgeAddress(props.config.wsUrl ?? ''), bridge: { ...desc, features: info?.features ?? [], catOk: radio !== null }, radio }
+          : { target: normalizeBridgeAddress(props.config.wsUrl ?? ''), error: `No answer from ${base} — check the address and that the bridge is on this network.`, radio },
+      })
+      return
+    }
+    // USB serial
+    const serial = (navigator as Navigator & { serial?: { requestPort(): Promise<SerialPort> } }).serial
+    if (!serial) { setProbe({ busy: false, result: { target: 'USB serial', error: 'This browser has no Web Serial (use Chrome, Edge or Opera).' } }); return }
+    let port: SerialPort
+    try { port = await serial.requestPort() } catch { setProbe({ busy: false }); return }
+    try {
+      const radio = await probeRadioOverSerial(port, props.config)
+      preselectSerialPort(port)
+      setProbe({ busy: false, result: { target: `USB serial at ${props.config.baudRate} baud`, radio } })
+    } catch (err) {
+      setProbe({ busy: false, result: { target: 'USB serial', error: `Could not open the port: ${err instanceof Error ? err.message : String(err)}` } })
+    }
+  }
+
   const isWebSocket = () => props.config.transport === 'websocket'
 
   const applyPreset = (idx: number) => {
@@ -468,8 +542,8 @@ function SettingsPanel(props: {
             <input
               type="text"
               value={props.config.wsUrl ?? ''}
-              onChange={(e) => props.onConfigChange({ ...props.config, wsUrl: normalizeBridgeWsUrl(e.currentTarget.value) })}
-              placeholder="ws://usdx-bridge.local/cat"
+              onChange={(e) => props.onConfigChange({ ...props.config, wsUrl: normalizeBridgeAddress(e.currentTarget.value) })}
+              placeholder="usdx-bridge.local or 192.168.0.13"
               class={`bg-[#0d1117] border text-[#c9d1d9] text-xs rounded px-2 py-1.5 focus:outline-none font-mono
                 ${isValidBridgeWsUrl(props.config.wsUrl ?? '') ? 'border-[#30363d] focus:border-[#388bfd]' : 'border-[#f85149] focus:border-[#f85149]'}`}
             />
@@ -484,9 +558,9 @@ function SettingsPanel(props: {
               }
             >
               <p class="text-[10px] text-[#8b949e]">
-                Address of the ESP32 CAT bridge's WebSocket endpoint — defaults to its mDNS name,{' '}
-                <code class="text-[#79c0ff]">usdx-bridge.local</code>, if your network resolves it;
-                otherwise use its IP address (shown on the bridge's LCD).
+                The bridge's address: its mDNS name (e.g.{' '}
+                <code class="text-[#79c0ff]">usdx-bridge.local</code>) or IP address;{' '}
+                <code class="font-mono">ws://</code> is filled in.
               </p>
             </Show>
           </div>
@@ -543,6 +617,21 @@ function SettingsPanel(props: {
           rate is fixed on the bridge itself (set via its own firmware config) and isn't controlled from here.
         </p>
       </Show>
+
+      <div class="flex flex-col gap-2">
+        <button
+          type="button"
+          onClick={() => void runProbe()}
+          disabled={probe().busy || (props.config.transport === 'websocket' && !(props.config.wsUrl ?? '').trim())}
+          class="self-start rounded-md border border-[#30363d] bg-[#21262d] px-3 py-1.5 text-xs font-semibold text-[#c9d1d9] hover:bg-[#30363d] disabled:opacity-40"
+          title={props.config.transport === 'websocket'
+            ? 'Test the bridge and the radio behind it, and read what they can do, without connecting'
+            : 'Pick the USB port and ask the radio what it is and what it supports, without connecting'}
+        >
+          {probe().busy ? 'Probing…' : 'Probe'}
+        </button>
+        <Show when={probe().result}>{(res) => <ProbeCard result={res()} />}</Show>
+      </div>
 
       <button
         onClick={props.onConnect}
@@ -1147,6 +1236,11 @@ function PABiasPanel(props: {
 // factory-reset button — it's disruptive (the bridge drops off Wi-Fi for a
 // few seconds) even though it's not destructive to any stored settings.
 
+function inputLabel(inp: BridgeInput): string {
+  const rate = inp.rateHz > 0 ? `${inp.rateHz / 1000} kHz` : ''
+  return [inp.chip, [rate, inp.jack].filter(Boolean).join(', ')].filter(Boolean).join(' — ')
+}
+
 function BridgeResetButton(props: { onConfirm: () => void; busy: boolean }) {
   const [armed, setArmed] = createSignal(false)
 
@@ -1297,9 +1391,16 @@ function BridgeInputModeControl(props: {
   iqBridge: IQBridge
   setBridgeInputMode: (wsUrl: string, mode: 'audio' | 'iq') => Promise<boolean>
   onSwitched: () => void
+  /** Single-codec bridges: offer the Audio / I/Q input-mode switch. */
+  modeSwitch: boolean
 }) {
   const iq = props.iqBridge
   const [busy, setBusy] = createSignal(false)
+  // Channels of whichever input currently feeds the audio stream.
+  const audioInputChannels = () => {
+    const id = iq.state().routing?.audio.input
+    return iq.state().capabilities?.inputs.find((i) => i.id === id)?.channels ?? []
+  }
 
   // Mirrors the firmware's own rejection (http_control.c's input_mode_handler):
   // switching to "audio" while the saved rate is 96000 (I/Q-only) is
@@ -1331,6 +1432,7 @@ function BridgeInputModeControl(props: {
 
   return (
     <div class="flex flex-col gap-2">
+      <Show when={props.modeSwitch}>
       <div class="flex items-center gap-2 flex-wrap">
         <span class="text-[10px] text-[#8b949e] whitespace-nowrap">Input mode</span>
         <button
@@ -1356,7 +1458,8 @@ function BridgeInputModeControl(props: {
           I/Q
         </button>
       </div>
-      <Show when={audioBlockedBy96k()}>
+      </Show>
+      <Show when={props.modeSwitch && audioBlockedBy96k()}>
         <p class="text-[10px] text-[#f0883e]">
           Switching to Audio is blocked while the sample rate is 96kHz (I/Q-only) — lower it first in the bridge's
           own control page.
@@ -1417,13 +1520,60 @@ function BridgeInputModeControl(props: {
           issue (mixer self-mixing or ADC/analog DC offset, not a wiring swap) — this subtracts each channel's own
           running mean before anything else sees the signal.
         </p>
+        <Show when={inputsFor(iq.state().capabilities, 'iq').length > 1 || inputsFor(iq.state().capabilities, 'audio').length > 1}>
+          <div class="flex flex-wrap items-center gap-2 text-[10px] text-[#8b949e]">
+            <Show when={inputsFor(iq.state().capabilities, 'iq').length > 1}>
+              <span>I/Q from</span>
+              <select
+                class="bg-[#0d1117] border border-[#30363d] rounded px-1 py-0.5 text-[#c9d1d9]"
+                value={iq.state().routing?.iq.input ?? ''}
+                onChange={(e) => void iq.updateRouting({ iq: { input: e.currentTarget.value } })}
+              >
+                <For each={inputsFor(iq.state().capabilities, 'iq')}>
+                  {(inp) => <option value={inp.id}>{inputLabel(inp)}</option>}
+                </For>
+              </select>
+            </Show>
+            <Show when={inputsFor(iq.state().capabilities, 'audio').length > 1 && iq.state().capabilities?.concurrentInputs}>
+              <span>Audio from</span>
+              <select
+                class="bg-[#0d1117] border border-[#30363d] rounded px-1 py-0.5 text-[#c9d1d9]"
+                value={iq.state().routing?.audio.input ?? ''}
+                onChange={(e) => void iq.updateRouting({ audio: { input: e.currentTarget.value } })}
+              >
+                <For each={inputsFor(iq.state().capabilities, 'audio')}>
+                  {(inp) => <option value={inp.id}>{inputLabel(inp)}</option>}
+                </For>
+              </select>
+            </Show>
+            <Show when={audioInputChannels().length > 1}>
+              <span>channel</span>
+              <select
+                class="bg-[#0d1117] border border-[#30363d] rounded px-1 py-0.5 text-[#c9d1d9]"
+                value={iq.state().routing?.audio.channel ?? 'left'}
+                onChange={(e) => void iq.updateRouting({ audio: { channel: e.currentTarget.value } })}
+              >
+                <For each={audioInputChannels()}>{(ch) => <option value={ch.id}>{ch.label}</option>}</For>
+              </select>
+            </Show>
+          </div>
+          <p class="text-[10px] text-[#8b949e]">
+            Which of this bridge's inputs feeds the I/Q waterfall and which the audio. The bridge saves the choice
+            and its own control page shows the same thing. Running both inputs at once lets you compare them on
+            the same signal (a Y-splitter into both jacks).
+          </p>
+        </Show>
         <label class="flex items-center gap-2 text-[10px] text-[#8b949e]">
           <input
             type="checkbox"
             checked={iq.state().imbalanceCorrectionEnabled}
+            disabled={iq.state().bridgeDsp}
             onChange={(e) => iq.setImbalanceCorrection(e.currentTarget.checked)}
           />
           Correct I/Q gain &amp; phase imbalance
+          <Show when={iq.state().bridgeDsp}>
+            <span class="text-[#d29922]">(not available: this bridge shifts and narrows the I/Q itself)</span>
+          </Show>
         </label>
         <p class="text-[10px] text-[#8b949e]">
           If a real signal shows a fainter PARTIAL mirror of itself on the opposite side (not a full, equal-strength
@@ -1562,6 +1712,8 @@ function BridgeAudioControl(props: { wsUrl: string; audioBridge: AudioBridge }) 
 
 function BridgeStatusPanel(props: {
   wsUrl: string
+  /** CAT connection state: a (re)connect reloads the panel. */
+  connected: boolean
   audioBridge: AudioBridge
   iqBridge: IQBridge
   getBridgeStatus: (wsUrl: string) => Promise<BridgeStatus | null>
@@ -1610,10 +1762,15 @@ function BridgeStatusPanel(props: {
     // own narrow /status read, only when the firmware actually reports the
     // feature (older bridges 404 on /input-mode's absence gracefully
     // enough, but there's no reason to even try).
-    if (i?.features.includes('input_mode_select')) void props.iqBridge.refreshInfo(props.wsUrl)
+    if (i?.features.some((f) => f === 'input_mode_select' || f === 'iq_spectrum' || f === 'routing')) void props.iqBridge.refreshInfo(props.wsUrl)
+    // Capabilities and routing, for whichever bridge this panel is pointed
+    // at now (a different bridge may have replaced the last one).
+    void props.iqBridge.refreshBridgeDescription(props.wsUrl)
   }
 
-  load()
+  // Reload whenever the panel is pointed at another bridge, or CAT
+  // (re)connects: the bridge behind the address may have changed.
+  createEffect(on([() => props.wsUrl, () => props.connected], () => { void load() }))
 
   const handleRefresh = () => { void load() }
 
@@ -1816,13 +1973,16 @@ function BridgeStatusPanel(props: {
         </div>
       </Show>
 
-      <Show when={hasFeature('input_mode_select')}>
+      {/* The I/Q settings: any bridge that can carry I/Q. The Audio / I/Q
+          mode switch only on single-codec bridges (input_mode_select). */}
+      <Show when={hasFeature('input_mode_select') || hasFeature('iq_spectrum') || hasFeature('routing')}>
         <div class="border-t border-[#21262d] pt-3">
           <BridgeInputModeControl
             wsUrl={props.wsUrl}
             iqBridge={props.iqBridge}
             setBridgeInputMode={props.setBridgeInputMode}
             onSwitched={() => void load()}
+            modeSwitch={hasFeature('input_mode_select')}
           />
         </div>
       </Show>
@@ -1878,7 +2038,7 @@ const DEFAULT_CONFIG: CATConnectionConfig & { presetIdx: number } = {
   baudRate: 38400, dataBits: 8, stopBits: 1, parity: 'none',
   timeoutMs: 200, pollIntervalMs: 500, debug: false,
   rigProfile: RADIO_PRESETS[0].rigProfile,
-  transport: 'serial', wsUrl: 'ws://usdx-bridge.local/cat',
+  transport: 'serial', wsUrl: 'ws://usdx-bridge.local',
 }
 
 // Restores presetIdx/transport/wsUrl from localStorage, but re-derives
@@ -1889,6 +2049,7 @@ const DEFAULT_CONFIG: CATConnectionConfig & { presetIdx: number } = {
 // checked since a shrunk preset list could otherwise index out of bounds.
 function loadInitialConfig(): CATConnectionConfig & { presetIdx: number } {
   const stored = loadObject(CAT_CONFIG_STORAGE_KEY, DEFAULT_CONFIG)
+  if (stored.wsUrl) stored.wsUrl = normalizeBridgeAddress(stored.wsUrl)  // shown and saved without /cat
   const presetIdx = stored.presetIdx >= 0 && stored.presetIdx < RADIO_PRESETS.length
     ? stored.presetIdx : DEFAULT_CONFIG.presetIdx
   const preset = RADIO_PRESETS[presetIdx]
@@ -1925,6 +2086,8 @@ export default function RadioCATPanel(props: {
   // feature's original purpose (decoder content below stays reachable
   // once nothing here is expanded).
   onSubpanelOpenChange?: (open: boolean) => void
+  /** True when decoding uses I/Q rather than the radio's audio (App's RX source). Falls back to the bridge's mode. */
+  decodingFromIQ?: boolean
 }): JSX.Element {
   const cat = props.cat
   const state = () => cat.state()
@@ -1947,7 +2110,7 @@ export default function RadioCATPanel(props: {
   const [micGainDb, setMicGainDb] = createSignal<number | null>(null)
   createEffect(() => {
     if (state().connected && config().transport === 'websocket' && config().wsUrl) {
-      void cat.getBridgeMicGain(config().wsUrl!).then(setMicGainDb)
+      void cat.getBridgeMicGain(bridgeCatUrl(config().wsUrl)).then(setMicGainDb)
     } else {
       setMicGainDb(null)
     }
@@ -1960,10 +2123,11 @@ export default function RadioCATPanel(props: {
 
   createEffect(() => {
     const c = config()
-    props.onWsUrlChange?.(c.transport === 'websocket' ? c.wsUrl : undefined)
+    props.onWsUrlChange?.(c.transport === 'websocket' && c.wsUrl ? bridgeCatUrl(c.wsUrl) : undefined)
   })
 
-  const handleConnect    = () => { setShowSettings(false); cat.connect(config()).catch(() => {}) }
+  // The field holds the bridge's address; CAT itself is at its /cat path.
+  const handleConnect    = () => { setShowSettings(false); cat.connect({ ...config(), wsUrl: bridgeCatUrl(config().wsUrl) }).catch(() => {}) }
   const handleFreqCommit = (hz: number) => { cat.setFrequency(hz).catch(() => {}) }
   const handleModeChange = (m: CATMode) => { if (state().tune === 'idle') cat.setMode(m).catch(() => {}) }  // locked while a TUNE owns the mode
   const handlePTTToggle  = () => { cat.setPTT(!state().ptt).catch(() => {}) }  // unkeying during a TUNE ends it (setPTT → stopTune)
@@ -1978,7 +2142,7 @@ export default function RadioCATPanel(props: {
   const handleDrive      = (n: number) => { cat.setDrive(n).catch(() => {}) }
   const handleBacklight  = (n: number) => { cat.setBacklight(n).catch(() => {}) }
   const handleMicGain    = (db: number) => {
-    const wsUrl = config().wsUrl
+    const wsUrl = config().wsUrl ? bridgeCatUrl(config().wsUrl) : undefined
     if (!wsUrl) return
     void cat.setBridgeMicGain(wsUrl, db).then((r) => { if (r) setMicGainDb(r.db) })
   }
@@ -2122,13 +2286,18 @@ export default function RadioCATPanel(props: {
             />
           </Show>
 
+          {/* The radio's report on the last transmission (TX_DIAG builds push TA) */}
+          <Show when={state().txReport}>
+            {(r) => <TxReportChip report={r()} drive={state().drive} />}
+          </Show>
+
           {/* uSDX BLACK_BRICK 4.01a extensions */}
           <Show when={config().rigProfile === 'usdx-blackbrick' && state().firmwareVersion !== null && !props.collapsed}>
             <BlackBrickControls
               volume={state().volume} att1={state().att1} att2={state().att2} nr={state().nr}
               agc={state().agc} agcLevel={state().agcLevel} filter={state().filter} drive={state().drive} backlight={state().backlight} firmwareVersion={state().firmwareVersion}
               paOpen={showPABias()}
-              iqModeActive={props.iqBridge.state().inputMode === 'iq'}
+              iqModeActive={props.decodingFromIQ ?? props.iqBridge.state().inputMode === 'iq'}
               micGainDb={micGainDb()}
               iqAgcEnabled={props.iqBridge.state().agcEnabled}
               iqAgcLevel={props.iqBridge.state().agcLevel}
@@ -2167,7 +2336,8 @@ export default function RadioCATPanel(props: {
 
       <Show when={!props.collapsed && showBridgeStatus() && config().transport === 'websocket' && config().wsUrl}>
         <BridgeStatusPanel
-          wsUrl={config().wsUrl!}
+          wsUrl={bridgeCatUrl(config().wsUrl)}
+          connected={state().connected}
           audioBridge={props.audioBridge}
           iqBridge={props.iqBridge}
           getBridgeStatus={cat.getBridgeStatus} resetBridge={cat.resetBridge}
