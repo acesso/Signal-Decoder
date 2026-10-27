@@ -12,6 +12,12 @@ them into a version section when cutting a release.
 
 ## [Unreleased]
 
+## [0.28.1] - 2026-10-27
+
+### Fixed
+
+- **TX audio sent to a bridge carried mirror images.** The 12 → 16 kHz resampler applied the rate ratio twice when building its filter table, so every FT8/FT4 slot upload added an image of each tone mirrored around 2 kHz, 9–18 dB below it (a 2500 Hz tone also put one at 1500 Hz). Images are now below −83 dB. The A1S firmware's 16 → 48 kHz upsampler gets the same correction (harmless at that ratio).
+
 ## [0.28.0] - 2026-10-27
 
 ### Added

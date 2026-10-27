@@ -246,14 +246,41 @@ function gcd(a: number, b: number): number {
 // (fromRate, toRate) pair actually seen (typically just once per mic
 // session, since micCtx's own native rate doesn't change mid-session) and
 // reused for every chunk after that — cheap relative to real-time audio.
+//
+// BUG this fixes (reported 2026-09-02: a mirrored second tone visible in
+// the bridge's mic-sniff waterfall on every real FT8 TX, confirmed absent
+// with the bridge's own generated test tone, ruling out hardware/codec —
+// present with Fake Split off too, ruling that feature out; both point at
+// this shared resample step, hit by every FT8/FT4 TX regardless of any
+// other setting). `phase` here is a LOOP INDEX (0..M-1) enumerating every
+// row of the table, but the runtime caller (downsampleBandlimited, below)
+// tracks its OWN running phase state the same Bresenham way — advance by L,
+// wrap at M — and uses that value DIRECTLY as a row index into this table
+// (`state.kernel.subarray(phase * BANDLIMITED_TAPS, ...)`), not as an input
+// to any further formula. So the fractional input-sample offset a runtime
+// phase value of `p` actually needs is simply `p / M` (the invariant
+// `center + phase/M` exactly tracks true continuous time — verified
+// numerically). The old `exact = (phase * L) / M` re-multiplied by L a
+// SECOND time (phase already accumulates in units of L), which happens to
+// silently cancel out whenever L=1 or M=1 (why this passed unnoticed on
+// the 48000->16000 mic-capture path, where the ratio always reduces to
+// L=1) but produces a real, audible/visible image whenever a genuine L>1,
+// M>1 ratio is used — exactly the FT8-encoder-to-bridge-wire-rate case
+// (12000->16000, L=3/M=4) but not exclusive to it (e.g. a 24000 or 44100
+// Hz bridge codec rate on the firmware side hits the identical L>1/M>1
+// condition in upsample_build_kernel()). Confirmed via direct simulation:
+// the buggy formula measures a ~13-34% (tone-dependent) mirror image at
+// `toRate - f`/`fromRate - f`-family frequencies; the corrected formula
+// below drops every such peak to numerical noise floor for the same test
+// tones, on both the 12000->16000 (buggy under the old formula) and
+// 48000->16000 (accidentally fine either way, since M=1 there) cases.
 function buildPolyphaseKernel(fromRate: number, toRate: number): { kernel: Float64Array; L: number; M: number } {
   const g = gcd(fromRate, toRate)
   const L = fromRate / g
   const M = toRate / g
   const kernel = new Float64Array(M * BANDLIMITED_TAPS)
   for (let phase = 0; phase < M; phase++) {
-    const exact = (phase * L) / M
-    const frac = exact - Math.floor(exact)
+    const frac = phase / M
     for (let t = 0; t < BANDLIMITED_TAPS; t++) {
       const x = (t - BANDLIMITED_SINC_HALF_WIDTH) - frac
       kernel[phase * BANDLIMITED_TAPS + t] = windowedSinc(x, BANDLIMITED_SINC_HALF_WIDTH)

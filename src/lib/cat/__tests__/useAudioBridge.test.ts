@@ -281,4 +281,51 @@ describe('downsampleBandlimited', () => {
       expect(Math.abs(curFirst - prevLast)).toBeLessThan(Math.max(maxNormalStep, 0.05));
     }
   });
+
+  // REGRESSION (reported 2026-09-02, confirmed on real hardware: a mirrored
+  // second tone in the ESP32 bridge's mic-sniff waterfall on every real FT8
+  // TX — present with Fake Split off too, ruling that feature out — but
+  // NOT on the bridge's own generated test tone, which never passes
+  // through this function at all). buildPolyphaseKernel()'s table-building
+  // formula re-multiplied the loop index by L a second time (the runtime
+  // caller already tracks phase in units of L), which happens to cancel
+  // out whenever the rate ratio reduces to L=1 or M=1 — true of every
+  // (fromRate, toRate) pair the three tests above use (48000->16000
+  // reduces to L=3, M=1) — but produces a real, audible/visible mirror
+  // image whenever a genuine L>1 AND M>1 ratio is used. 12000->16000
+  // (FT8's encoder rate to the bridge's wire rate, toBridgeWireFormat() in
+  // useFTTransmit.ts) is exactly such a ratio (L=3, M=4) and is hit by
+  // EVERY FT8/FT4 transmission sent over the bridge, not a rare setting.
+  it('does not fold a mirror image into the output when BOTH L>1 and M>1 (the FT8-to-bridge-wire-rate case)', () => {
+    const fromRate = 12000; // FT8/FT4 encoder rate (ENC_RATE in useFTTransmit.ts)
+    const toRate = 16000;   // BRIDGE_PLAYBACK_RATE_HZ
+    const toneHz = 1750;    // Fake Split's default sweet spot — arbitrary, any tone reproduces this
+    const chunkSize = 2048;
+    const state = makeBandlimitedResampleState();
+    const step = (2 * Math.PI * toneHz) / fromRate;
+    let phase = 0;
+    const outChunks: Float32Array[] = [];
+    for (let c = 0; c < 40; c++) {
+      const input = new Float32Array(chunkSize);
+      for (let i = 0; i < chunkSize; i++) { input[i] = Math.sin(phase) * 0.6; phase += step; }
+      outChunks.push(downsampleBandlimited(input, fromRate, toRate, state));
+    }
+    const total = outChunks.reduce((s, c) => s + c.length, 0);
+    const all = new Float32Array(total);
+    let off = 0;
+    for (const c of outChunks) { all.set(c, off); off += c.length; }
+    const settled = all.subarray(Math.round(toRate * 0.3));
+
+    const fundamental = goertzelMag(settled, toneHz, toRate);
+    expect(fundamental).toBeGreaterThan(0.2);
+
+    // The bug's specific signature: a real, structured peak at
+    // fromRate/L - toneHz (here 4000 - 1750 = 2250 Hz) — NOT generic
+    // broadband noise, so this checks the exact suspect frequency
+    // directly rather than an averaged floor.
+    const mirrorHz = (fromRate / 3) - toneHz; // 4000 - 1750 = 2250, matches the reported/simulated bug exactly
+    const mirrorMag = goertzelMag(settled, Math.abs(mirrorHz), toRate);
+    // Buggy formula measured ~23% of the fundamental here; fixed is <1%.
+    expect(mirrorMag / fundamental).toBeLessThan(0.05);
+  });
 });
