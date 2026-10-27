@@ -1,5 +1,26 @@
 menu "CAT Bridge Config"
 
+    choice BRIDGE_BOARD
+        prompt "Bridge board"
+        default BRIDGE_BOARD_S3 if IDF_TARGET_ESP32S3
+        default BRIDGE_BOARD_A1S
+        help
+            Which bridge hardware this build is for. Follows the target chip:
+            `idf.py set-target esp32` builds the A1S, `esp32s3` the S3 board.
+
+        config BRIDGE_BOARD_A1S
+            bool "AI-Thinker ESP32-A1S Audio Kit (ES8388 codec)"
+            depends on IDF_TARGET_ESP32
+
+        config BRIDGE_BOARD_S3
+            bool "ESP32-S3-N16R8 with WM8782 / PCM1808 / PCM5102"
+            depends on IDF_TARGET_ESP32S3
+            help
+                See main/doc/S3_PORT_PLAN.md. The converters are brought up
+                in stages; until then this board runs Wi-Fi, CAT, the PA
+                watchdog and OTA with no audio.
+    endchoice
+
     config BRIDGE_WIFI_SSID
         string "Wi-Fi SSID"
         default "myssid"

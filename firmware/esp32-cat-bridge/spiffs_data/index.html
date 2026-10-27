@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" class="features-pending">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -8,7 +8,7 @@
 <link rel="icon" href="data:,">
 </head>
 <body>
-<h1>uSDX CAT bridge</h1>
+<h1>uSDX CAT bridge <span id="board-badge" class="board-badge" hidden></span></h1>
 
 <div class="layout">
   <div class="col col-side">
@@ -30,6 +30,7 @@
     <section id="status-card" class="card">
       <h2>Status</h2>
       <dl id="status-list">
+        <dt>Board</dt><dd id="s-board" class="board-name">&hellip;</dd>
         <dt>Wi-Fi</dt><dd id="s-wifi">&hellip;</dd>
         <dt>IP address</dt><dd id="s-ip">&hellip;</dd>
         <dt>Signal</dt><dd id="s-rssi">&hellip;</dd>
@@ -83,26 +84,35 @@
 
     <section id="system-card" class="card">
       <h2>System</h2>
-      <div class="audio-input-row">
+      <div class="audio-input-row" data-feature="alc_control">
         <span class="audio-input-label">ALC</span>
         <div class="audio-input-toggle">
           <button data-alc-enable="true" type="button" class="audio-input-option">On</button>
           <button data-alc-enable="false" type="button" class="audio-input-option">Off</button>
         </div>
       </div>
-      <p class="hint audio-input-hint">The ES8388's Automatic Level Control &mdash; confirmed off by the chip's own
+      <p data-feature="alc_control" class="hint audio-input-hint">The ES8388's Automatic Level Control &mdash; confirmed off by the chip's own
       power-on-reset default and never touched by firmware, but exposed here as a checkable diagnostic. Not
       persisted; resets to Off after a reboot regardless.</p>
-      <div class="audio-input-row">
+      <div class="audio-input-row" data-feature="noise_gate_control">
         <span class="audio-input-label">Noise gate</span>
         <div class="audio-input-toggle">
           <button data-noise-gate-enable="true" type="button" class="audio-input-option">On</button>
           <button data-noise-gate-enable="false" type="button" class="audio-input-option">Off</button>
         </div>
       </div>
-      <p class="hint audio-input-hint">Part of the ALC block above &mdash; only has an audible effect while ALC
+      <p data-feature="noise_gate_control" class="hint audio-input-hint">Part of the ALC block above &mdash; only has an audible effect while ALC
       itself is also on. Same off-by-default, not-persisted caveats.</p>
-      <div class="audio-input-row">
+      <div class="audio-input-row" data-feature="led_enable">
+        <span class="audio-input-label">Status LEDs</span>
+        <div class="audio-input-toggle">
+          <button data-led-enable="true" type="button" class="audio-input-option">On</button>
+          <button data-led-enable="false" type="button" class="audio-input-option">Off</button>
+        </div>
+      </div>
+      <p data-feature="led_enable" class="hint audio-input-hint">Turns the status LED off and on, for example to check whether its switching
+      adds noise to the audio path. Not saved: the LED is back on after a reboot.</p>
+      <div class="audio-input-row" data-feature="cpu_monitor">
         <span class="audio-input-label">CPU frequency</span>
         <div class="audio-input-toggle">
           <button data-cpu-freq="80" type="button" class="audio-input-option">80 MHz</button>
@@ -110,10 +120,10 @@
           <button data-cpu-freq="240" type="button" class="audio-input-option">240 MHz</button>
         </div>
       </div>
-      <p class="hint audio-input-hint">Pins the ESP32's CPU clock (no dynamic scaling either way) &mdash; a
+      <p data-feature="cpu_monitor" class="hint audio-input-hint">Pins the ESP32's CPU clock (no dynamic scaling either way) &mdash; a
       low-confidence experiment for whether digital switching activity couples into the analog audio path. Not
       persisted; reverts to 240 MHz (the board's boot-time default) after a reboot.</p>
-      <div class="audio-input-row">
+      <div class="audio-input-row" data-feature="wifi_tx_power_control">
         <span class="audio-input-label">WiFi TX power</span>
         <div class="audio-input-toggle">
           <button data-wifi-tx-power="8" type="button" class="audio-input-option">2 dBm</button>
@@ -123,10 +133,21 @@
           <button data-wifi-tx-power="78" type="button" class="audio-input-option">19.5 dBm (max)</button>
         </div>
       </div>
-      <p class="hint audio-input-hint">Live-sets the WiFi radio's max transmit power &mdash; a low-confidence
+      <p data-feature="wifi_tx_power_control" class="hint audio-input-hint">Live-sets the WiFi radio's max transmit power &mdash; a low-confidence
       experiment for whether the radio's own transmit activity couples noise into the analog audio path.
       Applied immediately AND persisted to NVS &mdash; lowering it may weaken WiFi range/reliability, so raise
       it back if the connection gets flaky.</p>
+      <div class="sys-graph" title="CPU load per core over the last 3 minutes (100% minus each core's idle task).">
+        <div class="sys-graph-head"><span>CPU</span><span id="sys-cpu-now" class="sys-graph-now"></span></div>
+        <canvas id="sys-cpu-graph" width="320" height="64"></canvas>
+        <div class="sys-legend"><span class="sw sw-a"></span>core 0 <span class="sw sw-b"></span>core 1</div>
+      </div>
+      <div class="sys-graph" title="Free memory over the last 3 minutes, as % of each pool: internal RAM (DMA and fast buffers) and PSRAM.">
+        <div class="sys-graph-head"><span>Memory free</span><span id="sys-mem-now" class="sys-graph-now"></span></div>
+        <canvas id="sys-mem-graph" width="320" height="64"></canvas>
+        <div class="sys-legend"><span class="sw sw-a"></span>internal <span class="sw sw-b"></span>PSRAM</div>
+      </div>
+      <div id="sys-storage" class="sys-storage"></div>
       <dl id="cpu-stats-list">
         <dt>Heap free</dt><dd id="cpu-heap-free">&hellip;</dd>
         <dt>Heap min free</dt><dd id="cpu-heap-min">&hellip;</dd>
@@ -137,7 +158,7 @@
       </dl>
       <table id="cpu-task-table" class="cpu-task-table">
         <thead>
-          <tr><th>Task</th><th>CPU%</th><th>Core</th><th>Stack free</th></tr>
+          <tr><th data-sort="name">Task</th><th data-sort="cpu_pct">CPU%</th><th data-sort="core">Core</th><th data-sort="stack_free">Stack free</th></tr>
         </thead>
         <tbody id="cpu-task-body"></tbody>
       </table>
@@ -147,19 +168,19 @@
   </div>
 
   <div class="col col-main">
-    <section id="audio-quality-card" class="card">
+    <section id="audio-tools-card" class="card card-wide" data-feature="audio">
       <div class="cat-header">
-        <h2>Audio</h2>
+        <h2 title="Listen to the radio and check what the bridge sends to it: spectrum bars, waterfall, scope and stats per channel. The blue dashed line marks the estimated passband roll-off (~-6 dB): watch it while adjusting the interface board&#39;s RC trimpots.">Audio tools <span class="info">ⓘ</span></h2>
       </div>
       <div class="audio-listen-sniff-row">
         <div class="audio-listen-sniff-col">
           <div class="audio-buttons">
-            <button id="audio-listen-btn" type="button">Listen to Radio</button>
+            <button id="audio-listen-btn" type="button" title="Stream the radio audio from the bridge (/audio), independent of CAT.">Listen to Radio</button>
           </div>
         </div>
         <div class="audio-listen-sniff-col">
           <div class="audio-buttons">
-            <button id="mic-sniff-btn" type="button">Start Sniffing</button>
+            <button id="mic-sniff-btn" type="button" title="Read-only tap on the exact samples the bridge writes to the radio&#39;s mic input (/audio-mic-sniff): the only way to confirm TX audio reached the radio. Never slows the real TX path.">Start Sniffing</button>
           </div>
           <label class="cat-pause-label">
             <input id="mic-sniff-play" type="checkbox" checked>
@@ -285,7 +306,7 @@
           </div>
           <div class="tone-panel">
             <div class="tone-head">
-              <span class="audio-input-label">Test tone</span>
+              <span class="audio-input-label" title="Continuous sine on the TX path, for tuning the radio&#39;s preamps against a fixed reference. Retunes without clicking; always off after a reboot; won&#39;t start while a TX slot plays.">Test tone <span class="info">ⓘ</span></span>
               <span id="tone-readout" class="quality-readout">off</span>
               <button id="tone-toggle" type="button" class="tone-toggle">Start</button>
             </div>
@@ -299,160 +320,119 @@
               <input id="tone-amp" type="range" min="0" max="100" step="1" value="25">
               <span id="tone-amp-val">25%</span>
             </label>
-            <p class="hint tone-hint">Continuous sine on the mic-send path, for tuning the radio's
-            preamps against a fixed reference &mdash; it shows up in the waterfall above. Retunes
-            without clicking while running. Always starts off after a reboot, and won't start while
-            a TX slot is playing.</p>
           </div>
         </div>
       </div>
-      <p class="hint">"Speaker" streams raw audio over a second WebSocket
-      (<code>/audio</code>), independent of the CAT connection. "Mic &rarr;
-      Radio" is a read-only tap on the exact samples the bridge just wrote to
-      the radio's mic input (<code>/audio-mic-sniff</code>) &mdash; since the
-      web app's mic-send path has no return signal at all, this is the only
-      way to confirm audio actually reached the radio and hear/see what it
-      sounded like. Both are independent and can be on or off in any
-      combination; the sniffer can never affect or slow down the real
-      mic-send path. For tuning the interface board's audio-in/audio-out RC
-      filter trimpots by eye &mdash; the horizontal blue dashed line marks the
-      estimated passband rolloff amplitude (~-6dB below peak); watch it move
-      as you adjust each trimpot.</p>
-      <div class="audio-input-row">
-        <span class="audio-input-label">ADC input</span>
-        <div class="audio-input-toggle">
-          <button data-adc-input="lin1" type="button" class="audio-input-option">LIN1</button>
-          <button data-adc-input="lin2" type="button" class="audio-input-option">LIN2 (P2 jack)</button>
-          <button data-adc-input="mic1" type="button" class="audio-input-option">MIC1 (onboard)</button>
-          <button data-adc-input="mic2" type="button" class="audio-input-option">MIC2 (onboard)</button>
-          <button data-adc-input="diff" type="button" class="audio-input-option">Diff</button>
-        </div>
-      </div>
-      <p class="hint audio-input-hint">Which physical input path the ES8388 codec reads from. Confirmed via a
-      known-good phone line-out test: LIN2 is the P2 jack and sounds best of the 5 &mdash; the others are mostly
-      for reference/comparison now.</p>
-      <div class="audio-input-row">
-        <span class="audio-input-label">ADC RX channel</span>
-        <div class="audio-input-toggle">
-          <button data-rx-slot="left" type="button" class="audio-input-option">Left</button>
-          <button data-rx-slot="right" type="button" class="audio-input-option">Right</button>
-        </div>
-      </div>
-      <p class="hint audio-input-hint">A SEPARATE axis from ADC input above &mdash; once a physical input is
-      selected, this picks which of its two ADC channels (left/right) the ESP32 actually keeps. A jack's tip
-      signal can land on either one depending on board wiring. Switching pauses capture briefly.</p>
-      <div class="audio-input-row">
-        <span class="audio-input-label">MIC PGA gain</span>
-        <input id="mic-gain-slider" type="range" min="-6" max="24" step="3" value="0" class="audio-gain-slider">
-        <span id="mic-gain-readout" class="audio-input-label">0 dB</span>
-      </div>
-      <p class="hint audio-input-hint">0dB (unity gain) is the ES8388's own PGA default. The onboard mic capsule was
-      found bleeding audibly into every ADC input mode (a board-wiring issue, not fixable by any register here)
-      &mdash; raising or lowering this won't fix that bleed, only the overall input level.</p>
-      <div class="audio-input-row">
-        <span class="audio-input-label">Status LEDs</span>
-        <div class="audio-input-toggle">
-          <button data-led-enable="true" type="button" class="audio-input-option">On</button>
-          <button data-led-enable="false" type="button" class="audio-input-option">Off</button>
-        </div>
-      </div>
-      <p class="hint audio-input-hint">One-time reversible test: does the LEDs' own PWM switching (right next to
-      the codec on this board) inject noise into the audio path too? Toggle off, listen for a change, toggle back
-      &mdash; not persisted, resets to On after a reboot regardless.</p>
-      <div class="audio-input-row">
-        <span class="audio-input-label">ADC high-pass filter</span>
-        <div class="audio-input-toggle">
-          <button data-adc-hpf-enable="true" type="button" class="audio-input-option">On</button>
-          <button data-adc-hpf-enable="false" type="button" class="audio-input-option">Off</button>
-        </div>
-      </div>
-      <p class="hint audio-input-hint">On (removing DC offset) is the ES8388's own power-on-reset default &mdash;
-      unlike ALC/noise gate above, this one starts ON, not off. Exposed so it can be turned off to compare while
-      chasing a reported broadband noise floor that shows up even on a clean sine wave from a known-clean source.</p>
-      <div class="audio-input-row">
-        <span class="audio-input-label">Speaker amp (NS4150)</span>
-        <div class="audio-input-toggle">
-          <button data-speaker-amp-enable="true" type="button" class="audio-input-option">On</button>
-          <button data-speaker-amp-enable="false" type="button" class="audio-input-option">Off</button>
-        </div>
-      </div>
-      <p class="hint audio-input-hint">Forces the onboard NS4150 speaker amp's own enable/shutdown GPIO directly,
-      bypassing the codec driver. A class-D amp has its own free-running switching oscillator &mdash; a real
-      on-board noise source. The enable pin's polarity was only ever a guess, never confirmed &mdash; toggle both
-      ways and listen/measure to see which one actually silences it, and whether it changes the line-in noise
-      floor at all. Not persisted; resets to On after a reboot regardless.</p>
-      <div class="audio-input-row">
-        <span class="audio-input-label">Speaker volume</span>
-        <input id="speaker-vol-slider" type="range" min="0" max="100" step="5" value="80" class="audio-gain-slider">
-        <span id="speaker-vol-readout" class="audio-input-label">80</span>
-      </div>
-      <p class="hint audio-input-hint">The ES8388 DAC's own output level, separate from the amp on/off toggle above
-      &mdash; both need to be right for the jack to be audible. This firmware never set this before, so it silently
-      defaulted to ~0 (near-silent) on every boot even with the amp enabled and real audio reaching the codec.
-      Applied immediately and persisted.</p>
-      <div class="audio-input-row">
-        <span class="audio-input-label">TX/playback output</span>
-        <div class="audio-input-toggle">
-          <button data-tx-slot="left" type="button" class="audio-input-option">Left</button>
-          <button data-tx-slot="right" type="button" class="audio-input-option">Right</button>
-          <button data-tx-slot="both" type="button" class="audio-input-option">Both</button>
-        </div>
-      </div>
-      <p class="hint audio-input-hint">Which physical jack output(s) TX/playback audio (mic-send AND FT8/FT4 /tx-play)
-      reaches. This firmware never set this before, so it was always Left-only regardless of what got selected here
-      &mdash; "Both" duplicates the (always-mono) TX source to both channels in hardware, not something that costs
-      any extra CPU. Applied immediately (a brief output gap while it reconfigures) and persisted. Refuses to apply
-      while a /tx-play is actually in progress &mdash; change it between transmissions.</p>
-      <div class="audio-input-row">
-        <span class="audio-input-label">Input mode</span>
-        <div class="audio-input-toggle">
-          <button data-input-mode="audio" type="button" class="audio-input-option">Audio</button>
-          <button data-input-mode="iq" type="button" class="audio-input-option">I/Q</button>
-        </div>
-      </div>
-      <p class="hint audio-input-hint"><strong>Audio</strong> is the original, long-proven mode: the line-in jack
-      carries already-demodulated SSB/audio, captured mono, broadcast on <code>/audio</code>. <strong>I/Q</strong>
-      is for a radio that instead puts raw in-phase/quadrature (pre-demodulation, wideband) on the SAME jack &mdash;
-      I on the left ADC channel, Q on the right &mdash; captured as true stereo and broadcast on the separate
-      <code>ws://&lt;device&gt;/iq-data</code> instead. <strong>Changing this saves and reboots the bridge</strong>
-      to apply. Switching to I/Q forces the ADC RX channel row below to both-Left-and-Right (it needs both
-      channels at once, not a choice between them) and unlocks 96kHz on the Sample rate row.</p>
-      <div class="audio-input-row">
-        <span class="audio-input-label">Sample rate</span>
-        <div class="audio-input-toggle">
-          <button data-sample-rate="8000" type="button" class="audio-input-option">8k</button>
-          <button data-sample-rate="16000" type="button" class="audio-input-option">16k</button>
-          <button data-sample-rate="22050" type="button" class="audio-input-option iq-unsupported-rate">22.05k</button>
-          <button data-sample-rate="32000" type="button" class="audio-input-option">32k</button>
-          <button data-sample-rate="44100" type="button" class="audio-input-option iq-unsupported-rate">44.1k</button>
-          <button data-sample-rate="48000" type="button" class="audio-input-option">48k</button>
-          <button data-sample-rate="96000" type="button" class="audio-input-option" id="sample-rate-96k">96k</button>
-        </div>
-      </div>
-      <p class="hint audio-input-hint">The /audio (or /iq-data, in I/Q mode) WebSocket's wire rate, which IS the
-      codec/I2S hardware's own sample rate too. Defaults to 48kHz to match a typical laptop sound card, so A/B
-      comparisons against a direct sound-card capture aren't also comparing two different rates.
-      <strong>96k is only available in I/Q mode</strong> and switches the ES8388 into double-speed mode &mdash;
-      genuinely less proven than the other rates (see the Known Limitations note in the README); 48k is a safe
-      fallback if it doesn't clock cleanly on your board. <strong>22.05k and 44.1k are disabled in I/Q mode</strong>
-      &mdash; real-hardware captures showed unique, reproducible spectral artifacts at exactly those two rates,
-      not present at any other rate; still available in Audio mode. <strong>Changing this saves and reboots the
-      bridge</strong> to apply &mdash; not a live switch, unlike the other controls on this page.</p>
-      <p class="hint">"Listen to Radio" streams raw audio over a second
-      WebSocket (<code>/audio</code>), independent of the CAT connection.
-      "Start Sniffing" is a read-only tap on the exact samples the bridge
-      just wrote to the radio's mic input (<code>/audio-mic-sniff</code>)
-      &mdash; since the web app's mic-send path has no return signal at
-      all, this is the only way to confirm audio actually reached the radio
-      and hear/see what it sounded like. Both are independent and can be on
-      or off in any combination; the sniffer can never affect or slow down
-      the real mic-send path. For tuning the interface board's
-      audio-in/audio-out RC filter trimpots by eye &mdash; the horizontal
-      blue dashed line marks the estimated passband rolloff amplitude
-      (~-6dB below peak); watch it move as you adjust each trimpot.</p>
     </section>
 
-    <section id="iq-spectrum-card" class="card">
+    <section id="hardware-card" class="card" data-feature="audio">
+      <div class="cat-header">
+        <h2 title="The bridge&#39;s converters, grouped by input and output. Changes apply immediately and are saved, except where a reboot is noted.">Hardware settings <span class="info">ⓘ</span></h2>
+      </div>
+
+      <h3 class="hw-group">Inputs</h3>
+
+      <div class="hw-device" data-feature="audio_input_select">
+        <div class="hw-device-head"><span class="hw-chip">ES8388</span><span class="hw-sub">codec · line in</span></div>
+        <div class="audio-input-row" data-feature="input_mode_select">
+          <span class="audio-input-label" title="Audio: the jack carries demodulated audio, streamed on /audio. I/Q: it carries raw I (left) and Q (right), streamed on /iq-data. Changing it saves and reboots the bridge.">Input mode <span class="info">ⓘ</span></span>
+          <div class="audio-input-toggle"><button data-input-mode="audio" type="button" class="audio-input-option">Audio</button><button data-input-mode="iq" type="button" class="audio-input-option">I/Q</button></div>
+        </div>
+        <div class="audio-input-row" data-feature="sample_rate_select">
+          <span class="audio-input-label" title="The stream rate, which is also the codec rate. 96k is I/Q only (less proven); 22.05k and 44.1k are audio only (artifacts in I/Q). Changing it saves and reboots the bridge.">Sample rate <span class="info">ⓘ</span></span>
+          <div class="audio-input-toggle"><button data-sample-rate="8000" type="button" class="audio-input-option">8k</button><button data-sample-rate="16000" type="button" class="audio-input-option">16k</button><button data-sample-rate="22050" type="button" class="audio-input-option iq-unsupported-rate">22.05k</button><button data-sample-rate="32000" type="button" class="audio-input-option">32k</button><button data-sample-rate="44100" type="button" class="audio-input-option iq-unsupported-rate">44.1k</button><button data-sample-rate="48000" type="button" class="audio-input-option">48k</button><button data-sample-rate="96000" type="button" class="audio-input-option" id="sample-rate-96k">96k</button></div>
+        </div>
+        <div class="audio-input-row" data-feature="audio_input_select">
+          <span class="audio-input-label" title="Which input path the ES8388 reads. LIN2 is the P2 jack and sounds best; the others are for comparison.">ADC input <span class="info">ⓘ</span></span>
+          <div class="audio-input-toggle"><button data-adc-input="lin1" type="button" class="audio-input-option">LIN1</button><button data-adc-input="lin2" type="button" class="audio-input-option">LIN2 (P2 jack)</button><button data-adc-input="mic1" type="button" class="audio-input-option">MIC1</button><button data-adc-input="mic2" type="button" class="audio-input-option">MIC2</button><button data-adc-input="diff" type="button" class="audio-input-option">Diff</button></div>
+        </div>
+        <div class="audio-input-row" data-feature="rx_slot_select">
+          <span class="audio-input-label" title="Which ADC channel the audio stream keeps: a jack&#x27;s tip can land on either, depending on wiring. Switching pauses capture briefly.">Channel <span class="info">ⓘ</span></span>
+          <div class="audio-input-toggle"><button data-rx-slot="left" type="button" class="audio-input-option">Left</button><button data-rx-slot="right" type="button" class="audio-input-option">Right</button></div>
+        </div>
+        <div class="audio-input-row" data-feature="mic_gain">
+          <span class="audio-input-label" title="The ES8388 preamp gain (0 dB is its default). It changes the input level only; it can&#x27;t fix the onboard mic bleeding into every input.">Mic PGA gain <span class="info">ⓘ</span></span>
+          <input id="mic-gain-slider" type="range" min="-6" max="24" step="3" value="0" class="audio-gain-slider"><span id="mic-gain-readout" class="audio-input-label">0 dB</span>
+        </div>
+        <div class="audio-input-row" data-feature="adc_hpf_control">
+          <span class="audio-input-label" title="DC removal, on by default. Turn it off to compare while chasing a broadband noise floor.">High-pass filter <span class="info">ⓘ</span></span>
+          <div class="audio-input-toggle"><button data-adc-hpf-enable="true" type="button" class="audio-input-option">On</button><button data-adc-hpf-enable="false" type="button" class="audio-input-option">Off</button></div>
+        </div>
+      </div>
+
+      <div class="hw-device" data-feature="adc_source_select">
+        <div class="hw-device-head"><span class="hw-chip">WM8782</span><span class="hw-sub">I/Q jack · <span title="Set by the module&#x27;s DIP switch S1 (lever 3: + = 96 kHz, 0 = 192 kHz, − = 48 kHz); the bridge measures it and follows."><span id="wm8782-rate">96 kHz</span> <span class="info">ⓘ</span></span></span></div>
+        <div class="audio-input-row">
+          <span class="audio-input-label" title="Which streams this ADC feeds. Both ADCs run all the time; each stream takes one of them.">Feeds <span class="info">ⓘ</span></span>
+          <div class="audio-input-toggle"><button data-iq-source="wm8782" type="button" class="audio-input-option">I/Q</button><button data-audio-source="wm8782" type="button" class="audio-input-option" title="Decimated to 48 kHz for /audio">Audio</button></div>
+        </div>
+      </div>
+
+      <div class="hw-device" data-feature="adc_source_select">
+        <div class="hw-device-head"><span class="hw-chip">PCM1808</span><span class="hw-sub">RX/loop jack · <span title="Clocked from the board&#x27;s 24.576 MHz oscillator: 48 kHz, fixed.">48 kHz <span class="info">ⓘ</span></span></span></div>
+        <div class="audio-input-row">
+          <span class="audio-input-label" title="Which streams this ADC feeds. As I/Q: tip = I, ring = Q (48 kHz wide). As audio: tip = RX audio, ring = audio loop.">Feeds <span class="info">ⓘ</span></span>
+          <div class="audio-input-toggle"><button data-iq-source="pcm1808" type="button" class="audio-input-option">I/Q</button><button data-audio-source="pcm1808" type="button" class="audio-input-option">Audio</button></div>
+        </div>
+      </div>
+
+      <div class="hw-device" data-feature="adc_source_select">
+        <div class="hw-device-head"><span class="hw-chip">Audio stream</span><span class="hw-sub">/audio · 48 kHz mono</span></div>
+        <div class="audio-input-row" data-feature="rx_slot_select">
+          <span class="audio-input-label" title="Which channel of the ADC feeding audio is streamed: left = RX audio (PCM1808) or I (WM8782); right = audio loop or Q.">Channel <span class="info">ⓘ</span></span>
+          <div class="audio-input-toggle"><button data-rx-slot="left" type="button" class="audio-input-option">Left</button><button data-rx-slot="right" type="button" class="audio-input-option">Right</button></div>
+        </div>
+      </div>
+
+      <div class="hw-device" data-feature="iq_spectrum">
+        <div class="hw-device-head"><span class="hw-chip">I/Q processing</span><span class="hw-sub">on the bridge · <span id="iq-proc-load">—</span></span></div>
+        <div class="audio-input-row">
+          <span class="audio-input-label" title="Spectrum resolution: 4096 points at 96 kHz is 23 Hz per bin.">FFT size <span class="info">ⓘ</span></span>
+          <div class="audio-input-toggle"><button data-iq-fft="1024" type="button" class="audio-input-option">1024</button><button data-iq-fft="2048" type="button" class="audio-input-option">2048</button><button data-iq-fft="4096" type="button" class="audio-input-option">4096</button></div>
+        </div>
+        <div class="audio-input-row">
+          <span class="audio-input-label" title="Waterfall rows per second, capped by the FFT rate (23 per second for 4096 points at 96 kHz).">Rows / s <span class="info">ⓘ</span></span>
+          <div class="audio-input-toggle"><button data-iq-rows="5" type="button" class="audio-input-option">5</button><button data-iq-rows="10" type="button" class="audio-input-option">10</button><button data-iq-rows="20" type="button" class="audio-input-option">20</button><button data-iq-rows="30" type="button" class="audio-input-option">30</button></div>
+        </div>
+      </div>
+
+      <h3 class="hw-group">Outputs</h3>
+
+      <div class="hw-device" data-feature="speaker_vol">
+        <div class="hw-device-head"><span class="hw-chip">ES8388</span><span class="hw-sub">codec · line out</span></div>
+        <div class="audio-input-row" data-feature="tx_slot_select">
+          <span class="audio-input-label" title="Which DAC channel(s) carry the TX audio (mic-send and slot playback). Both = the same mono audio on both. Refused while a slot is playing.">TX channel <span class="info">ⓘ</span></span>
+          <div class="audio-input-toggle"><button data-tx-slot="left" type="button" class="audio-input-option">Left</button><button data-tx-slot="right" type="button" class="audio-input-option">Right</button><button data-tx-slot="both" type="button" class="audio-input-option">Both</button></div>
+        </div>
+        <div class="audio-input-row" data-feature="speaker_amp_control">
+          <span class="audio-input-label" title="Forces the onboard NS4150 amp on or off (a class-D noise source). Its enable polarity is unconfirmed: try both. Not saved.">Speaker amp <span class="info">ⓘ</span></span>
+          <div class="audio-input-toggle"><button data-speaker-amp-enable="true" type="button" class="audio-input-option">On</button><button data-speaker-amp-enable="false" type="button" class="audio-input-option">Off</button></div>
+        </div>
+        <div class="audio-input-row" data-feature="speaker_vol">
+          <span class="audio-input-label" title="The DAC output level, separate from the amp switch; both must be right for the jack to be audible.">Volume <span class="info">ⓘ</span></span>
+          <input id="speaker-vol-slider" type="range" min="0" max="100" step="5" value="80" class="audio-gain-slider"><span id="speaker-vol-readout" class="audio-input-label">80</span>
+        </div>
+      </div>
+
+      <div class="hw-device" data-feature="adc_source_select">
+        <div class="hw-device-head"><span class="hw-chip">PCM5102A</span><span class="hw-sub">DAC · TX jack · 48 kHz</span></div>
+        <div class="audio-input-row" data-feature="tx_slot_select">
+          <span class="audio-input-label" title="Which DAC channel(s) carry the TX audio (mic-send and slot playback). Both = the same mono audio on both. Refused while a slot is playing.">TX channel <span class="info">ⓘ</span></span>
+          <div class="audio-input-toggle"><button data-tx-slot="left" type="button" class="audio-input-option">Left</button><button data-tx-slot="right" type="button" class="audio-input-option">Right</button><button data-tx-slot="both" type="button" class="audio-input-option">Both</button></div>
+        </div>
+        <div class="audio-input-row" data-feature="dac_level">
+          <span class="audio-input-label" title="Digital level on everything sent to the DAC: slots, live audio and the test tone. Saved. On the uSDX, its mic input clips above about −11 dBFS and full power starts near −34 dBFS.">Level <span class="info">ⓘ</span></span>
+          <input id="dac-level-slider" type="range" min="-40" max="0" step="1" value="0" class="audio-gain-slider"><span id="dac-level-readout" class="audio-input-label">0 dB</span>
+        </div>
+        <div class="audio-input-row" data-feature="dac_level">
+          <span class="audio-input-label" title="The DAC's soft mute (its XSMT pin). Not saved: the DAC unmutes on restart.">Mute <span class="info">ⓘ</span></span>
+          <div class="audio-input-toggle"><button data-dac-muted="true" type="button" class="audio-input-option">On</button><button data-dac-muted="false" type="button" class="audio-input-option">Off</button></div>
+        </div>
+      </div>
+
+    </section>
+
+    <section id="iq-spectrum-card" class="card" data-feature="input_mode_select|iq_spectrum">
       <div class="cat-header">
         <h2>I/Q spectrum</h2>
         <span id="iq-spectrum-readout" class="quality-readout">inactive</span>
@@ -513,7 +493,7 @@
       </div>
     </section>
 
-    <section id="diag-card" class="card">
+    <section id="diag-card" class="card" data-feature="audio_mic_sniff">
       <div class="cat-header">
         <h2>Diagnostic &mdash; live audio test</h2>
         <span id="live-readout" class="quality-readout">idle</span>
@@ -548,7 +528,7 @@
       </div>
     </section>
 
-    <section id="tx-cache-card" class="card">
+    <section id="tx-cache-card" class="card" data-feature="tx_buffer_playback">
       <div class="cat-header">
         <h2>TX cache</h2>
         <span id="tx-cache-readout" class="quality-readout">&mdash;</span>

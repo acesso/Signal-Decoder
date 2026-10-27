@@ -1,7 +1,13 @@
-// Encodes and plays back a single composed SSTV image via Web Audio —
-// one-shot (no window scheduling like FT8), reusing the same gain/output
-// device/ring-buffer-tap/Auto-PTT patterns as useFTTransmit.ts.
-import { createSignal } from 'solid-js';
+// Encodes and transmits a single composed SSTV image — one-shot (no window
+// scheduling like FT8), reusing the same gain/output device/ring-buffer-tap/
+// Auto-PTT patterns as useFTTransmit.ts. The output is the shared TX output
+// (txSink.ts): the local sound card, played live, or the bridge, where the
+// image is uploaded to a TX slot and played from the device.
+import { createEffect, createSignal } from 'solid-js';
+import type { AudioSinkKind } from '../audio/audioSource';
+import { createSlotStaging } from '../audio/slotStaging';
+import { txSink } from '../audio/txSink';
+import { modeTxGain } from '../audio/bridgeTxLevel';
 import { SSTV_MODES, SAMPLE_RATE } from './constants';
 import { audioRecorder } from '../audio/ringRecorder';
 import { createCaptureNode, type CaptureNode } from '../audio/captureNode';
@@ -19,6 +25,8 @@ export interface SSTVTxState {
   sinkIdSupported: boolean;
   autoPTT: boolean;
   preKeyMs: number;
+  /** Where the image goes: see txSink.ts. */
+  audioSink: AudioSinkKind;
 }
 
 const LS_OUTPUT = 'sstv_tx_output_device';
@@ -36,8 +44,9 @@ const DEFAULT_GAIN = Math.pow(10, -12 / 20); // -12 dB — SSTV audio is played 
 // solid-state PAs) don't need it.
 const MAX_PREKEY_MS = 2000;
 
+// Shared by every mode now (txSink.ts); LS_OUTPUT is only read there once, to migrate.
 function loadOutputDevice(): string {
-  return loadString(LS_OUTPUT, '', ['']);
+  return txSink.device();
 }
 
 let encWorker: Worker | null = null;
@@ -73,7 +82,10 @@ function encodeAsync(img: Uint8ClampedArray, mode: keyof typeof SSTV_MODES, samp
 /** `getOnSetPTT` mirrors createFTTransmit's pattern: a getter so the caller's
  *  own createEffect keeps it current (e.g. CAT connect/disconnect) without
  *  this factory needing its own dependency tracking on a plain arg. */
-export function createSSTVTransmit(getOnSetPTT?: () => ((tx: boolean) => Promise<void>) | undefined) {
+export function createSSTVTransmit(
+  getOnSetPTT?: () => ((tx: boolean) => Promise<void>) | undefined,
+  getBridgeWsUrl: () => string | undefined = () => undefined,
+) {
   const [state, setState] = createSignal<SSTVTxState>({
     phase: 'idle',
     progress: 0,
@@ -84,6 +96,7 @@ export function createSSTVTransmit(getOnSetPTT?: () => ((tx: boolean) => Promise
     sinkIdSupported: typeof AudioContext !== 'undefined' && 'setSinkId' in AudioContext.prototype,
     autoPTT: loadBoolean(LS_AUTOPTT, false),
     preKeyMs: loadNumber(LS_PREKEY, 0),
+    audioSink: txSink.kind(),
   });
 
   let audioCtx: AudioContext | null = null;
@@ -96,11 +109,78 @@ export function createSSTVTransmit(getOnSetPTT?: () => ((tx: boolean) => Promise
   let currentSource: AudioBufferSourceNode | null = null;
   let stopped = false;
 
+  // Bridge output: the encoded image goes into a free TX slot and plays from
+  // the device; the slot is freed again afterwards, since a QSO card is a
+  // one-off rather than a message to keep staged.
+  const staging = createSlotStaging<{ img: Uint8ClampedArray; mode: keyof typeof SSTV_MODES }>({
+    getWsUrl: getBridgeWsUrl,
+    mode: 'SSTV',
+    getGain: () => modeTxGain(gain),
+    encode: async ({ img, mode }) => ({ samples: await encodeAsync(img, mode, SAMPLE_RATE), sampleRateHz: SAMPLE_RATE }),
+  });
+
+  createEffect(() => {
+    const kind = txSink.kind();
+    setState((prev) => (prev.audioSink === kind ? prev : { ...prev, audioSink: kind }));
+  });
+  createEffect(() => {
+    const d = txSink.device();
+    outputDevice = d;
+    setState((prev) => (prev.outputDeviceId === d ? prev : { ...prev, outputDeviceId: d }));
+  });
+
+  async function keyPTT(on: boolean): Promise<boolean> {
+    const onSetPTT = getOnSetPTT?.();
+    if (!autoPTTOn || !onSetPTT) return false;
+    try {
+      await Promise.race([
+        onSetPTT(on),
+        new Promise<void>((_, reject) => setTimeout(() => reject(new Error('PTT timeout')), 500)),
+      ]);
+      return true;
+    } catch {
+      return false; // CAT not connected or timed out
+    }
+  }
+
+  async function transmitViaBridge(img: Uint8ClampedArray, mode: keyof typeof SSTV_MODES): Promise<void> {
+    stopped = false;
+    setState((prev) => ({ ...prev, phase: 'encoding', progress: 0, durationSec: 0, error: null }));
+    const staged = await staging.stage({ img, mode }, `SSTV ${mode}`, `QSO card ${mode}`);
+    if (!staged.ok || staged.slot === undefined) {
+      setState((prev) => ({ ...prev, phase: 'idle', error: staged.error ?? 'Upload to the bridge failed' }));
+      return;
+    }
+    const slot = staged.slot;
+    const durationSec = staging.slots()[slot]?.durationSec ?? 0;
+    if (stopped) { await staging.clear(slot); setState((prev) => ({ ...prev, phase: 'idle' })); return; }
+    let pttOn = false;
+    try {
+      pttOn = await keyPTT(true);
+      if (preKeyMs > 0 && autoPTTOn && getOnSetPTT?.()) await new Promise<void>((r) => setTimeout(r, preKeyMs));
+      if (stopped) return;
+      setState((prev) => ({ ...prev, phase: 'playing', progress: 0, durationSec }));
+      const startedAt = performance.now();
+      const timer = setInterval(() => {
+        if (durationSec > 0) setState((prev) => ({ ...prev, progress: Math.min(1, (performance.now() - startedAt) / 1000 / durationSec) }));
+      }, 250);
+      const ok = await staging.send(slot, () => !stopped);
+      clearInterval(timer);
+      setState((prev) => ({
+        ...prev, phase: 'idle', progress: stopped ? prev.progress : 1,
+        error: ok || stopped ? null : (staging.error() ?? 'Bridge playback failed'),
+      }));
+    } finally {
+      if (pttOn) await keyPTT(false);
+      await staging.clear(slot);
+    }
+  }
+
   async function ensureAudioContext(): Promise<AudioContext> {
     if (!audioCtx || audioCtx.state === 'closed') {
       audioCtx = new AudioContext();
       gainNode = audioCtx.createGain();
-      gainNode.gain.value = gain;
+      gainNode.gain.value = modeTxGain(gain);
       gainNode.connect(audioCtx.destination);
       const ctx = audioCtx;
       txTap = await createCaptureNode(ctx, 4096, (samples) => {
@@ -118,6 +198,7 @@ export function createSSTVTransmit(getOnSetPTT?: () => ((tx: boolean) => Promise
   }
 
   async function encodeAndTransmit(img: Uint8ClampedArray, mode: keyof typeof SSTV_MODES): Promise<void> {
+    if (txSink.kind() === 'bridge') return transmitViaBridge(img, mode);
     stopped = false;
     setState((prev) => ({ ...prev, phase: 'encoding', progress: 0, durationSec: 0, error: null }));
     let pttOn = false;
@@ -205,6 +286,8 @@ export function createSSTVTransmit(getOnSetPTT?: () => ((tx: boolean) => Promise
       } catch { /* already stopped */ }
       currentSource = null;
     }
+    // A bridge transmission plays from the device's own RAM: stop it there too.
+    if (txSink.kind() === 'bridge') void staging.stopPlayback();
     setState((prev) => ({ ...prev, phase: 'idle' }));
   }
 
@@ -222,14 +305,24 @@ export function createSSTVTransmit(getOnSetPTT?: () => ((tx: boolean) => Promise
   }
 
   function setOutputDevice(deviceId: string) {
-    outputDevice = deviceId;
-    saveString(LS_OUTPUT, deviceId);
-    setState((prev) => ({ ...prev, outputDeviceId: deviceId }));
+    txSink.setDevice(deviceId);
   }
+
+  function setAudioSink(kind: AudioSinkKind) {
+    txSink.setKind(kind);
+    setState((prev) => ({ ...prev, audioSink: kind }));
+  }
+
+  // While the bridge's DAC level is the TX level (bridgeTxLevel.ts), this mode
+  // sends at full scale; follow it when the TX output or the bridge changes.
+  createEffect(() => {
+    const g = modeTxGain(gain);
+    if (gainNode) gainNode.gain.value = g;
+  });
 
   function setTxGain(v: number) {
     gain = v;
-    if (gainNode) gainNode.gain.value = v;
+    if (gainNode) gainNode.gain.value = modeTxGain(v);
     saveNumber(LS_GAIN, v);
     setState((prev) => ({ ...prev, txGain: v }));
   }
@@ -252,6 +345,7 @@ export function createSSTVTransmit(getOnSetPTT?: () => ((tx: boolean) => Promise
     setTxGain,
     setAutoPTT,
     setPreKeyMs,
+    setAudioSink,
     destroy,
   };
 }

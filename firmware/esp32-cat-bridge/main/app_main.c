@@ -16,6 +16,10 @@
 
 #include "audio_monitor.h"
 #include "audio_sniff.h"
+#include "aux_serial.h"
+#if CONFIG_BRIDGE_BOARD_S3
+#include "iq_dsp.h"
+#endif
 #include "audio_ws.h"
 #include "bridge_settings.h"
 #include "bridge_state.h"
@@ -26,6 +30,7 @@
 #include "http_control.h"
 #include "led_status.h"
 #include "pa_watchdog.h"
+#include "io_routing.h"
 #include "wifi_net.h"
 #include "ws_server.h"
 
@@ -45,9 +50,14 @@ void app_main(void) {
     audio_ws_start(ws_server_get_httpd()); // needs ws_server's httpd handle — after ws_server_start()
     audio_sniff_start(ws_server_get_httpd()); // read-only mic-to-radio tap — see audio_sniff.h
     http_control_start();     // needs ws_server's httpd handle — after ws_server_start()
+    aux_serial_start(ws_server_get_httpd());  // S3 only: tuner + frequency-module serial lines (no-op on the A1S)
+#if CONFIG_BRIDGE_BOARD_S3
+    iq_dsp_start(ws_server_get_httpd());      // I/Q spectrum + passband streams (iq_dsp.h)
+#endif
     control_page_start();     // standalone control UI — same httpd instance
     cat_bridge_start(ws_server_send_to_client);
     audio_monitor_start();    // needs audio_ws_start() already registered its rx callback slot
+    io_routing_start(ws_server_get_httpd());  // /capabilities, /routing — after the audio backend and iq_dsp exist
 
 
     // OTA rollback gate (see partitions.csv / ota_handler()). With

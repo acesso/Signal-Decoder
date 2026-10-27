@@ -4,11 +4,13 @@
 // Kept close to the original's imperative timing logic verbatim (the
 // comments explaining UTC-window/consecutive-TX/auto-CQ-cadence logic are
 // load-bearing, not stylistic).
-import { createSignal } from 'solid-js'
+import { createEffect, createSignal } from 'solid-js'
 import { FTMode, FT_WINDOW_SECONDS, FT_SUPPORTED } from '$decoder-lib/ft/decoder'
 import { audioRecorder } from '$decoder-lib/audio/ringRecorder'
 import { createCaptureNode, type CaptureNode } from '$decoder-lib/audio/captureNode'
 import { speakerSink, type AudioSinkKind, type AudioSinkHandle } from '$decoder-lib/audio/audioSource'
+import { txSink } from '$decoder-lib/audio/txSink'
+import { modeTxGain } from '$decoder-lib/audio/bridgeTxLevel'
 import {
   TX_SLOT_COUNT,
   bridgeHttpUrl,
@@ -257,23 +259,23 @@ export function loadMyGrid(): string {
 export function saveMyGrid(v: string) {
   if (typeof window !== 'undefined') localStorage.setItem(LS_GRID, v);
 }
+// The TX output is shared by every mode now (txSink.ts); these keep FT's
+// existing call sites working. LS_OUTPUT / LS_AUDIO_SINK are only read once,
+// by txSink.ts, to migrate an older saved choice.
 export function loadOutputDevice(): string {
-  if (typeof window === 'undefined') return '';
-  return localStorage.getItem(LS_OUTPUT) ?? '';
+  return txSink.device();
 }
 export function saveOutputDevice(v: string) {
-  if (typeof window !== 'undefined') localStorage.setItem(LS_OUTPUT, v);
+  txSink.setDevice(v);
 }
 // null = no explicit choice ever saved — callers use this to distinguish
 // "never touched" (still eligible for auto-pick-bridge-on-connect) from an
 // operator's deliberate choice of 'speaker' (which must stick).
 export function loadAudioSinkKind(): AudioSinkKind | null {
-  if (typeof window === 'undefined') return null;
-  const stored = localStorage.getItem(LS_AUDIO_SINK);
-  return stored === 'bridge' || stored === 'speaker' ? stored : null;
+  return txSink.hasExplicitKind() ? txSink.kind() : null;
 }
 export function saveAudioSinkKind(v: AudioSinkKind) {
-  if (typeof window !== 'undefined') localStorage.setItem(LS_AUDIO_SINK, v);
+  txSink.setKind(v);
 }
 const DEFAULT_GAIN = Math.pow(10, -50 / 20); // -50 dB
 export function loadTxGain(): number {
@@ -652,7 +654,7 @@ export function createFTTransmit(
     // content already lives in another slot, uploadToBridgeSlot() reuses it
     // and never writes the requested one, so marking the requested slot
     // ready would describe a slot the device didn't actually fill.
-    void uploadToBridgeSlot(wsUrl, slot, samples, sourceRateHz, gain, { message, label: deviceLabel, audioHz })
+    void uploadToBridgeSlot(wsUrl, slot, samples, sourceRateHz, modeTxGain(gain), { message, label: deviceLabel, audioHz })
       .then(resolved => setBridgeSlotInfo(resolved, message, deviceLabel, true, audioHz));
   }
 
@@ -835,7 +837,7 @@ export function createFTTransmit(
 
   async function getAudioContext(): Promise<AudioContext> {
     const ctx = audioCtx!;
-    const deviceId = outputDevice;
+    const deviceId = txSink.device();
     if (deviceId && 'setSinkId' in ctx) {
       try {
         // @ts-expect-error — setSinkId not yet in TS lib
@@ -1152,7 +1154,7 @@ export function createFTTransmit(
         // already holds byte-identical audio — always play what it returns.
         let slot = wantSlot;
         if (wsUrl) {
-          slot = await uploadToBridgeSlot(wsUrl, wantSlot, samples, 12000, gain, { message: txMessage, label: txDeviceLabel, audioHz: txAudioHz });
+          slot = await uploadToBridgeSlot(wsUrl, wantSlot, samples, 12000, modeTxGain(gain), { message: txMessage, label: txDeviceLabel, audioHz: txAudioHz });
           setBridgeSlotInfo(slot, txMessage, txDeviceLabel, true, txAudioHz);
         }
         const ok = wsUrl && await playBridgeSlotAndWait(wsUrl, slot, () => isRunning);
@@ -1371,7 +1373,7 @@ export function createFTTransmit(
     if (!audioCtx || audioCtx.state === 'closed') {
       audioCtx = new AudioContext();
       gainNode = audioCtx.createGain();
-      gainNode.gain.value = gain;
+      gainNode.gain.value = modeTxGain(gain);
       sink = null;
       sinkKind = null;
       ensureSink(audioCtx, gainNode);
@@ -1514,10 +1516,23 @@ export function createFTTransmit(
     saveOutputDevice(deviceId);
     setState(prev => ({ ...prev, outputDeviceId: deviceId }));
   }
+  // Another mode may change the shared output device; follow it.
+  createEffect(() => {
+    const d = txSink.device();
+    outputDevice = d;
+    setState(prev => (prev.outputDeviceId === d ? prev : { ...prev, outputDeviceId: d }));
+  });
+
+  // While the bridge's DAC level is the TX level (bridgeTxLevel.ts), this mode
+  // sends at full scale; follow it when the TX output or the bridge changes.
+  createEffect(() => {
+    const g = modeTxGain(gain)
+    if (gainNode) gainNode.gain.value = g
+  });
 
   function setTxGain(v: number) {
     gain = v;
-    if (gainNode) gainNode.gain.value = v;
+    if (gainNode) gainNode.gain.value = modeTxGain(v);
     saveTxGain(v);
     setState(prev => ({ ...prev, txGain: v }));
   }

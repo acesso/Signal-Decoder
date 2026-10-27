@@ -29,6 +29,41 @@ export type AudioSinkKind = 'speaker' | 'bridge'
 // automatic correction on top of it.
 export type AudioSourceOverride = 'auto' | 'microphone' | 'bridge-audio' | 'bridge-iq' | 'soundcard-iq' | 'usb-iq'
 
+// ── RX: two independent selections (IO_ROUTING_PLAN.md) ────────────────────
+// Where the I/Q comes from (waterfall + I/Q demodulation), and where the
+// audio the decoders read comes from. They replace the single override above
+// as the operator's settings; deriveAudioSourceOverride() maps them back onto
+// it, so the decoders keep resolving their input the same way.
+//   I/Q:   'auto'  the bridge, when it's routed to carry I/Q
+//          'off' | 'bridge' | 'soundcard' | 'usb'
+//   Audio: 'auto'  demodulated I/Q when I/Q is running, else bridge audio,
+//                  else the sound card
+//          'iq' (demodulated I/Q) | 'bridge' | 'soundcard' (the browser's
+//          audio input: a sound card line-in or the microphone)
+export type RxIQSource = 'auto' | 'off' | 'bridge' | 'soundcard' | 'usb'
+export type RxAudioSource = 'auto' | 'iq' | 'bridge' | 'soundcard'
+export const RX_IQ_SOURCES: RxIQSource[] = ['auto', 'off', 'bridge', 'soundcard', 'usb']
+export const RX_AUDIO_SOURCES: RxAudioSource[] = ['auto', 'iq', 'bridge', 'soundcard']
+
+export function deriveAudioSourceOverride(iq: RxIQSource, audio: RxAudioSource): AudioSourceOverride {
+  if (audio === 'bridge') return 'bridge-audio'
+  if (audio === 'soundcard') return 'microphone'
+  if (audio === 'iq') return iq === 'soundcard' ? 'soundcard-iq' : iq === 'usb' ? 'usb-iq' : 'bridge-iq'
+  return 'auto'
+}
+
+/** The pair an older single override value meant. */
+export function splitAudioSourceOverride(v: AudioSourceOverride): { iq: RxIQSource; audio: RxAudioSource } {
+  switch (v) {
+    case 'microphone': return { iq: 'off', audio: 'soundcard' }
+    case 'bridge-audio': return { iq: 'off', audio: 'bridge' }
+    case 'bridge-iq': return { iq: 'bridge', audio: 'iq' }
+    case 'soundcard-iq': return { iq: 'soundcard', audio: 'iq' }
+    case 'usb-iq': return { iq: 'usb', audio: 'iq' }
+    default: return { iq: 'auto', audio: 'auto' }
+  }
+}
+
 // Single shared precedence rule, extracted from what all 5 decoders
 // (FTDecoder, CWDecoder, RTTYDecoder, SSTVDecoder, MFSKDecoder) used to
 // duplicate independently and identically. Returns both the AudioSourceKind

@@ -195,7 +195,7 @@ static void uart_open(int baud) {
     // uart_set_pin() only handles GPIO-matrix routing, not pull resistors,
     // so this needs its own explicit call.
     ESP_ERROR_CHECK(gpio_set_pull_mode(CAT_UART_RX_PIN, GPIO_PULLUP_ONLY));
-    ESP_LOGI(TAG, "UART2 open at %d baud (TX=%d RX=%d)", baud, CAT_UART_TX_PIN, CAT_UART_RX_PIN);
+    ESP_LOGI(TAG, "UART%d open at %d baud (TX=%d RX=%d)", CAT_UART_PORT, baud, CAT_UART_TX_PIN, CAT_UART_RX_PIN);
 }
 
 // One-shot query fired right after the reader task starts, so the LCD (and
@@ -280,7 +280,7 @@ void cat_bridge_start(cat_bridge_rx_cb_t rx_cb) {
 
     xTaskCreatePinnedToCore(uart_reader_task, "cat_uart_rx", 4096, NULL,
                              CAT_BRIDGE_TASK_PRIO, NULL, CAT_BRIDGE_TASK_CORE);
-    xTaskCreatePinnedToCore(boot_query_task, "cat_boot_query", 2048, NULL,
+    xTaskCreatePinnedToCore(boot_query_task, "cat_boot_query", 3072, NULL,
                              CAT_BRIDGE_TASK_PRIO, NULL, CAT_BRIDGE_TASK_CORE);
 }
 

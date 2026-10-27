@@ -383,3 +383,8 @@
 // Registers all control routes on the already-running httpd instance. Call
 // after ws_server_start() (needs the same httpd_handle_t).
 void http_control_start(void);
+
+// io_routing.c (A1S): whether `hz` is a valid codec rate in input `mode`, the
+// same rule POST /input-mode applies before switching.
+#include "audio_monitor.h"
+bool http_control_rate_ok_for_mode(uint32_t hz, audio_input_mode_t mode);

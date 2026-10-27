@@ -1,5 +1,6 @@
 // Port of src/components/FTTransmitPanel.tsx (Next.js app).
 import { batch, createEffect, createMemo, createSignal, For, onCleanup, onMount, Show, untrack, type JSX } from 'solid-js'
+import { txSink } from '../lib/audio/txSink'
 import {
   createFTTransmit, loadMyCall, saveMyCall, loadMyGrid, saveMyGrid,
   loadAutoReply, saveAutoReply, loadBaseFreq, saveBaseFreq,
@@ -19,6 +20,7 @@ import type { AudioBridge } from '$decoder-lib/cat/useAudioBridge'
 import type { AudioSinkKind } from '$decoder-lib/audio/audioSource'
 import { parseModeLabel } from '$decoder-lib/audio/bridgeSlots'
 import type { IQBridge } from '$decoder-lib/cat/useIQBridge'
+import { bridgeTxLevel } from '$decoder-lib/audio/bridgeTxLevel'
 
 // rAF-driven countdown: seconds until next window boundary, updated at ~4 Hz.
 // Uses epoch time (not Date.getSeconds()) so it matches useFTTransmit's own
@@ -538,12 +540,10 @@ export default function FTTransmitPanel(props: FTTransmitPanelProps): JSX.Elemen
   // local sound card/PA cabling needed). Only offered when a bridge
   // instance was actually passed in (App.tsx wires this up once
   // useRadioCAT/useAudioBridge are both lifted) — see audioSource.ts.
+  // Shared with RTTY and SSTV (txSink.ts): one TX output for every mode.
   const hadStoredSinkKind = loadAudioSinkKind() !== null
-  const [audioSinkKind, setAudioSinkKindState] = createSignal<AudioSinkKind>(loadAudioSinkKind() ?? 'speaker')
-  const setAudioSinkKind = (v: AudioSinkKind) => {
-    setAudioSinkKindState(v)
-    saveAudioSinkKind(v)
-  }
+  const audioSinkKind = txSink.kind
+  const setAudioSinkKind = (v: AudioSinkKind) => saveAudioSinkKind(v)
   // Auto-picks 'bridge' the moment the bridge's audio connects, same
   // principle as App.tsx's handleStart() auto-connecting bridge audio for
   // decode — if CAT is set up to use the bridge, TX should go out through
@@ -650,6 +650,9 @@ export default function FTTransmitPanel(props: FTTransmitPanelProps): JSX.Elemen
   const gainToDb = (g: number) => g <= 0 ? -60 : 20 * Math.log10(g)
   const dbToGain = (db: number) => db <= -60 ? 0 : Math.pow(10, db / 20)
   const txDb = createMemo(() => Math.round(gainToDb(tx.state().txGain)))
+  // While the TX output is the bridge, the slider is the bridge's DAC level (bridgeTxLevel.ts).
+  const levelDb = () => (bridgeTxLevel.active() ? bridgeTxLevel.db() : txDb())
+  const setLevelDb = (db: number) => (bridgeTxLevel.active() ? bridgeTxLevel.set(db) : tx.setTxGain(dbToGain(db)))
 
   // Push persisted callsign/grid to parent on first render
   onMount(() => {
@@ -1033,13 +1036,13 @@ export default function FTTransmitPanel(props: FTTransmitPanelProps): JSX.Elemen
         <div class="flex flex-col gap-1">
           <label class="text-[#8b949e] text-[10px] font-semibold tracking-wide">
             TX Level
-            <span class="ml-1.5 font-mono text-[#c9d1d9]">{txDb() === 0 ? '0 dB' : `${txDb()} dB`}</span>
+            <span class="ml-1.5 font-mono text-[#c9d1d9]">{levelDb() === 0 ? '0 dB' : `${levelDb()} dB`}{bridgeTxLevel.active() ? ' · bridge DAC' : ''}</span>
           </label>
           <div class="flex items-center gap-2">
             <input type="range"
               min={-60} max={0} step={1}
-              value={txDb()}
-              onInput={e => tx.setTxGain(dbToGain(Number(e.currentTarget.value)))}
+              value={levelDb()}
+              onInput={e => setLevelDb(Number(e.currentTarget.value))}
               class="w-28 accent-[#388bfd] cursor-pointer"
             />
           </div>
@@ -1068,8 +1071,8 @@ export default function FTTransmitPanel(props: FTTransmitPanelProps): JSX.Elemen
                 disabled={audioSinkKind() === 'speaker' && micHeldByManual()}
                 class="bg-[#0d1117] border border-[#30363d] rounded px-2 py-1 text-xs text-[#c9d1d9] font-mono focus:outline-none focus:border-[#388bfd] disabled:opacity-50"
               >
-                <option value="speaker">Local speaker</option>
-                <option value="bridge">ESP32 Bridge (radio mic-in)</option>
+                <option value="speaker">Local sound card (live)</option>
+                <option value="bridge">Bridge (slotted)</option>
               </select>
             </Show>
             <div class={audioSinkKind() === 'bridge' ? 'opacity-40 pointer-events-none' : ''}>

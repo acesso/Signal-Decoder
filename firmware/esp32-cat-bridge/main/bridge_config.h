@@ -17,6 +17,18 @@
 #include "driver/i2c_master.h"
 #include "driver/i2s_std.h"
 #include "driver/uart.h"
+#include "sdkconfig.h"
+
+// ── Board ────────────────────────────────────────────────────────────────────
+// Chosen by the target chip (main/Kconfig.projbuild): the AI-Thinker ESP32-A1S
+// (ES8388 codec) or the ESP32-S3-N16R8 board with discrete converters (see
+// main/doc/S3_PORT_PLAN.md). Pins below are grouped per board; everything not
+// in an #if is shared.
+#if CONFIG_BRIDGE_BOARD_S3
+#define BRIDGE_BOARD_NAME "s3"
+#else
+#define BRIDGE_BOARD_NAME "a1s"
+#endif
 
 // ── Bridge firmware version + capabilities ──────────────────────────────────
 // Follows the same versioning spirit as the radio firmware itself (queried
@@ -28,12 +40,16 @@
 // capability lands (e.g. "audio" once WebRTC firmware exists) — features are
 // additive and never removed once shipped, so an older web app talking to a
 // newer bridge just ignores flags it doesn't recognize.
-#define BRIDGE_FIRMWARE_VERSION "0.10.0"
+#define BRIDGE_FIRMWARE_VERSION "0.12.0"
 
 // ── Wi-Fi (station mode) ────────────────────────────────────────────────────
 // Credentials come from Kconfig (idf.py menuconfig -> "CAT Bridge Config"),
 // not hardcoded here, so they aren't committed to the repo in plaintext.
+#if CONFIG_BRIDGE_BOARD_S3
+#define BRIDGE_HOSTNAME        "usdx-bridge-s3" // its own mDNS name, so both bridges can share a network
+#else
 #define BRIDGE_HOSTNAME        "usdx-bridge"   // usdx-bridge.local via mDNS
+#endif
 #define BRIDGE_WIFI_MAXIMUM_RETRY 10
 
 // ── CAT UART (radio side) ───────────────────────────────────────────────────
@@ -48,9 +64,18 @@
 // — no advantage to picking any of them instead. This leaves UART0
 // (GPIO1/3, wired to the onboard USB-serial chip) completely free for
 // flashing/ESP_LOG the whole time the CAT cable is connected.
+#if CONFIG_BRIDGE_BOARD_S3
+// S3: the data header follows the level shifter's LV row (LV1 LV2 LV GND
+// LV3 LV4) and lands straight on pins 9-14. LV1 is taken as TX; if CAT stays
+// silent, swap TX and RX here, no rewiring.
+#define CAT_UART_TX_PIN        GPIO_NUM_9
+#define CAT_UART_RX_PIN        GPIO_NUM_10
+#define CAT_UART_PORT          UART_NUM_1
+#else
 #define CAT_UART_TX_PIN        GPIO_NUM_18
 #define CAT_UART_RX_PIN        GPIO_NUM_23
 #define CAT_UART_PORT          UART_NUM_2
+#endif
 #define CAT_UART_BAUD_DEFAULT  38400
 #define CAT_UART_RX_BUF_SIZE   1024
 #define CAT_UART_TX_BUF_SIZE   1024
@@ -80,6 +105,7 @@
 // unconfirmed value — no source gave an explicit active-high/active-low
 // statement, only circumstantial evidence pointing to active-high (false).
 // Revisit if the amp turns out to be permanently on or permanently silent.
+#if CONFIG_BRIDGE_BOARD_A1S
 #define ES8388_I2C_PORT         I2C_NUM_0
 #define ES8388_I2C_SDA_PIN      GPIO_NUM_33
 #define ES8388_I2C_SCL_PIN      GPIO_NUM_32
@@ -111,7 +137,40 @@
 // value used once anything has been saved.
 #define ES8388_SAMPLE_RATE_HZ   8000
 #define ES8388_MASTER_MODE      true            // ESP32 drives I2S clocks, ES8388 is I2S slave
-#define ES8388_MASTER_MODE      true            // ESP32 drives I2S clocks, ES8388 is I2S slave
+#endif // CONFIG_BRIDGE_BOARD_A1S
+
+#if CONFIG_BRIDGE_BOARD_S3
+// S3 converters (S3_PORT_PLAN.md "Clocking" and "Draft pin map"); used once the
+// audio stages land. I/Q: the WM8782 module is the clock master and I2S0 its
+// slave. Audio: I2S1 is master at 48 kHz, clocked by the module's 24.576 MHz
+// crystal on S3_EXT_MCLK_PIN (also wired to the PCM1808's SCKI).
+// Order matches the WM8782 module's header as mounted (draft 4: reading
+// B LR D CLK under S3 pins 4 5 6 7 — hardware/bridge-s3/wiring.md), so the
+// wires run straight across without crossing. CLK reaches GPIO7 through the
+// 74LVC1G157 buffer; the S3 takes its external master clock on any pin.
+#define S3_EXT_MCLK_PIN         GPIO_NUM_7
+#define S3_EXT_MCLK_HZ          24576000
+#define S3_IQ_I2S_PORT          I2S_NUM_0
+#define S3_IQ_BCLK_PIN          GPIO_NUM_4
+#define S3_IQ_WS_PIN            GPIO_NUM_5
+#define S3_IQ_DIN_PIN           GPIO_NUM_6
+#define S3_AUDIO_I2S_PORT       I2S_NUM_1
+// Order chosen so the bottom-face wires to the PCM1808 (BCK OUT LRC, left to
+// right) and on to the PCM5102A never cross (hardware/bridge-s3/wiring.md):
+#define S3_AUDIO_DOUT_PIN       GPIO_NUM_15     // S3 -> PCM5102 DIN
+#define S3_AUDIO_BCLK_PIN       GPIO_NUM_16
+#define S3_AUDIO_DIN_PIN        GPIO_NUM_17     // PCM1808 DOUT -> S3
+#define S3_AUDIO_WS_PIN         GPIO_NUM_18
+#define S3_DAC_XSMT_PIN         GPIO_NUM_8      // PCM5102 soft mute (low = muted)
+// Generic serial lines for the tuner and the frequency-sensing module (last
+// priority; 9600 8N1 until the devices are known).
+#define S3_TUNER_UART_PORT      UART_NUM_2
+#define S3_TUNER_TX_PIN         GPIO_NUM_12
+#define S3_TUNER_RX_PIN         GPIO_NUM_13
+#define S3_FREQ_UART_PORT       UART_NUM_0
+#define S3_FREQ_TX_PIN          GPIO_NUM_1
+#define S3_FREQ_RX_PIN          GPIO_NUM_2
+#endif // CONFIG_BRIDGE_BOARD_S3
 
 // ── Status LED (onboard, shared with a button — see wiring notes in the
 // README) ───────────────────────────────────────────────────────────────────
@@ -122,7 +181,11 @@
 // dropped rather than trying to fold two independent levels onto one LED.
 // Wi-Fi connecting/AP-fallback/PA-emergency states still show as distinct
 // blink patterns on this one LED — see led_status.c for the priority order.
+#if CONFIG_BRIDGE_BOARD_S3
+#define LED_STATUS_PIN          GPIO_NUM_48     // onboard WS2812 RGB LED (led_strip over RMT)
+#else
 #define LED_STATUS_PIN          GPIO_NUM_22
+#endif
 #define LED_PWM_FREQ_HZ         2000
 #define LED_PWM_RESOLUTION      LEDC_TIMER_8_BIT
 
@@ -167,8 +230,13 @@
 // out to have similar surprises. NEITHER of these header pins has been
 // bench-verified yet with the real interface board wired up — confirm both
 // read/drive as expected before trusting the watchdog on real hardware.
+#if CONFIG_BRIDGE_BOARD_S3
+#define PA_SENSE_PIN            GPIO_NUM_14   // LV4
+#define PA_EMERGENCY_PIN        GPIO_NUM_11   // LV3
+#else
 #define PA_SENSE_PIN            GPIO_NUM_19
 #define PA_EMERGENCY_PIN        GPIO_NUM_5
+#endif
 // Master enable for actually ASSERTING the emergency clamp. Set to 0 while
 // the interface board's clamp diode sits on the transistor's base junction:
 // in that topology asserting the clamp turns the switching transistor ON,

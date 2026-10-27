@@ -1,0 +1,33 @@
+# AI-Thinker ESP32-A1S Audio Kit (ES8388 codec) — read after sdkconfig.defaults.
+# The board itself is selected by the target (CONFIG_BRIDGE_BOARD_A1S follows
+# CONFIG_IDF_TARGET_ESP32, see main/Kconfig.projbuild).
+
+# Target board: AI-Thinker ESP32-A1S Audio Kit — 4MB flash (the ESP-IDF
+# default assumes 2MB, which is wrong for this board and would make
+# esptool misjudge the flash layout).
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+
+# Flash, PSRAM and chip revision, measured with GET /bench (mem_bench.c) on the
+# A1S (ESP32-D0WD-V3 rev 3.1, Zbit 5E4016 flash), 2026-10-11:
+#   setting                          PSRAM->internal  random PSRAM read  flash read via cache
+#   DIO 40 MHz / PSRAM 40 MHz          13 MB/s          1860 ns            7.5 MB/s
+#   QIO 80 MHz / PSRAM 80 MHz          25 MB/s           985 ns           24.6 MB/s
+# - Flash mode and clock are applied by the BOOTLOADER, which OTA never rewrites:
+#   a board still running an older bootloader needs one USB flash
+#   (idf.py -p <port> flash; NVS settings and the CAT log are kept).
+# - REV_MIN_3 drops the PSRAM cache workaround that only revision 0/1 chips
+#   need (an extra instruction around PSRAM accesses everywhere): 56 KB
+#   smaller app. A chip below rev 3 refuses this image and keeps the old one.
+# - Soak at 80 MHz under load (I/Q stream + CAT polling + benchmarks): no resets,
+#   I/Q at the full 48 kHz rate, PSRAM memory test passes at boot.
+CONFIG_ESPTOOLPY_FLASHMODE_QIO=y
+CONFIG_ESPTOOLPY_FLASHFREQ_80M=y
+CONFIG_ESP32_REV_MIN_3=y
+
+# 8MB PSRAM on this WROVER-class module (quad). 80 MHz PSRAM needs flash at
+# 80 MHz as well (see above).
+CONFIG_SPIRAM_TYPE_AUTO=y
+CONFIG_SPIRAM_SPEED_80M=y
+
+# 4 MB layout: see partitions.csv.
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"

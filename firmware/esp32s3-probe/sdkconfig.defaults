@@ -1,0 +1,26 @@
+# Bring-up probe for the ESP32-S3-N16R8 bridge board (see
+# ../esp32-cat-bridge/main/doc/S3_PORT_PLAN.md, phase 1).
+CONFIG_IDF_TARGET="esp32s3"
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+# DIO: the bootloader cannot set the quad-enable bit on this XM25QH128A ("Failed to set QIE bit").
+CONFIG_ESPTOOLPY_FLASHMODE_DIO=y
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_SPEED_80M=y
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
+# Console on the native USB port (USB-Serial/JTAG): esptool resets the
+# board itself, no BOOT/RST buttons needed.
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+# Memory setup, chosen by the probe's benchmark (S3_PORT_PLAN.md, "Board facts"):
+# - largest caches with 64-byte data lines: about 40% faster sequential PSRAM
+#   (PSRAM->internal 61 -> 88 MB/s), for about 47 KB less internal RAM;
+# - code and read-only data run from PSRAM: a flash erase/write no longer
+#   stalls the other core (about 25 ms -> under 0.1 ms), so OTA, NVS and
+#   CAT-log writes can't glitch audio. PSRAM (octal DDR, 80 MHz) also beats this
+#   board's flash, which only runs in DIO mode.
+# Octal PSRAM at 120 MHz is left off: ESP-IDF marks it experimental and
+# temperature-sensitive.
+CONFIG_ESP32S3_INSTRUCTION_CACHE_32KB=y
+CONFIG_ESP32S3_DATA_CACHE_64KB=y
+CONFIG_ESP32S3_DATA_CACHE_LINE_64B=y
+CONFIG_SPIRAM_XIP_FROM_PSRAM=y

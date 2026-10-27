@@ -30,6 +30,7 @@ import {
 import { saveCard, loadAllCards, deleteCard, clearAllCards, renameCard, type QSOCard } from '$decoder-lib/sstv/qsoCardStore'
 import { formatSignalReport } from '$decoder-lib/sstv/signalReport'
 import type { CapturedImage } from '$decoder-lib/sstv/audioProcessor'
+import { bridgeTxLevel } from '../lib/audio/bridgeTxLevel'
 
 const CANVAS_REF_WIDTH = 320 // reference width text layer coordinates/fontSize are relative to
 
@@ -77,6 +78,9 @@ interface SSTVComposerProps {
   /** Live TX status, forwarded so App.tsx can show a summary chip in the
    *  collapsed panel's summary line (mirrors FTTransmitPanel's onStatusChange). */
   onStatusChange?: (status: SSTVTxStatus) => void
+  /** The bridge's CAT WebSocket URL when CAT runs over a bridge: offers the
+   *  bridge as the TX output (the image is uploaded to a TX slot). */
+  bridgeWsUrl?: string
 }
 
 export interface SSTVTxStatus {
@@ -109,7 +113,7 @@ export default function SSTVComposer(props: SSTVComposerProps): JSX.Element {
   // in place rather than accumulating duplicates.
   const [editingCardId, setEditingCardId] = createSignal<string | null>(null)
 
-  const tx = createSSTVTransmit(() => props.onSetPTT)
+  const tx = createSSTVTransmit(() => props.onSetPTT, () => props.bridgeWsUrl)
 
   createEffect(() => saveTxMode(mode()))
   createEffect(() => saveTextLayers(layers()))
@@ -580,6 +584,9 @@ export default function SSTVComposer(props: SSTVComposerProps): JSX.Element {
   const gainToDb = (g: number) => (g <= 0 ? -60 : 20 * Math.log10(g))
   const dbToGain = (db: number) => (db <= -60 ? 0 : Math.pow(10, db / 20))
   const txDb = createMemo(() => Math.round(gainToDb(tx.state().txGain)))
+  // While the TX output is the bridge, the slider is the bridge's DAC level (bridgeTxLevel.ts).
+  const levelDb = () => (bridgeTxLevel.active() ? bridgeTxLevel.db() : txDb())
+  const setLevelDb = (db: number) => (bridgeTxLevel.active() ? bridgeTxLevel.set(db) : tx.setTxGain(dbToGain(db)))
 
   createEffect(() => {
     props.onStatusChange?.({ phase: txPhase(), progress: txProgress(), remainingSec: txRemainingSec() })
@@ -897,17 +904,31 @@ export default function SSTVComposer(props: SSTVComposerProps): JSX.Element {
           <div class="space-y-2 rounded-lg border border-[#30363d] bg-[#0d1117] p-3">
             <label class="flex items-center justify-between text-xs text-[#8b949e]">
               TX Gain
-              <span class="ml-1.5 font-mono text-[#c9d1d9]">{txDb() === 0 ? '0 dB' : `${txDb()} dB`}</span>
+              <span class="ml-1.5 font-mono text-[#c9d1d9]">{levelDb() === 0 ? '0 dB' : `${levelDb()} dB`}{bridgeTxLevel.active() ? ' · bridge DAC' : ''}</span>
             </label>
             <input
               type="range"
               min="-60"
               max="0"
               step="1"
-              value={txDb()}
-              onInput={(e) => tx.setTxGain(dbToGain(Number(e.currentTarget.value)))}
+              value={levelDb()}
+              onInput={e => setLevelDb(Number(e.currentTarget.value))}
               class="w-full accent-[#2ea043]"
             />
+
+            <Show when={props.bridgeWsUrl}>
+              <label class="flex items-center justify-between gap-2 text-xs text-[#8b949e]" title="Shared by every transmit mode. Local sound card plays live; Bridge uploads the image to a bridge TX slot and plays it from there.">
+                Output
+                <select
+                  value={tx.state().audioSink}
+                  onChange={(e) => tx.setAudioSink(e.currentTarget.value as 'speaker' | 'bridge')}
+                  class="rounded border border-[#30363d] bg-[#0d1117] px-2 py-1 text-xs text-[#c9d1d9]"
+                >
+                  <option value="speaker">Local sound card (live)</option>
+                  <option value="bridge">Bridge (slotted)</option>
+                </select>
+              </label>
+            </Show>
 
             <label class="flex items-center justify-between text-xs text-[#8b949e]" title={props.onSetPTT ? 'Automatically key radio PTT via CAT while transmitting' : 'Auto-PTT requires CAT connection'}>
               Auto-PTT

@@ -10,12 +10,14 @@
 //    keying PTT) per character. A lookahead scheduler tracks the next
 //    buffer's start time; each new character's buffer is queued right after
 //    whatever's already scheduled.
-import { createSignal } from 'solid-js';
+import { createEffect, createSignal } from 'solid-js';
 import type { RTTYConfig } from './decoder';
 import { encodeRTTYSamples, encodeBaudotChars, encodeAsciiChars } from './encoder';
 import { audioRecorder } from '../audio/ringRecorder';
 import { createCaptureNode, type CaptureNode } from '../audio/captureNode';
 import type { AudioSinkKind } from '../audio/audioSource';
+import { txSink } from '../audio/txSink';
+import { modeTxGain } from '../audio/bridgeTxLevel';
 import { createSlotStaging, type SlotStaging } from '../audio/slotStaging';
 import { loadPreKeyMs, loadPostKeyMs } from '../ft/useFTTransmit';
 import { loadString, saveString, loadNumber, saveNumber, loadBoolean, saveBoolean } from '../storage';
@@ -44,13 +46,15 @@ const LS_GAIN = 'rtty_tx_gain';
 const LS_AUTOPTT = 'rtty_tx_auto_ptt';
 const LS_AUDIO_SINK = 'rtty_tx_audio_sink';
 
+// The TX output is shared by every mode (txSink.ts); LS_AUDIO_SINK and
+// LS_OUTPUT are only read once there, to migrate an older choice.
 function loadAudioSink(): AudioSinkKind {
-  return loadString(LS_AUDIO_SINK, 'speaker', ['speaker', 'bridge']) as AudioSinkKind;
+  return txSink.kind();
 }
 const DEFAULT_GAIN = Math.pow(10, -12 / 20); // -12 dB, matches SSTV's near-line-level default
 
 function loadOutputDevice(): string {
-  return loadString(LS_OUTPUT, '', ['']);
+  return txSink.device();
 }
 
 const ENC_RATE = 8000; // RTTY's whole passband fits comfortably under 4kHz — no need for FT8/SSTV's higher rates
@@ -118,7 +122,7 @@ export function createRTTYTransmit(
   const staging: SlotStaging<{ text: string; config: RTTYConfig }> = createSlotStaging({
     getWsUrl: getBridgeWsUrl,
     mode: 'RTTY',
-    getGain: () => gain,
+    getGain: () => modeTxGain(gain),
     encode: async ({ text, config }) => {
       const { samples, dropped } = await encodeAsync(text, config, ENC_RATE);
       if (dropped.length) setState(prev => ({ ...prev, droppedChars: dropped }));
@@ -137,7 +141,7 @@ export function createRTTYTransmit(
     if (!audioCtx || audioCtx.state === 'closed') {
       audioCtx = new AudioContext();
       gainNode = audioCtx.createGain();
-      gainNode.gain.value = gain;
+      gainNode.gain.value = modeTxGain(gain);
       gainNode.connect(audioCtx.destination);
       const ctx = audioCtx;
       txTap = await createCaptureNode(ctx, 4096, (samples) => {
@@ -161,7 +165,7 @@ export function createRTTYTransmit(
     // exactly the failure staging exists to prevent (in I/Q the radio is
     // never on the local output). Stage instead of transmitting locally,
     // rather than quietly sending audio somewhere the radio cannot hear.
-    if (state().audioSink === 'bridge') {
+    if (txSink.kind() === 'bridge') {
       await stageToBridge(text, config);
       return;
     }
@@ -227,7 +231,7 @@ export function createRTTYTransmit(
     // A staged send plays from the DEVICE's own RAM, so clearing local state
     // is only half a stop — without this the ESP32 transmits to the end of
     // the buffer while the browser has already dropped PTT.
-    if (state().audioSink === 'bridge') void staging.stopPlayback();
+    if (txSink.kind() === 'bridge') void staging.stopPlayback();
     stopLive();
     setState((prev) => ({ ...prev, phase: 'idle' }));
   }
@@ -242,7 +246,7 @@ export function createRTTYTransmit(
     // Live keying cannot work through slots — a slot is a complete buffer
     // uploaded before playback begins. Starting it under the bridge sink
     // would key PTT and play to the local speakers instead of the radio.
-    if (state().audioSink === 'bridge') {
+    if (txSink.kind() === 'bridge') {
       setState(prev => ({ ...prev, error: 'Live keying is unavailable over the bridge — switch output to Local speaker' }));
       return;
     }
@@ -396,13 +400,23 @@ export function createRTTYTransmit(
   }
 
   function setAudioSink(kind: AudioSinkKind) {
-    saveString(LS_AUDIO_SINK, kind);
-    setState(prev => ({ ...prev, audioSink: kind }));
+    txSink.setKind(kind);
+    setState((prev) => ({ ...prev, audioSink: kind }));
+  }
+  // Follow the shared TX output, whichever mode changed it.
+  createEffect(() => {
+    const kind = txSink.kind();
+    setState(prev => (prev.audioSink === kind ? prev : { ...prev, audioSink: kind }));
     // Live keying cannot work through slots (see slotStaging.ts), so leaving
     // it engaged while switching to the bridge would silently key a sink that
     // can never carry it.
     if (kind === 'bridge') stopLive();
-  }
+  });
+  createEffect(() => {
+    const d = txSink.device();
+    outputDevice = d;
+    setState(prev => (prev.outputDeviceId === d ? prev : { ...prev, outputDeviceId: d }));
+  });
 
   // ── Settings ──────────────────────────────────────────────────────────────
 
@@ -413,14 +427,19 @@ export function createRTTYTransmit(
   }
 
   function setOutputDevice(deviceId: string) {
-    outputDevice = deviceId;
-    saveString(LS_OUTPUT, deviceId);
-    setState((prev) => ({ ...prev, outputDeviceId: deviceId }));
+    txSink.setDevice(deviceId);
   }
+
+  // While the bridge's DAC level is the TX level (bridgeTxLevel.ts), this mode
+  // sends at full scale; follow it when the TX output or the bridge changes.
+  createEffect(() => {
+    const g = modeTxGain(gain);
+    if (gainNode) gainNode.gain.value = g;
+  });
 
   function setTxGain(v: number) {
     gain = v;
-    if (gainNode) gainNode.gain.value = v;
+    if (gainNode) gainNode.gain.value = modeTxGain(v);
     saveNumber(LS_GAIN, v);
     setState((prev) => ({ ...prev, txGain: v }));
   }
