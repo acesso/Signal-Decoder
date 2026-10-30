@@ -18,6 +18,7 @@ import { useIQBridge, type IQCorrection } from './lib/cat/useIQBridge'
 import { loadSuspendIQDuringTx } from './lib/ft/useFTTransmit'
 import PWAInstallPrompt from './components/PWAInstallPrompt'
 import UpdateAvailablePrompt from './components/UpdateAvailablePrompt'
+import { LcdFeedProvider, LcdMenu } from './components/lcd/LcdFeed'
 import { globalAudio } from './lib/audio/globalAudio'
 import type { DecoderControls } from './lib/decoderControls'
 import { type FTDecoderStats, type FTDecoderStatus, type FTMode, subscribeDecoderStats, subscribeDecoderStatus } from '$decoder-lib/ft/decoder'
@@ -1241,7 +1242,10 @@ function App(): JSX.Element {
 
   const meta = createMemo(() => MODE_META[mode()])
 
+  // The LCD is the S3 bridge's: only while CAT is connected through a bridge
+  // (and that bridge reports client views, which the provider checks).
   return (
+    <LcdFeedProvider bridgeWsUrl={cat.state().connected ? bridgeWsUrl() : undefined}>
     <main class="flex h-screen flex-col overflow-hidden">
       {/* Header */}
       <div class="shrink-0 px-4 pt-4 pb-3 sm:px-6 sm:pt-6 lg:px-8 lg:pt-8">
@@ -1251,6 +1255,8 @@ function App(): JSX.Element {
             <p class="text-sm text-[#8b949e] sm:text-base">{meta().description}</p>
           </div>
 
+          <div class="flex shrink-0 items-start gap-2 self-start sm:self-auto">
+          <LcdMenu />
           {/* Mode selector */}
           <div class="flex shrink-0 items-center gap-1 self-start rounded-lg border border-[#30363d] bg-[#0d1117] p-1 sm:self-auto">
             <For each={VALID_MODES}>
@@ -1263,6 +1269,7 @@ function App(): JSX.Element {
                 </button>
               )}
             </For>
+          </div>
           </div>
         </div>
       </div>
@@ -1491,6 +1498,7 @@ function App(): JSX.Element {
       <PWAInstallPrompt />
       <UpdateAvailablePrompt />
     </main>
+    </LcdFeedProvider>
   )
 }
 

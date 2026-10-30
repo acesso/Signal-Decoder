@@ -4,7 +4,7 @@
 # component requirements before sdkconfig exists, and the board follows the
 # target one-to-one (main/Kconfig.projbuild).
 if(IDF_TARGET STREQUAL "esp32s3")
-    set(board_srcs "audio_monitor_s3.c" "iq_dsp.c" "ws_fanout.c")
+    set(board_srcs "audio_monitor_s3.c" "iq_dsp.c" "ws_fanout.c" "lcd_pcd8544.c" "lcd_gfx.c" "status_display.c")
     set(board_requires led_strip esp-dsp)
 else()
     set(board_srcs "audio_monitor.c")

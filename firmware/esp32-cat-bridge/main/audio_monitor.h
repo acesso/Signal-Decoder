@@ -477,4 +477,13 @@ audio_source_t audio_monitor_get_audio_source(void);
 const char *audio_monitor_audio_source_name(audio_source_t src);
 bool audio_monitor_parse_audio_source(const char *name, audio_source_t *out);
 bool audio_monitor_set_audio_source(audio_source_t src);
+
+// Peak meters for the status display: the largest |sample| per channel since
+// the last call, as a share of full scale (0..1), then reset. Channels: WM8782
+// I and Q (as wired: left, right), PCM1808 left and right, and the PCM5102A
+// output after its level.
+typedef enum { AUDIO_PEAK_WM_I = 0, AUDIO_PEAK_WM_Q, AUDIO_PEAK_ADC_L, AUDIO_PEAK_ADC_R, AUDIO_PEAK_DAC, AUDIO_PEAK_COUNT } audio_peak_t;
+void audio_monitor_take_peaks(float out[AUDIO_PEAK_COUNT]);
+int audio_monitor_get_dac_level_db(void);
+bool audio_monitor_get_dac_muted(void);
 #endif

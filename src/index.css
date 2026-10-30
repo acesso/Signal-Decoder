@@ -1,4 +1,8 @@
-@import 'tailwindcss';
+/* Class names are only looked for in src/ (this file's folder). Tailwind's
+   automatic detection scans the whole repo and sends the dev server a full
+   page reload when any scanned non-module file changes: an edit to the
+   firmware, its bridge page, the docs or the changelog reloaded the app. */
+@import 'tailwindcss' source('./');
 
 /* Same GitHub Dark theme as the original Next.js app (src/app/globals.css). */
 :root {

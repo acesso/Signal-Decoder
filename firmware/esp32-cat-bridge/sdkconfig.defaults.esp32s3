@@ -22,6 +22,10 @@ CONFIG_ESP32S3_INSTRUCTION_CACHE_32KB=y
 CONFIG_ESP32S3_DATA_CACHE_64KB=y
 CONFIG_ESP32S3_DATA_CACHE_LINE_64B=y
 CONFIG_SPIRAM_XIP_FROM_PSRAM=y
+# Lets a task keep its stack in PSRAM (the status display's: status_display.c).
+CONFIG_SPIRAM_ALLOW_STACK_EXTERNAL_MEMORY=y
+# The status LCD polls SPI, so the SPI master's ISR needn't take IRAM (shared with the heap on the S3).
+# CONFIG_SPI_MASTER_ISR_IN_IRAM is not set
 
 # Console on the native USB port (USB-Serial/JTAG): flashing and logs need no
 # BOOT/RST presses, and UART0 stays free for a peripheral.
@@ -35,9 +39,10 @@ CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions_s3.csv"
 CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH=y
 CONFIG_ESP_COREDUMP_DATA_FORMAT_ELF=y
 
-# 16 (shared default) + room for the aux serial lines' and the I/Q streams'
-# WebSocket clients (ws_server.c max_open_sockets).
-CONFIG_LWIP_MAX_SOCKETS=28
+# 16 (shared default) + room for the aux serial lines', the I/Q streams' and
+# the LCD feed's WebSocket clients (ws_server.c max_open_sockets, 24; httpd
+# needs 3 more of its own, and mDNS and the rest a few).
+CONFIG_LWIP_MAX_SOCKETS=32
 
 # Streaming over Wi-Fi: with the default 4-segment TCP send buffer/window a
 # single lost Wi-Fi frame can't trigger a fast retransmit, so each stream

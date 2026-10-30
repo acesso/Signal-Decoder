@@ -1,0 +1,187 @@
+# The reference scene: drawn by the firmware's lcd_gfx.c into scene.bin
+# (scripts/lcd-gfx-reference), and by gfx.ts in gfx.test.ts. Format: main.c.
+
+# 1: primitives, clipping at the edges, xor
+clear
+px 0 0 1
+px 83 47 1
+px -1 5 1
+px 84 5 1
+px 5 48 1
+hline 2 30 2 1
+hline 40 10 4 1
+vline 1 3 40 1
+vline 3 40 10 1
+line 10 10 30 15 1
+line 30 10 10 30 1
+line 10 30 12 12 1
+line 40 40 20 38 1
+line 50 5 50 5 1
+line -5 -5 90 60 1
+fill 60 2 20 10 1
+fill 62 4 16 6 2
+rect 60 14 20 10 1
+rect 80 30 1 1 1
+rect 70 30 5 2 1
+rect 70 34 1 5 1
+fill 40 20 30 25 2
+dither 5 40 30 8 0
+dither 50 40 30 8 1
+frame
+
+# 2: rounded shapes, radius 0..4, outline and fill, on and off
+clear
+round 0 0 15 11 0 1
+fillround 0 13 15 11 0 1
+fillround 2 15 11 7 0 0
+round 0 26 4 3 0 1
+fillround 8 26 3 4 0 2
+round 16 0 15 11 1 1
+fillround 16 13 15 11 1 1
+fillround 18 15 11 7 1 0
+round 16 26 5 4 1 1
+fillround 24 26 4 5 1 2
+round 32 0 15 11 2 1
+fillround 32 13 15 11 2 1
+fillround 34 15 11 7 2 0
+round 32 26 6 5 2 1
+fillround 40 26 5 6 2 2
+round 48 0 15 11 3 1
+fillround 48 13 15 11 3 1
+fillround 50 15 11 7 3 0
+round 48 26 7 6 3 1
+fillround 56 26 6 7 3 2
+round 64 0 15 11 4 1
+fillround 64 13 15 11 4 1
+fillround 66 15 11 7 4 0
+round 64 26 8 7 4 1
+fillround 72 26 7 8 4 2
+box 2 36 50 12
+round 56 36 28 12 3 2
+frame
+
+# 3: tiny font, every glyph, lower case, an unknown character, widths
+clear
+tiny 0 0 1 ABCDEFGHIJKLMNOPQRSTUVWXYZ
+tiny 0 6 1 0123456789 .:,-+/%<>!?()=*_#
+tiny 0 12 1 lower case: ok
+tiny 0 18 1 TAB	AND ~ UNKNOWN
+tinyw 0 24 MWNQ 14.074
+tinyw 0 26 A
+fill 0 28 84 8 1
+tiny 2 30 0 INVERSE TEXT -12 DB
+tiny 70 40 1 CLIPPED AT THE EDGE
+tiny -3 40 1 W
+frame
+
+# 4 and 5: the 5 x 7 font, all of ASCII
+clear
+small 0 0 1  !"#$%&'()*+,-
+small 0 8 1 ./0123456789:;
+small 0 16 1 <=>?@ABCDEFGHI
+small 0 24 1 JKLMNOPQRSTUVW
+smallw 0 40 Hello, 5x7!
+small 70 42 1 edge
+frame
+clear
+small 0 0 1 PQRSTUVWXYZ[\]
+small 0 8 1 ^_`abcdefghijk
+small 0 16 1 lmnopqrstuvwxy
+small 0 24 1 z{|}~
+small 0 40 2 xor over
+fill 0 38 40 10 2
+frame
+
+# 6: big digits
+clear
+big 0 0 1 14.074
+big 0 16 1 -7 3.5
+bigw 0 33 14.074
+bigw 0 35 -7 3.5
+big 60 30 1 98
+frame
+
+# 7 and 8: every icon, every frame, plain and scaled
+clear
+icon 0 0 CAT 0 1
+icon 9 0 CAT 1 1
+icon 18 0 CAT 2 1
+icon 27 0 HEART 0 1
+icon 36 0 HEART 1 1
+icon 45 0 HEART 2 1
+icon 54 0 BOLT 0 1
+icon 63 0 BOLT 1 1
+icon 72 0 ARROW_DOWN 0 1
+icon 0 9 ARROW_DOWN 1 1
+icon 9 9 WARN 0 1
+icon 18 9 WARN 1 1
+icon 27 9 PERSON 0 1
+icon 36 9 PERSON 1 1
+icon 45 9 CHIP 0 1
+icon 54 9 CHIP 1 1
+icon 63 9 THERMO 0 1
+icon 72 9 THERMO 1 1
+icon 0 18 STAR 0 1
+icon 9 18 STAR 1 1
+icon 18 18 STAR 2 1
+icon 27 18 SMILE 0 1
+icon 36 18 SMILE 1 1
+icon 45 18 SAD 0 1
+icon 54 18 SAD 1 1
+icon 63 18 NOTE 0 1
+icon 72 18 NOTE 1 1
+icon 0 27 ANTENNA 0 1
+icon 9 27 ANTENNA 1 1
+icon 18 27 ANTENNA 2 1
+icon 27 27 ANTENNA 3 1
+icon 36 27 UPLOAD 0 1
+icon 45 27 UPLOAD 1 1
+fill 0 40 84 8 1
+icon 1 41 CAT 0 0
+icon 10 41 HEART 1 0
+icon 20 41 STAR 0 2
+icon 80 41 ANTENNA 2 1
+frame
+clear
+iconk 0 0 CAT 0 3
+iconk 22 0 CAT 1 3
+iconk 44 0 WARN 0 2
+iconk 60 0 ANTENNA 1 2
+iconk 0 24 STAR 3 2
+iconk 16 24 UPLOAD 0 1
+iconk 78 40 HEART 0 2
+frame
+
+# 9: the pieces of the look
+clear
+pill 0 0 1 USB
+pill 20 0 0 RX
+pill 40 0 1 FT8 -12
+pill 0 9 0 CQ PY2ABC
+segbar 0 18 40 4 0
+bar 44 18 30 4 0
+segbar 0 22 40 4 0.33
+bar 44 22 31 4 0.33
+segbar 0 26 40 4 0.5
+bar 44 26 32 4 0.5
+segbar 0 30 40 4 1
+bar 44 30 33 4 1
+segbar 0 34 40 4 -1
+bar 44 34 34 4 -1
+segbar 0 38 40 4 2
+bar 44 38 35 4 2
+segbar 0 42 40 4 0.666
+bar 44 42 36 4 0.666
+segbar 74 0 10 16 0.7
+frame
+
+# 10: an overlay box, inverted
+clear
+dither 0 0 84 48 0
+box 1 10 82 37
+pill 30 13 1 LAST TX
+iconk 6 23 STAR 0 2
+tiny 22 23 1 FULL POWER
+segbar 22 37 57 6 0.43
+invert
+frame

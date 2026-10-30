@@ -1,6 +1,6 @@
 {
   "name": "signal-decoder",
-  "version": "0.28.1",
+  "version": "0.29.0",
   "description": "Free web-based signal decoder for amateur radio. Decode FT8/FT4 (with QSO tracking, world map, ADIF log, and CAT transmit), RTTY, CW, SSTV, NAVTEX/SITOR-B, and MFSK signals in real-time from your browser.",
   "keywords": [
     "ft8",
@@ -50,11 +50,13 @@
     "test:calibration-live": "tsx scripts/calibration-live-test.ts",
     "test:perf": "tsx scripts/perf-testbed.ts",
     "test:pskreporter": "tsx scripts/pskreporter-test-send.ts",
-    "dev:test": "vite --port 3002"
+    "dev:test": "vite --port 3002",
+    "lcd:reference": "sh scripts/lcd-gfx-reference/build.sh"
   },
   "dependencies": {
     "@e04/ft8ts": "^0.0.14",
     "@types/leaflet": "^1.9.21",
+    "html-to-image": "1.11.13",
     "leaflet": "^1.9.4",
     "solid-js": "^1.9.13",
     "workbox-window": "^7.4.1"

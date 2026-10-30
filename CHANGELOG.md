@@ -12,6 +12,22 @@ them into a version section when cutting a release.
 
 ## [Unreleased]
 
+## [0.29.0] - 2026-10-30
+
+### Added
+
+- **Status LCD on the S3 bridge (bridge firmware 0.13.0).** A Nokia 5110 module soldered to the board edge shows six views: radio, spectrum, levels, TX, system and network. On top of any view it can show a PA emergency, Wi-Fi setup, upload progress, or a Last TX report after key-up. Its look: rounded bars and panels, segmented meters, and small animated pixel icons. The bridge control page gets a Display section with a live preview of the screen, a view picker, auto-cycle, contrast, backlight and invert. The frequency-module serial line moves from GPIO1/2 to GPIO47/21 to free the pins.
+- **Client views on the S3 status LCD.** A web app or any other tool can add up to 4 views of its own to the LCD, over the `/display-ws` WebSocket or `POST /display/client`. The client draws the picture; the bridge adds the title bar, page dots, slide and overlays, and drops a view that stops updating for 10 s. A view can ask for the glass while the radio transmits. The control page lists client views next to the built-in ones, and its preview now follows the screen live over the same socket.
+- **Events on the S3 status LCD.** `POST /display/event` (or the same over `/display-ws`) pops up a short announcement over whatever the LCD shows, drawn by the bridge like its upload overlay: a title, up to three lines and an icon each side. Icons come from the built-in set, from a library of 21 animated icons stored with the control page (`lcd_icons.txt`, editable), or as the client's own small static picture. Clients can also lay their own picture over the LCD the same way.
+- **LCD views from the web app.** An LCD button in the header picks any box on the page, like a browser's screenshot tool, and puts it on the bridge's LCD: canvases such as the waterfall are mirrored, other boxes redrawn about once a second, with a contrast slider per view. Picking the FT transmit panel gives a QSO view made for unattended operation: what the station does now, this session's completed QSOs and countries, and the last two. Each completed QSO pops up a "QSO n!" announcement over whatever the LCD shows.
+- **TUNE on the S3 status LCD.** While the web app's TUNE carrier is on, the LCD shows a TUNE overlay with the band, the frequency and the seconds on air ("TUNE DRY" in diagnostic mode).
+- **The S3 status LCD follows TX.** At key-down it switches to the TX view (or a client view that asked for TX) and goes back to the previous view 2 s after key-up. Auto-cycle pauses meanwhile.
+- **Event icons on the bridge control page.** The Display section shows every icon an LCD event can use, built-in and library, animated as on the LCD (`GET /display/icons?rows=1`).
+
+### Fixed
+
+- **S3 bridge crash at boot when internal RAM ran short.** The I/Q passband filter wrote through a null pointer when its buffers didn't fit in internal RAM. It now falls back to PSRAM, or switches the passband off cleanly. The status LCD keeps its stack and frame buffers in PSRAM and drives the SPI without DMA, so it costs little internal RAM.
+
 ## [0.28.1] - 2026-10-27
 
 ### Fixed

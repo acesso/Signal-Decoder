@@ -392,3 +392,23 @@ bool bridge_settings_set_str(const char *key, const char *value) {
     ESP_LOGI(TAG, "saved %s=%s to NVS: %s", key, value, ok ? "ok" : "FAILED");
     return ok;
 }
+
+// A small fixed-size record; false (out untouched) unless one of exactly
+// `size` bytes is saved under `key`.
+bool bridge_settings_get_blob(const char *key, void *out, size_t size) {
+    nvs_handle_t h;
+    if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &h) != ESP_OK) return false;
+    size_t len = 0;
+    bool ok = nvs_get_blob(h, key, NULL, &len) == ESP_OK && len == size && nvs_get_blob(h, key, out, &len) == ESP_OK;
+    nvs_close(h);
+    return ok;
+}
+
+bool bridge_settings_set_blob(const char *key, const void *data, size_t size) {
+    nvs_handle_t h;
+    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h) != ESP_OK) return false;
+    esp_err_t e1 = nvs_set_blob(h, key, data, size);
+    esp_err_t e2 = nvs_commit(h);
+    nvs_close(h);
+    return e1 == ESP_OK && e2 == ESP_OK;
+}

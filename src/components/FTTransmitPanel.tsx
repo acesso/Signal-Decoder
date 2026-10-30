@@ -12,6 +12,12 @@ import {
   classifyCallsign, type Contact, type MsgType,
   MSG_TYPE_COLOR, MSG_TYPE_LABEL, gridToLatLon, haversineKm,
 } from '$decoder-lib/ft/parser'
+import { currentQso, exchangeWith, latestMessage, messagesToMe, sentTo } from '$decoder-lib/ft/conversation'
+import { qsoLogRecords } from '$decoder-lib/ft/qsoLog'
+import { registerLcdView } from '$decoder-lib/lcd/elementSource'
+import { drawFtContact } from '$decoder-lib/lcd/views/ftContact'
+import { drawFtSession, drawQsoOverlay, QsoAnnouncer, sessionQsos } from '$decoder-lib/lcd/views/ftSession'
+import { useLcdFeed } from './lcd/LcdFeed'
 import { callsignCountry } from '$decoder-lib/ft/prefixes'
 import { FT_WINDOW_SECONDS, DEFAULT_DECODER_PARAMS, type FTMode } from '$decoder-lib/ft/decoder'
 import { fmtAbsHz } from '$decoder-lib/formatFreq'
@@ -778,26 +784,13 @@ export default function FTTransmitPanel(props: FTTransmitPanelProps): JSX.Elemen
       const callsign = contact.callsign.toUpperCase()
       if (callsign === myCallUp) continue
 
-      // Messages they sent addressed to us
-      const theirMsgsToUs = contact.msgs.filter(m =>
-        m.role === 'tx' && m.parsed.callee?.toUpperCase() === myCallUp
-      )
-      if (theirMsgsToUs.length === 0) continue
-
-      // Latest by timestamp — the quarantine gate can replay released
-      // messages out of push order.
-      const lastTheirMsg = theirMsgsToUs.reduce(
-        (latest, m) => m.windowStart > latest.windowStart ? m : latest, theirMsgsToUs[0],
-      )
+      // Their latest message to us, and what we last sent them (lib/ft/conversation.ts,
+      // shared with the LCD's QSO view).
+      const theirMsgsToUs = messagesToMe(contact, myCallUp)
+      const lastTheirMsg = latestMessage(theirMsgsToUs)
+      if (!lastTheirMsg) continue
       const lastTheirType = lastTheirMsg.parsed.type
-
-      // What we've already sent them — read from the TX sent log, not from decoded
-      // contacts (our own transmissions are never decoded back by the receiver).
-      // state.sent is newest-first, so filter then take index 0 for the most recent.
-      const sentToThem = tx.state().sent.filter(e =>
-        parseFTMsg(e.message).callee?.toUpperCase() === callsign
-      )
-      const lastSentMsg = sentToThem.length ? sentToThem[0] : null
+      const lastSentMsg = sentTo(callsign, tx.state().sent)[0] ?? null
 
       // Fingerprint: re-fire whenever either side has a NEW latest message.
       // Never counts — the contact's 60-message ring rotates, so counts can
@@ -853,6 +846,56 @@ export default function FTTransmitPanel(props: FTTransmitPanelProps): JSX.Elemen
       })
     }
   })
+
+  // ── The bridge's LCD ─────────────────────────────────────────────────────────
+  // Two views made for the LCD (lib/lcd/elementSource.ts): "ft-session" on
+  // this panel (lib/lcd/views/ftSession.ts: what the station does now, this
+  // session's completed QSOs) and "ft-contact:<CALL>" on each contact card
+  // (FTContactsPanel; lib/lcd/views/ftContact.ts: my QSO with that station and
+  // its last messages), drawn here because the TX log lives here. Each QSO
+  // that completes is announced with a "QSO n!" overlay over whatever the LCD
+  // shows, whenever a bridge with an LCD is connected. The session is this
+  // page's: it starts when the page opens.
+  const QSO_OVERLAY_MS = 12_000
+  const sessionStartMs = Date.now()
+  const session = createMemo(() => sessionQsos(qsoLogRecords(), sessionStartMs))
+  const lcdFeed = useLcdFeed()
+  const announcer = new QsoAnnouncer()
+  createEffect(() => {
+    const all = session()
+    const fresh = announcer.update(all)
+    const feed = untrack(lcdFeed)
+    if (fresh && feed) feed.overlay((g, tick) => drawQsoOverlay(g, tick, fresh, all.length), QSO_OVERLAY_MS)
+  })
+  onCleanup(registerLcdView('ft-session', {
+    title: () => `${props.mode} SESSION`,
+    draw: (g, tick) => {
+      const st = tx.state()
+      const nowMs = Date.now()
+      drawFtSession(g, tick, {
+        nowMs,
+        windowSec: FT_WINDOW_SECONDS[props.mode] ?? 15,
+        armed: isRunning(),
+        txStatus: st.status,
+        activity: currentQso(myCall(), props.contacts, st.sent, nowMs),
+        sessionStartMs,
+        session: session(),
+      })
+    },
+  }))
+  onCleanup(registerLcdView('ft-contact', {
+    title: (call) => call,
+    draw: (g, tick, call) => {
+      const up = call.toUpperCase()
+      const contact = props.contacts.get(call) ?? [...props.contacts.values()].find((c) => c.callsign.toUpperCase() === up)
+      drawFtContact(g, tick, {
+        nowMs: Date.now(),
+        call: up,
+        contact,
+        exchange: exchangeWith(up, myCall().toUpperCase(), contact, tx.state().sent),
+      })
+    },
+  }))
 
   // ── Suggestion sort / filter state ──────────────────────────────────────────
   type SugSort = 'default' | 'snr-hi' | 'snr-lo' | 'near' | 'far'
@@ -991,7 +1034,7 @@ export default function FTTransmitPanel(props: FTTransmitPanelProps): JSX.Elemen
   const secToWindow = useWindowCountdown(windowSec)
 
   return (
-    <div class="space-y-3">
+    <div data-lcd-view="ft-session" class="space-y-3">
 
       {/* ── Top row: identity + ring + Output ── */}
       <div class="flex flex-wrap gap-3 items-end">

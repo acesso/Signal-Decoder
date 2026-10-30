@@ -178,3 +178,8 @@ bool bridge_settings_set_cat_log_enabled(bool enabled);
 // (15 characters at most).
 bool bridge_settings_get_str(const char *key, char *out, size_t out_sz);
 bool bridge_settings_set_str(const char *key, const char *value);
+
+// Generic small records (the status display's settings): get returns false,
+// leaving `out` untouched, unless a record of exactly `size` bytes is saved.
+bool bridge_settings_get_blob(const char *key, void *out, size_t size);
+bool bridge_settings_set_blob(const char *key, const void *data, size_t size);

@@ -363,6 +363,20 @@ npm run test:pskreporter          # sends to the test listener on port 14739
 That listener parses the packet and publishes what it saw at
 <https://report.pskreporter.info/cgi-bin/psk-analysis.pl>.
 
+## Bridge status LCD
+
+With the S3 bridge (its Nokia 5110 LCD, firmware 0.13.0), the app can put parts of itself on the bridge's screen. An **LCD** button appears in the header only while CAT is connected through such a bridge; with no bridge, a bridge without an LCD, or CAT disconnected, there is no LCD button (and no announcements).
+
+- **Pick a box:** the button's menu starts a picker, like a browser's screenshot tool. The box under the mouse is outlined, ↑/↓ widen or narrow it, and a click puts it on the LCD as a view of its own, next to the bridge's built-in views. Up to 4 views; each can be renamed, shown at once, given more or less contrast, or set to take the screen while transmitting. Picks are remembered.
+- **Views made for the LCD:** while picking, boxes that have one are outlined in amber with a **★ LCD view** badge, and the outline snaps to them. Such a pick keeps the view, not the box: it goes on working when the list re-sorts or scrolls the box away.
+  - **A contact card** (FT contacts): that station, to keep an eye on it. Grid, country, its last SNR and when; my QSO with it as a row of steps, with the reports; its last two messages.
+  - **The FT transmit panel** ("FT8 SESSION"): made for leaving auto-CQ and auto-reply running. What the station does now, this session's completed QSOs and countries, and the last two QSOs.
+  - **The FT map:** its visible area redrawn as coastlines and station marks (a square for a QSO, a box for a partial one, a dot for a station heard).
+- **Any other box:** a canvas (the waterfall, an SSTV picture) is mirrored and dithered; anything else is redrawn about once a second.
+- **"QSO n!"**: each completed QSO pops up over whatever the LCD shows, for 12 seconds, whatever was picked.
+
+The bridge's side, including an events API for scripts (`POST /display/event`) and an editable library of animated icons, is in `firmware/esp32-cat-bridge/README.md` ("S3: status LCD"). The drawing code is a copy of the firmware's (`src/lib/lcd/gfx.ts`), checked pixel for pixel against it by its tests; after changing `lcd_gfx.c`, run `npm run lcd:reference`.
+
 ## Audio Ring Buffer (Rec)
 
 A global retroactive audio recorder: while decoding runs, ring buffers

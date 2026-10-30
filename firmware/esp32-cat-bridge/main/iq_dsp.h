@@ -71,3 +71,10 @@ int iq_dsp_source_rate_hz(iq_dsp_source_t src);
 // The WM8782 reader reports a measured rate change; the processing restarts at it.
 void iq_dsp_set_wm8782_rate(int hz);
 void iq_dsp_on_client_close(int sockfd);
+
+// A coarse copy of the latest spectrum row for the status display: `cols`
+// columns across -fs/2..+fs/2 (the VFO in the middle), each the strongest bin
+// it covers, in dBFS. Updated with every row, whether or not anyone streams.
+// Returns the row's input rate (0 if no row yet, or none in the last 2 s);
+// *center_hz gets the passband center.
+int iq_dsp_overview(float *db, int cols, int32_t *center_hz);

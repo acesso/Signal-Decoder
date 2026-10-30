@@ -72,6 +72,16 @@ static StreamBufferHandle_t s_tx_q;  // int16 mono 48 kHz, filled by report_out_
 static _Atomic int64_t s_max_loop_us, s_max_read_us, s_max_bcast_us;
 static _Atomic uint32_t s_loop_count;
 
+// Peak meters (audio_monitor_take_peaks): each writer raises its own channel,
+// the display reads and clears. A raise racing the clear only loses one block.
+static _Atomic uint32_t s_peak[AUDIO_PEAK_COUNT];  // |sample| in 16-bit units
+static inline void peak_raise(int ch, uint32_t v) { if (v > atomic_load(&s_peak[ch])) atomic_store(&s_peak[ch], v); }
+static inline uint32_t abs16(int32_t v) { return (uint32_t)(v < 0 ? -(v >> 16) : v >> 16); }
+
+void audio_monitor_take_peaks(float out[AUDIO_PEAK_COUNT]) {
+    for (int c = 0; c < AUDIO_PEAK_COUNT; c++) out[c] = atomic_exchange(&s_peak[c], 0) / 32768.0f;
+}
+
 // ── /audio framing ─────────────────────────────────────────────────────────
 
 static int16_t s_win[AUDIO_WINDOW_SAMPLES];
@@ -179,6 +189,14 @@ static void wm_task(void *arg) {
         }
 
         iq_dsp_feed(IQ_DSP_SRC_WM8782, buf, frames);
+        uint32_t pi = 0, pq = 0;
+        for (int i = 0; i < frames; i++) {
+            uint32_t a = abs16(buf[2 * i]), b = abs16(buf[2 * i + 1]);
+            if (a > pi) pi = a;
+            if (b > pq) pq = b;
+        }
+        peak_raise(AUDIO_PEAK_WM_I, pi);
+        peak_raise(AUDIO_PEAK_WM_Q, pq);
         if (atomic_load(&s_audio_src) != AUDIO_SRC_WM8782) continue;
         int ch = atomic_load(&s_rx_right) ? 1 : 0, out = 0;
         for (int i = 0; i < frames; i++) {
@@ -212,6 +230,14 @@ static void adc_task(void *arg) {
         if (i2s_channel_read(s_port_rx, buf, PORT_BLOCK_FRAMES * 2 * sizeof(int32_t), &got, pdMS_TO_TICKS(100)) != ESP_OK || got == 0) continue;
         int frames = (int)(got / (2 * sizeof(int32_t)));
         iq_dsp_feed(IQ_DSP_SRC_PCM1808, buf, frames);
+        uint32_t pl = 0, pr = 0;
+        for (int i = 0; i < frames; i++) {
+            uint32_t a = abs16(buf[2 * i]), b = abs16(buf[2 * i + 1]);
+            if (a > pl) pl = a;
+            if (b > pr) pr = b;
+        }
+        peak_raise(AUDIO_PEAK_ADC_L, pl);
+        peak_raise(AUDIO_PEAK_ADC_R, pr);
         if (atomic_load(&s_audio_src) != AUDIO_SRC_PCM1808) continue;
         int ch = atomic_load(&s_rx_right) ? 1 : 0;
         for (int i = 0; i < frames; i++) mono[i] = s24_to_s16(buf[2 * i + ch]);
@@ -231,6 +257,12 @@ static void dac_task(void *arg) {
         size_t got = xStreamBufferReceive(s_tx_q, mono, PORT_BLOCK_FRAMES * sizeof(int16_t), 0) / sizeof(int16_t);
         if (got < PORT_BLOCK_FRAMES) memset(mono + got, 0, (PORT_BLOCK_FRAMES - got) * sizeof(int16_t));
         int slot = atomic_load(&s_tx_slot);
+        uint32_t pk = 0;
+        for (int i = 0; i < PORT_BLOCK_FRAMES; i++) {
+            uint32_t a = (uint32_t)abs(mono[i]);
+            if (a > pk) pk = a;
+        }
+        peak_raise(AUDIO_PEAK_DAC, pk);
         for (int i = 0; i < PORT_BLOCK_FRAMES; i++) {
             int32_t v = (int32_t)mono[i] << 16;
             out[2 * i] = slot == AUDIO_TX_SLOT_RIGHT ? 0 : v;
@@ -329,6 +361,9 @@ static esp_err_t audio_source_get(httpd_req_t *req) {
     httpd_resp_set_type(req, "application/json");
     return httpd_resp_send(req, body, n);
 }
+
+int audio_monitor_get_dac_level_db(void) { return atomic_load(&s_dac_db); }
+bool audio_monitor_get_dac_muted(void) { return atomic_load(&s_dac_muted); }
 
 static esp_err_t dac_level_get(httpd_req_t *req) {
     char body[64];

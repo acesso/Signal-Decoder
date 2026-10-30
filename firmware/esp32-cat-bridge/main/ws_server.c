@@ -15,6 +15,7 @@
 #include "aux_serial.h"
 #if CONFIG_BRIDGE_BOARD_S3
 #include "iq_dsp.h"
+#include "status_display.h"
 #include "ws_fanout.h"
 #endif
 #include "bridge_config.h"
@@ -295,6 +296,7 @@ static void on_client_close(httpd_handle_t hd, int sockfd) {
     aux_serial_on_client_close(sockfd);
 #if CONFIG_BRIDGE_BOARD_S3
     iq_dsp_on_client_close(sockfd);
+    status_display_on_client_close(sockfd);
 #endif
     ESP_LOGI(TAG, "CAT client socket closed (fd=%d)", sockfd);
     close(sockfd);
@@ -348,10 +350,12 @@ void ws_server_start(void) {
     // visible failure, since max_open_sockets is a soft cap httpd enforces
     // by refusing new connections, not by silently corrupting existing ones.
 #if CONFIG_BRIDGE_BOARD_S3
-    // + the two aux serial lines' WebSocket clients (aux_serial.h) and the I/Q
-    // spectrum/passband clients (iq_dsp.h); LWIP_MAX_SOCKETS is raised to match
-    // in sdkconfig.defaults.esp32s3.
-    config.max_open_sockets = WS_MAX_CLIENTS + AUDIO_WS_MAX_CLIENTS + 6 + 2 * AUX_SERIAL_MAX_CLIENTS + 2 * WS_FANOUT_MAX_CLIENTS;
+    // + the two aux serial lines' WebSocket clients (aux_serial.h), the I/Q
+    // spectrum/passband clients (iq_dsp.h) and the LCD's /display-ws clients
+    // (status_display.h); LWIP_MAX_SOCKETS is raised to match in
+    // sdkconfig.defaults.esp32s3.
+    config.max_open_sockets = WS_MAX_CLIENTS + AUDIO_WS_MAX_CLIENTS + 6 + 2 * AUX_SERIAL_MAX_CLIENTS + 2 * WS_FANOUT_MAX_CLIENTS +
+                              STATUS_DISPLAY_FEED_CLIENTS;
 #else
     config.max_open_sockets = WS_MAX_CLIENTS + AUDIO_WS_MAX_CLIENTS + 6;
 #endif
@@ -388,7 +392,7 @@ void ws_server_start(void) {
     // rather than inching it up by exactly 4 — cheap insurance (this only
     // costs a bit of static handler-table memory, not a scarce resource
     // worth rationing tightly).
-    config.max_uri_handlers = 64;  // 60 registered on the S3 (aux serial lines, I/Q streams, /audio-source, /dac-level, /capabilities, /routing)
+    config.max_uri_handlers = 72;  // 66 registered on the S3 (aux serial lines, I/Q streams, /audio-source, /dac-level, /capabilities, /routing, /display, /display-ws, /display/event)
     // Wildcard matching so http_control.c can register a single "/*" OPTIONS
     // handler for CORS preflight instead of one per concrete route — exact
     // routes (/cat, /status, /reset) still match themselves first under this

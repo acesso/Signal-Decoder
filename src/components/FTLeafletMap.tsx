@@ -11,6 +11,8 @@ import L from 'leaflet'
 import 'leaflet/dist/leaflet.css'
 import { Contact, haversineKm, isConfirmedQSO, isPartialQSO } from '$decoder-lib/ft/parser'
 import { DEFAULT_DECODER_PARAMS } from '$decoder-lib/ft/decoder'
+import { registerLcdView } from '$decoder-lib/lcd/elementSource'
+import { drawMap, type MapStation } from '$decoder-lib/lcd/views/map'
 
 // Map view (center/zoom) persistence. This is a plain client-side SPA (no
 // SSR), so reading localStorage synchronously on mount is always safe here.
@@ -369,6 +371,35 @@ export default function FTLeafletMap(props: FTLeafletMapProps) {
     map.on('moveend', persistView)
     map.on('zoomend', persistView)
 
+    // The map's view made for the LCD ("ft-map", marked on the container): the
+    // visible area redrawn as vectors (lib/lcd/views/map.ts); the coastline
+    // data loads on first use.
+    let coast: readonly (readonly number[])[] | null = null
+    let coastLoading = false
+    onCleanup(registerLcdView('ft-map', {
+      title: () => 'MAP',
+      draw: (g, tick) => {
+        if (!map) return
+        if (!coast && !coastLoading) {
+          coastLoading = true
+          void import('$decoder-lib/lcd/views/coastlines').then((m) => { coast = m.COASTLINES })
+        }
+        const b = map.getBounds()
+        const bounds = { west: b.getWest(), south: b.getSouth(), east: b.getEast(), north: b.getNorth() }
+        const me = props.myCall?.toUpperCase()
+        const stations: MapStation[] = []
+        for (const c of props.contacts.values()) {
+          if (!c.latLon || c.callsign.toUpperCase() === me) continue
+          const [lat, lon] = c.latLon
+          if (lat < bounds.south || lat > bounds.north) continue
+          const worked = !me ? 'none' : isConfirmedQSO(c, me) ? 'full' : isPartialQSO(c, me) ? 'partial' : 'none'
+          stations.push({ lat, lon, worked, selected: c.callsign === props.selected })
+        }
+        const mine = me ? props.contacts.get(me)?.latLon : undefined
+        drawMap(g, tick, { bounds, stations, me: mine, coast })
+      },
+    }))
+
     // Center the initial view on the browser's reported location, once — no
     // marker, just a better starting point than the [20, 10] world-view
     // default. Skipped entirely once a saved view exists (the user's own
@@ -639,5 +670,5 @@ export default function FTLeafletMap(props: FTLeafletMapProps) {
     terminatorLayers = []
   })
 
-  return <div ref={containerEl} style={{ height: '100%', width: '100%' }} />
+  return <div ref={containerEl} data-lcd-view="ft-map" style={{ height: '100%', width: '100%' }} />
 }

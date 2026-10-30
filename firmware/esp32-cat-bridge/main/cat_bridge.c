@@ -127,6 +127,10 @@ static void request_snoop_recovery(bool from_radio);
 // a frame that terminates normally but doesn't parse as FA/SM is just some
 // OTHER CAT command going by (e.g. "MD2;"), not corruption, so only the
 // overflow case triggers recovery — everything else stays purely passive.
+static cat_bridge_frame_cb_t s_frame_cb;
+
+void cat_bridge_set_frame_observer(cat_bridge_frame_cb_t cb) { s_frame_cb = cb; }
+
 static void feed_cat_snoop(cat_linebuf_t *lb, const uint8_t *data, size_t len, bool from_radio) {
     for (size_t i = 0; i < len; i++) {
         char c = (char)data[i];
@@ -134,6 +138,7 @@ static void feed_cat_snoop(cat_linebuf_t *lb, const uint8_t *data, size_t len, b
             try_extract_vfo(lb->buf, lb->len);
             try_extract_smeter(lb->buf, lb->len);
             cat_log_append(from_radio, lb->buf, lb->len);
+            if (s_frame_cb) s_frame_cb(from_radio, lb->buf, lb->len);
             lb->len = 0;
             continue;
         }

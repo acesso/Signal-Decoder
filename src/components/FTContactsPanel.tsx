@@ -1384,7 +1384,8 @@ export default function FTContactsPanel(props: Props): JSX.Element {
           const age = Date.now() - c.firstSeen.getTime()
           const newFraction = age < windowMs() ? 1 - age / windowMs() : 0
           return (
-            <div ref={c.callsign === expanded() ? (el) => measureExpanded(el) : undefined} style={{ overflow: c.callsign === expanded() ? 'visible' : 'hidden' }}>
+            // data-lcd-view: the card has a view made for the LCD (the station's QSO with me; FTTransmitPanel draws it)
+            <div ref={c.callsign === expanded() ? (el) => measureExpanded(el) : undefined} data-lcd-view={`ft-contact:${c.callsign}`} style={{ overflow: c.callsign === expanded() ? 'visible' : 'hidden' }}>
               <ContactCard
                 contact={c}
                 expanded={expanded() === c.callsign}

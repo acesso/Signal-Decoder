@@ -40,7 +40,7 @@
 // capability lands (e.g. "audio" once WebRTC firmware exists) — features are
 // additive and never removed once shipped, so an older web app talking to a
 // newer bridge just ignores flags it doesn't recognize.
-#define BRIDGE_FIRMWARE_VERSION "0.12.0"
+#define BRIDGE_FIRMWARE_VERSION "0.13.0"
 
 // ── Wi-Fi (station mode) ────────────────────────────────────────────────────
 // Credentials come from Kconfig (idf.py menuconfig -> "CAT Bridge Config"),
@@ -168,8 +168,20 @@
 #define S3_TUNER_TX_PIN         GPIO_NUM_12
 #define S3_TUNER_RX_PIN         GPIO_NUM_13
 #define S3_FREQ_UART_PORT       UART_NUM_0
-#define S3_FREQ_TX_PIN          GPIO_NUM_1
-#define S3_FREQ_RX_PIN          GPIO_NUM_2
+#define S3_FREQ_TX_PIN          GPIO_NUM_47     // moved off GPIO1/2 for the status LCD
+#define S3_FREQ_RX_PIN          GPIO_NUM_21
+// Status LCD (Nokia 5110, PCD8544) soldered onto the top-edge pads beside the
+// free J3 header, hanging up (doc/plans/s3-status-lcd/PLAN.md, wiring.md
+// section 11): each pad links straight to the J3 pin beside it. 43/44 are
+// UART0's pins, free because the console is on USB-Serial/JTAG; 41/42 are
+// JTAG, free because debugging runs over USB too.
+#define S3_LCD_SPI_HOST         SPI2_HOST
+#define S3_LCD_LED_PIN          GPIO_NUM_43     // backlight, driven directly (under 20 mA), PWM
+#define S3_LCD_CLK_PIN          GPIO_NUM_44
+#define S3_LCD_DIN_PIN          GPIO_NUM_1
+#define S3_LCD_DC_PIN           GPIO_NUM_2
+#define S3_LCD_RST_PIN          GPIO_NUM_42
+#define S3_LCD_CE_PIN           GPIO_NUM_41
 #endif // CONFIG_BRIDGE_BOARD_S3
 
 // ── Status LED (onboard, shared with a button — see wiring notes in the
