@@ -266,16 +266,10 @@ export interface RadioCATControls {
   /** One-shot GET /info: the bridge's firmware version + capability list.
    *  Call once when the bridge panel opens (alongside getBridgeStatus) to
    *  decide which of the controls below to show — an older bridge simply
-   *  won't report "backlight"/"wifi_config" in its features, so gate on
+   *  won't report e.g. "wifi_config" in its features, so gate on
    *  that instead of comparing version strings. Resolves null on the same
    *  conditions as getBridgeStatus. */
   getBridgeInfo: (wsUrl: string) => Promise<BridgeInfo | null>;
-  /** POST /backlight — sets the bridge's LCD backlight PWM duty (0..255,
-   *  see LCD_BACKLIGHT_MAX_DUTY in the firmware) immediately AND persists it
-   *  as the new boot default. Only meaningful if getBridgeInfo().features
-   *  includes "backlight". Resolves the duty the bridge confirmed (its
-   *  echo) and whether the save to flash succeeded, or null on failure. */
-  setBridgeBacklight: (wsUrl: string, duty: number) => Promise<{ duty: number; saved: boolean } | null>;
   /** GET /status's mic_gain_db — the ES8388 MIC preamp (PGA) gain, in dB.
    *  The I/Q-mode counterpart of the radio's own Volume/AG control: shown
    *  next to it in BlackBrickControls, mutually exclusive by input mode
@@ -298,13 +292,6 @@ export interface RadioCATControls {
    *  it there without knowing the new network's own address). Only
    *  meaningful if getBridgeInfo().features includes "wifi_config". */
   setBridgeWifiConfig: (wsUrl: string, ssid: string, password: string) => Promise<boolean>;
-  /** POST /contrast — sets the bridge's LCD contrast (PCD8544 Vop register,
-   *  0..127, see LCD_CONTRAST_MAX in the firmware) immediately AND persists
-   *  it as the new boot default. Pure software (same SPI bus already
-   *  driving the framebuffer) — no extra hardware needed. Only meaningful
-   *  if getBridgeInfo().features includes "contrast". Resolves the vop the
-   *  bridge confirmed and whether the save to flash succeeded, or null on failure. */
-  setBridgeContrast: (wsUrl: string, vop: number) => Promise<{ vop: number; saved: boolean } | null>;
   /** POST /cat-baud — sets the bridge's CAT UART baud rate (one of
    *  9600/19200/38400/57600) immediately, no reboot needed, AND persists it
    *  to the bridge's NVS as the new boot default. There's no CAT command
@@ -1867,26 +1854,6 @@ export function useRadioCAT(): RadioCATControls {
     }
   };
 
-  const setBridgeBacklight = async (wsUrl: string, duty: number): Promise<{ duty: number; saved: boolean } | null> => {
-    const base = bridgeHttpBase(wsUrl);
-    if (!base) return null;
-    log('info', 'setBridgeBacklight →', duty);
-    try {
-      const resp = await fetch(base + '/backlight', {
-        method: 'POST', signal: AbortSignal.timeout(5000),
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ duty: Math.round(duty) }),
-      });
-      if (!resp.ok) return null;
-      const j = await resp.json();
-      if (typeof j.duty !== 'number') return null;
-      return { duty: j.duty, saved: j.saved === true };
-    } catch (err) {
-      log('warn', 'setBridgeBacklight failed:', err);
-      return null;
-    }
-  };
-
   // The ES8388's MIC preamp (PGA) gain, in dB — the I/Q-mode equivalent of
   // the uSDX's own Volume control (BlackBrickControls' NumberStepper),
   // hence shown right next to it: on THIS board, "how loud is the signal
@@ -1965,26 +1932,6 @@ export function useRadioCAT(): RadioCATControls {
     }
   };
 
-  const setBridgeContrast = async (wsUrl: string, vop: number): Promise<{ vop: number; saved: boolean } | null> => {
-    const base = bridgeHttpBase(wsUrl);
-    if (!base) return null;
-    log('info', 'setBridgeContrast →', vop);
-    try {
-      const resp = await fetch(base + '/contrast', {
-        method: 'POST', signal: AbortSignal.timeout(5000),
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ vop: Math.round(vop) }),
-      });
-      if (!resp.ok) return null;
-      const j = await resp.json();
-      if (typeof j.vop !== 'number') return null;
-      return { vop: j.vop, saved: j.saved === true };
-    } catch (err) {
-      log('warn', 'setBridgeContrast failed:', err);
-      return null;
-    }
-  };
-
   // POST /cat-baud — no reboot, unlike setBridgeWifiConfig: the radio's own
   // baud is a local-menu-only setting with no CAT command to announce a
   // change (see the firmware README), so this must apply live the moment
@@ -2048,7 +1995,7 @@ export function useRadioCAT(): RadioCATControls {
     setVolume, setAtt1, setAtt2, setNR, setAGC, setAgcLevel, setFilter, setDrive,
     setBacklight, getPABias, setPABias, getTxTimeout, setTxTimeout, resetRadio,
     getFactoryDefaults, factoryResetRadio, getRefFreq, setRefFreq,
-    getBridgeStatus, resetBridge, getBridgeInfo, setBridgeBacklight, setBridgeWifiConfig, setBridgeContrast,
+    getBridgeStatus, resetBridge, getBridgeInfo, setBridgeWifiConfig,
     setBridgeCatBaud, clearBridgePaEmergency, setBridgeInputMode, getBridgeMicGain, setBridgeMicGain,
   };
 }

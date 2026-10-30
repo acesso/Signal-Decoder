@@ -5,6 +5,7 @@
 #pragma once
 
 #include <stddef.h>
+#include <stdbool.h>
 #include <stdint.h>
 
 // Called from the CAT bridge's own task context whenever bytes arrive from
@@ -25,6 +26,13 @@ void cat_bridge_start(cat_bridge_rx_cb_t rx_cb);
 // Thread-safe — may be called from the WS server's own task/context.
 // Returns the number of bytes actually written (mirrors uart_write_bytes).
 int cat_bridge_write(const uint8_t *data, size_t len);
+
+// Optional observer for every complete CAT frame passing through the bridge,
+// either way (the text before the ';', not NUL-terminated). Called from the
+// UART reader task or the writer's context, so keep it short. One observer;
+// the S3's status display uses it for mode, PTT and the TX report.
+typedef void (*cat_bridge_frame_cb_t)(bool from_radio, const char *frame, size_t len);
+void cat_bridge_set_frame_observer(cat_bridge_frame_cb_t cb);
 
 // Re-opens UART2 at a new baud rate without restarting the reader task —
 // used if/when the app adds a runtime baud-change control message. Safe to

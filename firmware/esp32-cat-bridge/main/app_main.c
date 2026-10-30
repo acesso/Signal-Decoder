@@ -19,6 +19,7 @@
 #include "aux_serial.h"
 #if CONFIG_BRIDGE_BOARD_S3
 #include "iq_dsp.h"
+#include "status_display.h"
 #endif
 #include "audio_ws.h"
 #include "bridge_settings.h"
@@ -58,6 +59,9 @@ void app_main(void) {
     cat_bridge_start(ws_server_send_to_client);
     audio_monitor_start();    // needs audio_ws_start() already registered its rx callback slot
     io_routing_start(ws_server_get_httpd());  // /capabilities, /routing — after the audio backend and iq_dsp exist
+#if CONFIG_BRIDGE_BOARD_S3
+    status_display_start(ws_server_get_httpd());  // the edge-mounted LCD — draws what the modules above measure
+#endif
 
 
     // OTA rollback gate (see partitions.csv / ota_handler()). With

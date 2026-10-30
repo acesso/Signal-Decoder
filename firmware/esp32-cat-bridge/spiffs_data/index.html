@@ -430,6 +430,34 @@
         </div>
       </div>
 
+      <h3 class="hw-group" data-feature="display">Display</h3>
+
+      <div class="hw-device" data-feature="display">
+        <div class="hw-device-head"><span class="hw-chip">PCD8544</span><span class="hw-sub">Nokia 5110 LCD · 84 × 48 · <span id="lcd-state">…</span></span></div>
+        <div class="lcd-module"><div class="lcd-glass"><canvas id="lcd-canvas" width="420" height="240" aria-label="What the LCD shows now"></canvas></div></div>
+        <div class="audio-input-row">
+          <span class="audio-input-label" title="The view on the LCD. The dashed one is on the glass right now (it differs while auto-cycling, or under an overlay: PA emergency, Wi-Fi setup, an upload, Last TX).">View <span class="info">ⓘ</span></span>
+          <div class="audio-input-toggle" id="lcd-views"></div>
+        </div>
+        <div class="audio-input-row">
+          <span class="audio-input-label" title="Steps through every view on its own, each for the time set here.">Auto-cycle <span class="info">ⓘ</span></span>
+          <div class="audio-input-toggle"><button data-lcd-cycle="true" type="button" class="audio-input-option">On</button><button data-lcd-cycle="false" type="button" class="audio-input-option">Off</button></div>
+          <input id="lcd-dwell" type="range" min="2" max="60" step="1" value="8" class="audio-gain-slider" data-lcd-key="dwell_s"><span id="lcd-dwell-readout" class="audio-input-label">8 s</span>
+        </div>
+        <div class="audio-input-row">
+          <span class="audio-input-label" title="Backlight brightness (PWM on GPIO43).">Backlight <span class="info">ⓘ</span></span>
+          <input id="lcd-backlight" type="range" min="0" max="100" step="5" value="60" class="audio-gain-slider" data-lcd-key="backlight"><span id="lcd-backlight-readout" class="audio-input-label">60 %</span>
+        </div>
+        <div class="audio-input-row">
+          <span class="audio-input-label" title="Light pixels on a dark background.">Invert <span class="info">ⓘ</span></span>
+          <div class="audio-input-toggle"><button data-lcd-invert="true" type="button" class="audio-input-option">On</button><button data-lcd-invert="false" type="button" class="audio-input-option">Off</button></div>
+        </div>
+        <div class="audio-input-row lcd-icons-row">
+          <span class="audio-input-label" title="The icons an event can show (POST /display/event, &quot;icon&quot;:&quot;&lt;name&gt;&quot;): the built-in ones, then the animated library stored on the bridge (lcd_icons.txt).">Event icons <span class="info">ⓘ</span></span>
+          <div id="lcd-icons" class="lcd-icons"></div>
+        </div>
+      </div>
+
     </section>
 
     <section id="iq-spectrum-card" class="card" data-feature="input_mode_select|iq_spectrum">

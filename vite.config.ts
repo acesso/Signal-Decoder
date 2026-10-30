@@ -26,6 +26,12 @@ export default defineConfig({
     headers: {
       'Cache-Control': 'no-store',
     },
+    // Folders that are not the web app (firmware and its build output,
+    // hardware, docs, samples, the old prototype, the production build): not
+    // watched, so editing or building them never touches the dev server.
+    watch: {
+      ignored: ['**/firmware/**', '**/hardware/**', '**/doc/**', '**/test-samples/**', '**/svelte-prototype/**', '**/dist/**'],
+    },
   },
   // Force a fresh dependency pre-bundle on every dev server start instead of
   // reusing node_modules/.vite's cache — that cache is normally a nice speed

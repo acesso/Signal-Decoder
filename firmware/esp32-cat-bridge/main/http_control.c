@@ -30,6 +30,7 @@
 #include "pa_watchdog.h"
 #include "mem_bench.h"
 #include "radio_ota.h"
+#include "status_display.h"
 #include "ws_server.h"
 #include "wifi_net.h"
 
@@ -163,6 +164,11 @@ static const char *TAG = "http_control";
 // I/Q streams ("wm8782" or "pcm1808") — see audio_monitor_s3.c.
 // "dac_level" (S3) means: GET/POST /dac-level sets the PCM5102A output level
 // (a digital gain, dB, saved) and its soft mute (XSMT, not saved).
+// "display" (S3) means: the status LCD — GET/POST /display for its views and
+// settings, GET /display/frame for the picture on it (status_display.h).
+// "display_client_views" (S3) means: clients can add their own LCD views
+// over /display-ws or POST /display/client, and /display-ws carries the live
+// frame feed (status_display.h).
 // "capabilities" / "routing" (both boards) mean: GET /capabilities describes
 // the bridge, GET/POST /routing selects and saves its stream routing (io_routing.h).
 // GET /info also reports "board" ("a1s" or "s3").
@@ -171,7 +177,8 @@ static const char *const BRIDGE_FEATURES[] = {
     "cat", "wifi_config", "wifi_scan", "reset", "audio", "cat_baud", "pa_watchdog", "rx_slot_select", "led_enable",
     "cpu_monitor", "wifi_tx_power_control", "cat_log", "audio_mic_sniff", "tx_buffer_playback", "tx_slot_select",
     "ota", "ota_storage", "cat_echo_text", "radio_ota", "mem_bench", "aux_serial",
-    "iq_spectrum", "iq_passband", "adc_source_select", "capabilities", "routing", "dac_level",
+    "iq_spectrum", "iq_passband", "adc_source_select", "capabilities", "routing", "dac_level", "display",
+    "display_client_views",
 };
 #else
 static const char *const BRIDGE_FEATURES[] = {
@@ -351,8 +358,9 @@ static esp_err_t info_handler(httpd_req_t *req) {
     // update with no visible error at all). Sized with real headroom
     // (22 entries -> ~380 bytes as of tx_buffer_playback landing) so the
     // next several feature additions don't repeat this exact bug a
-    // second time.
-    char body[512];
+    // second time. 768 since display_client_views: the S3's list had
+    // reached ~470 of 512.
+    char body[768];
     size_t o = (size_t)snprintf(body, sizeof(body),
         "{\"firmware_version\":\"%s\",\"board\":\"%s\",\"features\":[", BRIDGE_FIRMWARE_VERSION, BRIDGE_BOARD_NAME);
     for (size_t i = 0; i < BRIDGE_FEATURES_COUNT && o < sizeof(body); i++) {
@@ -1793,6 +1801,7 @@ static esp_err_t ota_handler(httpd_req_t *req) {
             return ESP_FAIL;
         }
         received_total += (size_t)received;
+        status_display_progress("FIRMWARE", (int)(received_total * 100 / content_len));
     }
     free(buf);
 
@@ -1899,10 +1908,12 @@ static esp_err_t ota_storage_handler(httpd_req_t *req) {
             break;
         }
         offset += STORAGE_SECTOR_BYTES;
+        status_display_progress("WEB PAGE", (int)((offset < content_len ? offset : content_len) * 100 / content_len));
     }
     free(buf);
 
     bool page_ok = control_page_storage_mount();
+    status_display_reload_icons();  // the page's storage also holds the LCD's icon library
     if (err != ESP_OK) {
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
                             "storage update failed part-way — the control page is unavailable until a good image is uploaded again");

@@ -623,9 +623,37 @@ Raw 96 kHz I/Q is about 375 KB/s per listener, too much for Wi-Fi. The S3 sends 
 - **Web app:** it detects this from `/info` (`iq_spectrum` + `iq_passband`). It then reads these two streams, sends its passband centre, I/Q correction and DC removal to the bridge, and demodulates at 0 Hz. Imbalance correction isn't available in this mode. Any other bridge keeps the raw `/iq-data` path.
 - **Test signal:** until the WM8782 is wired, `"source":"test"` feeds a synthetic signal: tones at +5000 Hz (−20 dBFS), −12000 Hz (−40 dBFS) and +20300 Hz (−60 dBFS).
 
+#### S3: status LCD (0.13.0)
+
+A Nokia 5110 module (PCD8544, 84 × 48) on the board edge beside J3 (`hardware/bridge-s3/wiring.md` section 11): SPI2 at 4 MHz, LED 43, CLK 44, DIN 1, D/C 2, RST 42, CE 41. `main/status_display.c` redraws it 5 times a second on core 0; `main/lcd_gfx.c` has the fonts, shapes and pixel icons.
+
+- **Views:** radio (frequency, mode, RX/TX, S-meter), spectrum (from the bridge's own I/Q FFT), levels (peak meters on the WM8782, PCM1808 and PCM5102A), TX (slots, playback, DAC level, last TX report), system (CPU per core, RAM, PSRAM, temperature, uptime) and network (RSSI history, clients, IP, CAT traffic). One shows at a time, picked on the control page or auto-cycled.
+- **While transmitting:** the glass switches to the TX view (or a client view registered with `focus_on_tx`) at key-down and goes back to the previous view 2 s after key-up, unless another view was picked meanwhile. Auto-cycle pauses meanwhile.
+- **Overlays:** PA emergency, Wi-Fi setup (AP fallback), firmware or page upload progress, TUNE while the radio is keyed in CW (the web app's TUNE carrier: band, frequency, seconds on; "TUNE DRY" in diagnostic mode), and Last TX for 6 s after key-up (the radio's `TA` report, judged like the web app's chip).
+- **Memory:** the radio and DSP come first. `iq_dsp_start()` builds its passband FIR before the converters and the LCD start (`/iq-config` reports `fir_memory`). The LCD starts last, and its stack and frame buffers sit in PSRAM, so it takes about 1.5 KB of internal RAM.
+- **Radio data:** the mode, PTT, drive, diag mode and `TA` report come from the CAT frames passing through (`cat_bridge_set_frame_observer`); the bridge sends nothing new to the radio.
+
+- **Client views:** up to 4 more views drawn by the web app or any other tool (`doc/plans/lcd-client-views/PLAN.md`). The client sends the picture under the title bar; the bridge adds the title bar, the page dots, the slide and the overlays. A client view follows the built-in ones in the page order and in auto-cycle. With no new picture for 10 s it leaves the list, and the glass goes back to the built-in view it showed. `focus_on_tx` asks for the glass while the radio is keyed, instead of the TX view.
+
+| Endpoint | What |
+|---|---|
+| `GET`/`POST /display` | `view`, `cycle`, `dwell_s` (2–60), `contrast` (Vop 0–127), `bias` (0–7), `backlight` (0–100), `invert`; `{"next":true}` steps once. Saved. `view` may also be a live client view's id: shown, not saved. `GET` lists `client_views` |
+| `GET /display/frame` | The 504 bytes on the glass right now (PCD8544 layout); `X-Display-View` names the view |
+| `ws://<bridge>/display-ws` | Live feed, up to 4 clients. Bridge → client: the frame (BINARY, 504 bytes) when it changes; `{"showing":…,"client_views":[…]}` (TEXT) when the view or the list changes. Client → bridge: `{"register":"<id>","title":"…","focus_on_tx":true}` → `{"slot":N}`; then BINARY `[slot][420 bytes]`; also `{"unregister":"<id>"}`, `{"show":"<view>"}`. Closing the socket removes its views. The control page's preview uses it |
+| `POST /display/client?id=<id>&title=<title>&focus_on_tx=1` | A client view's picture (420 bytes) without WebSocket; registers it on first use. `503` when all 4 slots are taken |
+| `POST /display/event` | An announcement drawn by the bridge over any view, in its overlay panel: `{"title":"QSO 12!","lines":["LU1ABC","GF05 AR","S-14 R-08"],"icon":"trophy","seconds":10}`. Up to 3 lines (the first large when it fits), 1–60 s (8 by default), queued 4 deep (`503` when full). `icon` names a built-in or library icon; `icon_rows` (up to 11 × 11 strings of `.`/`#`) is the client's own static one instead. Also as `{"event":{…}}` over `/display-ws` |
+| `GET /display/icons` | The icon names: `builtin`, and the animated `library` read from `spiffs_data/lcd_icons.txt` at boot and after a page upload. `?rows=1` adds each icon's pixels (`rows`, frame after frame), which the control page's Display section uses to show them all |
+| `/display-ws` overlay | BINARY `[255][420 bytes]`: a client's own picture over any view, inside the overlay panel (x 1–82, y 10–46, corner radius 3), while frames come and 1.5 s after. The web app's "QSO n!" announcement uses it |
+
+**The icon library:** `spiffs_data/lcd_icons.txt`, on the storage partition with the control page, read into PSRAM: 21 animated 9 × 9 icons (rocket, trophy, bell, mail, check, cross, globe, wifi, signal, sun, moon, rain, fire, sparkle, coffee, clock, battery, pulse, flag, ghost, qso). An icon is a line `<name> <width> <height> <frames>`, then its rows frame after frame, `#` lit; up to 11 × 11, 8 frames, 48 icons. Adding one needs only a page upload.
+
+**A client view's picture:** rows 8–47 of the frame, 420 bytes in the controller's layout (5 banks of 84 column bytes, bit 0 at the top). Row 8 is drawn over by the title bar, so the client's own drawing starts at row 9. Ids are 1–23 of `a-z 0-9 - _`; registering an id already in use takes it over (a reloaded page replaces its view). Titles are drawn in the tiny font: capitals, digits, space and `- . : / + %`.
+
+The module on this board ignores the contrast command (its contrast is fixed in hardware; checked with raw commands on 2026-10-28), so the page has no contrast controls. The firmware still sends `contrast`/`bias` at start-up, as a genuine PCD8544 expects.
+
 #### S3: tuner and frequency-module serial lines
 
-Two plain byte pipes: tuner on UART2 (GPIO12 TX / GPIO13 RX), frequency module on UART0 (GPIO1 TX / GPIO2 RX). Both run 9600 8N1 by default.
+Two plain byte pipes: tuner on UART2 (GPIO12 TX / GPIO13 RX), frequency module on UART0 (GPIO47 TX / GPIO21 RX; GPIO1/2 before 0.13.0, now the status LCD's). Both run 9600 8N1 by default.
 
 | Endpoint | What |
 |---|---|

@@ -76,10 +76,16 @@ All signal pins are on the left header, except the frequency-module serial line.
 | GPIO14 | PA_SENSE | data cable (LV4) |
 | GPIO12 | TUNER_TX | tuner socket (future) |
 | GPIO13 | TUNER_RX | tuner socket (future) |
-| GPIO1 (right header) | FREQ_TX | frequency-module socket (future) |
-| GPIO2 (right header) | FREQ_RX | frequency-module socket (future) |
+| GPIO47 (J3) | FREQ_TX | frequency-module socket (future; was GPIO1 before the LCD) |
+| GPIO21 (J3) | FREQ_RX | frequency-module socket (future; was GPIO2) |
+| GPIO43 (J3) | LCD_LED | status LCD backlight (section 11) |
+| GPIO44 (J3) | LCD_CLK | status LCD |
+| GPIO1 (J3) | LCD_DIN | status LCD |
+| GPIO2 (J3) | LCD_DC | status LCD |
+| GPIO42 (J3) | LCD_RST | status LCD |
+| GPIO41 (J3) | LCD_CE | status LCD |
 
-**Leave unconnected:** GPIO0/3/45/46 (strapping), 19/20 (USB), 35/36/37 (PSRAM), 43/44 (second USB port).
+**Leave unconnected:** GPIO0/3/45/46 (strapping), 19/20 (USB), 35/36/37 (PSRAM).
 
 ### WM8782 module (I/Q ADC, clock master)
 
@@ -412,3 +418,13 @@ The bit clock and word clock continue from the PCM1808's pins, under the PCM1808
   - Its 3.3 V also goes through a hole to the PCM1808's `3.3V`.
 - **Ground:** the adapters' ground takes the long way round on the top face: left of the buffer, along the strip between the S3 and the WM8782, then down the WM8782's right edge to the LP5907. From there it goes through a hole into the TPS7A-to-J5 ground wire.
 - **One crossing:** the 3.3 V wire from the LP5907 to the buffer crosses branch B once, on the top face. It is a DC wire crossing at 90°, insulated, so the coupling is negligible. It is marked in the drawing.
+
+## 11. Draft 6: status LCD on the board edge
+
+A Nokia 5110/3310 LCD module (PCD8544, 84 × 48) for live status. The plan, the views and the firmware outline are in `doc/plans/s3-status-lcd/PLAN.md`; the drawing shows it in draft 6.
+
+- **Mounting:** the module's 8 pins are soldered onto the top-edge pads beside the S3's free header (J3), at 90° to the board, display facing out, **hanging up**. That puts pin 8 (LED) at the antenna end and pin 1 (VCC) toward USB. Hot glue or a bracket takes the load off the joints.
+- **Links (bottom face):** six pads straight across the two hole rows to their J3 pins: LED → GPIO43 (backlight under 20 mA, driven directly), CLK → GPIO44, DIN → GPIO1, D/C → GPIO2, RST → GPIO42, SCE → GPIO41.
+- **GND:** the next pad (beside J3's 40, unused) takes a wire along the hole row next to J3, toward the USB end, to J3's GND there.
+- **VCC:** the last pad (beside 39, unused) takes a top-face wire along the row by the edge to the hole past J3's antenna end, then on the bottom face under the S3 to its second `3V3` pin (J1). Nothing crosses.
+- **Firmware (0.13.0):** `main/status_display.c` draws the views; the frequency-module serial line moved from GPIO1/2 to GPIO47/21 to free the pins.

@@ -221,6 +221,17 @@ button:disabled { opacity: 0.5; cursor: default; }
   cursor: not-allowed;
 }
 .audio-gain-slider { flex: 1; min-width: 8rem; max-width: 16rem; }
+.audio-input-option.showing { outline: 2px dashed var(--accent); outline-offset: 1px; }
+/* The LCD preview, drawn like the module: red board, grey-green glass. */
+.lcd-module { background: #a3201c; border-radius: 10px; padding: 10px 14px; margin: 0.25rem 0 0.6rem; max-width: 460px; box-shadow: inset 0 0 0 2px #7a1512; }
+.lcd-glass { background: #1b1d1a; border-radius: 6px; padding: 6px; }
+.lcd-icons-row { align-items: flex-start; }
+.lcd-icons { display: flex; flex-wrap: wrap; gap: 6px; max-width: 460px; }
+.lcd-icon { display: flex; flex-direction: column; align-items: center; gap: 2px; width: 52px; padding: 4px 2px; background: #1b1d1a; border-radius: 4px; }
+.lcd-icon canvas { image-rendering: pixelated; }
+.lcd-icon span { font: 10px monospace; color: #c9d1d9; }
+.lcd-icon.library span { color: #d29922; }
+#lcd-canvas { display: block; width: 100%; height: auto; border-radius: 3px; }
 .audio-input-hint { margin-top: 0; margin-bottom: 0.5rem; }
 #msg {
   min-height: 1.2rem;

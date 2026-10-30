@@ -12,6 +12,7 @@
 #include "dsps_fir.h"
 #include "dsps_wind_hann.h"
 #include "esp_heap_caps.h"
+#include "esp_memory_utils.h"
 #include "esp_log.h"
 #include "esp_random.h"
 #include "esp_timer.h"
@@ -82,6 +83,7 @@ static float s_win_gain2;  // (sum of window)^2 — a full-scale tone reads 0 dB
 static fir_f32_t s_fir_i, s_fir_q;
 static float *s_fir_coeffs, *s_fir_delay_i, *s_fir_delay_q;
 static int s_fir_taps, s_decim;
+static const char *volatile s_fir_mem = "none";  // where the FIR landed: "internal", "psram" or "none"
 static float *s_mix_i, *s_mix_q, *s_dec_i, *s_dec_q;
 static int16_t *s_pb_buf;
 static int s_pb_fill, s_pb_frame_len;
@@ -95,15 +97,32 @@ static _Atomic int s_cfg_source = IQ_DSP_SRC_WM8782;  // read lock-free by the p
 // 0.4 x the output rate, -74 dB from 0.6 x, so nothing folds back into the
 // 0..0.4 x band. Taps = 5.5 x fs / transition, rounded up to a multiple of 4
 // (the S3-optimized FIR needs that).
+// Internal RAM is tight on this board (the I2S DMA rings live there), so a
+// filter that doesn't fit takes PSRAM: slower per tap, but it runs.
+static float *fir_alloc(int taps) {
+    float *p = heap_caps_aligned_calloc(16, taps, sizeof(float), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    return p ? p : heap_caps_aligned_calloc(16, taps, sizeof(float), MALLOC_CAP_SPIRAM);
+}
+
 static void design_fir(int decim) {
     float fs_out = (float)s_fs / decim;
     float transition = 0.2f * fs_out;
     int taps = (int)ceilf(5.5f * s_fs / transition);
     taps = (taps + 3) & ~3;
     heap_caps_free(s_fir_coeffs); heap_caps_free(s_fir_delay_i); heap_caps_free(s_fir_delay_q);
-    s_fir_coeffs = heap_caps_aligned_calloc(16, taps, sizeof(float), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    s_fir_delay_i = heap_caps_aligned_calloc(16, taps, sizeof(float), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    s_fir_delay_q = heap_caps_aligned_calloc(16, taps, sizeof(float), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    s_fir_coeffs = fir_alloc(taps);
+    s_fir_delay_i = fir_alloc(taps);
+    s_fir_delay_q = fir_alloc(taps);
+    if (!s_fir_coeffs || !s_fir_delay_i || !s_fir_delay_q) {
+        // Not even PSRAM: the passband stays off until the next redesign.
+        ESP_LOGE(TAG, "FIR (%d taps): out of memory — passband off", taps);
+        heap_caps_free(s_fir_coeffs); heap_caps_free(s_fir_delay_i); heap_caps_free(s_fir_delay_q);
+        s_fir_coeffs = s_fir_delay_i = s_fir_delay_q = NULL;
+        s_fir_taps = 0;
+        s_decim = decim;
+        s_fir_mem = "none";
+        return;
+    }
     float fc = 0.5f * fs_out / s_fs;  // cutoff, cycles/sample
     float sum = 0;
     for (int n = 0; n < taps; n++) {
@@ -114,6 +133,8 @@ static void design_fir(int decim) {
         sum += s_fir_coeffs[n];
     }
     for (int n = 0; n < taps; n++) s_fir_coeffs[n] /= sum;  // unity gain at DC
+    s_fir_mem = esp_ptr_internal(s_fir_coeffs) && esp_ptr_internal(s_fir_delay_i) && esp_ptr_internal(s_fir_delay_q) ? "internal" : "psram";
+    if (s_fir_mem[0] == 'p') ESP_LOGW(TAG, "FIR (%d taps) in PSRAM: internal RAM is short", taps);
     dsps_fird_init_f32(&s_fir_i, s_fir_coeffs, s_fir_delay_i, taps, decim);
     dsps_fird_init_f32(&s_fir_q, s_fir_coeffs, s_fir_delay_q, taps, decim);
     s_fir_taps = taps;
@@ -189,6 +210,53 @@ static void emit_row(void) {
     ws_fanout_send(&s_spec_out, &h, sizeof(h), s_row, n);
 }
 
+// The status display's overview (iq_dsp_overview): a few columns of maxima,
+// kept under a spinlock (written on core 1, read on core 0).
+#define OVERVIEW_COLS 96
+static float s_ov[OVERVIEW_COLS];
+static int s_ov_fs;
+static int64_t s_ov_at;
+static portMUX_TYPE s_ov_lock = portMUX_INITIALIZER_UNLOCKED;
+
+static void update_overview(void) {
+    const int n = s_live.fft_size;
+    const float norm = 1.0f / (s_avg_count * s_win_gain2);
+    float col[OVERVIEW_COLS];
+    for (int c = 0; c < OVERVIEW_COLS; c++) {
+        int k0 = c * n / OVERVIEW_COLS, k1 = (c + 1) * n / OVERVIEW_COLS;
+        float m = 0;
+        for (int k = k0; k < k1; k++) {
+            float p = s_pow[(k + n / 2) & (n - 1)];
+            if (p > m) m = p;
+        }
+        col[c] = 10.0f * log10f(m * norm + 1e-20f);
+    }
+    portENTER_CRITICAL(&s_ov_lock);
+    memcpy(s_ov, col, sizeof(col));
+    s_ov_fs = s_fs;
+    s_ov_at = esp_timer_get_time();
+    portEXIT_CRITICAL(&s_ov_lock);
+}
+
+int iq_dsp_overview(float *db, int cols, int32_t *center_hz) {
+    float col[OVERVIEW_COLS];
+    portENTER_CRITICAL(&s_ov_lock);
+    memcpy(col, s_ov, sizeof(col));
+    int fs = s_ov_fs;
+    int64_t at = s_ov_at;
+    portEXIT_CRITICAL(&s_ov_lock);
+    if (center_hz) *center_hz = s_live.center_hz;
+    if (!fs || esp_timer_get_time() - at > 2000000) return 0;
+    for (int c = 0; c < cols; c++) {  // resample to the caller's width, keeping maxima
+        int a = c * OVERVIEW_COLS / cols, b = (c + 1) * OVERVIEW_COLS / cols;
+        if (b <= a) b = a + 1;
+        float m = -200;
+        for (int k = a; k < b && k < OVERVIEW_COLS; k++) if (col[k] > m) m = col[k];
+        db[c] = m;
+    }
+    return fs;
+}
+
 static void spectrum_feed(const float *i_in, const float *q_in, int len) {
     const int n = s_live.fft_size;
     for (int k = 0; k < len; k++) {
@@ -201,6 +269,7 @@ static void spectrum_feed(const float *i_in, const float *q_in, int len) {
         for (int b = 0; b < n; b++) s_pow[b] += s_fft[2 * b] * s_fft[2 * b] + s_fft[2 * b + 1] * s_fft[2 * b + 1];
         if (++s_avg_done < s_avg_count) continue;
         if (ws_fanout_count(&s_spec_out) > 0) emit_row();
+        update_overview();
         s_avg_done = 0;
         memset(s_pow, 0, n * sizeof(float));
     }
@@ -220,6 +289,7 @@ static void passband_feed(const float *i_in, const float *q_in, int len) {
     s_nco_re = re / mag;
     s_nco_im = im / mag;
 
+    if (!s_fir_coeffs) return;  // the FIR didn't fit (design_fir)
     int outs = dsps_fird_f32(&s_fir_i, s_mix_i, s_dec_i, len / s_decim);
     dsps_fird_f32(&s_fir_q, s_mix_q, s_dec_q, len / s_decim);
     for (int k = 0; k < outs; k++) {
@@ -375,15 +445,15 @@ static esp_err_t config_get(httpd_req_t *req) {
     xSemaphoreTake(s_cfg_mutex, portMAX_DELAY);
     iq_cfg_t c = s_cfg;
     xSemaphoreGive(s_cfg_mutex);
-    char body[400];
+    char body[448];
     int n = snprintf(body, sizeof(body),
         "{\"fs\":%d,\"source\":\"%s\",\"center_hz\":%" PRId32 ",\"pb_rate\":%d,\"fft_size\":%d,\"rows_per_s\":%d,"
         "\"db_floor\":%d,\"db_span\":%d,\"iq_correction\":\"%s\",\"dc_removal\":%s,\"dsp_load_pct\":%.1f,\"input_dropped\":%" PRIu32 ",\"rows\":%" PRIu32 ","
-        "\"pb_frames\":%" PRIu32 ",\"spectrum_clients\":%d,\"passband_clients\":%d,\"client_frames_dropped\":%" PRIu32 "}",
+        "\"pb_frames\":%" PRIu32 ",\"spectrum_clients\":%d,\"passband_clients\":%d,\"client_frames_dropped\":%" PRIu32 ",\"fir_memory\":\"%s\"}",
         fs_for(c.source), SRC_NAMES[c.source], c.center_hz, c.pb_rate, c.fft_size, c.rows_per_s,
         c.db_floor, c.db_span, CORR_NAMES[c.correction], c.dc_removal ? "true" : "false", atomic_load(&s_load_permille) / 10.0, atomic_load(&s_in_dropped), atomic_load(&s_rows),
         atomic_load(&s_pb_frames), ws_fanout_count(&s_spec_out), ws_fanout_count(&s_pb_out),
-        s_spec_out.dropped + s_pb_out.dropped);
+        s_spec_out.dropped + s_pb_out.dropped, s_fir_mem);
     httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
     httpd_resp_set_type(req, "application/json");
     return httpd_resp_send(req, body, n);
@@ -541,6 +611,11 @@ void iq_dsp_start(httpd_handle_t server) {
     }
     s_live.fft_size = 0;  // force the window build on the first apply_config()
     s_live.source = IQ_DSP_SRC_NONE;  // and the source setup
+    // Build the working state now, before the converters, the status LCD and
+    // the rest claim internal RAM: the passband FIR is the DSP's one internal
+    // allocation that can grow, and it runs fastest there.
+    apply_config();
+    atomic_store(&s_cfg_changed, false);
     xTaskCreatePinnedToCore(dsp_task, "iq_dsp", 6144, NULL, IQ_DSP_TASK_PRIO, NULL, IQ_DSP_TASK_CORE);
     xTaskCreatePinnedToCore(test_source_task, "iq_test_src", 4096, NULL, IQ_DSP_TASK_PRIO, NULL, IQ_DSP_TASK_CORE);
 

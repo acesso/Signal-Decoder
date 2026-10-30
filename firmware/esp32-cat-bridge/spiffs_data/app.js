@@ -503,6 +503,192 @@ if (dacSlider) {
   dacMuteBtns.forEach((btn) => btn.addEventListener('click', () => void postDac({ muted: btn.dataset.dacMuted === 'true' }, 'DAC mute')));
 }
 
+// ── Status LCD (S3, GET/POST /display, /display-ws) ──────────────────────
+// The preview draws the frame the bridge just sent to the glass: 6 banks of
+// 84 column bytes, bit 0 at the top, each pixel a small square with a gap.
+// Frames come over /display-ws as they change; while that socket is down
+// (or the bridge's 4 feed clients are taken) the page polls GET /display/frame.
+// Client views (drawn by the web app or another tool) get a button each,
+// after the built-in views.
+const lcdCanvas = document.getElementById('lcd-canvas');
+const LCD_VIEW_LABELS = { radio: 'Radio', spectrum: 'Spectrum', levels: 'Levels', tx: 'TX', system: 'System', network: 'Network' };
+const LCD_POLL_MS = 250;
+const LCD_WS_RETRY_MS = 3000;
+let lcdBacklight = 60;
+let lcdWs = null;
+let lcdBuiltin = [];
+let lcdClient = [];   // [{id, title}], live client views
+let lcdSaved = null, lcdShowing = null;
+
+function drawLcd(frame) {
+  const g = lcdCanvas.getContext('2d'), k = lcdCanvas.width / 84;
+  const lit = 0.55 + 0.45 * (lcdBacklight / 100);
+  g.fillStyle = `rgb(${Math.round(176 * lit)},${Math.round(196 * lit)},${Math.round(160 * lit)})`;
+  g.fillRect(0, 0, lcdCanvas.width, lcdCanvas.height);
+  for (let y = 0; y < 48; y++) {
+    for (let x = 0; x < 84; x++) {
+      const on = frame[(y >> 3) * 84 + x] & (1 << (y & 7));
+      g.fillStyle = on ? '#1c2418' : 'rgba(28,36,24,0.06)';
+      g.fillRect(x * k + 0.5, y * k + 0.5, k - 1, k - 1);
+    }
+  }
+}
+
+function lcdButtons() {
+  const views = document.getElementById('lcd-views');
+  const want = [...lcdBuiltin.map((v) => [v, LCD_VIEW_LABELS[v] || v, false]), ...lcdClient.map((c) => [c.id, c.title, true])];
+  const have = [...views.querySelectorAll('button')].map((b) => b.dataset.lcdView).join('|');
+  if (have !== want.map(([v]) => v).join('|')) {
+    views.replaceChildren(...want.map(([v, label, client]) => {
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.className = 'audio-input-option';
+      b.dataset.lcdView = v;
+      b.textContent = label;
+      if (client) b.title = `Drawn by a client (view id "${v}"): shown while it keeps sending, not saved as the view.`;
+      b.addEventListener('click', () => void postLcd({ view: v }, 'LCD view'));
+      return b;
+    }));
+  }
+  markActive(views.querySelectorAll('button'), 'lcdView', lcdSaved);
+  views.querySelectorAll('button').forEach((b) => b.classList.toggle('showing', b.dataset.lcdView === lcdShowing));
+}
+
+function showLcd(d) {
+  lcdBuiltin = d.views;
+  if (Array.isArray(d.client_views)) lcdClient = d.client_views.filter((c) => c.live);
+  lcdSaved = d.view;
+  lcdShowing = d.showing;
+  lcdButtons();
+  markActive(document.querySelectorAll('[data-lcd-cycle]'), 'lcdCycle', String(!!d.cycle));
+  markActive(document.querySelectorAll('[data-lcd-invert]'), 'lcdInvert', String(!!d.invert));
+  for (const [id, key, unit] of [['lcd-dwell', 'dwell_s', ' s'], ['lcd-backlight', 'backlight', ' %']]) {
+    const el = document.getElementById(id);
+    if (typeof d[key] === 'number' && document.activeElement !== el) el.value = d[key];
+    document.getElementById(`${id}-readout`).textContent = `${el.value}${unit}`;
+  }
+  lcdBacklight = d.backlight;
+  document.getElementById('lcd-state').textContent = d.lcd_ok ? 'running' : 'SPI setup failed';
+}
+
+async function postLcd(patch, what) {
+  try {
+    const res = await fetch('/display', { method: 'POST', body: JSON.stringify(patch) });
+    if (!res.ok) throw new Error(await res.text() || `HTTP ${res.status}`);
+    showLcd(await res.json());
+    showMsg(`${what} applied.`, 'ok');
+  } catch (err) {
+    showMsg(`Failed to change ${what}: ${err.message}`, 'error');
+  }
+}
+
+const lcdWanted = () => bridgeFeatures && bridgeFeatures.has('display') && document.visibilityState === 'visible';
+
+function openLcdFeed() {
+  if (lcdWs || !lcdWanted()) return;
+  const ws = new WebSocket(`ws://${location.host}/display-ws`);
+  ws.binaryType = 'arraybuffer';
+  lcdWs = ws;
+  ws.onmessage = (ev) => {
+    if (typeof ev.data !== 'string') { drawLcd(new Uint8Array(ev.data)); return; }
+    try {
+      const m = JSON.parse(ev.data);
+      if (m.showing !== undefined) lcdShowing = m.showing;
+      if (Array.isArray(m.client_views)) lcdClient = m.client_views;
+      lcdButtons();
+    } catch { /* not ours */ }
+  };
+  ws.onclose = () => { lcdWs = null; setTimeout(openLcdFeed, LCD_WS_RETRY_MS); };
+}
+
+async function pollLcd() {
+  try {
+    if (lcdWanted() && !(lcdWs && lcdWs.readyState === WebSocket.OPEN)) {
+      const res = await fetch('/display/frame');
+      if (res.ok) {
+        drawLcd(new Uint8Array(await res.arrayBuffer()));
+        lcdShowing = res.headers.get('X-Display-View');
+        lcdButtons();
+      }
+    }
+  } catch { /* the next poll tries again */ }
+  setTimeout(pollLcd, LCD_POLL_MS);
+}
+
+if (lcdCanvas) {
+  const loadLcd = () => fetch('/display').then((r) => (r.ok ? r.json() : null)).then((d) => d && showLcd(d)).catch(() => {});
+  void loadLcd();
+  setInterval(loadLcd, ROUTING_REFRESH_MS);
+  document.querySelectorAll('[data-lcd-cycle]').forEach((b) => b.addEventListener('click', () => void postLcd({ cycle: b.dataset.lcdCycle === 'true' }, 'Auto-cycle')));
+  document.querySelectorAll('[data-lcd-invert]').forEach((b) => b.addEventListener('click', () => void postLcd({ invert: b.dataset.lcdInvert === 'true' }, 'Invert')));
+  document.querySelectorAll('[data-lcd-key]').forEach((el) => {
+    const unit = { dwell_s: ' s', backlight: ' %' }[el.dataset.lcdKey] || '';
+    el.addEventListener('input', () => { document.getElementById(`${el.id}-readout`).textContent = `${el.value}${unit}`; });
+    const name = { dwell_s: 'Dwell time', backlight: 'Backlight' }[el.dataset.lcdKey];
+    el.addEventListener('change', () => void postLcd({ [el.dataset.lcdKey]: Number(el.value) }, name));
+  });
+  // The feed closes while the tab is hidden and reopens when it shows again.
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') openLcdFeed();
+    else if (lcdWs) { lcdWs.onclose = () => { lcdWs = null; }; lcdWs.close(); }
+  });
+  setInterval(openLcdFeed, LCD_WS_RETRY_MS);  // also covers bridgeFeatures arriving after load
+  void pollLcd();
+}
+
+// The event icons (GET /display/icons?rows=1), each drawn 3x on a small glass,
+// the animated ones stepping through their frames like the LCD does (every 400 ms).
+const LCD_ICON_SCALE = 3, LCD_ICON_FRAME_MS = 400;
+let lcdIcons = [];  // [{canvas, icon}]
+async function loadLcdIcons() {
+  const box = document.getElementById('lcd-icons');
+  if (!box) return;
+  try {
+    const res = await fetch('/display/icons?rows=1');
+    if (!res.ok) return;
+    const d = await res.json();
+    box.replaceChildren();
+    lcdIcons = [];
+    for (const [list, kind] of [[d.builtin, 'builtin'], [d.library, 'library']]) {
+      for (const icon of list || []) {
+        if (typeof icon !== 'object' || !Array.isArray(icon.rows)) continue;  // older firmware: names only
+        const cell = document.createElement('div');
+        cell.className = `lcd-icon ${kind}`;
+        cell.title = `${icon.name}: ${icon.w} x ${icon.h}${icon.frames > 1 ? `, ${icon.frames} frames` : ''} (${kind === 'library' ? 'library, lcd_icons.txt' : 'built in'})`;
+        const canvas = document.createElement('canvas');
+        canvas.width = 11 * LCD_ICON_SCALE;
+        canvas.height = 11 * LCD_ICON_SCALE;
+        const label = document.createElement('span');
+        label.textContent = icon.name;
+        cell.append(canvas, label);
+        box.append(cell);
+        lcdIcons.push({ canvas, icon });
+      }
+    }
+    drawLcdIcons(0);
+  } catch { /* the bridge is busy: the list stays as it was */ }
+}
+function drawLcdIcons(step) {
+  for (const { canvas, icon } of lcdIcons) {
+    const g = canvas.getContext('2d'), k = LCD_ICON_SCALE;
+    const rows = icon.rows.slice((step % icon.frames) * icon.h, (step % icon.frames + 1) * icon.h);
+    const x0 = Math.floor((11 - icon.w) / 2) * k, y0 = Math.floor((11 - icon.h) / 2) * k;
+    g.fillStyle = '#b0c4a0';  // the glass of drawLcd() at full backlight
+    g.fillRect(0, 0, canvas.width, canvas.height);
+    g.fillStyle = '#1c2418';
+    rows.forEach((r, j) => { for (let i = 0; i < r.length; i++) if (r[i] === '#') g.fillRect(x0 + i * k, y0 + j * k, k, k); });
+  }
+}
+if (document.getElementById('lcd-icons')) {
+  let step = 0;
+  const waitFeatures = setInterval(() => {
+    if (!bridgeFeatures) return;
+    clearInterval(waitFeatures);
+    if (bridgeFeatures.has('display')) void loadLcdIcons();
+  }, 500);
+  setInterval(() => { if (lcdIcons.length && document.visibilityState === 'visible') drawLcdIcons(++step); }, LCD_ICON_FRAME_MS);
+}
+
 // ── Explanations as hover tooltips ───────────────────────────────────────
 // Every explanatory paragraph (p.hint) becomes the tooltip of the control it
 // follows, marked with an ⓘ, so the page shows controls rather than prose.

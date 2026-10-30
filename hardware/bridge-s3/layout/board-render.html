@@ -81,14 +81,15 @@ td code { font-family: var(--font-mono); font-size: 12.5px; }
 
 <div class="wrap">
   <header>
-    <div class="eyebrow">uSDX CAT bridge · v2 hardware · draft 5</div>
+    <div class="eyebrow">uSDX CAT bridge · v2 hardware · draft 6</div>
     <h1>S3 Bridge Board</h1>
     <p class="lede">The new floor of the bridge stack: an ESP32-S3 with a WM8782 for 96 kHz I/Q, a PCM1808 for RX audio and a PCM5102A for TX audio, all clocked from one 24.576 MHz crystal. Hover or tap a wire to see where it goes; pick a part to see only its wires.</p>
     <div class="specs">
       <span><b>80 × 120 mm</b> double-sided perfboard</span>
       <span><b>2.54 mm</b> grid</span>
       <span><b>AWG22</b> wiring</span>
-      <span>I/Q <b>96 kHz</b> · audio <b>48 kHz</b></span>
+      <span>I/Q <b>96 / 192 kHz</b> · audio <b>48 kHz</b></span>
+      <span>draft 6: <b>status LCD</b> on the edge (planned)</span>
     </div>
   </header>
 
@@ -166,6 +167,8 @@ td code { font-family: var(--font-mono); font-size: 12.5px; }
           <tr><td>10 µF 50 V electrolytic</td><td>2</td><td>AMS1117 input and output (Cin, Cout)</td><td>7.5 V and 5 V lanes to GND</td></tr>
           <tr><td>10 µF 0805 MLCC (harvested)</td><td>3</td><td>LP5907 IN and OUT, AMS1117 OUT (its stability needs low ESR)</td><td>On the adapters</td></tr>
           <tr><td>100 nF (104) ceramic</td><td>1</td><td>Oscillator supply decoupling</td><td>Bottom face, pins 8–4</td></tr>
+          <tr><th colspan="4">Draft 6: status display (planned, not built)</th></tr>
+          <tr><td>Nokia 5110/3310 LCD module (PCD8544, 84 × 48, red board)</td><td>1</td><td>Live status on the bridge: frequency, levels, spectrum, system, Last TX, alerts (<code>doc/plans/s3-status-lcd/PLAN.md</code>)</td><td>Pins soldered onto 8 top-edge pads at 90° to the board, facing out, hanging up; pin 8 (LED) at the antenna end. Links to J3: LED 43 (direct, under 20 mA), CLK 44, DIN 1, D/C 2, RST 42, SCE 41. GND by a wire along the edge row to J3's GND at the USB end; VCC by a top-face wire to a hole past J3, then under the S3 to its second 3V3. Hot glue or a bracket for strength</td></tr>
           <tr><th colspan="4">Connectors and wiring</th></tr>
           <tr><td>2-pin JST XH, white (housing over 3 × 3 holes)</td><td>1</td><td>7.5 V and GND (the ground star)</td><td>From the main board's 7805 input, after its 100 µH choke and 330 µF</td></tr>
           <tr><td>1×6 pin header</td><td>1</td><td>Data cable to the main board's level shifter, in its LV order so the cable runs straight</td><td>Pin 1 by S3 pin 9: CAT TX 9, CAT RX 10, 3.3 V (red top-face wire to the S3's 3V3), GND (black, to the WM8782 ground hole), PA emergency 11, PA sense 14</td></tr>
@@ -192,6 +195,7 @@ td code { font-family: var(--font-mono); font-size: 12.5px; }
     aud:  { c: '#c98cff', name: 'Audio I2S', sub: 'GPIO15–18 to the PCM1808 and PCM5102A, mute on GPIO8' },
     sig:  { c: '#7fe0a0', name: 'Analog in', sub: 'I/Q jack to the WM8782, RX jack to the PCM1808' },
     data: { c: '#2ee6c4', name: 'Data cable', sub: 'CAT and PA lines, header to the S3, one to one' },
+    lcd:  { c: '#7ad3ff', name: 'Status LCD (draft 6, planned)', sub: 'Edge pads to the S3\'s J3: SPI, reset, backlight; VCC from 3V3' },
     v75:  { c: '#ff4d4d', name: '7.5 V', sub: 'JST XH in, to the TPS7A4701 and the AMS1117' },
     v5:   { c: '#ffb000', name: '5 V lane', sub: 'From the AMS1117 to the PCM1808, PCM5102A and LP5907 (the S3 takes 5 V over USB from the main board)' },
     v5q:  { c: '#ff7eb6', name: 'Quiet 5 V', sub: 'TPS7A4701 output to the WM8782 only' },
@@ -199,7 +203,7 @@ td code { font-family: var(--font-mono); font-size: 12.5px; }
     gnd:  { c: '#0b0f0c', name: 'Ground', sub: 'Every return ends at the JST XH ground pin (the star)', dash: true },
     jmp:  { c: '#c9d1d8', name: 'Solder jumper', sub: 'A bridge between neighbouring pins or pads, no wire', jmp: true },
   };
-  const PARTS = ['ESP32-S3', 'WM8782', 'PCM1808', 'PCM5102A', 'TPS7A4701', '74LVC1G157', 'LP5907', 'Oscillator', 'AMS1117', 'Data header', 'Power header', 'Jacks'];
+  const PARTS = ['ESP32-S3', 'WM8782', 'PCM1808', 'PCM5102A', 'TPS7A4701', '74LVC1G157', 'LP5907', 'Oscillator', 'AMS1117', 'Data header', 'Power header', 'Jacks', 'Status LCD'];
 
   // ── Geometry (top-side coordinates, mm) ──
   // The hole grid, measured on the user's board photo: holes at X(i), Y(j).
@@ -214,6 +218,13 @@ td code { font-family: var(--font-mono); font-size: 12.5px; }
   const S3_TOP = ['GND','TX','RX','1','2','42','41','40','39','38','37','36','35','0','45','48','47','21','20','19','GND','GND'];
   const g = n => SX(S3_BOTTOM.indexOf(n));
   const S3Y = Y(14), S3TY = Y(4);
+  // Draft 6: Nokia 5110 status LCD, pins soldered onto the top-edge pads, 90° to the board, facing out,
+  // hanging up. That puts pin 8 (LED) at the antenna end: pins 8-3 beside J3's 43, 44, 1, 2, 42, 41,
+  // then GND and VCC beside 40 and 39 (unused), each by its own wire.
+  const LCD_PINS = ['LED','CLK','DIN','D/C','RST','SCE','GND','VCC'];
+  const LCD_GPIO = ['43','44','1','2','42','41'];
+  const LCD_X = k => X(10 + k), EDGE_PAD_Y = 2.1;
+  const LCD_VIA = [X(8), Y(2)];
 
   const modules = [
     { id: 'ESP32-S3', x: 17.34, y: 8.9, w: 67.2, h: 29, fill: '#141414', stroke: '#3a3a3a', label: 'ESP32-S3-N16R8', lx: 52, ly: 21.6 },
@@ -315,6 +326,15 @@ td code { font-family: var(--font-mono); font-size: 12.5px; }
     w('sig','b',[[X(4),Y(42)],[X(12),Y(42)],[X(14),Y(40)],[X(14),Y(33)],[X(13),Y(33)]],'RX jack, tip (RX audio)','PCM1808 LIN',['Jacks','PCM1808'],as('yellow')),
     w('gnd','b',[[X(1),Y(42)],[halfX(1),Y(41)],[halfX(11),Y(41)],[halfX(13),Y(39)],[halfX(13),Y(34)],[X(13),Y(34)]],'RX jack, sleeve (black wire)','PCM1808 input ground',['Jacks','PCM1808']),
     w('sig','b',[[X(2),Y(40)],[X(11),Y(40)],[X(13),Y(38)],[X(13),Y(35)]],'RX jack, ring (audio loop)','PCM1808 RIN',['Jacks','PCM1808'],as('orange')),
+    // status LCD (draft 6, planned): edge pad -> straight link on the bottom face to its J3 pin
+    ...LCD_GPIO.map((gp, k) => w('lcd', 'b', [[LCD_X(k), EDGE_PAD_Y], [LCD_X(k), S3TY]],
+      `LCD pin ${8 - k} ${LCD_PINS[k]} (edge pad)`, `S3 J3 ${S3_TOP[k + 1]} (GPIO${gp})`, ['Status LCD','ESP32-S3'])),
+    w('gnd','b',[[LCD_X(6), EDGE_PAD_Y], [LCD_X(6), Y(3)], [SX(20), Y(3)], [SX(20), S3TY]],
+      'LCD pin 2 GND (edge pad)', 'S3 J3 GND (USB end), along the free row by the edge', ['Status LCD','ESP32-S3']),
+    w('lcd','t',[[LCD_X(7), EDGE_PAD_Y], [LCD_X(7), Y(2)], LCD_VIA],
+      'LCD pin 1 VCC (edge pad)', 'hole past J3\'s antenna end, on the top face (above the GND wire and the links)', ['Status LCD','ESP32-S3'], { via: LCD_VIA }),
+    w('lcd','b',[LCD_VIA, [X(8), half(14)], [SX(1), half(14)], [SX(1), S3Y]],
+      'LCD VCC (from the hole past J3)', 'S3 3V3 (J1, second pin), under the S3', ['Status LCD','ESP32-S3']),
     // data header, in the level shifter's LV order (LV1 LV2 LV GND LV3 LV4), so the cable runs straight; pin 1 (LV1) by S3 pin 9
     w('data','b',[[X(23),Y(17)],[g('9'),S3Y]],'data header pin 1, LV1 (CAT TX), orange','S3 GPIO9 (CAT TX)',['Data header','ESP32-S3'],as('orange')),
     w('data','b',[[X(24),Y(17)],[g('10'),S3Y]],'data header pin 2, LV2 (CAT RX), yellow','S3 GPIO10 (CAT RX)',['Data header','ESP32-S3'],as('yellow')),
@@ -443,6 +463,17 @@ td code { font-family: var(--font-mono); font-size: 12.5px; }
       for (const j of jacks) label(j.label, j.x + j.w / 2, j.y + j.h / 2, { size: 1.7, fill: '#bfe3cb', weight: 400 });
     }
 
+    // draft 6: the status LCD, seen edge-on beyond the top edge, and its 8 edge pads
+    {
+      const cx = (LCD_X(0) + LCD_X(7)) / 2;
+      rectM({ x: cx - 22.5, y: -3.4, w: 45, h: 2.2 }, { rx: 0.4, fill: mirror ? 'none' : '#b3261e', stroke: '#7ad3ff', 'stroke-width': 0.3, 'stroke-dasharray': mirror ? '1 0.8' : 'none' });
+      label('LCD', cx, -2.3, { size: 1.3, fill: '#ffffff', weight: 600 });
+      LCD_PINS.forEach((n, k) => {
+        el('rect', { x: MX(LCD_X(k)) - 0.85, y: EDGE_PAD_Y - 1.5, width: 1.7, height: 3, rx: 0.3, fill: '#e6c46a', stroke: '#7ad3ff', 'stroke-width': 0.3 }, svg);
+        label(n, LCD_X(k), EDGE_PAD_Y + 2.6, { size: 0.9, fill: '#d8f3ff' });
+      });
+    }
+
     // header pins and labels
     S3_BOTTOM.forEach((n, i) => {
       el('rect', { x: MX(SX(i)) - 0.9, y: S3Y - 0.9, width: 1.8, height: 1.8, fill: '#d9b85e', stroke: '#8c6f2a', 'stroke-width': 0.2 }, svg);
@@ -479,7 +510,7 @@ td code { font-family: var(--font-mono); font-size: 12.5px; }
 
     // wires on this face (top view also shows the bridges made on the modules themselves)
     const faces = mirror ? ['b'] : ['t', 'm'];
-    const order = ['gnd', 'v5', 'v75', 'v5q', 'v33', 'data', 'sig', 'aud', 'iq', 'clk', 'jmp'];
+    const order = ['gnd', 'v5', 'v75', 'v5q', 'v33', 'data', 'lcd', 'sig', 'aud', 'iq', 'clk', 'jmp'];
     const layer = el('g', {}, svg);
     for (const key of order) for (const wr of wires.filter(x => x.n === key && faces.includes(x.f))) {
       const net = NET[wr.n];

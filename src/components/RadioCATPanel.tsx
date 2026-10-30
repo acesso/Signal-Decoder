@@ -1266,38 +1266,6 @@ function BridgeResetButton(props: { onConfirm: () => void; busy: boolean }) {
   )
 }
 
-// ── BridgeSliderControl ───────────────────────────────────────────────────────
-// Generic 0..max slider for a bridge LCD setting (backlight PWM duty,
-// contrast/Vop) — applies live and persists as the bridge's new boot
-// default. Local draft state so dragging the slider doesn't fire a request
-// per pixel; commits on release (change), not on every input event.
-
-function BridgeSliderControl(props: {
-  label: string
-  value: number
-  max: number
-  onCommit: (n: number) => void
-  busy: boolean
-}) {
-  const [draft, setDraft] = createSignal(props.value)
-  createEffect(() => setDraft(props.value))
-
-  return (
-    <div class="flex items-center gap-2">
-      <span class="text-[10px] font-semibold text-[#8b949e] whitespace-nowrap">{props.label}</span>
-      <input
-        type="range" min={0} max={props.max} step={1}
-        value={draft()}
-        disabled={props.busy}
-        onInput={(e) => setDraft(Number(e.currentTarget.value))}
-        onChange={(e) => props.onCommit(Number(e.currentTarget.value))}
-        class="w-28 accent-[#388bfd] disabled:opacity-50"
-      />
-      <span class="text-[10px] text-[#c9d1d9] font-mono w-8 text-right">{draft()}</span>
-    </div>
-  )
-}
-
 // ── BridgeWifiConfigForm ──────────────────────────────────────────────────────
 // Change the bridge's own Wi-Fi network — persists to the bridge's NVS and
 // reboots it onto the new network. Deliberately separate from the CAT
@@ -1719,8 +1687,6 @@ function BridgeStatusPanel(props: {
   getBridgeStatus: (wsUrl: string) => Promise<BridgeStatus | null>
   resetBridge: (wsUrl: string) => Promise<boolean>
   getBridgeInfo: (wsUrl: string) => Promise<BridgeInfo | null>
-  setBridgeBacklight: (wsUrl: string, duty: number) => Promise<{ duty: number; saved: boolean } | null>
-  setBridgeContrast: (wsUrl: string, vop: number) => Promise<{ vop: number; saved: boolean } | null>
   setBridgeWifiConfig: (wsUrl: string, ssid: string, password: string) => Promise<boolean>
   setBridgeCatBaud: (wsUrl: string, baud: number) => Promise<{ baud: number; saved: boolean } | null>
   clearBridgePaEmergency: (wsUrl: string) => Promise<boolean | null>
@@ -1731,10 +1697,6 @@ function BridgeStatusPanel(props: {
   const [failed, setFailed] = createSignal(false)
   const [loading, setLoading] = createSignal(true)
   const [resetBusy, setResetBusy] = createSignal(false)
-  const [backlightBusy, setBacklightBusy] = createSignal(false)
-  const [backlightDuty, setBacklightDuty] = createSignal(0)
-  const [contrastBusy, setContrastBusy] = createSignal(false)
-  const [contrastVop, setContrastVop] = createSignal(0x3F) // matches LCD_CONTRAST_DEFAULT_VOP
   const [wifiConfigBusy, setWifiConfigBusy] = createSignal(false)
   const [catBaudBusy, setCatBaudBusy] = createSignal(false)
   const [catBaudDraft, setCatBaudDraft] = createSignal(38400)
@@ -1751,11 +1713,7 @@ function BridgeStatusPanel(props: {
     setLoading(false)
     if (s) setStatus(s); else setFailed(true)
     setInfo(i)
-    // Neither backlight nor contrast has a readback in GET /status — the
-    // panel starts both sliders at a reasonable default (mid-range) rather
-    // than lying about the bridge's actual current values, which this
-    // endpoint doesn't report. cat_baud IS reported, though, so that select
-    // reflects the bridge's real current setting.
+    // cat_baud is reported, so that select reflects the bridge's real setting.
     if (s?.catBaud) setCatBaudDraft(s.catBaud)
     // input_mode/sample_rate_hz aren't part of BridgeStatus (see
     // useIQBridge.ts's header comment for why) — refreshInfo() does its
@@ -1799,20 +1757,6 @@ function BridgeStatusPanel(props: {
       }
     }
     setResetBusy(false)
-  }
-
-  const handleBacklightCommit = async (duty: number) => {
-    setBacklightBusy(true)
-    const result = await props.setBridgeBacklight(props.wsUrl, duty)
-    if (result) setBacklightDuty(result.duty)
-    setBacklightBusy(false)
-  }
-
-  const handleContrastCommit = async (vop: number) => {
-    setContrastBusy(true)
-    const result = await props.setBridgeContrast(props.wsUrl, vop)
-    if (result) setContrastVop(result.vop)
-    setContrastBusy(false)
   }
 
   const handleWifiConfigSubmit = async (ssid: string, password: string) => {
@@ -1911,18 +1855,6 @@ function BridgeStatusPanel(props: {
             <span class="text-[#c9d1d9]">{Math.floor(s().uptimeSeconds / 60)}m {s().uptimeSeconds % 60}s</span>
           </div>
         )}
-      </Show>
-
-      <Show when={hasFeature('backlight')}>
-        <div class="border-t border-[#21262d] pt-3">
-          <BridgeSliderControl label="Backlight" value={backlightDuty()} max={255} onCommit={(n) => void handleBacklightCommit(n)} busy={backlightBusy()} />
-        </div>
-      </Show>
-
-      <Show when={hasFeature('contrast')}>
-        <div class="border-t border-[#21262d] pt-3">
-          <BridgeSliderControl label="Contrast" value={contrastVop()} max={127} onCommit={(n) => void handleContrastCommit(n)} busy={contrastBusy()} />
-        </div>
       </Show>
 
       <Show when={hasFeature('cat_baud')}>
@@ -2342,7 +2274,6 @@ export default function RadioCATPanel(props: {
           iqBridge={props.iqBridge}
           getBridgeStatus={cat.getBridgeStatus} resetBridge={cat.resetBridge}
           getBridgeInfo={cat.getBridgeInfo}
-          setBridgeBacklight={cat.setBridgeBacklight} setBridgeContrast={cat.setBridgeContrast}
           setBridgeWifiConfig={cat.setBridgeWifiConfig} setBridgeCatBaud={cat.setBridgeCatBaud}
           clearBridgePaEmergency={cat.clearBridgePaEmergency}
           setBridgeInputMode={cat.setBridgeInputMode}
