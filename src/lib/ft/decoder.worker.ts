@@ -24,6 +24,7 @@
 import type { FTMode, FTDecoderParams } from './decoder';
 import { resampleTo12k } from './resample';
 import { detectSimdTier, type SimdTier } from './simdTier';
+import { standardHashPlaceholders } from './hashPlaceholder';
 
 export type WorkerRequest =
   | {
@@ -232,7 +233,7 @@ function decodeWithFt8Mon(
     (decoded: number, freq: number, dt: number, snr: number, sync: number, pass: number, msg: string, osd: number) => {
       self.postMessage({
         type: 'progress', id, decoded,
-        message: { freq, dt, snr, msg, sync, pass, osd },
+        message: { freq, dt, snr, msg: standardHashPlaceholders(msg), sync, pass, osd },
       } satisfies WorkerResponse);
     };
   try {
@@ -241,7 +242,9 @@ function decodeWithFt8Mon(
     const maxHz = hzRange?.max ?? params.maxHz;
     const jsonPtr = mod._ftm_decode(ptr, samples.length, sampleRate,
                                     minHz, maxHz, params.budgetSec);
-    return JSON.parse(mod.UTF8ToString(jsonPtr));
+    const out = JSON.parse(mod.UTF8ToString(jsonPtr)) as Messages;
+    for (const m of out) m.msg = standardHashPlaceholders(m.msg);
+    return out;
   } finally {
     delete (self as unknown as Record<string, unknown>).__ftmProgress;
     mod._free(ptr);

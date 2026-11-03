@@ -4,6 +4,8 @@ import { defineConfig } from 'vite'
 import solid from 'vite-plugin-solid'
 import tailwindcss from '@tailwindcss/vite'
 import { VitePWA } from 'vite-plugin-pwa'
+import type { Plugin } from 'vite'
+import { HEARD_CACHE_S, cleanCallsign, parseReports, upstreamUrl } from './proxy/pskreporter-worker/src/heard.js'
 
 // Same GitHub Pages subpath pattern as the Next.js app (next.config.js) and
 // the earlier SvelteKit prototype: CI sets BASE_PATH from
@@ -13,6 +15,37 @@ const BASE_PATH = process.env.BASE_PATH || ''
 // App version shown in the footer — sourced from the repo-root package.json
 // (the canonical version, same one CI releases from).
 const APP_VERSION = JSON.parse(readFileSync(fileURLToPath(new URL('./package.json', import.meta.url)), 'utf-8')).version
+
+// Dev stand-in for the PSK Reporter Worker's GET /heard (proxy/pskreporter-worker),
+// so the Sent Log's "heard" marks work on the dev server before a deploy: the
+// same parsing, with a per-callsign in-memory cache of the same length.
+// Only in `vite` (serve); the build talks to the deployed Worker.
+function pskHeardDev(): Plugin {
+  const cache = new Map<string, { at: number; body: string }>()
+  return {
+    name: 'psk-heard-dev',
+    apply: 'serve',
+    configureServer(server) {
+      server.middlewares.use('/__psk/heard', async (req, res) => {
+        const call = cleanCallsign(new URL(req.url ?? '', 'http://dev').searchParams.get('call'))
+        res.setHeader('content-type', 'application/json')
+        if (!call) { res.statusCode = 400; res.end('{"error":"bad callsign"}'); return }
+        const hit = cache.get(call)
+        if (hit && Date.now() - hit.at < HEARD_CACHE_S * 1000) { res.end(hit.body); return }
+        try {
+          const up = await fetch(upstreamUrl(call, ''), { signal: AbortSignal.timeout(10_000) })
+          if (!up.ok) { res.statusCode = up.status === 429 || up.status === 503 ? 503 : 502; res.end('{"error":"upstream"}'); return }
+          const body = JSON.stringify({ at: Math.floor(Date.now() / 1000), reports: parseReports(await up.text(), call) })
+          cache.set(call, { at: Date.now(), body })
+          res.end(body)
+        } catch {
+          res.statusCode = 502
+          res.end('{"error":"upstream"}')
+        }
+      })
+    },
+  }
+}
 
 export default defineConfig({
   base: BASE_PATH ? `${BASE_PATH}/` : '/',
@@ -43,6 +76,7 @@ export default defineConfig({
     force: true,
   },
   plugins: [
+    pskHeardDev(),
     solid(),
     tailwindcss(),
     // Same offline-first PWA behavior as the Next.js app's next-pwa config:

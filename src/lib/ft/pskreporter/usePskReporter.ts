@@ -6,7 +6,7 @@
  * analytics.ts and analyticsInit.ts. The logic worth testing lives in
  * ipfix.ts, spotQueue.ts and eligibility.ts, none of which touch the network.
  */
-import { createEffect, createSignal, onCleanup, type Accessor } from 'solid-js'
+import { createEffect, createSignal, onCleanup, untrack, type Accessor } from 'solid-js'
 import type { AdmittedDecode } from '../parser'
 import type { FTMode } from '../decoder'
 import {
@@ -17,6 +17,7 @@ import {
 } from './spotQueue'
 import { toSpot, type IneligibleReason } from './eligibility'
 import { loadPskSettings, savePskSettings } from './settings'
+import { heardChecks } from './heardSettings'
 import type { PskReceiver } from './ipfix'
 
 /**
@@ -35,7 +36,7 @@ import type { PskReceiver } from './ipfix'
  * production. Empty means "not configured", same as absent.
  */
 const DEFAULT_PROXY_URL = 'https://pskreporter.signal-decoder.workers.dev'
-const PROXY_URL: string = (import.meta.env.VITE_PSKREPORTER_PROXY_URL || DEFAULT_PROXY_URL).replace(/\/+$/, '')
+export const PROXY_URL: string = (import.meta.env.VITE_PSKREPORTER_PROXY_URL || DEFAULT_PROXY_URL).replace(/\/+$/, '')
 
 /**
  * How often the queue is asked whether a send is due. Short enough that a
@@ -150,6 +151,7 @@ export function createPskReporter(opts: PskReporterOptions): PskReporter {
       cadenceMode: cadenceMode(),
       intervalMinutes: intervalMinutes(),
       sessionId: stored.sessionId,
+      heardChecks: untrack(heardChecks), // owned by heardSettings.ts: kept here, not tracked
     })
   }
 

@@ -13,6 +13,7 @@ import {
   type SendCadence,
 } from '$decoder-lib/ft/pskreporter/spotQueue'
 import type { PskReporter, ReporterBlocked } from '$decoder-lib/ft/pskreporter/usePskReporter'
+import { heardChecks, setHeardChecks } from '$decoder-lib/ft/pskreporter/heardSettings'
 
 interface Props {
   reporter: PskReporter
@@ -123,6 +124,14 @@ export default function PskReporterPanel(props: Props): JSX.Element {
               onChange={(v) => props.reporter.setEnabled(v)}
             />
             <span>Report my decodes</span>
+          </label>
+
+          <label
+            class="flex cursor-pointer items-center gap-2 text-[#c9d1d9]"
+            title="Looks up on PSK Reporter which stations reported your FT8/FT4 transmissions, and shows them on the Sent Log rows (📡, or 🎯 when the station you called heard you). At most one lookup every 5 minutes, only while a transmission from the last 30 minutes is waiting for reports."
+          >
+            <Toggle checked={heardChecks()} disabled={!props.reporter.available} onChange={(v) => setHeardChecks(v)} />
+            <span>Show who heard my TX</span>
           </label>
 
           {/* Read-only: these belong to the Transmit panel. */}

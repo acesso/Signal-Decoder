@@ -4,17 +4,18 @@
 // Each QSO completing is announced by drawQsoOverlay(), laid over whatever
 // view is on the glass (LcdFeed.overlay(), like the bridge's upload overlay).
 //
-//   ↓ CALLING CQ        13S    what the station does now, seconds left in the slot
-//   12  QSOS SINCE 11:30       this session (since the page opened, UTC): completed QSOs (big),
+//   ↓ CALLING CQ          ◔    what the station does now; a clock filling up over the TX/RX window
+//   12  QSOS SINCE 11:30       this session (since the page opened, local time): completed QSOs (big),
 //       7 COUNTRIES            countries worked
-//   LU1ABC   -14 -08  11:58    the last two: call, report sent and received, UTC
+//   LU1ABC   -14 -08  11:58    the last two: call, report sent and received, local time
 //   K1XX     -10 -12  11:51
 
 import { QSO_STEPS, type QsoActivity } from '../../ft/conversation'
 import type { QSORecord } from '../../ft/parser'
 import { callsignCountry } from '../../ft/prefixes'
 import { OVERLAY_H, OVERLAY_W, OVERLAY_X, OVERLAY_Y } from '../feed'
-import { ICONS, LCD_BODY_TOP, LCD_W, ON, type Gfx } from '../gfx'
+import { ICONS, LCD_BODY_TOP, LCD_W, OFF, ON, type Gfx } from '../gfx'
+import type { DecodeSummary } from '../../ft/decodeSummary'
 
 export interface FtSessionViewData {
   nowMs: number
@@ -27,6 +28,8 @@ export interface FtSessionViewData {
   sessionStartMs: number
   /** This session's completed QSOs, newest first (sessionQsos()). */
   session: readonly QSORecord[]
+  /** What the decoder hears (lib/ft/decodeSummary.ts): fills the view before the first QSO. */
+  decodes?: DecodeSummary | null
 }
 
 /** Completed QSOs (reports exchanged both ways) that ended since sinceMs, newest first. */
@@ -61,13 +64,13 @@ const fmtReport = (r: number | undefined) =>
 
 const hhmm = (ms: number) => {
   const t = new Date(ms)
-  return `${String(t.getUTCHours()).padStart(2, '0')}:${String(t.getUTCMinutes()).padStart(2, '0')}`
+  return `${String(t.getHours()).padStart(2, '0')}:${String(t.getMinutes()).padStart(2, '0')}`
 }
 
 function statusLine(g: Gfx, tick: number, d: FtSessionViewData, y: number): void {
   const q = d.activity.qso
   const text = !d.armed ? 'TX OFF'
-    : q && !q.done ? `${q.call} ${QSO_STEPS[q.step]}`
+    : q && !q.done && !q.movedOn ? `${q.call} ${QSO_STEPS[q.step]}`
     : d.activity.callingCq ? 'CALLING CQ'
     : 'LISTENING'
   if (d.txStatus === 'playing') g.icon(0, y - 1, ICONS.ANTENNA, tick, ON)
@@ -75,9 +78,27 @@ function statusLine(g: Gfx, tick: number, d: FtSessionViewData, y: number): void
   else g.tiny(1, y + 1, '-', ON)
   g.tiny(9, y + 1, text.slice(0, 16), ON)
   const windowMs = d.windowSec * 1000
-  const left = `${Math.ceil((windowMs - (d.nowMs % windowMs)) / 1000)}S`
-  g.tiny(LCD_W - g.tinyWidth(left), y + 1, left, ON)
+  slotClock(g, LCD_W - 7, y, (d.nowMs % windowMs) / windowMs)
   g.hline(0, LCD_W - 1, y + 8, ON)
+}
+
+/**
+ * The FT window as a clock, 7 x 7 at (x, y): a dial that fills clockwise from
+ * 12 o'clock as the window runs (frac 0..1), a step per second in FT8.
+ */
+export function slotClock(g: Gfx, x: number, y: number, frac: number): void {
+  const cx = x + 3, cy = y + 3
+  for (let j = 0; j < 7; j++) {
+    for (let i = 0; i < 7; i++) {
+      const dx = i - 3, dy = j - 3, r2 = dx * dx + dy * dy
+      if (r2 > 10) continue // the dial: r = 3 and its corners rounded
+      if (r2 >= 7) { g.px(x + i, y + j, ON); continue } // the rim
+      // angle from 12 o'clock, clockwise, 0..1
+      const a = (Math.atan2(dx, -dy) / (2 * Math.PI) + 1) % 1
+      if (r2 === 0 || a < frac) g.px(x + i, y + j, ON)
+    }
+  }
+  g.px(cx, cy, ON)
 }
 
 function totals(g: Gfx, d: FtSessionViewData, y: number): void {
@@ -92,7 +113,20 @@ function totals(g: Gfx, d: FtSessionViewData, y: number): void {
 }
 
 function lastQsos(g: Gfx, d: FtSessionViewData, y: number): void {
-  if (!d.session.length) { g.tiny(0, y + 3, 'NONE YET THIS SESSION', ON); return }
+  if (!d.session.length) {
+    const s = d.decodes
+    if (!s?.recording) { g.tiny(0, y + 3, 'NONE YET THIS SESSION', ON); return }
+    // Before the first QSO: how busy the band is, and the newest decode (to me first).
+    g.tiny(0, y, `NO QSO YET  HEARD ${s.stations}`, ON)
+    const line = s.recent.find((l) => l.toMe) ?? s.recent[0]
+    if (line) {
+      let t = line.msg.toUpperCase()
+      while (t && g.tinyWidth(t) > LCD_W - 2) t = t.slice(0, -1)
+      if (line.toMe) { g.fill(0, y + 5, LCD_W, 7, ON); g.tiny(1, y + 6, t, OFF) }
+      else g.tiny(0, y + 6, t, ON)
+    }
+    return
+  }
   d.session.slice(0, 2).forEach((r, i) => {
     const ry = y + i * 6
     g.tiny(0, ry, r.callsign.slice(0, 9), ON)

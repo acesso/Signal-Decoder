@@ -15,7 +15,6 @@ import type { RTTYConfig } from '$decoder-lib/rtty/decoder'
 import RadioCATPanel, { useRadioCAT } from './components/RadioCATPanel'
 import { useAudioBridge } from './lib/cat/useAudioBridge'
 import { useIQBridge, type IQCorrection } from './lib/cat/useIQBridge'
-import { loadSuspendIQDuringTx } from './lib/ft/useFTTransmit'
 import PWAInstallPrompt from './components/PWAInstallPrompt'
 import UpdateAvailablePrompt from './components/UpdateAvailablePrompt'
 import { LcdFeedProvider, LcdMenu } from './components/lcd/LcdFeed'
@@ -1161,29 +1160,6 @@ function App(): JSX.Element {
     void handleStart()
   })
 
-  // Real-hardware profiling of the ESP32 bridge found WiFi's dynamic
-  // packet buffers and I2S's DMA descriptors draw from the same physical
-  // memory pool — streaming /iq-data concurrently with TX measurably
-  // degrades TX audio quality (see the bridge firmware's WiFi buffer-count
-  // reduction, RadioCATPanel.tsx's "Suspend I/Q spectrum during TX"
-  // checkbox). Bracket each keyed TX window by disconnecting iqBridge
-  // (also fine RX-wise: half-duplex, nothing to receive while keyed) and
-  // reconnecting once it ends. wasConnectedForTx tracks whether THIS
-  // window actually suspended a connection, so windowEnd doesn't
-  // reconnect when the operator wasn't using I/Q at all.
-  let wasConnectedForTx = false
-  function handleTxWindowStart() {
-    if (!loadSuspendIQDuringTx()) return
-    if (!iqBridge.state().connected) return
-    wasConnectedForTx = true
-    iqBridge.disconnect()
-  }
-  function handleTxWindowEnd() {
-    if (!wasConnectedForTx) return
-    wasConnectedForTx = false
-    const wsUrl = bridgeWsUrl()
-    if (wsUrl) void iqBridge.connect(wsUrl)
-  }
   let clearSent: (() => void) | null = null
   function handleReset() {
     activeHandle().current?.reset()
@@ -1356,8 +1332,6 @@ function App(): JSX.Element {
                   onSetPTT={cat.state().connected ? cat.setPTT : undefined}
                   onSetFrequency={cat.state().connected ? cat.setFrequency : undefined}
                   catTransportKind={cat.getTransportKind()}
-                  onTxWindowStart={handleTxWindowStart}
-                  onTxWindowEnd={handleTxWindowEnd}
                   onSentMessage={(msg, windowStart, vfoHz, audioHz) =>
                     ft.current?.injectSentMessage(msg, windowStart, vfoHz, audioHz)
                   }

@@ -28,6 +28,9 @@ import { loadNumberArray, saveNumberArray, loadBoolean, saveBoolean, loadNumber,
 import type { AudioBridge } from '$decoder-lib/cat/useAudioBridge'
 import type { IQBridge } from '$decoder-lib/cat/useIQBridge'
 import { resolveAudioSource, type AudioSourceKind, type AudioSourceOverride } from '$decoder-lib/audio/audioSource'
+import { registerLcdView } from '$decoder-lib/lcd/elementSource'
+import { drawFtDecodes } from '$decoder-lib/lcd/views/ftDecodes'
+import { decodeSummary, setDecodeSummary, STATIONS_MS, type DecodedLine } from '$decoder-lib/ft/decodeSummary'
 
 const DEFAULT_PANEL_WEIGHTS = [0.8, 0.6, 1.2]
 const LS_PANEL_WEIGHTS = 'ft_panel_weights'
@@ -822,6 +825,38 @@ export default function FTDecoder(props: Props): JSX.Element {
   const windowSec = createMemo(() => FT_WINDOW_SECONDS[props.ftMode])
   const totalMsgs = createMemo(() => processor.state().results.reduce((s, r) => s + r.messages.length, 0))
 
+  // ── The bridge's LCD: the decoder's view ("ft-decodes", lib/lcd/views/ftDecodes.ts),
+  // and the summary the FT session view also reads (lib/ft/decodeSummary.ts).
+  createEffect(() => {
+    const st = processor.state()
+    const myUp = (props.myCall ?? '').trim().toUpperCase()
+    const byNewest = st.results.slice().sort((a, b) => b.windowStart.getTime() - a.windowStart.getTime())
+    const finished = byNewest.find((r) => !r.decoding)
+    const recent: DecodedLine[] = []
+    for (const r of byNewest) {
+      for (const m of r.messages.slice().sort((a, b) => b.snr - a.snr)) {
+        recent.push({ msg: m.msg, snr: m.snr, toMe: !!myUp && parseFTMsgCached(m.msg).callee?.toUpperCase() === myUp })
+        if (recent.length >= 8) break
+      }
+      if (recent.length >= 8) break
+    }
+    const since = Date.now() - STATIONS_MS
+    let stations = 0
+    for (const c of contacts().values()) if (c.msgs.some((m) => m.role === 'tx' && m.windowStart.getTime() >= since)) stations++
+    setDecodeSummary({
+      recording: st.isRecording,
+      decoding: byNewest.some((r) => r.decoding),
+      last: finished ? { windowStartMs: finished.windowStart.getTime(), count: finished.messages.length, decodeMs: finished.decodeMs } : null,
+      stations,
+      recent,
+    })
+  })
+  onCleanup(() => setDecodeSummary(null))
+  onCleanup(registerLcdView('ft-decodes', {
+    title: () => `${props.ftMode} DECODES`,
+    draw: (g, tick) => drawFtDecodes(g, tick, { nowMs: Date.now(), windowSec: windowSec(), summary: decodeSummary() }),
+  }))
+
   type SepRow = {
     kind: 'sep'
     time: Date
@@ -938,8 +973,8 @@ export default function FTDecoder(props: Props): JSX.Element {
         class="flex flex-col gap-4 lg:h-[max(480px,calc(100vh-280px))] lg:flex-row lg:items-stretch lg:gap-0"
         style={{ 'min-height': '480px' }}
       >
-        {/* Panel 1 — Decoded Messages */}
-        <div class="flex min-w-0 flex-col rounded-lg border border-[#30363d] bg-[#161b22] p-3 sm:p-4" style={{ flex: panelWeights()[0] }}>
+        {/* Panel 1 — Decoded Messages (data-lcd-view: a view made for the LCD, lib/lcd/views/ftDecodes.ts) */}
+        <div data-lcd-view="ft-decodes" class="flex min-w-0 flex-col rounded-lg border border-[#30363d] bg-[#161b22] p-3 sm:p-4" style={{ flex: panelWeights()[0] }}>
           <div class="mb-3 flex shrink-0 items-start justify-between gap-3">
             <h2 class="text-lg font-semibold sm:text-xl">Decoded Messages</h2>
             <div class={`flex shrink-0 items-center gap-2 transition-opacity ${!processor.state().isRecording ? 'opacity-30' : ''}`}>

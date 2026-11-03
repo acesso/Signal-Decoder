@@ -13,6 +13,7 @@
  * reflector.
  */
 import { connect } from 'cloudflare:sockets'
+import { HEARD_BACKOFF_S, HEARD_CACHE_S, cleanCallsign, parseReports, upstreamUrl, type HeardResponse } from './heard'
 
 const PSKREPORTER_HOST = 'report.pskreporter.info'
 const PSKREPORTER_PORT = 4739
@@ -90,6 +91,12 @@ const ALLOWED_SET_IDS = new Set([SET_TEMPLATE, SET_OPTIONS_TEMPLATE, SET_RECEIVE
 interface Env {
   /** Cloudflare rate-limiting binding; see wrangler.toml. */
   PSK_RATE_LIMIT?: { limit(o: { key: string }): Promise<{ success: boolean }> }
+  /** The project's contact address for PSK Reporter's query API (wrangler.toml [vars]); '' sends none. */
+  APP_CONTACT?: string
+}
+
+interface Ctx {
+  waitUntil(p: Promise<unknown>): void
 }
 
 interface Validation {
@@ -145,7 +152,7 @@ function validatePacket(bytes: Uint8Array): Validation {
 function corsHeaders(origin: string | null): Record<string, string> {
   return {
     'Access-Control-Allow-Origin': origin ?? '',
-    'Access-Control-Allow-Methods': 'POST, OPTIONS',
+    'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
     'Access-Control-Allow-Headers': 'content-type',
     'Access-Control-Max-Age': '86400',
     Vary: 'Origin',
@@ -164,8 +171,55 @@ async function forward(packet: Uint8Array, port: number): Promise<void> {
   }
 }
 
+// The Workers cache (caches.default), keyed on made-up URLs of this Worker's own.
+const edgeCache = () => (caches as unknown as { default: Cache }).default
+const cacheKey = (what: string) => new Request(`https://heard-cache.invalid/${what}`)
+
+/**
+ * GET /heard?call=<call>: PSK Reporter's reception reports of that callsign's
+ * signal over the last hour, as JSON (src/heard.ts). At most one upstream
+ * query per callsign per HEARD_CACHE_S for everyone: every tab and every user
+ * asking within that time gets the cached answer. When PSK Reporter refuses
+ * (429/503) nothing is asked for HEARD_BACKOFF_S, and the last good answer
+ * (kept an hour) is served meanwhile, marked stale.
+ */
+async function heard(call: string, env: Env, ctx: Ctx, cors: Record<string, string>): Promise<Response> {
+  const cache = edgeCache()
+  const reply = (body: string, status = 200, extra: Record<string, string> = {}) =>
+    new Response(body, { status, headers: { ...cors, 'content-type': 'application/json', 'cache-control': 'no-store', ...extra } })
+  const fresh = await cache.match(cacheKey(`fresh/${call}`))
+  if (fresh) return reply(await fresh.text())
+  const stale = async (status: number) => {
+    const s = await cache.match(cacheKey(`stale/${call}`))
+    return s ? reply(await s.text(), 200, { 'x-heard-stale': '1' }) : reply('{"error":"upstream unavailable"}', status, { 'retry-after': String(HEARD_BACKOFF_S) })
+  }
+  if (await cache.match(cacheKey('backoff'))) return stale(503)
+
+  let res: Response
+  try {
+    res = await fetch(upstreamUrl(call, env.APP_CONTACT ?? ''), {
+      headers: { 'user-agent': 'Signal-Decoder (https://acesso.github.io/Signal-Decoder/)', 'accept-encoding': 'gzip' },
+      signal: AbortSignal.timeout(10_000),
+    })
+  } catch {
+    return stale(502)
+  }
+  if (res.status === 429 || res.status === 503) {
+    ctx.waitUntil(cache.put(cacheKey('backoff'), new Response('1', { headers: { 'cache-control': `max-age=${HEARD_BACKOFF_S}` } })))
+    return stale(503)
+  }
+  if (!res.ok) return stale(502)
+
+  const body = JSON.stringify({ at: Math.floor(Date.now() / 1000), reports: parseReports(await res.text(), call) } satisfies HeardResponse)
+  ctx.waitUntil(Promise.all([
+    cache.put(cacheKey(`fresh/${call}`), new Response(body, { headers: { 'cache-control': `max-age=${HEARD_CACHE_S}` } })),
+    cache.put(cacheKey(`stale/${call}`), new Response(body, { headers: { 'cache-control': 'max-age=3600' } })),
+  ]))
+  return reply(body)
+}
+
 export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
+  async fetch(request: Request, env: Env, ctx: Ctx): Promise<Response> {
     const url = new URL(request.url)
     const origin = request.headers.get('Origin')
 
@@ -201,6 +255,15 @@ export default {
       // Preflight carries no Referer, so Origin is the whole check here.
       if (!originAllowed(origin)) return new Response(null, { status: 403 })
       return new Response(null, { status: 204, headers: corsHeaders(origin) })
+    }
+
+    if (url.pathname === '/heard' && request.method === 'GET') {
+      if (!originAllowed(origin)) return new Response('forbidden origin\n', { status: 403 })
+      if (!refererAllowed(request.headers.get('Referer'))) return new Response('forbidden referer\n', { status: 403 })
+      const cors = corsHeaders(origin)
+      const call = cleanCallsign(url.searchParams.get('call'))
+      if (!call) return new Response('bad callsign\n', { status: 400, headers: cors })
+      return heard(call, env, ctx, cors)
     }
 
     if (url.pathname !== '/report' || request.method !== 'POST') {

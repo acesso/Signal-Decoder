@@ -20,3 +20,10 @@ enabled = true
 name = "PSK_RATE_LIMIT"
 namespace_id = "1001"
 simple = { limit = 12, period = 60 }
+
+# GET /heard (src/heard.ts): the project's contact address, sent to PSK
+# Reporter's query API as appcontact= so its operator can reach whoever runs
+# this Worker (pskreporter.info/pskdev.html asks frequent users for one).
+# Empty sends none. PSK Reporter asks for an email; the app's page is used.
+[vars]
+APP_CONTACT = "https://acesso.github.io/Signal-Decoder/"

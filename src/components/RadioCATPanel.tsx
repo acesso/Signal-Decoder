@@ -21,6 +21,10 @@ import { normalizeBridgeAddress, bridgeCatUrl } from '../lib/cat/bridgeUrl'
 import { probeRadioOverSerial, probeRadioOverWebSocket } from '../lib/cat/radioProbe'
 import { ProbeCard, type ProbeResult } from './ProbeCard'
 import { assessTxReport, TX_MIC_RAIL, type TxReport } from '../lib/cat/txReport'
+import { calibrate, followStep } from '../lib/cat/txLevelAuto'
+import { txLevelFollow } from '../lib/cat/txLevelFollow'
+import { bridgeTxLevel } from '../lib/audio/bridgeTxLevel'
+import { loadBaseFreq } from '../lib/ft/useFTTransmit'
 import CalibrationWizard from './CalibrationWizard'
 import NumberField from './NumberField'
 import { loadObject, saveObject } from '../lib/storage'
@@ -2063,7 +2067,61 @@ export default function RadioCATPanel(props: {
   const handleFreqCommit = (hz: number) => { cat.setFrequency(hz).catch(() => {}) }
   const handleModeChange = (m: CATMode) => { if (state().tune === 'idle') cat.setMode(m).catch(() => {}) }  // locked while a TUNE owns the mode
   const handlePTTToggle  = () => { cat.setPTT(!state().ptt).catch(() => {}) }  // unkeying during a TUNE ends it (setPTT → stopTune)
-  const handleTuneToggle = () => { (state().tune === 'idle' ? cat.startTune() : cat.stopTune()).catch(() => {}) }
+  // Automatic TX level (lib/cat/txLevelAuto.ts), on the bridge's DAC level,
+  // never the radio's drive. TUNE runs it after the carrier: a dry run in
+  // diagnostic mode with the bridge's test tone (nothing on air), when the
+  // radio is on the bridge and has diagnostic mode; the Last TX box shows its
+  // report. Only a failure is said here.
+  const [autoLevelError, setAutoLevelError] = createSignal<string | null>(null)
+  const [autoLevelBusy, setAutoLevelBusy] = createSignal(false)
+  const autoLevelPossible = () => state().connected && state().diagMode !== null && bridgeTxLevel.active()
+  const autoLevel = async () => {
+    if (autoLevelBusy() || !autoLevelPossible()) return
+    setAutoLevelBusy(true)
+    const out = await calibrate({
+      ready: () => {
+        const s = state()
+        if (!s.connected) return 'the radio is not connected'
+        if (s.ptt || s.tune !== 'idle') return 'the radio is transmitting'
+        if (s.mode !== 'USB' && s.mode !== 'LSB') return 'the radio is not in USB or LSB'
+        return null
+      },
+      setDiag: (on) => cat.setDiagMode(on),
+      diagIsOn: () => state().diagMode === true,
+      setPTT: (on) => cat.setPTT(on),
+      tone: (hz) => bridgeTxLevel.tone(hz),
+      report: () => { const r = state().txReport; return r ? { r, at: r.at } : null },
+      level: () => bridgeTxLevel.db(),
+      setLevel: (db) => bridgeTxLevel.set(db),
+      drive: () => state().drive,
+      sleep: (ms) => new Promise((res) => setTimeout(res, ms)),
+      now: () => Date.now(),
+    }, loadBaseFreq())
+    setAutoLevelBusy(false)
+    setAutoLevelError(out.ok ? null : `TX level not set: ${out.error}`)
+    if (!out.ok) setTimeout(() => setAutoLevelError(null), 20_000)
+  }
+  // Follow: one small step from each real TX's key-up report.
+  let followSeenAt = 0
+  createEffect(() => {
+    const r = state().txReport
+    if (!r || r.live || r.at === followSeenAt) return
+    followSeenAt = r.at
+    if (!txLevelFollow() || autoLevelBusy() || state().diagMode === true || !bridgeTxLevel.active()) return
+    const step = followStep(bridgeTxLevel.db(), r, state().drive)
+    if (step) bridgeTxLevel.set(bridgeTxLevel.db() + step)
+  })
+
+  const handleTuneToggle = () => {
+    if (state().tune !== 'idle') { cat.stopTune().catch(() => {}); return }
+    void (async () => {
+      await cat.startTune().catch(() => {})
+      if (state().tune === 'idle') return // it did not start
+      // then, once the carrier is over and the mode is back, the TX level
+      for (let waited = 0; state().tune !== 'idle' && waited < 30_000; waited += 200) await new Promise((r) => setTimeout(r, 200))
+      if (state().tune === 'idle') await autoLevel()
+    })()
+  }
   const handleVolume     = (n: number) => { cat.setVolume(n).catch(() => {}) }
   const handleAtt1       = (n: number) => { cat.setAtt1(n).catch(() => {}) }
   const handleAtt2       = (n: number) => { cat.setAtt2(n).catch(() => {}) }
@@ -2209,13 +2267,16 @@ export default function RadioCATPanel(props: {
             && (state().catQueries === null || state().catQueries!.includes('TU'))}>
             <TuneButton
               tune={state().tune}
-              disabled={state().tune === 'idle' && (state().ptt || state().pttConfirmAlarm)}
+              disabled={autoLevelBusy() || (state().tune === 'idle' && (state().ptt || state().pttConfirmAlarm))}
               suggestion={retuneSuggestion(state().frequency ?? 0, state().lastTuneHz)}
               lastTuneHz={state().lastTuneHz}
               tuneEndsAt={state().tuneEndsAt}
               diag={state().diagMode === true}
               onToggle={handleTuneToggle}
             />
+            <Show when={autoLevelError()}>
+              <span class="max-w-[22rem] text-[10px] text-[#f85149]">{autoLevelError()}</span>
+            </Show>
           </Show>
 
           {/* The radio's report on the last transmission (TX_DIAG builds push TA) */}

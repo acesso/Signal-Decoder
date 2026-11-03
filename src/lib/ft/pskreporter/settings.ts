@@ -25,6 +25,8 @@ export interface PskReporterSettings {
    * each session would make this reporter look like many.
    */
   sessionId: number
+  /** Look up on PSK Reporter who heard my transmissions, for the Sent Log (heard.ts). */
+  heardChecks: boolean
 }
 
 const DEFAULTS: PskReporterSettings = {
@@ -34,6 +36,7 @@ const DEFAULTS: PskReporterSettings = {
   cadenceMode: 'interval',
   intervalMinutes: DEFAULT_INTERVAL_MINUTES,
   sessionId: 0,
+  heardChecks: true,
 }
 
 function randomSessionId(): number {
@@ -50,6 +53,7 @@ export function loadPskSettings(): PskReporterSettings {
     ...raw,
     cadenceMode: raw.cadenceMode === 'window' ? 'window' : 'interval',
     intervalMinutes: clampIntervalMinutes(raw.intervalMinutes),
+    heardChecks: raw.heardChecks !== false,
   }
   if (!stored.sessionId) {
     const seeded = { ...stored, sessionId: randomSessionId() }

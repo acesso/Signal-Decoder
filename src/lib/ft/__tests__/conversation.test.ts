@@ -1,4 +1,4 @@
-import { currentQso, latestMessage, messagesToMe, QSO_STALE_MS, sentTo } from '../conversation'
+import { currentQso, exchangeWith, latestMessage, messagesToMe, QSO_STALE_MS, sentTo } from '../conversation'
 import { parseFTMsg, type Contact, type ContactMsg } from '../parser'
 import type { SentEntry } from '../useFTTransmit'
 
@@ -78,4 +78,15 @@ test('calling CQ: after a finished QSO the QSO is no longer shown', () => {
 
 test('nothing going on', () => {
   expect(currentQso(ME, new Map([['X1', contact('LU1ABC', [msg('CQ LU1ABC GF05', 1)])]]), [], now(1))).toEqual({ qso: null, callingCq: false })
+})
+
+test('a station that went back to others after my call has moved on', () => {
+  const pw = contact('PW2DSY', [msg('CQ PW2DSY GH64', 0), msg('DL9FFM PW2DSY -02', 2), msg('CQ PW2DSY GH64', 4)], 'GH64')
+  const log = [sent('PW2DSY PY2ME GG66', 1)]
+  expect(exchangeWith('PW2DSY', ME, pw, log)).toMatchObject({ step: 1, movedOn: true, done: false })
+  // it answers me after all: back in the QSO
+  pw.msgs.push(msg('PY2ME PW2DSY -11', 6))
+  expect(exchangeWith('PW2DSY', ME, pw, log)).toMatchObject({ step: 2, movedOn: false })
+  // my newer call: not moved on until it ignores that one too
+  expect(exchangeWith('PW2DSY', ME, contact('PW2DSY', [msg('CQ PW2DSY GH64', 0)]), [sent('PW2DSY PY2ME GG66', 1)]).movedOn).toBe(false)
 })

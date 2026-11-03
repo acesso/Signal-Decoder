@@ -1,6 +1,6 @@
 import {
   parseFTMsg, mergeContacts, isValidCallsign, classifyCallsign, gridToLatLon, haversineKm,
-  generateADIF, isConfirmedQSO, isPartialQSO, buildFTMessage, needsHashedExchange, qsyAudioOffsetHz,
+  generateADIF, isConfirmedQSO, isPartialQSO, buildFTMessage, needsHashedExchange, qsyAudioOffsetHz, foxMessageParts, baseCallsign,
   baseCallsign, extractQSORecords, generateADIFFromRecords, nextTxMsgType,
   type TxMsgType,
 } from '../parser';
@@ -436,9 +436,10 @@ describe('QSO log records — capture at decode time, export after rotation', ()
 
     // The peer keeps CQing: 60 further messages push the whole exchange out
     // of the contact's 60-message ring.
-    const later = new Date(t.getTime() + 60_000);
-    const cqSpam = Array.from({ length: 60 }, () => ({ msg: `CQ ${them} FN42`, freq: 1500, snr: -10 }));
-    contacts = mergeContacts(contacts, later, cqSpam).contacts;
+    // One CQ per window: the same text twice in one window is one transmission.
+    for (let i = 0; i < 60; i++) {
+      contacts = mergeContacts(contacts, new Date(t.getTime() + 60_000 + i * 15_000), [{ msg: `CQ ${them} FN42`, freq: 1500, snr: -10 }]).contacts;
+    }
 
     // Deriving from live contacts now silently loses the QSO — the old export bug.
     expect(isConfirmedQSO(contacts.get(them)!, me)).toBe(false);
@@ -562,21 +563,42 @@ describe('nextTxMsgType — QSO auto-sequencing incl. retries', () => {
 });
 
 describe('nextTxMsgType — Fox/Hound (DXpedition) mode', () => {
-  it('jumps straight to RR73 once Fox reports us, skipping the normal r_report step', () => {
-    expect(nextTxMsgType('answer', 'report', true)).toBe('rr73');
-    expect(nextTxMsgType('answer', 'r_report', true)).toBe('rr73');
+  // WSJT-X's FT8 DXpedition Mode User Guide: call, Fox reports, R+report, Fox RR73, done.
+  it('answers the Fox report with R+report, as in a normal QSO', () => {
+    expect(nextTxMsgType('answer', 'report', true)).toBe('r_report');
+    expect(nextTxMsgType('answer', 'r_report', true)).toBe('r_report');
   });
 
-  it('defaults to normal-QSO behavior when foxHound is omitted or false', () => {
-    expect(nextTxMsgType('answer', 'report')).toBe('r_report');
-    expect(nextTxMsgType('answer', 'report', false)).toBe('r_report');
+  it("ends at the Fox's RR73: no 73 back; a missed RR73 repeats the R+report", () => {
+    expect(nextTxMsgType('r_report', 'rr73', true)).toBe('cq');
+    expect(nextTxMsgType('r_report', 'rr73')).toBe('tx73'); // normal QSO: 73 back
+    expect(nextTxMsgType('r_report', 'report', true)).toBe('r_report');
   });
 
-  it('leaves every other state unaffected by foxHound', () => {
+  it('keeps calling the Fox until it reports', () => {
+    expect(nextTxMsgType('answer', 'cq', true)).toBe('answer');
     expect(nextTxMsgType('cq', 'answer', true)).toBe('report');
     expect(nextTxMsgType('rr73', 'tx73', true)).toBe('cq');
-    expect(nextTxMsgType('answer', 'rr73', true)).toBe('tx73');
-    expect(nextTxMsgType('answer', 'cq', true)).toBe('answer'); // keep calling in
+  });
+});
+
+describe('foxMessageParts', () => {
+  it("splits the Fox's compound message into its RR73 and its report, from the base call", () => {
+    expect(foxMessageParts('K1ABC RR73; W9XYZ <KH1/KH7Z> -17')).toEqual(['K1ABC KH7Z RR73', 'W9XYZ KH7Z -17'])
+    expect(foxMessageParts('K1ABC RR73; W9XYZ KH7Z -08')).toEqual(['K1ABC KH7Z RR73', 'W9XYZ KH7Z -08'])
+    expect(foxMessageParts('K1ABC RR73; W9XYZ <...> -08')).toEqual(['K1ABC <...> RR73', 'W9XYZ <...> -08'])
+    expect(foxMessageParts('CQ KH1/KH7Z')).toEqual(['CQ KH1/KH7Z'])
+  });
+
+  it('files both parts under the Fox, each addressed to its Hound', () => {
+    const t = new Date(Date.UTC(2026, 10, 2, 12, 0, 0))
+    const { contacts } = mergeContacts(new Map(), t, [{ msg: 'PU7FTW RR73; W9XYZ <KH1/KH7Z> -17', freq: 14_090_450, snr: -9 }])
+    const fox = contacts.get('KH7Z')!
+    expect(fox.msgs.map((m) => [m.role, m.parsed.type, m.parsed.callee])).toEqual([['tx', 'rr73', 'PU7FTW'], ['tx', 'report', 'W9XYZ']])
+  });
+
+  it('baseCallsign', () => {
+    expect(['KH1/KH7Z', 'K1ABC/P', 'EA8/K1ABC', 'PU7FTW'].map(baseCallsign)).toEqual(['KH7Z', 'K1ABC', 'K1ABC', 'PU7FTW'])
   });
 });
 
@@ -748,3 +770,29 @@ describe('mergeContacts admitted decodes', () => {
     expect(admitted.map(a => a.callsign)).toEqual(['PU7FTW', 'K1ABC']);
   });
 });
+
+test('buildFTMessage sends the 4-character square of a 6-character locator', () => {
+  // A standard message carries 4 characters; with 6 the encoder dropped the grid entirely.
+  expect(buildFTMessage('cq', 'PU7FTW', '', undefined, 'HI22NU')).toBe('CQ PU7FTW HI22')
+  expect(buildFTMessage('answer', 'PU7FTW', 'PR2AE', undefined, 'HI22NU')).toBe('PR2AE PU7FTW HI22')
+  expect(parseFTMsg(buildFTMessage('answer', 'PU7FTW', 'PR2AE', undefined, 'HI22NU'))).toEqual(expect.objectContaining({ type: 'answer', clean: true, callee: 'PR2AE', grid: 'HI22' }))
+})
+
+test('mergeContacts keeps one copy of my TX recorded as sent and decoded back', () => {
+  const boundary = new Date(Date.UTC(2026, 9, 30, 11, 55, 45))
+  const sentAt = new Date(boundary.getTime() + 180) // injectSentMessage: stamped at TX start
+  let contacts = mergeContacts(new Map(), sentAt, [{ msg: 'PP5NK PU7FTW HI22', freq: 21_074_850, snr: 0 }]).contacts
+  contacts = mergeContacts(contacts, boundary, [{ msg: 'PP5NK PU7FTW HI22', freq: 21_075_559, snr: -10.8 }]).contacts // my receiver heard it
+  expect(contacts.get('PP5NK')!.msgs).toHaveLength(1)
+  expect(contacts.get('PU7FTW')!.msgs).toHaveLength(1)
+  // the next window's repeat is a transmission of its own
+  contacts = mergeContacts(contacts, new Date(boundary.getTime() + 30_000), [{ msg: 'PP5NK PU7FTW HI22', freq: 21_074_850, snr: 0 }]).contacts
+  expect(contacts.get('PP5NK')!.msgs).toHaveLength(2)
+})
+
+test('mergeContacts: my TX and its decode count once despite the decoder\'s padded spacing', () => {
+  const b = new Date(Date.UTC(2026, 10, 2, 23, 34, 45))
+  let contacts = mergeContacts(new Map(), new Date(b.getTime() + 150), [{ msg: 'W4PSK PU7FTW HI22', freq: 21_074_850, snr: 0 }]).contacts
+  contacts = mergeContacts(contacts, b, [{ msg: ' W4PSK PU7FTW HI22', freq: 21_075_400, snr: -9 }]).contacts
+  expect(contacts.get('W4PSK')!.msgs).toHaveLength(1)
+})

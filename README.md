@@ -295,6 +295,12 @@ Callsigns are extracted from decoded messages and tracked as contacts with full 
 - **Sorting**: By last activity, TX count, or callsign — click the active sort again to reverse
 - **ADIF export**: Download the QSO log as a standard `.adi` file for import into any logger. QSOs are captured into a persistent log the moment they are decoded, so they survive contact-list rotation and page reloads; the Clear button empties both the contacts and this log
 
+### Transmitting extras
+
+- **Fox/Hound (DXpedition, Hound side):** with **🦊 F/H** on, the sequence is WSJT-X's (FT8 DXpedition Mode User Guide): call the Fox, R+report at the frequency it called you on when it reports you, done at its RR73 (no 73). The Fox's compound messages (`K1ABC RR73; W9XYZ <KH1/KH7Z> -17`) are read as the RR73 and the report they carry, and a Fox with a compound call is called by its base call. Click the Fox's **Call Fox** card, then **🦊 auto**: the app keeps calling it every cycle for 2 minutes (click the card again to extend), in the other half of the minute from the Fox and at 1000 Hz or above, and answers it on its own even with Auto-Reply off.
+- **TX level:** with the TX output on the S3 bridge, **TUNE** also sets the TX level (the bridge's DAC level, never the radio's drive): after the carrier, a dry run in the radio's diagnostic mode with the bridge's test tone puts the radio's envelope 6 dB above full power with the mic input under 60%. **Follow TX level** (Transmit panel) takes at most one small step after each transmission from the radio's TX report. The radio's TX audio report (TA) behind both, and the Last TX chip, treat up to 3% of the carrier gated off at a full-power TX's edges as normal.
+- **Grid on air:** a 6-character My Grid is sent as its 4-character square (`HI22NU` → `HI22`), the only size a standard message carries.
+
 ## PSK Reporter Spotting
 
 Optionally uploads decodes to [pskreporter.info](https://pskreporter.info), the
@@ -354,6 +360,14 @@ anything; it is a public endpoint that accepts packets from this app's origin an
 nothing else, not a secret. Deploy instructions are in that directory's README.
 Set `VITE_PSKREPORTER_PROXY_URL` only to point a build at a different relay.
 
+### Who heard my TX
+
+The FT Sent Log marks each transmission PSK Reporter has reports of, even when nobody answered: `📡 7 🇺🇸3 🇦🇷1 🇵🇹1 +2` (stations, then countries with their counts), 🎯 when the station you called heard you; hovering lists every country and its stations with SNR and distance. On by default, **Show who heard my TX** in the PSK Reporter panel switches it off.
+
+- **What PSK Reporter can say:** receivers report messages that carry your call and grid (your CQs and grid answers, not reports or RR73), and keep one report per station for about 20 minutes. A later row nobody reported gets a dimmed `📡 ~3` with the stations that reported you just before, once a check could have seen it; until then it shows ⏳.
+- **Contact cards:** 🎯 when that station reported hearing you; 📻? when others heard it in your reply slot while you decoded nothing from it, a likely answer you missed (looked up only for stations you called twice without hearing them, at most 3 per check).
+- **Load:** at most one lookup every 5 minutes, shared by all tabs, only while a TX of the last 30 minutes is waiting for reports, through the relay Worker's `GET /heard`, which caches each callsign for 5 minutes for everyone. The dev server answers `/heard` itself (`vite.config.ts`). Design and limits: `doc/plans/tx-heard/PLAN.md`.
+
 To check the encoder against PSK Reporter itself without sending live spots:
 
 ```bash
@@ -369,8 +383,9 @@ With the S3 bridge (its Nokia 5110 LCD, firmware 0.13.0), the app can put parts 
 
 - **Pick a box:** the button's menu starts a picker, like a browser's screenshot tool. The box under the mouse is outlined, ↑/↓ widen or narrow it, and a click puts it on the LCD as a view of its own, next to the bridge's built-in views. Up to 4 views; each can be renamed, shown at once, given more or less contrast, or set to take the screen while transmitting. Picks are remembered.
 - **Views made for the LCD:** while picking, boxes that have one are outlined in amber with a **★ LCD view** badge, and the outline snaps to them. Such a pick keeps the view, not the box: it goes on working when the list re-sorts or scrolls the box away.
-  - **A contact card** (FT contacts): that station, to keep an eye on it. Grid, country, its last SNR and when; my QSO with it as a row of steps, with the reports; its last two messages.
-  - **The FT transmit panel** ("FT8 SESSION"): made for leaving auto-CQ and auto-reply running. What the station does now, this session's completed QSOs and countries, and the last two QSOs.
+  - **A contact card** (FT contacts): that station, to keep an eye on it. Grid, country, its last SNR and when; its TX and RX counts (an icon animates as one rises); my QSO with it as a row of steps, with the reports, or MOVED ON when it went back to others; its last different messages (a repeat as one line with a count).
+  - **The FT transmit panel** ("FT8 SESSION"): made for leaving auto-CQ and auto-reply running. What the station does now with a window clock, this session's completed QSOs and countries (local times), and the last two QSOs; before the first one, the stations heard and the newest decode.
+  - **Decoded Messages** ("FT8 DECODES"): the newest window's decodes and decode time, the stations heard in 10 minutes, and the four newest messages with SNR, one to you inverted.
   - **The FT map:** its visible area redrawn as coastlines and station marks (a square for a QSO, a box for a partial one, a dot for a station heard).
 - **Any other box:** a canvas (the waterfall, an SSTV picture) is mirrored and dithered; anything else is redrawn about once a second.
 - **"QSO n!"**: each completed QSO pops up over whatever the LCD shows, for 12 seconds, whatever was picked.

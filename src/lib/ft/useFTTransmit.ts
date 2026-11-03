@@ -57,7 +57,17 @@ export interface SentEntry {
   vfoHz: number;
   audioHz: number;
   error?: string;
+  /** The mode it went out in. */
+  mode?: 'FT8' | 'FT4';
+  /** Start (ms epoch) of every TX this row stands for, newest first: a repeated
+   *  message refreshes its row in place (dedupeAndCapSent), and PSK Reporter's
+   *  reports of any of them belong to it (pskreporter/heard.ts). Capped. */
+  windows?: number[];
 }
+
+/** How many TX starts a Sent Log row keeps, and for how long. */
+const SENT_WINDOWS_MAX = 20;
+const SENT_WINDOWS_KEEP_MS = 30 * 60_000;
 
 export type TxStatus = 'idle' | 'waiting' | 'playing';
 
@@ -233,7 +243,6 @@ const LS_BASE_FREQ       = 'ft_base_freq';
 const LS_AUTOCQ_INTERVAL = 'ft_autocq_interval_min';
 const LS_PREKEY_MS       = 'ft_prekey_ms';
 const LS_POSTKEY_MS      = 'ft_postkey_ms';
-const LS_SUSPEND_IQ_TX   = 'ft_suspend_iq_during_tx';
 
 export const DEFAULT_BASE_FREQ = 1850;
 export function loadBaseFreq(): number {
@@ -292,23 +301,6 @@ export function loadAutoPTT(): boolean {
 }
 export function saveAutoPTT(v: boolean) {
   if (typeof window !== 'undefined') localStorage.setItem(LS_AUTOPTT, String(v));
-}
-// Real-hardware profiling of the ESP32 bridge found that WiFi's dynamic
-// packet-buffer allocator and I2S's DMA descriptors draw from the same
-// physical memory pool, so streaming /iq-data concurrently with TX
-// measurably degrades TX audio quality — a hardware/IDF limitation, not a
-// bug this codebase can fully fix (see the bridge firmware's WiFi buffer
-// count reduction, which helps but doesn't eliminate it). Defaults ON:
-// suspending the I/Q spectrum connection for the duration of each TX
-// window sidesteps the contention entirely at the cost of a spectrum-view
-// gap while transmitting.
-export function loadSuspendIQDuringTx(): boolean {
-  if (typeof window === 'undefined') return true;
-  const stored = localStorage.getItem(LS_SUSPEND_IQ_TX);
-  return stored !== null ? stored === 'true' : true;
-}
-export function saveSuspendIQDuringTx(v: boolean) {
-  if (typeof window !== 'undefined') localStorage.setItem(LS_SUSPEND_IQ_TX, String(v));
 }
 export function loadAllowConsecutiveTx(): boolean {
   if (typeof window === 'undefined') return false;
@@ -857,10 +849,15 @@ export function createFTTransmit(
   // Cap at 50 entries total.
 
   function dedupeAndCapSent(entry: SentEntry, prev: SentEntry[]): SentEntry[] {
+    const start = entry.windowStart.getTime();
     if (!entry.error && prev.length > 0 && prev[0].message === entry.message) {
-      return [entry, ...prev.slice(1)]; // refresh the row in place
+      // Refresh the row in place, keeping the earlier TX starts it stands for.
+      const windows = [start, ...(prev[0].windows ?? [])]
+        .filter((w) => start - w <= SENT_WINDOWS_KEEP_MS)
+        .slice(0, SENT_WINDOWS_MAX);
+      return [{ ...entry, windows }, ...prev.slice(1)];
     }
-    return [entry, ...prev].slice(0, 50);
+    return [{ ...entry, windows: entry.error ? [] : [start] }, ...prev].slice(0, 50);
   }
 
   // ── Transmit loop ─────────────────────────────────────────────────────────
@@ -1245,6 +1242,7 @@ export function createFTTransmit(
       const sent: SentEntry = {
         id: txId, message: txMessage, label: txLabel, windowStart,
         vfoHz: sentVfoHz, audioHz: txAudioHz,
+        mode: getMode() === 'FT2' ? undefined : getMode() as 'FT8' | 'FT4',  // PSK Reporter knows FT8 and FT4
       };
       // Record what we just sent into the contact store / QSO log. Guarded so
       // a throwing consumer can never break the TX loop itself — a failed log

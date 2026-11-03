@@ -30,4 +30,9 @@ describe('assessTxReport', () => {
   it('gated carrier', () => {
     expect(assessTxReport(parseTxReport('TA10,20,0,5,40;')!, 2).summary).toBe('carrier off 40%')
   })
+  it("1% gated at a full-power TX's edges is fine; more, or without full power, is not", () => {
+    expect(assessTxReport(parseTxReport('TA138,241,99,228,1;')!, 2)).toEqual(expect.objectContaining({ level: 'ok', summary: 'full power' }))
+    expect(assessTxReport(parseTxReport('TA138,241,95,228,5;')!, 2).summary).toBe('carrier off 5%')
+    expect(assessTxReport(parseTxReport('TA30,40,0,30,1;')!, 2).summary).toBe('carrier off 1%') // low level: the gating is real
+  })
 })

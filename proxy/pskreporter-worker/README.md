@@ -51,6 +51,7 @@ npm run tail      # live logs from the deployed Worker
 | `POST /report` | Body is the raw IPFIX message as `application/octet-stream`. Requires an allowlisted `Origin`. |
 | `POST /report?test=1` | Same, but diverted to the collector's analysis listener so the packet never reaches the live map. Diagnostic; the app never sets it. |
 | `GET /health` | TCP reachability probe against the collector. |
+| `GET /heard?call=<call>` | PSK Reporter's reception reports of `<call>` over the last hour, as JSON `{"at":…,"reports":[{"rx","grid","hz","t","snr","dxcc","mode"}]}`, for the app's Sent Log (`doc/plans/tx-heard/PLAN.md`). Requires an allowlisted `Origin`. One upstream query per callsign per 5 minutes for everyone (edge cache); after a 429/503 from PSK Reporter nothing is asked for 15 minutes and the last good answer is served with `x-heard-stale: 1`. Set `APP_CONTACT` in `wrangler.toml` to the project's contact address before deploying; PSK Reporter asks frequent users of its query API for one. |
 | `GET /analysis` | What the collector parsed from packets sent by this Worker. Diagnostic. |
 
 ### Testing the full path without inventing spots

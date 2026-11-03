@@ -56,6 +56,10 @@ export interface CurrentQso {
   lastMs: number;
   /** 73 sent or received, or RR73 sent: nothing more is needed from me. */
   done: boolean;
+  /** Not done, and since my last message to them the newest thing I heard
+   *  from them went to someone else (or was a CQ): they moved on. The same
+   *  rule as the suggestion cards' "abandoned" exchange. */
+  movedOn: boolean;
 }
 
 export interface QsoActivity {
@@ -84,6 +88,8 @@ export function exchangeWith(call: string, myCallUp: string, contact: Contact | 
   if (!theirs && !mine) return null;
   const lastSent = mine ? parseFTMsg(mine.message).type : null;
   const lastRcvd = theirs?.parsed.type ?? null;
+  const heard = contact ? latestMessage(contact.msgs.filter((m) => m.role === 'tx')) : null;
+  const done = lastSent === 'rr73' || lastSent === 'tx73' || lastRcvd === 'tx73';
   const myReport = mineAll.find((e) => reportOf(e.message) !== undefined);
   const theirReport = [...toMe].sort((a, b) => b.windowStart.getTime() - a.windowStart.getTime()).find((m) => m.parsed.report !== undefined);
   return {
@@ -96,7 +102,8 @@ export function exchangeWith(call: string, myCallUp: string, contact: Contact | 
     rstRcvd: theirReport?.parsed.report,
     snr: toMe.length ? toMe.reduce((s, m) => Math.max(s, m.snr), -99) : undefined,
     lastMs: Math.max(theirs?.windowStart.getTime() ?? 0, mine?.windowStart.getTime() ?? 0),
-    done: lastSent === 'rr73' || lastSent === 'tx73' || lastRcvd === 'tx73',
+    done,
+    movedOn: !done && !!mine && !!heard && heard.windowStart > mine.windowStart && heard.parsed.callee?.toUpperCase() !== myCallUp,
   };
 }
 

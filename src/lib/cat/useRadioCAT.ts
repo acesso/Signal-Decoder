@@ -209,6 +209,9 @@ export interface RadioCATControls {
    *  restore the mode it started from. Also runs on its own when the radio
    *  un-keys by itself (TX time-out, or CW Tune switched off on the rig). */
   stopTune: () => Promise<void>;
+  /** Radio diagnostic mode (DG1;/DG0;, TX_DIAG builds): resolves true once the
+   *  radio echoes the value asked for. Used by the TX level calibration. */
+  setDiagMode: (on: boolean) => Promise<boolean>;
   setVolume: (n: number) => Promise<void>;
   setAtt1: (n: number) => Promise<void>;
   setAtt2: (n: number) => Promise<void>;
@@ -1579,6 +1582,19 @@ export function useRadioCAT(): RadioCATControls {
     return false;
   };
 
+  const setDiagMode = async (on: boolean): Promise<boolean> => {
+    const n = on ? 1 : 0;
+    for (let attempt = 1; attempt <= CONFIRM_RETRIES; attempt++) {
+      let reply = '';
+      try { reply = await query(`DG${n};`); } catch { reply = ''; }
+      const v = parseIntField(reply, 'DG');
+      if (v !== null) setState(prev => ({ ...prev, diagMode: v >= 1 }));
+      if (v === n) return true;
+      log('warn', `setDiagMode: DG${n}; → "${reply}" did not confirm (attempt ${attempt}/${CONFIRM_RETRIES})`);
+    }
+    return false;
+  };
+
   const startTune = async () => {
     const s = state();
     if (tuneActive || !s.connected || s.ptt || s.pttConfirmAlarm) return;
@@ -1991,7 +2007,7 @@ export function useRadioCAT(): RadioCATControls {
 
   return {
     state, getTransportKind: () => transportKind,
-    connect, disconnect, dismissError, setFrequency, setMode, setPTT, startTune, stopTune,
+    connect, disconnect, dismissError, setFrequency, setMode, setPTT, startTune, stopTune, setDiagMode,
     setVolume, setAtt1, setAtt2, setNR, setAGC, setAgcLevel, setFilter, setDrive,
     setBacklight, getPABias, setPABias, getTxTimeout, setTxTimeout, resetRadio,
     getFactoryDefaults, factoryResetRadio, getRefFreq, setRefFreq,

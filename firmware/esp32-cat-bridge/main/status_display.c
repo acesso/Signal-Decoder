@@ -523,13 +523,17 @@ static const char *mode_name(char d) {
 // for a constant-envelope digital mode.
 typedef enum { TX_OK = 0, TX_WARN, TX_BAD } tx_level_t;
 #define TX_MIC_RAIL 480
+#define TX_GATED_EDGE_PCT 3  // = TX_GATED_EDGE_PCT in src/lib/cat/txReport.ts
 
 static tx_level_t tx_assess(const radio_t *r, char *summary, size_t cap, int *mic_pct) {
     *mic_pct = r->mic * 100 / TX_MIC_RAIL;
     int drive = r->drive < 0 ? 2 : r->drive > 8 ? 8 : r->drive;
     int full_env = 255 >> drive;
     if (r->mic >= TX_MIC_RAIL - 10) { snprintf(summary, cap, "MIC CLIPPING"); return TX_BAD; }
-    if (r->gated > 0) { snprintf(summary, cap, "CARRIER OFF %d%%", r->gated); return TX_WARN; }
+    // A few % gated is the TX's edges (FT8 ramps, the key held past the audio),
+    // not its level, when it was at full power the rest of the time (TX_GATED_EDGE_PCT).
+    bool full_rest = r->env >= full_env && r->clip >= 90;
+    if (r->gated > TX_GATED_EDGE_PCT || (r->gated > 0 && !full_rest)) { snprintf(summary, cap, "CARRIER OFF %d%%", r->gated); return TX_WARN; }
     if (r->env < full_env) { snprintf(summary, cap, "BELOW FULL PWR"); return TX_WARN; }
     if (r->clip < 90) { snprintf(summary, cap, "FULL PWR %d%%", r->clip); return TX_WARN; }
     if (*mic_pct > 80) { snprintf(summary, cap, "NEAR CLIPPING"); return TX_WARN; }

@@ -5,11 +5,11 @@ import {
   createFTTransmit, loadMyCall, saveMyCall, loadMyGrid, saveMyGrid,
   loadAutoReply, saveAutoReply, loadBaseFreq, saveBaseFreq,
   loadAudioSinkKind, saveAudioSinkKind,
-  loadSuspendIQDuringTx, saveSuspendIQDuringTx,
+  type SentEntry,
 } from '../lib/ft/useFTTransmit'
 import {
   buildFTMessage, nextTxMsgType, parseFTMsg, isValidCallsign, needsHashedExchange, qsyAudioOffsetHz,
-  classifyCallsign, type Contact, type MsgType,
+  classifyCallsign, baseCallsign, sameText, type Contact, type ContactMsg, type MsgType,
   MSG_TYPE_COLOR, MSG_TYPE_LABEL, gridToLatLon, haversineKm,
 } from '$decoder-lib/ft/parser'
 import { currentQso, exchangeWith, latestMessage, messagesToMe, sentTo } from '$decoder-lib/ft/conversation'
@@ -18,6 +18,10 @@ import { registerLcdView } from '$decoder-lib/lcd/elementSource'
 import { drawFtContact } from '$decoder-lib/lcd/views/ftContact'
 import { drawFtSession, drawQsoOverlay, QsoAnnouncer, sessionQsos } from '$decoder-lib/lcd/views/ftSession'
 import { useLcdFeed } from './lcd/LcdFeed'
+import HeardChip from './HeardChip'
+import { decodeSummary } from '$decoder-lib/ft/decodeSummary'
+import { setTxLevelFollow, txLevelFollow } from '$decoder-lib/cat/txLevelFollow'
+import { createHeard } from '$decoder-lib/ft/pskreporter/useHeard'
 import { callsignCountry } from '$decoder-lib/ft/prefixes'
 import { FT_WINDOW_SECONDS, DEFAULT_DECODER_PARAMS, type FTMode } from '$decoder-lib/ft/decoder'
 import { fmtAbsHz } from '$decoder-lib/formatFreq'
@@ -280,7 +284,14 @@ function lastHeardMs(c: Contact): number {
   return 0
 }
 
-function buildSuggestions(myCall: string, myGrid: string, contacts: Map<string, Contact>, vfoHz = 0, foxHound = false): Suggestion[] {
+/** How many lines a card's thread keeps when I have exchanged with the station (it scrolls). */
+const THREAD_MAX = 40
+/** Their latest messages to others shown in such a thread, for context. */
+const THREAD_CONTEXT = 3
+/** My TX as recorded twice (Sent Log and contact store) within this are one line. */
+const THREAD_SAME_TX_MS = 2_000
+
+function buildSuggestions(myCall: string, myGrid: string, contacts: Map<string, Contact>, vfoHz = 0, foxHound = false, sent: readonly SentEntry[] = []): Suggestion[] {
   const sugs: Suggestion[] = []
 
   sugs.push({
@@ -352,20 +363,42 @@ function buildSuggestions(myCall: string, myGrid: string, contacts: Map<string, 
       ? replieToUs.reduce((best, m) => m.snr > best ? m.snr : best, -99)
       : lastHeard.snr
     const reportDb = Math.round(bestSnr)
-    const message  = buildFTMessage(nextTxType, myCall, c.callsign, reportDb, myGrid)
+    // Hounds use the Fox's base call (KH7Z, not KH1/KH7Z), which also keeps the grid in the call.
+    const message  = buildFTMessage(nextTxType, myCall, foxHound ? baseCallsign(c.callsign) : c.callsign, reportDb, myGrid)
 
     // Build exchange thread: interleave their direct messages and our replies,
     // sorted by time, keep the last 4 entries. When abandoned, append their
     // most recent transmission too (even though it's not addressed to us) —
     // otherwise the thread only ever shows OUR side of a stale exchange with
     // no visible sign they've since answered someone else.
-    const threadMsgs: Array<{ t: Date; raw: string; mine: boolean; snr?: number }> = [
-      ...repliedToMe
-        ? replieToUs.map(m => ({ t: m.windowStart, raw: m.raw, mine: false, snr: m.snr }))
-        : theirMsgs.slice(-2).map(m => ({ t: m.windowStart, raw: m.raw, mine: false, snr: m.snr })),
-      ...ourMsgs.map(m => ({ t: m.windowStart, raw: m.raw, mine: true })),
-      ...abandoned ? [{ t: lastHeard.windowStart, raw: lastHeard.raw, mine: false, snr: lastHeard.snr }] : [],
-    ].sort((a, b) => a.t.getTime() - b.t.getTime()).slice(-4)
+    //
+    // Once I have exchanged with the station either way, the thread is its
+    // history with me (scrolling in the card, up to THREAD_MAX lines): my
+    // side from the Sent Log too, every repeat of a message included, so my
+    // calls do not rotate out of the contact's message ring while they keep
+    // transmitting to others; plus their last few messages to others.
+    type Line = { t: Date; raw: string; mine: boolean; snr?: number }
+    const theirLine = (m: ContactMsg): Line => ({ t: m.windowStart, raw: m.raw, mine: false, snr: m.snr })
+    const mine: Line[] = ourMsgs.map(m => ({ t: m.windowStart, raw: m.raw, mine: true }))
+    for (const e of sentTo(c.callsign.toUpperCase(), sent)) {
+      if (e.error) continue
+      for (const w of e.windows?.length ? e.windows : [e.windowStart.getTime()]) {
+        if (!mine.some(l => sameText(l.raw) === sameText(e.message) && Math.abs(l.t.getTime() - w) < THREAD_SAME_TX_MS)) mine.push({ t: new Date(w), raw: e.message, mine: true })
+      }
+    }
+    const interacted = repliedToMe || mine.length > 0
+    const threadMsgs: Line[] = (interacted
+      ? [
+          ...replieToUs.map(theirLine),
+          ...theirMsgs.filter(m => m.parsed.callee?.toUpperCase() !== myCallUp).slice(-THREAD_CONTEXT).map(theirLine),
+          ...mine,
+        ]
+      : theirMsgs.slice(-2).map(theirLine)
+    ).sort((a, b) => a.t.getTime() - b.t.getTime())
+      // One line per transmission, whatever recorded it (the Sent Log, the
+      // contact store, my own receiver decoding my TX back).
+      .filter((l, i, all) => !all.slice(0, i).some(p => p.mine === l.mine && sameText(p.raw) === sameText(l.raw) && l.t.getTime() - p.t.getTime() < THREAD_SAME_TX_MS))
+      .slice(interacted ? -THREAD_MAX : -4)
 
     const thread: QSOStep[] = threadMsgs.map(m => ({ raw: m.raw, mine: m.mine, snr: m.snr, time: m.t }))
 
@@ -578,12 +611,6 @@ export default function FTTransmitPanel(props: FTTransmitPanelProps): JSX.Elemen
     return !!s && s.micActive && s.micOwner === 'manual'
   }
 
-  // Relocated from RadioCATPanel.tsx's BridgeInputModeControl — persisted
-  // via useFTTransmit.ts's load/save pair since App.tsx reads
-  // loadSuspendIQDuringTx() fresh at the moment each TX window starts,
-  // rather than needing this threaded through as a reactive prop.
-  const [suspendDuringTx, setSuspendDuringTx] = createSignal(loadSuspendIQDuringTx())
-
   const tx = createFTTransmit(
     () => props.mode,
     baseFreq,
@@ -601,6 +628,17 @@ export default function FTTransmitPanel(props: FTTransmitPanelProps): JSX.Elemen
       ? (props.effectiveVfoHz as number) - (props.vfoFrequency as number)
       : 0,
   )
+
+  // Who heard my transmissions, from PSK Reporter (doc/plans/tx-heard/PLAN.md).
+  const heard = createHeard({ myCall, myGrid, sent: () => tx.state().sent, contacts: () => props.contacts })
+  const hhmm = (ms: number) => new Date(ms).toLocaleTimeString(undefined, { hour12: false, hour: '2-digit', minute: '2-digit' })
+  const heardStatus = () => {
+    if (!heard.enabled()) return null
+    const st = heard.status()
+    if (st.failing && st.nextAt) return { text: 'PSK Reporter unreachable', title: `Retrying at ${hhmm(st.nextAt)}` }
+    if (st.nextAt) return { text: st.okAt ? `heard checked ${hhmm(st.okAt)}` : 'heard check soon', title: `Next PSK Reporter check ${hhmm(st.nextAt)}` }
+    return null
+  }
 
   // Keep the auto-CQ cache in sync with mode/baseFreq changes. Debounced:
   // baseFreq (the "Audio Hz" field) commits on every single step-button
@@ -776,13 +814,17 @@ export default function FTTransmitPanel(props: FTTransmitPanelProps): JSX.Elemen
   })
 
   createEffect(() => {
-    if (!autoReply() || !isRunning() || !canOperate()) return
+    // Fox auto-call answers its Fox even with Auto-Reply off, as WSJT-X's
+    // Hound mode sends its R+report on its own.
+    const foxOnly = !autoReply() && foxAutoActive()
+    if ((!autoReply() && !foxOnly) || !isRunning() || !canOperate()) return
     const myCallUp = myCall().toUpperCase()
     const myGridUp = myGrid().toUpperCase()
 
     for (const contact of props.contacts.values()) {
       const callsign = contact.callsign.toUpperCase()
       if (callsign === myCallUp) continue
+      if (foxOnly && callsign !== foxTarget()) continue
 
       // Their latest message to us, and what we last sent them (lib/ft/conversation.ts,
       // shared with the LCD's QSO view).
@@ -839,6 +881,12 @@ export default function FTTransmitPanel(props: FTTransmitPanelProps): JSX.Elemen
       }
 
       autoReplied.set(callsign, fingerprint)
+      // F/H: the R+report goes out at the frequency the Fox called me on.
+      if (foxHound() && nextType === 'r_report' && callsign === foxTarget()) {
+        const vfo = props.effectiveVfoHz ?? props.vfoFrequency ?? 0
+        const audio = vfo > 0 && lastTheirMsg.freq > vfo ? lastTheirMsg.freq - vfo : lastTheirMsg.freq
+        if (audio > 100 && audio < 5000) convAudioHz.set(callsign, Math.round(audio))
+      }
       // Keep honoring a conversation's pinned QSY frequency across the exchange
       tx.enqueueFirst({
         id: uid(), message, label: `Auto → ${contact.callsign} (${labelMap[nextType] ?? nextType})`,
@@ -880,6 +928,7 @@ export default function FTTransmitPanel(props: FTTransmitPanelProps): JSX.Elemen
         activity: currentQso(myCall(), props.contacts, st.sent, nowMs),
         sessionStartMs,
         session: session(),
+        decodes: decodeSummary(),
       })
     },
   }))
@@ -910,6 +959,46 @@ export default function FTTransmitPanel(props: FTTransmitPanelProps): JSX.Elemen
   // reports us we jump straight to RR73 instead of the normal r_report step,
   // since Fox logs a Hound after one report and never round-trips an ack.
   const [foxHound,         setFoxHound]         = createSignal(false)
+  // Fox auto-call (Hound side of DXpedition mode): the Fox is the station
+  // whose "Call Fox" card was last clicked; while armed (FOX_ARM_MS, like
+  // WSJT-X's "re-enable Tx at least once every two minutes"), the call is
+  // re-queued every cycle until the Fox answers, and auto-reply carries the
+  // QSO on (R+report at the Fox's frequency, done at its RR73).
+  const FOX_ARM_MS = 2 * 60_000
+  /** Fox ignores Hounds calling below this (FT8 DXpedition Mode User Guide). */
+  const FOX_MIN_CALL_HZ = 1000
+  const [foxAuto,   setFoxAuto]   = createSignal(false)
+  const [foxTarget, setFoxTarget] = createSignal<string | null>(null)
+  const [foxArmedUntil, setFoxArmedUntil] = createSignal(0)
+  const [foxNow, setFoxNow] = createSignal(Date.now())
+  const foxAutoActive = () => foxHound() && foxAuto() && !!foxTarget() && foxNow() < foxArmedUntil()
+  const armFox = () => setFoxArmedUntil(Date.now() + FOX_ARM_MS)
+  {
+    const t = setInterval(() => setFoxNow(Date.now()), 1000)
+    onCleanup(() => clearInterval(t))
+  }
+  createEffect(() => {
+    if (!foxAutoActive() || !isRunning() || !canOperate()) return
+    const fox = foxTarget()!
+    const me = myCall().toUpperCase()
+    const contact = props.contacts.get(fox)
+      ?? [...props.contacts.values()].find((c) => baseCallsign(c.callsign.toUpperCase()) === fox)
+    // The Fox answered since this arming (a report, or its RR73): auto-reply has it from here.
+    const armedAt = foxArmedUntil() - FOX_ARM_MS
+    const answered = props.contacts.get(fox)
+    if (answered && messagesToMe(answered, me).some((m) => m.windowStart.getTime() >= armedAt - 60_000)) return
+    // Hounds transmit in the other half of the minute from the Fox.
+    const last = contact ? latestMessage(contact.msgs.filter((m) => m.role === 'tx')) : null
+    if (last && props.mode === 'FT8') {
+      const foxParity = Math.floor(last.windowStart.getTime() / 15_000) % 2
+      const mine = foxParity === 0 ? 'odd' : 'even'
+      if (tx.state().txWindowParity !== mine) tx.setTxWindowParity(mine)
+    }
+    const message = buildFTMessage('answer', me, fox, undefined, myGrid().toUpperCase())
+    if (tx.state().queue.some((e) => e.message === message) || tx.state().status === 'playing') return
+    if (!convAudioHz.has(fox) && baseFreq() < FOX_MIN_CALL_HZ) convAudioHz.set(fox, FOX_MIN_CALL_HZ + 200)
+    tx.enqueue({ id: uid(), message, label: `Fox call → ${fox}`, audioHz: convAudioHz.get(fox) })
+  })
 
   const SUG_LATEST_WINDOW_MS = 5 * 60_000
 
@@ -918,8 +1007,20 @@ export default function FTTransmitPanel(props: FTTransmitPanelProps): JSX.Elemen
   const myCallUp = createMemo(() => myCall().toUpperCase())
   const myGridUp = createMemo(() => myGrid().toUpperCase())
 
+  // A card's thread scrolls; the cards are rebuilt on every decode window, so
+  // where each one was scrolled to is kept by callsign: at the newest lines
+  // unless the operator scrolled up to read.
+  const threadScroll = new Map<string, number>() // distance from the bottom, px
+  const keepThreadScroll = (el: HTMLDivElement, call: string) => {
+    queueMicrotask(() => { el.scrollTop = el.scrollHeight - el.clientHeight - (threadScroll.get(call) ?? 0) })
+    el.addEventListener('scroll', () => threadScroll.set(call, el.scrollHeight - el.clientHeight - el.scrollTop), { passive: true })
+  }
+
+  // The Sent Log alone: tx.state() also changes with every TX status step,
+  // and the suggestions need rebuilding only when what I sent changes.
+  const sentLog = createMemo(() => tx.state().sent)
   const allSuggestions = createMemo(
-    () => buildSuggestions(myCallUp(), myGridUp(), props.contacts, props.effectiveVfoHz ?? props.vfoFrequency ?? 0, foxHound()),
+    () => buildSuggestions(myCallUp(), myGridUp(), props.contacts, props.effectiveVfoHz ?? props.vfoFrequency ?? 0, foxHound(), sentLog()),
   )
 
   const myLatLon = createMemo(
@@ -989,6 +1090,12 @@ export default function FTTransmitPanel(props: FTTransmitPanelProps): JSX.Elemen
 
   const addSuggestion = (sug: Suggestion) => {
     if (!canOperate()) return
+    if (foxHound() && sug.type === 'answer' && sug.callsign) {
+      const fox = baseCallsign(sug.callsign.toUpperCase())
+      if (foxTarget() !== fox) convAudioHz.delete(fox)
+      setFoxTarget(fox)
+      armFox()
+    }
     if (tx.state().queue.some(e => e.message === sug.message)) return
     const cs = sug.callsign?.toUpperCase()
     if (sug.qsyHz !== undefined && cs) convAudioHz.set(cs, sug.qsyHz)
@@ -1121,17 +1228,11 @@ export default function FTTransmitPanel(props: FTTransmitPanelProps): JSX.Elemen
             <div class={audioSinkKind() === 'bridge' ? 'opacity-40 pointer-events-none' : ''}>
               <OutputSelector value={tx.state().outputDeviceId} onChange={tx.setOutputDevice} supported={tx.state().sinkIdSupported} />
             </div>
-            <Show when={props.iqBridge?.state().inputMode === 'iq'}>
-              <label class="flex items-center gap-1.5 text-[10px] text-[#8b949e] whitespace-nowrap">
-                <input
-                  type="checkbox"
-                  checked={suspendDuringTx()}
-                  onChange={(e) => {
-                    setSuspendDuringTx(e.currentTarget.checked)
-                    saveSuspendIQDuringTx(e.currentTarget.checked)
-                  }}
-                />
-                Suspend I/Q spectrum during TX
+            <Show when={bridgeTxLevel.active()}>
+              <label class="flex items-center gap-1.5 text-[10px] text-[#8b949e] whitespace-nowrap"
+                title="Follow: after each transmission, at most one small TX level step from the radio's report (+2 dB when the carrier was gated off or below full power, −3 dB when the mic input passed 80%, −1 dB when the envelope was more than 12 dB above full power), between −40 and −6 dB, never during a transmission. TUNE also sets the level, in a dry run after the carrier.">
+                <input type="checkbox" checked={txLevelFollow()} onChange={(e) => setTxLevelFollow(e.currentTarget.checked)} />
+                Follow TX level
               </label>
             </Show>
           </div>
@@ -1524,6 +1625,25 @@ export default function FTTransmitPanel(props: FTTransmitPanelProps): JSX.Elemen
                 >
                   🦊 F/H
                 </button>
+                <Show when={foxHound()}>
+                  <button
+                    onClick={() => { const on = !foxAuto(); setFoxAuto(on); if (on) armFox() }}
+                    title={!foxTarget()
+                      ? 'Fox auto-call: click the Fox\'s "Call Fox" card first to pick it, then switch this on'
+                      : foxAutoActive()
+                        ? `Calling ${foxTarget()} every cycle for ${Math.ceil((foxArmedUntil() - foxNow()) / 1000)} s more (click its card again to extend); once it reports you, the R+report goes out at its frequency and the QSO ends at its RR73. Click to stop.`
+                        : `Fox auto-call: keep calling ${foxTarget()} for 2 minutes and answer it on its own, even with Auto-Reply off`}
+                    class={`text-[9px] font-mono px-1.5 py-0.5 rounded border transition-colors ${
+                      foxAutoActive()
+                        ? 'border-[#3fb950]/50 text-[#3fb950] bg-[#3fb950]/10 animate-pulse'
+                        : foxAuto()
+                          ? 'border-[#d29922]/50 text-[#d29922]'
+                          : 'border-[#30363d] text-[#484f58] hover:text-[#8b949e]'
+                    }`}
+                  >
+                    🦊 auto{foxAutoActive() ? ` ${Math.ceil((foxArmedUntil() - foxNow()) / 1000)}s` : ''}{foxTarget() ? ` ${foxTarget()}` : ''}
+                  </button>
+                </Show>
                 {/* Country select */}
                 <Show when={sugCountryOptions().length > 1}>
                   <select
@@ -1576,7 +1696,8 @@ export default function FTTransmitPanel(props: FTTransmitPanelProps): JSX.Elemen
                     style={{ border: `1px ${isHashed ? 'dashed' : 'solid'} ${borderColor}` }}>
                     {/* Thread — only shown when there's exchange history */}
                     <Show when={sug.thread.length > 0}>
-                      <div class="bg-[#0d1117] px-3 pt-2 pb-1 space-y-0.5 border-b" style={{ 'border-color': borderColor }}>
+                      <div class="bg-[#0d1117] px-3 pt-2 pb-1 space-y-0.5 border-b max-h-[100px] overflow-y-auto" style={{ 'border-color': borderColor }}
+                        ref={(el) => keepThreadScroll(el, sug.callsign ?? '')}>
                         <For each={sug.thread}>
                           {(step) => (
                             <div class={`flex gap-2 items-baseline text-[11px] font-mono ${step.mine ? 'justify-end' : 'justify-start'}`}>
@@ -1869,7 +1990,12 @@ export default function FTTransmitPanel(props: FTTransmitPanelProps): JSX.Elemen
             <div class="mt-2 pt-2 border-t border-[#21262d]">
               <div class="text-[#8b949e] text-[10px] font-semibold uppercase tracking-wide mb-1 flex items-center justify-between">
                 <span>Sent Log</span>
-                <span class="text-[#484f58] normal-case">{tx.state().sent.length}</span>
+                <span class="flex items-center gap-2 normal-case">
+                  <Show when={heardStatus()}>
+                    {(st) => <span class="font-normal text-[#484f58]" title={st().title}>{st().text}</span>}
+                  </Show>
+                  <span class="text-[#484f58]">{tx.state().sent.length}</span>
+                </span>
               </div>
               <div class="space-y-px">
                 <For each={tx.state().sent}>
@@ -1892,6 +2018,17 @@ export default function FTTransmitPanel(props: FTTransmitPanelProps): JSX.Elemen
                         <span class={`truncate flex-1 ${entry.error ? 'text-[#f85149]' : 'text-[#c9d1d9]'}`}>
                           {entry.message}
                         </span>
+                        <Show when={heard.summary(entry)} fallback={
+                          <Show when={heard.recent(entry)} fallback={
+                            <Show when={heard.pendingUntil(entry)}>
+                              {(at) => <span class="shrink-0 text-[10px] text-[#484f58]" title={`PSK Reporter not checked for this TX yet: next check ${hhmm(at())}`}>⏳</span>}
+                            </Show>
+                          }>
+                            {(sum) => <HeardChip summary={sum()} callee={parsed.callee} recent />}
+                          </Show>
+                        }>
+                          {(sum) => <HeardChip summary={sum()} callee={parsed.callee} />}
+                        </Show>
                         <span class="shrink-0 text-[10px] text-[#484f58]">
                           {absFreq > 0 ? fmtAbsHz(absFreq) : `${entry.audioHz} Hz`}
                         </span>

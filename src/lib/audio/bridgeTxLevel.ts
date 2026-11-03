@@ -56,6 +56,14 @@ export const bridgeTxLevel = createRoot(() => {
       void refresh()
     },
     refresh,
+    /** The bridge's continuous test tone (POST /tone) at hz, full scale, through
+     *  this same level; null stops it. Throws when the bridge refuses (a TX slot playing). */
+    async tone(hz: number | null): Promise<void> {
+      const b = base()
+      if (!b) throw new Error('No bridge to play the test tone.')
+      const res = await fetch(`${b}/tone`, { method: 'POST', body: JSON.stringify(hz === null ? { on: false } : { hz, amp: 0.99 }) })
+      if (!res.ok) throw new Error((await res.text()) || `The bridge refused the test tone (HTTP ${res.status}).`)
+    },
     /** Sets the level (dB, -60..0); the slider follows at once, the POST is debounced. */
     set(v: number) {
       const clamped = Math.max(DAC_LEVEL_MIN_DB, Math.min(0, Math.round(v)))

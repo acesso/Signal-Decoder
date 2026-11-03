@@ -15,11 +15,15 @@ import VirtualList from './VirtualList'
 import { loadNumber, saveNumber, loadBoolean, saveBoolean } from '$decoder-lib/storage'
 import FTLeafletMap from './FTLeafletMap'
 import { trackEvent } from '$decoder-lib/analytics'
+import { heardNoteFor } from '$decoder-lib/ft/pskreporter/useHeard'
 
 const LS_MAP_HEIGHT       = 'ft_map_height'
 const LS_CONTACTS_SORT_KEY = 'ft_contacts_sort_key'
 const LS_CONTACTS_SORT_REV = 'ft_contacts_sort_rev'
 const LS_ADIF_INCLUDE_PARTIAL = 'ft_adif_include_partial'
+const hhmm = (ms: number, seconds = false) =>
+  new Date(ms).toLocaleTimeString(undefined, { hour12: false, hour: '2-digit', minute: '2-digit', ...(seconds ? { second: '2-digit' } : {}) })
+
 const CONTACTS_SORT_KEYS = ['date', 'tx', 'rx', 'worked', 'alpha', 'snr-hi', 'snr-lo', 'near', 'far'] as const
 
 // Virtualized contact list geometry: collapsed cards are fixed-height
@@ -396,6 +400,7 @@ function ContactCard(props: {
   const locParts = createMemo(() => locationParts(props.contact))
   const longest = createMemo(() => props.expanded ? longestDistances(props.contact, props.contactMap) : { tx: null, rx: null })
   const badge = createMemo(() => callsignBadge(props.contact.callsign))
+  const heardNote = createMemo(() => heardNoteFor(props.contact))
 
   // Split peers into groups
   const peerGroups = createMemo(() => {
@@ -483,6 +488,23 @@ function ContactCard(props: {
           >
             QSO…
           </span>
+        </Show>
+        {/* PSK Reporter (doc/plans/tx-heard/PLAN.md): this station heard me, or was on air in my reply slot unheard */}
+        <Show when={heardNote()?.heardYou}>
+          {(r) => (
+            <span class="shrink-0 text-[9px] font-mono px-1 py-px rounded bg-[#1f6feb1a] text-[#79c0ff]"
+              title={`${props.contact.callsign} reported hearing you on PSK Reporter at ${hhmm(r().t * 1000)}${r().snr !== null ? ` (${r().snr} dB)` : ''}, whether or not you decoded its answer`}>
+              🎯 {hhmm(r().t * 1000)}
+            </span>
+          )}
+        </Show>
+        <Show when={heardNote()?.replySlot}>
+          {(ev) => (
+            <span class="shrink-0 text-[9px] font-mono px-1 py-px rounded bg-[#d299221a] text-[#d29922]"
+              title={`${props.contact.callsign} was on air in your reply slot at ${hhmm(ev().slotMs, true)}: ${ev().receivers} station${ev().receivers === 1 ? '' : 's'} heard it (best ${ev().best.rx}${ev().best.snr !== null ? ` ${ev().best.snr} dB` : ''}), you decoded nothing from it. Possibly an answer you missed; PSK Reporter does not say whom it called.`}>
+              📻? {hhmm(ev().slotMs, true)}
+            </span>
+          )}
         </Show>
         <Show when={locParts()}>
           <span class="font-mono text-[10px] text-[#484f58] flex items-center gap-1 truncate min-w-0"

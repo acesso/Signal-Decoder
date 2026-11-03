@@ -308,6 +308,20 @@ export function parseFTMsg(raw: string): ParsedFTMsg {
   return { type: 'other', ...base, clean: false };
 }
 
+/**
+ * A Fox's compound DXpedition message (type 0.1), "K1ABC RR73; W9XYZ <KH1/KH7Z> -17":
+ * an RR73 to one Hound and a report to the next, as the two messages they
+ * stand for, from the Fox's base call (the one Hounds use and its standard
+ * messages carry): ["K1ABC KH7Z RR73", "W9XYZ KH7Z -17"]. Any other message as is.
+ * An unresolved Fox ("<...>") stays a placeholder.
+ */
+export function foxMessageParts(msg: string): string[] {
+  const m = /^(\S+) RR73; (\S+) (\S+) ([+-]\d{2})$/.exec(msg.trim());
+  if (!m) return [msg];
+  const fox = m[3] === '<...>' ? '<...>' : baseCallsign(m[3].replace(/^<|>$/g, '').toUpperCase());
+  return [`${m[1]} ${fox} RR73`, `${m[2]} ${fox} ${m[4]}`];
+}
+
 export function gridToLatLon(grid: string): [number, number] | null {
   if (grid.length < 4) return null;
   const g  = grid.toUpperCase();
@@ -353,6 +367,11 @@ export interface Contact {
   firstSeen: Date;
   lastSeen: Date;
 }
+
+/** Copies of one message closer than this are one transmission (mergeContacts). */
+const SAME_TX_MS = 2_000;
+/** A message's words, for comparing two copies (spacing and case aside). */
+export const sameText = (raw: string): string => raw.trim().replace(/\s+/g, ' ').toUpperCase();
 
 // Maximum unique callsigns to keep in memory at once.
 // On a busy band (20m FT8) you can hear 200+ unique calls/hour — cap prevents
@@ -484,6 +503,16 @@ export function mergeContacts(
     const calleeValid = isValidCallsign(parsed.callee);
     if (!callerValid && !calleeValid) return;
 
+    // The same transmission arriving twice: my own TX is recorded as sent
+    // (FTDecoder's injectSentMessage, stamped at TX start) and, with the
+    // receiver left on during TX, decoded back too (stamped at the window
+    // start). Same text within SAME_TX_MS of a copy already kept is that one
+    // transmission; a real repeat is a whole window (7.5 s or more) apart.
+    const text = sameText(raw);
+    const sameTx = (c: Contact | undefined, role: ContactMsg['role']) =>
+      !!c && c.msgs.some((m) => m.role === role && sameText(m.raw) === text && Math.abs(m.windowStart.getTime() - when.getTime()) < SAME_TX_MS);
+    if ((callerValid && sameTx(contacts.get(parsed.caller), 'tx')) || (calleeValid && sameTx(contacts.get(parsed.callee!), 'rx'))) return;
+
     const lowConfidence = (osd ?? -1) >= 0;
     const latLon  = parsed.grid && callerValid ? gridToLatLon(parsed.grid) : null;
     const gridOk  = !callerValid || gridPlausible(parsed.caller, latLon);
@@ -573,7 +602,7 @@ export function mergeContacts(
     }
   };
 
-  for (const m of messages) processMessage(windowStart, m);
+  for (const m of messages) for (const part of foxMessageParts(m.msg)) processMessage(windowStart, { ...m, msg: part });
 
   // Evict oldest contacts when over the limit — sort by lastSeen ascending,
   // drop the stalest ones. Never evict a contact that has messages in this window
@@ -658,9 +687,15 @@ export function buildFTMessage(
     }
   }
 
+  // A standard FT8/FT4 message carries a 4-character grid only. A 6-character
+  // locator ("HI22NU") does not fit, and the encoder then sends the message
+  // with no grid at all ("CQ PU7FTW"); receivers do not spot a gridless
+  // answer to PSK Reporter, and this app's own parser reads it as "other".
+  // So the square ("HI22") goes on air; the full locator stays in settings.
+  const grid = myGrid.slice(0, 4);
   switch (type) {
-    case 'cq':       return myGrid ? `CQ ${myCall} ${myGrid}` : `CQ ${myCall}`;
-    case 'answer':   return myGrid ? `${theirCall} ${myCall} ${myGrid}` : `${theirCall} ${myCall}`;
+    case 'cq':       return grid ? `CQ ${myCall} ${grid}` : `CQ ${myCall}`;
+    case 'answer':   return grid ? `${theirCall} ${myCall} ${grid}` : `${theirCall} ${myCall}`;
     case 'report':   return `${theirCall} ${myCall} ${rpt}`;
     case 'r_report': return `${theirCall} ${myCall} R${rpt}`;
     case 'rr73':     return `${theirCall} ${myCall} RR73`;
@@ -714,14 +749,14 @@ export function qsyAudioOffsetHz(cqTag: string | undefined, vfoHz: number): numb
 // logs) with no way to ever stop, since there is no further peer message
 // that could signal "they got it" for a message that itself needs no ack.
 //
-// foxHound: DXpedition Fox/Hound mode (WSJT-X "Type F/H") compresses the
-// Hound's side of the exchange — Fox logs the Hound after a single report and
-// never round-trips an R+report acknowledgment, so once Fox reports us we
-// must jump straight to RR73. Sending r_report here (the normal-QSO next
-// step) would be a wasted transmission Fox simply ignores, burning one of a
-// Hound's limited call-in slots for nothing. Only the 'answer' state differs;
-// every other state (we called CQ, or the exchange is past the report step)
-// behaves the same either way.
+// foxHound: DXpedition Fox/Hound mode, as WSJT-X's "FT8 DXpedition Mode
+// User Guide" (K1JT) runs it from the Hound's side:
+//   Hound  KH7Z K1ABC FN42      (calls, repeatedly, 1000-4000 Hz)
+//   Fox    K1ABC KH7Z -13       (or "K1ABC RR73; W9XYZ <KH1/KH7Z> -17")
+//   Hound  KH7Z K1ABC R-11      (R+report, at the frequency Fox called it on)
+//   Fox    K1ABC RR73           QSO complete; the Hound sends nothing more.
+// A Hound that misses the RR73 repeats its R+report. So the report step is
+// the normal one; what differs is the end: no 73 after Fox's RR73.
 export function nextTxMsgType(lastSent: MsgType | null, lastRx: MsgType | null, foxHound = false): TxMsgType {
   if (!lastSent) return 'cq';
 
@@ -741,7 +776,7 @@ export function nextTxMsgType(lastSent: MsgType | null, lastRx: MsgType | null, 
   // RR73; they close → 73 back; anything else (incl. their repeated CQ) →
   // keep answering/calling in.
   if (lastSent === 'answer') {
-    if (lastRx === 'report' || lastRx === 'r_report') return foxHound ? 'rr73' : 'r_report';
+    if (lastRx === 'report' || lastRx === 'r_report') return 'r_report';
     if (lastRx === 'rr73' || lastRx === 'rrr')        return 'tx73';
     if (lastRx === 'tx73')                            return 'cq';
     return 'answer';
@@ -759,7 +794,7 @@ export function nextTxMsgType(lastSent: MsgType | null, lastRx: MsgType | null, 
   // We sent R+report: RR73/RRR → 73 back; their 73 → done; a repeated
   // report means they missed our R+report → re-send it.
   if (lastSent === 'r_report') {
-    if (lastRx === 'rr73' || lastRx === 'rrr') return 'tx73';
+    if (lastRx === 'rr73' || lastRx === 'rrr') return foxHound ? 'cq' : 'tx73';
     if (lastRx === 'tx73')                     return 'cq';
     return 'r_report';
   }

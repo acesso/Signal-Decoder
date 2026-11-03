@@ -1,6 +1,6 @@
 import { Gfx, LCD_BODY_TOP, LCD_H, LCD_W } from '../../gfx'
 import { OVERLAY_H, OVERLAY_W, OVERLAY_X, OVERLAY_Y } from '../../feed'
-import { drawFtSession, drawQsoOverlay, QsoAnnouncer, sessionQsos, type FtSessionViewData } from '../ftSession'
+import { drawFtSession, drawQsoOverlay, QsoAnnouncer, sessionQsos, slotClock, type FtSessionViewData } from '../ftSession'
 import type { QSORecord } from '../../../ft/parser'
 
 const T0 = Date.UTC(2026, 9, 29, 12, 0, 0)
@@ -13,7 +13,7 @@ const base: FtSessionViewData = {
   nowMs: T0 + 9000, windowSec: 15, armed: true, txStatus: 'waiting',
   activity: { qso: null, callingCq: false }, sessionStartMs: T0, session: [],
 }
-const working = { call: 'LU1ABC', grid: 'GF05', lastSent: 'answer' as const, lastRcvd: 'report' as const, step: 2, rstRcvd: -8, snr: -14, lastMs: 0, done: false }
+const working = { call: 'LU1ABC', grid: 'GF05', lastSent: 'answer' as const, lastRcvd: 'report' as const, step: 2, rstRcvd: -8, snr: -14, lastMs: 0, done: false, movedOn: false }
 const two = [rec('LU1ABC', 5), rec('K1XX', 3)]
 
 const states: Record<string, FtSessionViewData> = {
@@ -62,4 +62,14 @@ test('QsoAnnouncer: each new QSO once; those there at the start are not announce
   const d = rec('D', 4), e = rec('E', 5)
   expect(q.update([e, d, b])).toBe(e) // two at once: the newest
   expect(q.update([e, d, b])).toBeNull()
+})
+
+test('the window clock fills clockwise as the window runs', () => {
+  const lit = (frac: number) => { const g = new Gfx(); slotClock(g, 0, 0, frac); let n = 0; for (let y = 0; y < 7; y++) for (let x = 0; x < 7; x++) if (g.get(x, y)) n++; return n }
+  const counts = [0, 0.25, 0.5, 0.75, 0.99].map(lit)
+  expect(counts).toEqual([...counts].sort((a, b) => a - b)) // never empties mid-window
+  expect(counts[4]).toBeGreaterThan(counts[0] + 10)
+  const right = new Gfx(); slotClock(right, 0, 0, 0.3)
+  expect(right.get(4, 2)).toBe(true)  // a quarter in: the right half starts filling
+  expect(right.get(2, 4)).toBe(false) // not the lower left yet
 })

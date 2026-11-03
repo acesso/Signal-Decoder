@@ -33,6 +33,18 @@ export interface TxAssessment {
 /** The mic ADC's rail in counts (it saturates at 512; ~480 is where clipping starts). */
 export const TX_MIC_RAIL = 480
 
+/** Carrier-off share that is the transmission's edges, not its level: FT8
+ *  audio ramps in and out, and the radio stays keyed a moment past the
+ *  audio, so a full-power TX almost always reports 1% gated. More than
+ *  this, or any gating without full power the rest of the time, is the level. */
+export const TX_GATED_EDGE_PCT = 3
+
+/** The report shows the transmission at full power apart from its edges. */
+export function fullPowerApartFromEdges(r: TxReport, drive: number | null): boolean {
+  const fullPowerEnv = 255 >> Math.max(0, Math.min(8, drive ?? 2))
+  return r.envPeak >= fullPowerEnv && r.clipPct >= 90 && r.gatedPct <= TX_GATED_EDGE_PCT
+}
+
 export function parseTxReport(frame: string): TxReport | null {
   const m = /^TA(\d+),(\d+),(\d+),(\d+),(\d+);?$/.exec(frame.trim())
   if (!m) return null
@@ -49,7 +61,7 @@ export function assessTxReport(r: TxReport, drive: number | null): TxAssessment 
   if (r.micPeak >= TX_MIC_RAIL - 10) {
     return { level: 'bad', summary: 'mic clipping', micPct, advice: 'The radio\'s mic input is clipping, which distorts the signal: lower the TX level by about 6 dB.' }
   }
-  if (r.gatedPct > 0) {
+  if (r.gatedPct > TX_GATED_EDGE_PCT || (r.gatedPct > 0 && !fullPowerApartFromEdges(r, drive))) {
     return { level: 'warn', summary: `carrier off ${r.gatedPct}%`, micPct, advice: 'The level is so low that the radio switched the carrier off for part of the transmission: raise the TX level.' }
   }
   if (r.envPeak < fullPowerEnv) {
